@@ -1,4 +1,5 @@
 use std::{
+    fmt::Write as _,
     fs::OpenOptions,
     io::Write,
     path::{Path, PathBuf},
@@ -97,7 +98,12 @@ pub async fn spec_text_and_hash(cwd: &Path, config: &Config) -> Result<(String, 
         .with_context(|| format!("read authoritative spec {}", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(text.as_bytes());
-    Ok((text, format!("{:x}", hasher.finalize())))
+    let digest = hasher.finalize();
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(hash, "{byte:02x}")?;
+    }
+    Ok((text, hash))
 }
 
 pub async fn maybe_init_git(cwd: &Path, config: &Config) -> Result<()> {
