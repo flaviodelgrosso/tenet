@@ -1,799 +1,229 @@
 # loops
 
-`loops` is a small autonomous **spec-driven development controller** written in Rust.
+**Give it a spec. Walk away. Come back to a repository that satisfies it — verified by machines, not by an agent's word.**
 
-You give it a repository containing an authoritative `spec.md`. `loops` turns that specification into a requirement catalog, repeatedly inspects the repository, chooses one coherent work unit, delegates coding to a fresh headless coding-agent worker, runs deterministic verification, repairs failures, and independently reassesses the result until the specification is satisfied or the run is blocked.
+`loops` is a small, obsessively deterministic Rust controller for autonomous, spec-driven development. It doesn't chat with you. It doesn't hold a single sprawling agent conversation and hope the context window forgives it. It runs a state machine that repeatedly reads your repository, decides the one next thing worth doing, hands that — and only that — to a disposable coding-agent worker, checks the result with real build/test commands, and refuses to call anything "done" until an independent, skeptical worker agrees from scratch.
 
-The default backend is **Oh My Pi (OMP)** running headlessly through `omp --mode rpc`.
+The default engine behind every worker is **[Oh My Pi (OMP)](https://github.com/anthropics)**, driven headlessly through `omp --mode rpc`.
 
-> `loops` is the orchestrator. OMP is the coding-agent engine.
+> **`loops` is the orchestrator. OMP is the muscle.** Everything that matters about correctness, memory, and control lives in the Rust controller — not in the model.
 
 ---
 
-## Mental model
-
-The most important thing to understand is that `loops` is **not one long agent conversation**.
-
-A run is controlled by a deterministic Rust state machine. Whenever reasoning or coding is needed, the controller starts a brand-new OMP process for a specific role, gives that worker only the context needed for that step, waits for structured output, then terminates the worker.
+## The idea in one picture
 
 ```text
-                           authoritative
-                              spec.md
-                                 │
-                                 ▼
-                    ┌─────────────────────────┐
-                    │          loops          │
-                    │                         │
-                    │ state machine           │
-                    │ requirements            │
-                    │ verification            │
-                    │ evidence                │
-                    │ retries / circuit break │
-                    │ TUI                     │
-                    └────────────┬────────────┘
-                                 │
-                      fresh OMP processes
-                                 │
-          ┌──────────┬───────────┼───────────┬──────────┐
-          ▼          ▼           ▼           ▼          ▼
-      Architect   Reconcile   Implement    Repair     Assess
-      read-only   read-only    coding      coding    read-only
+                                authoritative
+                                   spec.md
+                                      │
+                                      ▼
+                       ┌─────────────────────────┐
+                       │           loops          │
+                       │                          │
+                       │   state machine          │
+                       │   requirement catalog    │
+                       │   deterministic verify   │
+                       │   evidence + audit trail │
+                       │   retries / circuit break│
+                       │   TUI                    │
+                       └────────────┬─────────────┘
+                                    │
+                          spawns fresh, disposable
+                              OMP processes
+                                    │
+           ┌──────────┬────────────┼────────────┬──────────┐
+           ▼          ▼            ▼             ▼          ▼
+       Architect   Reconcile   Implement       Repair     Assess
+       read-only   read-only    coding         coding    read-only
 ```
 
-There is no permanent "master LLM" carrying the whole run in its context window.
-
-State survives between workers through explicit artifacts: the repository, `spec.md`, `.loops/` state, work-unit summaries, and deterministic verification evidence.
+There is no permanent "master LLM" carrying the whole run in its head. State survives between workers the boring, reliable way: the repository itself, `spec.md`, `.loops/` state, work-unit summaries, and deterministic verification evidence. Every worker starts cold and leaves nothing but files behind.
 
 ---
 
-## Are there subagents?
+## Why this has legs
 
-**Logically yes; technically they are isolated workers, not nested OMP subagents.**
+Most "autonomous coding agent" demos are one long conversation wearing a trench coat. They work beautifully for five minutes and then rot: context bloats, the model forgets its own earlier decisions, and "I ran the tests and they pass" becomes something you have to take on faith. `loops` is a bet against that failure mode, built on a handful of unfashionable but load-bearing ideas:
 
-`loops` currently defines five agent roles:
+- **Disposable context, durable state.** Every role — Architect, Reconcile, Implement, Repair, Assess — runs in a brand-new OMP process with `--no-session`. Nothing leaks between them except what the controller deliberately writes to disk. No conversation to derail, no context window to exhaust, no "wait, why did it do that three turns ago."
+- **Agents propose, code decides.** An LLM saying "tests pass" is a hypothesis, not evidence. `loops` runs `cargo test`, `go test`, `pytest`, `npm run lint` — actual processes with actual exit codes — and only those decide whether a work unit is real.
+- **Reconcile against reality, not against a todo list.** After every change, a fresh worker re-inspects the live repository against the full requirement catalog. Task lists lie by omission; source code doesn't.
+- **Skepticism at the finish line.** Completion isn't self-certified. A final **Assess** worker — with none of the Implement/Repair conversation, only read-only tools and the requirement catalog — has to independently agree the spec is satisfied before the run is allowed to end.
+- **Fail closed.** Invalid structured output, a worker touching a protected file, stagnating on the same work unit, exhausting repair attempts — all of it blocks the run instead of quietly limping forward.
 
-| Role          | Purpose                                                                          | Repository access | When it runs                                                              |
-| ------------- | -------------------------------------------------------------------------------- | ----------------- | ------------------------------------------------------------------------- |
-| **Architect** | Convert `spec.md` into a stable requirement catalog                              | Read-only         | Initially, and again if `spec.md` changes                                 |
-| **Reconcile** | Compare the real repository with every requirement and choose the next work unit | Read-only         | At the beginning of every cycle                                           |
-| **Implement** | Implement exactly one work unit                                                  | Read/write/bash   | Once for each selected work unit                                          |
-| **Repair**    | Fix a deterministic verification failure                                         | Read/write/bash   | Only after verification fails                                             |
-| **Assess**    | Independently verify final completion from scratch                               | Read-only         | Only after reconciliation and final gates say the project may be complete |
-
-These workers are **not** spawned from another LLM conversation. The Rust controller starts separate commands similar to:
-
-```bash
-omp --mode rpc --no-session ...
-```
-
-Each worker therefore starts with a fresh context.
-
-Workers currently run **sequentially**, not in parallel.
+None of this requires a smarter model. It requires an orchestrator with better discipline than the model it's driving — which is exactly the gap a Rust state machine is good at filling.
 
 ---
 
-## Does every worker use the same model?
+## What actually happens, step by step
 
-**Yes, in v0.1.0 the model configuration is global.**
-
-There is one setting:
-
-```toml
-[agent]
-model = "openrouter/anthropic/claude-sonnet-4.6"
-```
-
-When `model` is configured, every OMP worker is launched with the same:
-
-```bash
---model <configured-model>
-```
-
-So Architect, Reconcile, Implement, Repair, and Assess use the **same model**, but they do **not** share context. They receive different:
-
-- system-role instructions;
-- tool permissions;
-- task input;
-- structured output schema.
-
-If `agent.model` is omitted, `loops` does not pass `--model`; each fresh OMP process resolves the normal model configured for OMP.
-
-The thinking level is also currently global:
-
-```toml
-[agent]
-thinking = "high"
-```
-
-### Why start with one model?
-
-The MVP deliberately keeps model selection simple so that failures are easier to reason about. If Architect behaves differently from Implement, the difference is caused primarily by role, context and tools rather than by an additional model variable.
-
-A future version can add per-role model routing, for example a stronger model for Architect/Assess and a cheaper model for implementation, but **that is not implemented today**.
-
----
-
-# Exact execution flow
-
-A normal `loops run` is a hierarchy of loops rather than a fixed linear script.
-
-At a high level:
+A `loops run` is a hierarchy of loops, not a linear script:
 
 ```text
 spec.md
    │
    ▼
-ARCHITECT                 only when requirement catalog is missing/stale
+ARCHITECT                 only when the requirement catalog is missing/stale
    │
    ▼
-┌──────────────────── PROJECT LOOP ────────────────────┐
-│                                                     │
-│  RECONCILE                                          │
-│      │                                              │
-│      ├── gaps ──► IMPLEMENT ──► VERIFY              │
-│      │                              │               │
-│      │                              ├─ PASS ─────┐  │
-│      │                              │            │  │
-│      │                              └─ FAIL      │  │
-│      │                                  │        │  │
-│      │                               REPAIR      │  │
-│      │                                  │        │  │
-│      │                               VERIFY      │  │
-│      │                                  │        │  │
-│      └──────────────────────────────────┴────────┘  │
-│                                                     │
-│          next cycle → RECONCILE repository again   │
-└─────────────────────────────────────────────────────┘
-   │
+┌──────────────────── PROJECT LOOP ─────────────────────┐
+│  RECONCILE                                            │
+│      ├── gaps ──► IMPLEMENT ──► VERIFY                │
+│      │                            ├─ PASS ─────┐      │
+│      │                            └─ FAIL      │      │
+│      │                                │        │      │
+│      │                             REPAIR       │      │
+│      │                                │        │      │
+│      │                             VERIFY       │      │
+│      │                                │        │      │
+│      └────────────────────────────────┴────────┘      │
+│              next cycle → RECONCILE the repo again    │
+└─────────────────────────────────────────────────────────┘
    │ reconciliation says complete
    ▼
 FINAL DETERMINISTIC GATES
-   │
-   ├── fail ──► REPAIR ──► verify again
-   │
+   │  ├── fail ──► REPAIR ──► verify again
    ▼
-ASSESS                     fresh independent worker
-   │
-   ├── gaps ──────────────► PROJECT LOOP again
-   │
+ASSESS                     fresh, independent, skeptical worker
+   │  ├── gaps ──► back into the PROJECT LOOP
    ▼
 DONE
 ```
 
-The detailed flow is below.
+### The five roles
 
----
+| Role          | Purpose                                                       | Repo access     | Runs when                                     |
+| ------------- | -------------------------------------------------------------- | --------------- | ---------------------------------------------- |
+| **Architect** | Turns `spec.md` prose into a stable `REQ-NNN` requirement catalog | Read-only        | Once, and again if `spec.md`'s hash changes    |
+| **Reconcile** | Compares the real repo against every requirement, picks the next work unit | Read-only        | Start of every project cycle                   |
+| **Implement** | Implements exactly one work unit                              | Read/write/bash  | Once per selected work unit                    |
+| **Repair**    | Fixes a deterministic verification failure                    | Read/write/bash  | Only after verification fails                  |
+| **Assess**    | Independently re-verifies completion from scratch              | Read-only        | Only after Reconcile and final gates say "done" |
 
-## Step 0 — Initialize controller state
-
-Before starting agent work, `loops`:
-
-1. creates `.loops/` if necessary;
-2. creates/loads `.loops/config.toml`;
-3. ensures `spec.md` exists;
-4. ensures `.loops/` is ignored by Git;
-5. optionally initializes Git according to config;
-6. acquires the run lock so two controllers cannot mutate the same project simultaneously;
-7. creates a unique run id;
-8. creates run logs under `.loops/runs/<run-id>/`;
-9. loads the persisted controller state.
-
-The LLM is not involved in this step.
-
----
-
-## Step 1 — Architect the specification
-
-The Architect exists to turn prose in `spec.md` into a machine-trackable catalog.
-
-It receives the complete product specification and must return requirements such as:
-
-```json
-{
-  "requirements": [
-    {
-      "id": "REQ-001",
-      "title": "Rust CLI application",
-      "description": "...",
-      "acceptanceCriteria": [
-        "The project builds with Cargo",
-        "The produced executable is named linekit"
-      ]
-    }
-  ]
-}
-```
-
-The controller enforces stable sequential IDs:
-
-```text
-REQ-001
-REQ-002
-REQ-003
-...
-```
-
-The Architect is **read-only**. It is not supposed to design implementation tasks or change the codebase.
-
-Its output is stored in:
-
-```text
-.loops/requirements.json
-```
-
-The catalog also contains a hash of `spec.md`.
-
-### Does Architect run every cycle?
-
-No.
-
-If `.loops/requirements.json` exists and its spec hash still matches the current `spec.md`, the existing catalog is reused.
-
-If `spec.md` changes during development, `loops` detects the new hash, invalidates completed work-unit claims, and runs a fresh Architect again.
-
----
-
-## Step 2 — Reconcile the repository
-
-Every project cycle starts with a fresh **Reconcile** worker.
-
-The reconciler receives:
-
-- the complete requirement catalog;
-- up to the five most recent completed work-unit summaries;
-- read-only access to the actual repository.
-
-The completed-work-unit summaries are explicitly treated as **claims, not evidence**. The reconciler is instructed to inspect source code, tests and configuration itself.
-
-For every requirement it returns:
-
-```text
-satisfied
-partial
-missing
-```
-
-plus concrete evidence and remaining gaps.
-
-Example:
-
-```json
-{
-  "id": "REQ-004",
-  "status": "partial",
-  "evidence": ["src/main.rs defines the stats command"],
-  "gaps": ["Unicode characters are still counted as bytes"]
-}
-```
-
-If work remains, Reconcile must choose **exactly one next work unit**:
-
-```json
-{
-  "id": "WU-004",
-  "title": "Complete Unicode-aware stats",
-  "objective": "Make character counting conform to REQ-004 and add tests",
-  "requirementIds": ["REQ-004", "REQ-006"],
-  "acceptanceCriteria": ["..."],
-  "suggestedChecks": ["cargo test stats"]
-}
-```
-
-The controller validates that the work unit only references known requirements.
-
-The latest reconciliation is persisted as:
-
-```text
-.loops/roadmap.json
-```
-
-### Why reconcile after every work unit?
-
-Because the task list is not the source of truth. The **repository and the product spec are**.
-
-After each change, a new context inspects the result again. This lets the controller discover:
-
-- an implementation that did not fully satisfy its target requirement;
-- side effects that satisfied other requirements;
-- new gaps exposed by the implementation;
-- incorrect completion claims from a previous worker.
-
----
-
-## Step 3 — Implement one work unit
-
-If Reconcile finds gaps, `loops` starts a fresh **Implement** worker.
-
-The Implement worker receives:
-
-- exactly one `WorkUnit`;
-- the full requirement catalog;
-- coding tools.
-
-It does **not** receive the previous reconciler conversation.
-
-Its role contract tells it to make the smallest coherent production-quality change needed for that work unit and to add/update tests when behavior changes.
-
-The default coding tool surface is:
-
-```text
-read
-grep
-find
-ls
-edit
-write
-bash
-```
-
-Before the worker starts, `loops` snapshots controller-owned files such as:
-
-```text
-spec.md
-AGENTS.md
-.loops/config.toml
-.loops/state.json
-.loops/requirements.json
-.loops/roadmap.json
-.loops/run.lock
-```
-
-After the worker exits, `loops` checks those files again.
-
-If the coding worker changed a protected file, the controller restores it and **blocks the run**.
-
-The Implement worker returns a structured summary containing changed files, tests it ran, notes and a short summary. That summary does not make the work unit complete; deterministic verification does.
-
----
-
-## Step 4 — Run deterministic verification
-
-After implementation, the controller runs verification **itself**, without an LLM.
-
-This separation is intentional:
-
-```text
-LLM says "tests pass"       → not trusted
-process exit code == 0      → evidence
-```
-
-Verification is fail-fast. As soon as one command fails, the remaining commands for that attempt are not executed.
-
-Auto-detection currently supports common project gates.
-
-### Rust
+These are not nested OMP subagents — they're separate OS processes, launched roughly like:
 
 ```bash
-cargo build
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
+omp --mode rpc --no-session --thinking high \
+    --tools <role-specific-tools> \
+    --no-extensions --no-skills --no-rules \
+    --append-system-prompt '<role contract>' \
+    --yolo
 ```
 
-### Go
+Workers run **sequentially**, each with tools scoped to its role, none of them aware the others — or the TUI — exist.
+
+### Structured output, not prose-scraping
+
+`loops` never asks a model to print a JSON code fence and prays a regex finds it. Every worker gets a host-owned RPC tool, `loops_yield`, backed by a role-specific JSON Schema (`ArchitectOutput`, `ReconcileResult`, `WorkerSummary`, …). The worker's turn isn't "done" until it calls that tool with output the controller can deserialize and validate; two structured-completion reminders are given before a non-yielding worker is treated as a failure.
+
+### Verification is real, and it's fail-fast
+
+`loops verify` (and every internal gate) auto-detects your stack and runs the boring commands that actually catch regressions:
 
 ```bash
+# Rust
+cargo build && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --all-targets
+# Go
 go test ./...
-```
-
-### Python
-
-When Python project markers and `tests/` exist:
-
-```bash
+# Python (when tests/ + project markers exist)
 python -m pytest -q
-```
-
-### Node
-
-For scripts present in `package.json`, `loops` detects:
-
-```text
-test
-typecheck
-lint
-build
-```
-
-and respects pnpm/yarn/bun/npm lockfiles.
-
-### Git
-
-Inside a Git repository:
-
-```bash
+# Node (whichever scripts exist, respecting your lockfile)
+test / typecheck / lint / build
+# Git
 git diff --check
 ```
 
-`git diff --check` alone is intentionally not sufficient when `require_project_gate = true`.
-
-You can add project-specific hard gates:
+Add your own hard gates in `.loops/config.toml`:
 
 ```toml
 [verification]
-commands = [
-  "cargo test --all-features",
-  "./scripts/acceptance.sh"
-]
+commands = ["cargo test --all-features", "./scripts/acceptance.sh"]
 ```
 
-Every verification attempt is saved as evidence under `.loops/evidence/`.
+Every attempt — pass or fail — is written to `.loops/evidence/` as an auditable report (command, exit code, stdout, stderr).
 
----
+### Repair doesn't argue with itself
 
-## Step 5 — Repair failed verification
+A failed gate never becomes "one more message" to the Implement worker. It spins up a fresh Repair worker with the exact failure report (not a summary of it) and nothing else. Repair #2 doesn't inherit Repair #1's reasoning — only the repository as Repair #1 left it, plus the newest deterministic evidence. Up to `max_repair_attempts` (default 3) before the run blocks rather than thrashes forever.
 
-If a deterministic gate fails, the controller does **not** send another message to the Implement worker.
+### Guardrails against runaway loops
 
-It creates a completely fresh **Repair** worker.
+- **Protected-file snapshotting** — `spec.md`, `.loops/config.toml`, `.loops/state.json`, etc. are snapshotted before every coding worker and restored if touched; the run blocks rather than silently accepting controller-state tampering.
+- **Stagnation detection** — if Reconcile keeps proposing the same fingerprinted work unit without requirement progress, a circuit breaker trips at `stagnation_limit` (default 3).
+- **Hard cycle ceiling** — `max_cycles` (default 25) stops an unbounded loop from burning tokens indefinitely.
 
-Repair receives:
-
-- the same work unit;
-- the full requirement catalog;
-- the exact deterministic verification report, including command, exit code, stdout and stderr;
-- coding tools.
-
-Its goal is to repair the root cause without weakening the verification system.
-
-Then the controller runs deterministic verification again.
-
-The loop is:
+### `DONE` is a Rust boolean, not an agent's opinion
 
 ```text
-VERIFY
-  │
-  ├─ pass → continue project loop
-  │
-  └─ fail
-       │
-       ▼
-     REPAIR #1      fresh OMP context
-       │
-       ▼
-     VERIFY
-       │
-       ├─ pass → continue
-       └─ fail
-            │
-            ▼
-          REPAIR #2 fresh OMP context
-            │
-            ▼
-          VERIFY
-            ...
+status = done   only when:
+  1. the requirement catalog is valid
+  2. Reconcile marks every requirement satisfied, with no next work unit
+  3. final deterministic verification passes on the integrated repo
+  4. an independent Assess worker — fresh context, read-only — also
+     confirms every requirement, with no next work unit
+  5. optional Git cleanliness policy passes
 ```
 
-Maximum repair attempts are configured with:
-
-```toml
-max_repair_attempts = 3
-```
-
-Every repair attempt is a new OMP process. Repair #2 does not inherit Repair #1's chat transcript; it sees the repository as Repair #1 left it plus the latest deterministic failure report.
-
-If verification is still failing after the configured attempts, the run becomes blocked.
+> Agent claims are hypotheses. Repository evidence and deterministic gates decide completion.
 
 ---
 
-## Step 6 — Record completed work-unit evidence
+## The full-screen TUI
 
-When verification passes, `loops`:
+`loops` owns the terminal; OMP runs headless in the background. Live LLM text and tool events stream into a Ratatui interface with three views:
 
-1. saves the verification report as evidence;
-2. records the work unit in `state.completed_work_units`;
-3. clears the current work unit;
-4. optionally creates a Git commit if `git.auto_commit = true`;
-5. starts another project cycle.
-
-Critically, the next operation is **not another implementation prompt**.
-
-It is another fresh Reconcile pass over the actual repository.
-
----
-
-## Step 7 — Detect stagnation
-
-An autonomous loop can get stuck repeatedly proposing the same work.
-
-`loops` therefore tracks the selected work-unit fingerprint and the number of satisfied requirements.
-
-If the controller repeatedly sees effectively the same next work unit without increasing requirement completion, a stagnation counter grows.
-
-When it reaches:
-
-```toml
-stagnation_limit = 3
-```
-
-`loops` trips a circuit breaker and blocks the run instead of burning tokens forever.
-
-There is also a hard project-loop limit:
-
-```toml
-max_cycles = 25
-```
-
----
-
-## Step 8 — Candidate completion
-
-Eventually a Reconcile worker may report:
+- **Run** — live worker activity and requirement progress
+- **Evidence** — current requirement evidence and gaps
+- **Timeline** — state transitions, worker boundaries, verification events
 
 ```text
-all requirements = satisfied
-next work unit    = none
-complete          = true
+Tab                 switch view        Home/g   jump to top
+Up/Down, j/k        scroll             End/G    follow live output
+PageUp/PageDown     scroll faster      q / Ctrl-C   stop an active run
 ```
 
-That still does **not** mean the run is done.
-
-This only moves the controller into the final completion gates.
+For CI or plain logs: `loops run --no-tui`.
 
 ---
 
-## Step 9 — Final deterministic gates
-
-`loops` executes the project verification suite again over the final repository.
-
-This catches cases where individual work units passed earlier but the integrated project later regressed.
-
-If a final gate fails, `loops` can run the same fresh Repair loop against a synthetic final work unit covering the whole requirement catalog.
-
-Only after the final deterministic gates pass does the controller move to semantic completion assessment.
-
----
-
-## Step 10 — Independent final assessment
-
-A fresh **Assess** worker is launched.
-
-The assessor gets:
-
-- the complete requirement catalog;
-- read-only repository tools.
-
-It does **not** receive:
-
-- Implement conversations;
-- Repair conversations;
-- Reconcile reasoning;
-- a trusted statement that the project is complete.
-
-Its instruction is explicitly skeptical: inspect the repository from scratch and provide evidence for every requirement.
-
-The Assess output uses the same shape as Reconcile:
-
-```text
-requirement status + evidence + gaps
-complete
-optional next work unit
-```
-
-If Assess finds a gap, the project is **not** completed. The controller returns to the project loop and lets a later Reconcile select new work.
-
-If Assess confirms every requirement, the final completion contract can succeed.
-
----
-
-## Step 11 — DONE
-
-`DONE` is controlled by Rust code, not by an agent saying "done".
-
-The run can complete only when all of these conditions hold:
-
-1. the requirement catalog is valid;
-2. Reconcile marks every requirement satisfied;
-3. Reconcile produces no next work unit;
-4. final deterministic verification passes;
-5. the independent Assess worker also marks every requirement satisfied;
-6. Assess produces no next work unit;
-7. optional Git cleanliness policy passes.
-
-Then state becomes:
-
-```text
-status = done
-phase  = complete
-```
-
-This is the central completion rule of `loops`:
-
-> agent claims are hypotheses; repository evidence and deterministic gates decide completion.
-
----
-
-# Fresh-context behavior
-
-Every agent role starts a command approximately like:
-
-```bash
-omp \
-  --mode rpc \
-  --no-session \
-  --thinking high \
-  --tools <role-specific-tools> \
-  --no-extensions \
-  --no-skills \
-  --no-rules \
-  --append-system-prompt '<role contract>' \
-  --yolo
-```
-
-If a model is configured, `loops` also adds:
-
-```bash
---model <model>
-```
-
-The process is terminated after that worker produces its structured result.
-
-This means:
-
-```text
-Reconcile context  ─X─► Implement context
-Implement context  ─X─► Repair context
-Repair context     ─X─► Assess context
-```
-
-The contexts do not flow into each other.
-
-What _does_ flow between stages is explicit state:
-
-```text
-filesystem / Git
-spec.md
-requirement catalog
-selected work unit
-verification report
-completed work-unit metadata
-```
-
-This is deliberate loop engineering: keep conversational memory disposable and durable state inspectable.
-
----
-
-# Structured worker output: `loops_yield`
-
-`loops` does not ask the model to print a JSON code block and then try to scrape it from prose.
-
-For every worker process the controller registers an OMP RPC **host-owned tool** named:
-
-```text
-loops_yield
-```
-
-The tool has a role-specific JSON Schema.
-
-Examples:
-
-- Architect must yield an `ArchitectOutput`;
-- Reconcile/Assess must yield a `ReconcileResult`;
-- Implement/Repair must yield a `WorkerSummary`.
-
-The normal worker lifecycle is therefore:
-
-```text
-loops starts OMP
-     │
-     ├─ installs loops_yield(schema)
-     │
-     ├─ sends role prompt
-     │
-     ├─ streams LLM text/tool events to the TUI
-     │
-     └─ worker calls loops_yield({...})
-                    │
-                    ▼
-          Rust deserializes + validates
-                    │
-                    ▼
-                 accepted
-```
-
-If the output does not match the schema, the tool call is rejected.
-
-If the model ends its turn without calling `loops_yield`, `loops` sends up to two structured-completion reminders. If it still does not yield a valid result, that worker fails.
-
----
-
-# OMP RPC and the TUI
-
-The TUI belongs to `loops`; OMP runs headlessly in child processes.
-
-`loops` listens to OMP RPC events including:
-
-```text
-message_update
-tool_execution_start
-tool_execution_end
-agent_end
-host_tool_call
-```
-
-LLM text deltas and coding-tool events are forwarded to the Ratatui interface and to persistent run logs.
-
-The worker does not know about the TUI and the TUI does not become part of the worker's context.
-
-The full-screen interface currently exposes three views:
-
-- **Run** — live worker text/tool activity and requirement progress;
-- **Evidence** — current requirement evidence and gaps;
-- **Timeline** — state-machine transitions, worker boundaries and verification events.
-
-Keys:
-
-```text
-Tab                 switch view
-Up/Down, j/k        scroll
-PageUp/PageDown     scroll faster
-Home/g              top
-End/G               follow live output
-q or Ctrl-C         stop an active run
-Enter/Esc/q         close a completed run
-```
-
-For CI or plain logging:
-
-```bash
-loops run --no-tui
-```
-
----
-
-# Persistent project state
-
-`loops init` creates:
+## Project state, on disk, human-inspectable
 
 ```text
 project/
-├── spec.md
+├── spec.md                  ← the human-authored, authoritative contract
 └── .loops/
     ├── config.toml
-    ├── state.json
-    ├── requirements.json
-    ├── roadmap.json
-    ├── evidence/
-    └── runs/
-        └── <run-id>/
-            ├── events.jsonl
-            ├── worker-events.jsonl
-            └── transcript.log
+    ├── state.json           ← status, phase, cycle, current/completed work units
+    ├── requirements.json    ← Architect's catalog, hashed to spec.md
+    ├── roadmap.json         ← latest Reconcile/Assess view: status + evidence + gaps
+    ├── evidence/            ← every verification report, ever
+    └── runs/<run-id>/
+        ├── events.jsonl
+        ├── worker-events.jsonl
+        └── transcript.log
 ```
 
-### `spec.md`
-
-Human-authored product contract and authoritative source of scope.
-
-### `requirements.json`
-
-Architect-derived stable requirement catalog, keyed to the hash of `spec.md`.
-
-### `roadmap.json`
-
-The most recent Reconcile/Assess view of requirement status, evidence, gaps and next work unit.
-
-### `state.json`
-
-Controller state including status, phase, cycle, current work unit and completed work units.
-
-### `evidence/`
-
-Deterministic verification reports for work units and repair attempts.
-
-### `runs/<run-id>/`
-
-Audit trail for one invocation, including controller events, worker events and readable transcript.
-
-`resume` is intentionally an alias for `run`: durable state is reconstructed from `.loops/` and the repository rather than from a preserved LLM conversation.
+`resume` is deliberately just an alias for `run`: state is reconstructed from `.loops/` and the repository itself, never from a preserved chat.
 
 ---
 
-# Configuration
+## Getting started
 
-`.loops/config.toml` is created by `loops init`.
+```bash
+cargo install --path .
+loops --version && omp --version
 
-Default shape:
+cd your-project
+loops init          # creates spec.md + .loops/
+$EDITOR spec.md     # write the product contract
+loops run           # or: loops run --no-tui
+loops status --json
+loops verify --json # run the deterministic gates without touching an LLM
+```
+
+Requirements: a Rust toolchain to build `loops`, `omp` installed and authenticated for at least one model, your project's own build/test tooling, and Git (recommended).
+
+### Configuration (`.loops/config.toml`)
 
 ```toml
 version = 1
@@ -809,6 +239,7 @@ auto_approve = true
 turn_timeout_secs = 900
 read_only_tools = ["read", "grep", "find", "ls"]
 coding_tools = ["read", "grep", "find", "ls", "edit", "write", "bash"]
+model = "openrouter/anthropic/claude-sonnet-4.6"  # optional; pins every role
 extra_args = []
 
 [verification]
@@ -824,99 +255,51 @@ auto_commit = false
 require_clean_tree = false
 ```
 
-To pin the model used by **all** worker roles:
-
-```toml
-[agent]
-model = "openrouter/anthropic/claude-sonnet-4.6"
-```
-
-If omitted, OMP chooses its normal configured/default model independently in each fresh process.
+If `agent.model` is omitted, each fresh OMP process resolves its own default. When set, **every** role — Architect through Assess — runs the same model. That's deliberate for v0.1.0: keeping model selection a non-variable makes it far easier to tell whether a bad outcome is a *role/prompt/tooling* problem or a *model* problem. Per-role routing (a stronger model for Architect/Assess, a cheaper one for Implement/Repair) is an obvious next step, not yet built.
 
 ---
 
-# Install
+## Safety: process isolation, not a sandbox
 
-Requirements:
+Fresh OMP processes buy **context isolation** — they do not buy a security boundary. Implement and Repair workers get real shell access, and the default `auto_approve = true` launches OMP with `--yolo` so a headless run never blocks on interactive approval.
 
-- Rust toolchain to build/install `loops`;
-- `omp` installed and authenticated/configured for at least one model;
-- the target project's own build/test tooling;
-- Git recommended.
+In practice:
 
-From this repository:
-
-```bash
-cargo install --path .
-```
-
-Verify:
-
-```bash
-loops --version
-omp --version
-```
+- Don't treat the prompt/tool contract as a filesystem or network boundary.
+- Don't point an autonomous run at an environment holding credentials or resources the worker shouldn't touch.
+- Use a container, VM, or restricted worktree when you need real isolation.
+- Protected-file snapshot/restore stops accidental controller-state corruption; it is not a substitute for OS-level sandboxing of arbitrary shell commands.
 
 ---
 
-# Safety and isolation
+## Honest MVP boundaries (v0.1.0)
 
-Fresh processes provide **context/process isolation**, not a security sandbox.
+This is a first cut, and it knows it. Deliberately **not** implemented yet:
 
-Implement and Repair workers deliberately receive shell access. With the default:
+- parallel/fleet workers running work units concurrently
+- nested OMP subagent orchestration
+- per-role model selection
+- branch/worktree isolation per work unit
+- cost/token accounting
+- coding-agent backends beyond OMP
+- OS-level sandboxing
+- interactive steering of an in-flight worker
+- remote execution
 
-```toml
-auto_approve = true
-```
-
-OMP is launched with `--yolo` so the autonomous headless process does not wait for interactive approval.
-
-Therefore:
-
-- do not treat prompts as a filesystem/network security boundary;
-- do not run autonomous coding on an environment containing credentials or resources the worker must not access;
-- use a container, VM, restricted worktree or other OS-level sandbox when stronger isolation is required.
-
-Protected-file snapshot/restore prevents accidental controller-state mutation; it does **not** sandbox arbitrary shell commands.
+The controller already talks to OMP through an `AgentBackend` trait, so a second backend is an implementation, not a rewrite — the state machine, verification engine, and TUI don't need to change to support one.
 
 ---
 
-# Current MVP boundaries
+## Design principles
 
-v0.1.0 intentionally does **not** implement:
-
-- parallel/fleet workers;
-- nested OMP subagent orchestration;
-- per-role model selection;
-- branch/worktree isolation;
-- cost/token accounting;
-- multiple coding-agent backends beyond OMP;
-- OS sandboxing;
-- interactive steering of an active worker;
-- remote execution.
-
-The controller talks through an `AgentBackend` trait, so another backend can be added later without rewriting the state machine, verification engine or TUI.
-
-A likely next evolution is per-role agent configuration, for example:
-
-```text
-Architect / Assess  → strongest reasoning model
-Reconcile           → strong reasoning model
-Implement / Repair  → faster coding model
-```
-
-but the current implementation intentionally uses one global model configuration.
+1. **The spec is authoritative.** Finishing a task is not the same thing as satisfying the product.
+2. **Contexts are disposable.** Durable memory lives in files and evidence, never in an ever-growing chat.
+3. **One coherent work unit at a time.** Reconcile against the real repo again after every verified change.
+4. **LLMs propose; deterministic code decides transitions.**
+5. **Verification output is repair input.** Never make a model guess why a test failed when the real stderr is sitting right there.
+6. **Completion needs independent evidence.** A fresh, skeptical assessor gets the last word before the controller marks a run done.
+7. **Fail closed.** Invalid output, protected-file mutation, stagnation, and exhausted repairs block the run instead of proceeding on hope.
 
 ---
 
-# Design principles
-
-`loops` is built around a few rules:
-
-1. **The spec is authoritative.** Task completion is not product completion.
-2. **Contexts are disposable.** Durable memory belongs in files and evidence, not an endlessly growing chat.
-3. **One coherent work unit at a time.** Reconcile again after every verified change.
-4. **LLMs propose; deterministic code controls transitions.**
-5. **Verification output is repair input.** Do not ask a model to guess why a test failed when the real stderr exists.
-6. **Completion needs independent evidence.** A fresh assessor gets the last word before the deterministic controller marks the run done.
-7. **Fail closed.** Invalid structured output, protected-file mutations, stagnation and exhausted repairs block the run rather than silently proceeding.
+`loops` is small on purpose. The bet isn't "a bigger agent will get there eventually" — it's that a boring, deterministic controller around disposable, narrowly-scoped agents already gets further, more cheaply, and more verifiably than one long unbroken conversation ever will.
