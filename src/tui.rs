@@ -32,97 +32,80 @@ pub async fn run(cwd: PathBuf, backend: Arc<dyn AgentBackend>) -> Result<State> 
     let cancel = CancellationToken::new();
     let controller = Controller::new(cwd, backend, EventSink::new(Some(tx)));
     let task_cancel = cancel.clone();
-    let mut task = tokio::spawn(async move { controller.run(task_cancel).await });
+    let task = tokio::spawn(async move { controller.run(task_cancel).await });
 
     let mut terminal = setup_terminal()?;
     let mut app = App::new();
-    let result = loop {
-        while let Ok(run_event) = rx.try_recv() {
-            app.apply(run_event);
-        }
+    let result: Result<State> = async {
+        loop {
+            while let Ok(run_event) = rx.try_recv() {
+                app.apply(run_event);
+            }
 
-        terminal.draw(|frame| draw(frame, &app))?;
+            terminal.draw(|frame| draw(frame, &app))?;
 
-        if event::poll(Duration::from_millis(60))? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(&mut app, key, &cancel) && app.finished {
-                    break task.await??;
+            if event::poll(Duration::from_millis(60))? {
+                if let Event::Key(key) = event::read()? {
+                    if handle_key(&mut app, key, &cancel) {
+                        return task.await?;
+                    }
                 }
             }
-        }
 
-        if task.is_finished() && !app.finished {
-            match (&mut task).await {
-                Ok(Ok(state)) => {
-                    app.state = state.clone();
-                    app.finished = true;
-                    app.push_timeline("run task finished".into());
-                    // The JoinHandle has been consumed. Return only after the user closes the final view.
-                    loop {
-                        while let Ok(run_event) = rx.try_recv() {
-                            app.apply(run_event);
-                        }
-                        terminal.draw(|frame| draw(frame, &app))?;
-                        if event::poll(Duration::from_millis(80))? {
-                            if let Event::Key(key) = event::read()? {
-                                if matches!(
-                                    key.code,
-                                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')
-                                ) {
-                                    break;
-                                }
-                                let _ = handle_key(&mut app, key, &cancel);
-                            }
-                        }
-                    }
-                    break state;
+            if task.is_finished() {
+                while let Ok(run_event) = rx.try_recv() {
+                    app.apply(run_event);
                 }
-                Ok(Err(error)) => {
-                    app.finished = true;
-                    app.push_transcript(format!("\n\nERROR: {error:#}\n"));
-                    loop {
-                        terminal.draw(|frame| draw(frame, &app))?;
-                        if event::poll(Duration::from_millis(80))? {
-                            if let Event::Key(key) = event::read()? {
-                                if matches!(
-                                    key.code,
-                                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')
-                                ) {
-                                    break;
-                                }
-                                let _ = handle_key(&mut app, key, &cancel);
-                            }
-                        }
-                    }
-                    restore_terminal(&mut terminal)?;
-                    return Err(error);
-                }
-                Err(join_error) => {
-                    restore_terminal(&mut terminal)?;
-                    return Err(join_error.into());
-                }
+                return task.await?;
             }
         }
-    };
+    }
+    .await;
 
-    restore_terminal(&mut terminal)?;
-    Ok(result)
+    let restore_result = restore_terminal(&mut terminal);
+    match result {
+        Ok(state) => {
+            restore_result?;
+            Ok(state)
+        }
+        Err(error) => {
+            let _ = restore_result;
+            Err(error)
+        }
+    }
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        let _ = disable_raw_mode();
+        return Err(error.into());
+    }
+
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
+    };
+    if let Err(error) = terminal.clear() {
+        let _ = restore_terminal(&mut terminal);
+        return Err(error.into());
+    }
     Ok(terminal)
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let cursor_result = terminal.show_cursor();
+    let screen_result = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let raw_mode_result = disable_raw_mode();
+    cursor_result?;
+    screen_result?;
+    raw_mode_result?;
     Ok(())
 }
 
