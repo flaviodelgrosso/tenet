@@ -200,7 +200,23 @@ fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    let pid = pid.to_string();
+    let output = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+        .output();
+
+    output
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.split("\",\"").nth(1).is_some_and(|value| value == pid))
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn process_alive(_pid: u32) -> bool {
     false
 }
