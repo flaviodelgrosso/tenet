@@ -7,6 +7,8 @@ use tokio::fs;
 
 pub const LOOPS_DIR: &str = ".loops";
 pub const CONFIG_FILE: &str = "config.toml";
+pub const CONFIG_SCHEMA_URL: &str =
+  "https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -213,7 +215,8 @@ pub async fn ensure_config(cwd: &Path) -> Result<Config> {
   if !path.exists() {
     let mut config = Config::default();
     config.agent.populate_role_defaults();
-    let text = toml::to_string_pretty(&config)?;
+    let body = toml::to_string_pretty(&config)?;
+    let text = format!("#:schema {CONFIG_SCHEMA_URL}\n\n{body}");
     fs::write(&path, text).await?;
     return Ok(config);
   }
@@ -232,7 +235,7 @@ pub async fn read_config(cwd: &Path) -> Result<Config> {
 mod tests {
   use tempfile::tempdir;
 
-  use super::{config_path, ensure_config, Config};
+  use super::{config_path, ensure_config, read_config, Config, CONFIG_SCHEMA_URL};
   use crate::model::WorkerRole;
 
   const ROLES: [WorkerRole; 5] = [
@@ -249,6 +252,220 @@ mod tests {
     let mut text = toml::to_string_pretty(&config).unwrap();
     text.push_str(role_overrides);
     text
+  }
+
+  fn config_schema() -> serde_json::Value {
+    serde_json::from_str(include_str!("../schemas/config.schema.json")).unwrap()
+  }
+
+  #[test]
+  fn config_schema_is_valid_json() {
+    config_schema();
+  }
+
+  #[test]
+  fn config_schema_root_and_role_properties_match_config() {
+    let schema = config_schema();
+    let mut root_properties = schema["properties"]
+      .as_object()
+      .unwrap()
+      .keys()
+      .map(String::as_str)
+      .collect::<Vec<_>>();
+    root_properties.sort_unstable();
+    let mut expected_root = vec![
+      "version",
+      "spec_file",
+      "max_cycles",
+      "max_repair_attempts",
+      "stagnation_limit",
+      "agent",
+      "verification",
+      "git",
+      "protected_paths",
+      "skills",
+    ];
+    expected_root.sort_unstable();
+
+    let mut role_properties = schema["$defs"]["agentRoleOverrides"]["properties"]
+      .as_object()
+      .unwrap()
+      .keys()
+      .map(String::as_str)
+      .collect::<Vec<_>>();
+    role_properties.sort_unstable();
+    let mut expected_roles = ROLES.map(WorkerRole::as_str);
+    expected_roles.sort_unstable();
+
+    assert_eq!(root_properties, expected_root);
+    assert_eq!(role_properties, expected_roles);
+    assert_eq!(
+      schema["$defs"]["agentRoleOverride"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>(),
+      ["model", "thinking"].into_iter().collect(),
+    );
+  }
+
+  #[test]
+  fn config_schema_defaults_match_config_defaults() {
+    let schema = config_schema();
+    let config = Config::default();
+
+    assert_eq!(schema["properties"]["version"]["default"], config.version);
+    assert_eq!(
+      schema["properties"]["spec_file"]["default"],
+      config.spec_file
+    );
+    assert_eq!(
+      schema["properties"]["max_cycles"]["default"],
+      config.max_cycles
+    );
+    assert_eq!(
+      schema["properties"]["max_repair_attempts"]["default"],
+      config.max_repair_attempts
+    );
+    assert_eq!(
+      schema["properties"]["stagnation_limit"]["default"],
+      config.stagnation_limit
+    );
+    assert_eq!(
+      schema["properties"]["protected_paths"]["default"],
+      serde_json::to_value(config.protected_paths).unwrap()
+    );
+    assert_eq!(
+      schema["$defs"]["agentConfig"]["properties"]["command"]["default"],
+      config.agent.command
+    );
+    assert_eq!(
+      schema["$defs"]["agentConfig"]["properties"]["thinking"]["default"],
+      config.agent.thinking
+    );
+    assert_eq!(
+      schema["$defs"]["agentConfig"]["properties"]["auto_approve"]["default"],
+      config.agent.auto_approve
+    );
+    assert_eq!(
+      schema["$defs"]["agentConfig"]["properties"]["turn_timeout_secs"]["default"],
+      config.agent.turn_timeout_secs
+    );
+    assert_eq!(
+      schema["$defs"]["agentConfig"]["properties"]["read_only_tools"]["default"],
+      serde_json::to_value(config.agent.read_only_tools).unwrap()
+    );
+    assert_eq!(
+      schema["$defs"]["agentConfig"]["properties"]["coding_tools"]["default"],
+      serde_json::to_value(config.agent.coding_tools).unwrap()
+    );
+    assert_eq!(
+      schema["$defs"]["agentConfig"]["properties"]["extra_args"]["default"],
+      serde_json::to_value(config.agent.extra_args).unwrap()
+    );
+    assert_eq!(
+      schema["$defs"]["verificationConfig"]["properties"]["auto_detect"]["default"],
+      config.verification.auto_detect
+    );
+    assert_eq!(
+      schema["$defs"]["verificationConfig"]["properties"]["require_project_gate"]["default"],
+      config.verification.require_project_gate
+    );
+    assert_eq!(
+      schema["$defs"]["verificationConfig"]["properties"]["commands"]["default"],
+      serde_json::to_value(config.verification.commands).unwrap()
+    );
+    assert_eq!(
+      schema["$defs"]["verificationConfig"]["properties"]["timeout_secs"]["default"],
+      config.verification.timeout_secs
+    );
+    assert_eq!(
+      schema["$defs"]["verificationConfig"]["properties"]["max_output_bytes"]["default"],
+      config.verification.max_output_bytes
+    );
+    assert_eq!(
+      schema["$defs"]["gitConfig"]["properties"]["init"]["default"],
+      config.git.init
+    );
+    assert_eq!(
+      schema["$defs"]["gitConfig"]["properties"]["auto_commit"]["default"],
+      config.git.auto_commit
+    );
+    assert_eq!(
+      schema["$defs"]["gitConfig"]["properties"]["require_clean_tree"]["default"],
+      config.git.require_clean_tree
+    );
+    assert_eq!(
+      schema["properties"]["skills"]["default"],
+      serde_json::json!({"shared": config.skills.shared, "roles": config.skills.roles})
+    );
+  }
+
+  #[tokio::test]
+  async fn generated_config_starts_with_schema_directive_and_remains_parseable() {
+    let project = tempdir().unwrap();
+
+    ensure_config(project.path()).await.unwrap();
+    let generated = tokio::fs::read_to_string(config_path(project.path()))
+      .await
+      .unwrap();
+    let loaded = read_config(project.path()).await.unwrap();
+
+    assert!(generated.starts_with(&format!("#:schema {CONFIG_SCHEMA_URL}\n\n")));
+    assert_eq!(loaded.version, Config::default().version);
+  }
+
+  #[tokio::test]
+  async fn existing_config_without_schema_directive_is_not_rewritten() {
+    let project = tempdir().unwrap();
+    ensure_config(project.path()).await.unwrap();
+    let legacy = toml::to_string_pretty(&Config::default()).unwrap();
+    tokio::fs::write(config_path(project.path()), &legacy)
+      .await
+      .unwrap();
+
+    let loaded = ensure_config(project.path()).await.unwrap();
+    let persisted = tokio::fs::read_to_string(config_path(project.path()))
+      .await
+      .unwrap();
+
+    assert_eq!(loaded.version, Config::default().version);
+    assert_eq!(persisted, legacy);
+  }
+
+  #[test]
+  fn representative_role_overrides_are_supported_by_config_and_schema() {
+    let text = serialized_config(
+      |_| {},
+      concat!(
+        "\n[agent.roles.architect]\nmodel = \"architect-model\"\n",
+        "[agent.roles.reconcile]\nthinking = \"medium\"\n",
+        "[agent.roles.implement]\nmodel = \"implement-model\"\nthinking = \"high\"\n",
+        "[agent.roles.repair]\nthinking = \"low\"\n",
+        "[agent.roles.assess]\nmodel = \"assess-model\"\n",
+      ),
+    );
+
+    let loaded: Config = toml::from_str(&text).unwrap();
+    let schema = config_schema();
+
+    assert_eq!(
+      (
+        loaded.agent.model_for(WorkerRole::Implement),
+        loaded.agent.thinking_for(WorkerRole::Implement),
+      ),
+      (Some("implement-model"), "high"),
+    );
+    for role in ROLES {
+      assert!(
+        schema["$defs"]["agentRoleOverrides"]["properties"]
+          .get(role.as_str())
+          .is_some(),
+        "schema is missing the {} role",
+        role.as_str()
+      );
+    }
   }
 
   #[tokio::test]

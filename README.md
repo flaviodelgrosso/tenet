@@ -263,6 +263,8 @@ Requirements: a Rust toolchain to build `loops`, `omp` installed and authenticat
 ### Configuration (`.loops/config.toml`)
 
 ```toml
+#:schema https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json
+
 version = 1
 spec_file = "spec.md"
 max_cycles = 25
@@ -305,6 +307,12 @@ require_clean_tree = false
 `agent.model` and `agent.thinking` are defaults for all five model-backed workers: Architect, Reconcile, Implement, Repair, and Assess. A table under `agent.roles.<role>` may override `model`, `thinking`, or both without repeating the other field. In the example above, Architect and Assess inherit `openai/gpt-5.2` and use `xhigh`; Implement uses `anthropic/claude-sonnet-4-5` and `medium`; Reconcile and Repair inherit both global values. If neither the role nor global configuration specifies a model, the fresh OMP process resolves its own default.
 
 Verification is deterministic controller logic, not an agent worker, so there is no `agent.roles.verify` configuration.
+
+#### Schema-aware editor support
+
+Newly generated `.loops/config.toml` files include the Taplo-compatible `#:schema` directive shown above. TOML editors and language servers that support JSON Schema associations, including Taplo and Even Better TOML, can use `schemas/config.schema.json` for key and table completion, hover documentation, value suggestions, and validation. Editors without TOML schema support continue to treat the directive as a comment.
+
+The repository-hosted schema works independently of SchemaStore. A SchemaStore submission can follow once the configuration format has stabilized.
 
 ---
 

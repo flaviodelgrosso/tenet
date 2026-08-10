@@ -1,0 +1,309 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json",
+  "title": "loops configuration",
+  "description": "Configuration for autonomous loops runs.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "spec_file",
+    "max_cycles",
+    "max_repair_attempts",
+    "stagnation_limit",
+    "agent",
+    "verification",
+    "git",
+    "protected_paths"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 1,
+      "description": "Configuration format version read by loops."
+    },
+    "spec_file": {
+      "type": "string",
+      "default": "spec.md",
+      "description": "Project-relative path to the specification that drives the run.",
+      "examples": ["spec.md"]
+    },
+    "max_cycles": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 25,
+      "description": "Maximum number of autonomous engineering cycles before the run stops."
+    },
+    "max_repair_attempts": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 3,
+      "description": "Maximum repair attempts for a work unit whose verification fails."
+    },
+    "stagnation_limit": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 3,
+      "description": "Number of consecutive cycles without requirement progress before the run is blocked."
+    },
+    "agent": {
+      "$ref": "#/$defs/agentConfig"
+    },
+    "verification": {
+      "$ref": "#/$defs/verificationConfig"
+    },
+    "git": {
+      "$ref": "#/$defs/gitConfig"
+    },
+    "protected_paths": {
+      "$ref": "#/$defs/stringList",
+      "default": [
+        "spec.md",
+        "AGENTS.md",
+        ".loops/config.toml",
+        ".loops/state.json",
+        ".loops/requirements.json",
+        ".loops/roadmap.json",
+        ".loops/STOP",
+        ".loops/run.lock"
+      ],
+      "description": "Project-relative paths restored if a coding worker modifies them.",
+      "examples": [["spec.md", "AGENTS.md", ".loops/config.toml"]]
+    },
+    "skills": {
+      "$ref": "#/$defs/skillsConfig",
+      "default": {
+        "shared": [],
+        "roles": {}
+      }
+    }
+  },
+  "$defs": {
+    "stringList": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "agentConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "OMP process settings shared by all model-backed workers.",
+      "required": [
+        "command",
+        "thinking",
+        "auto_approve",
+        "turn_timeout_secs",
+        "read_only_tools",
+        "coding_tools",
+        "extra_args"
+      ],
+      "properties": {
+        "command": {
+          "type": "string",
+          "default": "omp",
+          "description": "Executable used to launch each OMP worker process.",
+          "examples": ["omp"]
+        },
+        "model": {
+          "type": "string",
+          "description": "Default model used by agent workers unless overridden for a specific role. If omitted, OMP chooses its default model.",
+          "examples": ["openai/gpt-5.2", "anthropic/claude-sonnet-4-5"]
+        },
+        "thinking": {
+          "type": "string",
+          "default": "high",
+          "description": "Default OMP thinking level used unless overridden for a specific role. Values are forwarded to OMP and are not constrained by loops.",
+          "examples": ["low", "medium", "high", "xhigh"]
+        },
+        "roles": {
+          "$ref": "#/$defs/agentRoleOverrides",
+          "default": {},
+          "description": "Optional model and thinking overrides for the five model-backed worker roles."
+        },
+        "auto_approve": {
+          "type": "boolean",
+          "default": true,
+          "description": "Launches OMP with automatic tool approval so headless workers do not wait for interactive confirmation."
+        },
+        "turn_timeout_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 900,
+          "description": "Maximum duration in seconds allowed for one worker invocation."
+        },
+        "read_only_tools": {
+          "$ref": "#/$defs/stringList",
+          "default": ["read", "grep", "glob"],
+          "description": "OMP tools available to Architect, Reconcile, and Assess workers.",
+          "examples": [["read", "grep", "glob"]]
+        },
+        "coding_tools": {
+          "$ref": "#/$defs/stringList",
+          "default": ["read", "grep", "glob", "edit", "write", "bash"],
+          "description": "OMP tools available to Implement and Repair workers.",
+          "examples": [["read", "grep", "glob", "edit", "write", "bash"]]
+        },
+        "extra_args": {
+          "$ref": "#/$defs/stringList",
+          "default": [],
+          "description": "Additional command-line arguments appended when loops launches OMP.",
+          "examples": [["--provider", "openai"]]
+        }
+      }
+    },
+    "agentRoleOverrides": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "architect": {
+          "$ref": "#/$defs/agentRoleOverride",
+          "description": "Overrides for the Architect worker, which turns the specification into requirements."
+        },
+        "reconcile": {
+          "$ref": "#/$defs/agentRoleOverride",
+          "description": "Overrides for the Reconcile worker, which selects the next work unit."
+        },
+        "implement": {
+          "$ref": "#/$defs/agentRoleOverride",
+          "description": "Overrides for the Implement worker, which changes project files."
+        },
+        "repair": {
+          "$ref": "#/$defs/agentRoleOverride",
+          "description": "Overrides for the Repair worker, which fixes failed verification."
+        },
+        "assess": {
+          "$ref": "#/$defs/agentRoleOverride",
+          "description": "Overrides for the Assess worker, which evaluates implementation evidence."
+        }
+      }
+    },
+    "agentRoleOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Model override for this worker. If omitted, agent.model is used; if that is also omitted, OMP chooses its default.",
+          "examples": ["openai/gpt-5.2"]
+        },
+        "thinking": {
+          "type": "string",
+          "description": "Thinking-level override for this worker. If omitted, agent.thinking is used. Values are forwarded to OMP and are not constrained by loops.",
+          "examples": ["low", "medium", "high", "xhigh"]
+        }
+      }
+    },
+    "verificationConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Deterministic commands and limits used to verify each implemented work unit.",
+      "required": [
+        "auto_detect",
+        "require_project_gate",
+        "commands",
+        "timeout_secs",
+        "max_output_bytes"
+      ],
+      "properties": {
+        "auto_detect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically detects standard project verification commands when enabled."
+        },
+        "require_project_gate": {
+          "type": "boolean",
+          "default": true,
+          "description": "Requires at least one project-specific verification command before work can pass."
+        },
+        "commands": {
+          "$ref": "#/$defs/stringList",
+          "default": [],
+          "description": "Explicit shell commands run as project verification gates.",
+          "examples": [["cargo test", "cargo clippy --all-targets -- -D warnings"]]
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 120,
+          "description": "Maximum duration in seconds allowed for each verification command."
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 65536,
+          "description": "Maximum number of output bytes retained from each verification command."
+        }
+      }
+    },
+    "gitConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Repository initialization, commit, and cleanliness safeguards.",
+      "required": ["init", "auto_commit", "require_clean_tree"],
+      "properties": {
+        "init": {
+          "type": "boolean",
+          "default": true,
+          "description": "Initializes a Git repository when the project is not already inside one."
+        },
+        "auto_commit": {
+          "type": "boolean",
+          "default": false,
+          "description": "Creates loops-managed commits for accepted autonomous changes."
+        },
+        "require_clean_tree": {
+          "type": "boolean",
+          "default": false,
+          "description": "Refuses to start a run when the Git working tree already has changes."
+        }
+      }
+    },
+    "skillsConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Additional skill directories loaded into worker environments.",
+      "properties": {
+        "shared": {
+          "$ref": "#/$defs/stringList",
+          "default": [],
+          "description": "Skill directories loaded for every worker role.",
+          "examples": [[".loops/skills/project"]]
+        },
+        "roles": {
+          "$ref": "#/$defs/skillRolePaths",
+          "default": {},
+          "description": "Skill directories loaded only for the named worker role."
+        }
+      }
+    },
+    "skillRolePaths": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "architect": {
+          "$ref": "#/$defs/stringList",
+          "description": "Additional skill directories loaded by the Architect worker."
+        },
+        "reconcile": {
+          "$ref": "#/$defs/stringList",
+          "description": "Additional skill directories loaded by the Reconcile worker."
+        },
+        "implement": {
+          "$ref": "#/$defs/stringList",
+          "description": "Additional skill directories loaded by the Implement worker.",
+          "examples": [[".loops/skills/rust"]]
+        },
+        "repair": {
+          "$ref": "#/$defs/stringList",
+          "description": "Additional skill directories loaded by the Repair worker."
+        },
+        "assess": {
+          "$ref": "#/$defs/stringList",
+          "description": "Additional skill directories loaded by the Assess worker."
+        }
+      }
+    }
+  }
+}
