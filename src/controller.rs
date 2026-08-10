@@ -65,6 +65,7 @@ impl Controller {
     let events = self.events.clone().with_logger(logger);
     let ctx = BackendContext {
       cwd: self.cwd.clone(),
+      runtime_dir: self.cwd.join(LOOPS_DIR).join("runtime").join(&run_id),
       config: config.clone(),
       cancel: cancel.clone(),
       events: events.clone(),

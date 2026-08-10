@@ -120,7 +120,11 @@ async fn open_append(path: PathBuf) -> Result<tokio::fs::File> {
 fn render_worker(event: &WorkerEvent) -> String {
   use WorkerEvent::*;
   match event {
-    Start { role, .. } => format!("\n=== {} ===\n", role.as_str().to_uppercase()),
+    Start { role, skills, .. } => format!(
+      "\n=== {} · skills: {} ===\n",
+      role.as_str().to_uppercase(),
+      skills.join(", ")
+    ),
     Text { delta, .. } => delta.clone(),
     ToolStart {
       tool_name, args, ..
@@ -170,4 +174,33 @@ fn utf8_floor(text: &str, max_bytes: usize) -> usize {
     end -= 1;
   }
   end
+}
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Arc;
+
+  use tempfile::tempdir;
+
+  use super::{EventSink, RunLogger};
+  use crate::model::{WorkerEvent, WorkerRole};
+
+  #[tokio::test]
+  async fn worker_metadata_records_active_skills() {
+    let run = tempdir().unwrap();
+    let logger = Arc::new(RunLogger::create(run.path().to_path_buf()).await.unwrap());
+    EventSink::new(None)
+      .with_logger(logger)
+      .worker(WorkerEvent::Start {
+        role: WorkerRole::Implement,
+        at: "now".into(),
+        skills: vec!["implementation".into(), "rust".into()],
+      })
+      .await;
+
+    let events = tokio::fs::read_to_string(run.path().join("worker-events.jsonl"))
+      .await
+      .unwrap();
+    assert!(events.contains(r#""skills":["implementation","rust"]"#));
+  }
 }

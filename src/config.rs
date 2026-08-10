@@ -18,6 +18,8 @@ pub struct Config {
   pub verification: VerificationConfig,
   pub git: GitConfig,
   pub protected_paths: Vec<String>,
+  #[serde(default)]
+  pub skills: SkillsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +48,19 @@ pub struct GitConfig {
   pub init: bool,
   pub auto_commit: bool,
   pub require_clean_tree: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+  pub shared: Vec<String>,
+  pub roles: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl SkillsConfig {
+  pub fn role_paths(&self, role: crate::model::WorkerRole) -> impl Iterator<Item = &String> {
+    self.roles.get(role.as_str()).into_iter().flatten()
+  }
 }
 
 impl Default for Config {
@@ -97,6 +112,7 @@ impl Default for Config {
       .into_iter()
       .map(str::to_owned)
       .collect(),
+      skills: SkillsConfig::default(),
     }
   }
 }
@@ -148,5 +164,23 @@ mod tests {
     assert!(generated.contains("glob"));
     assert!(!generated.contains("\"find\""));
     assert!(!generated.contains("\"ls\""));
+  }
+
+  #[tokio::test]
+  async fn missing_skills_section_uses_reproducible_defaults() {
+    let project = tempdir().unwrap();
+    let config = ensure_config(project.path()).await.unwrap();
+    let generated = tokio::fs::read_to_string(config_path(project.path()))
+      .await
+      .unwrap();
+    let legacy = generated.split("\n[skills]\n").next().unwrap();
+    tokio::fs::write(config_path(project.path()), legacy)
+      .await
+      .unwrap();
+
+    let loaded = super::read_config(project.path()).await.unwrap();
+    assert!(loaded.skills.shared.is_empty());
+    assert!(loaded.skills.roles.is_empty());
+    assert_eq!(loaded.spec_file, config.spec_file);
   }
 }

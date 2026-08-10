@@ -163,9 +163,13 @@ impl App {
 
   fn apply_worker(&mut self, event: WorkerEvent) {
     match event {
-      WorkerEvent::Start { role, .. } => {
-        self.push_transcript(format!("\n\n◆ {} · fresh context\n", role_label(role)));
-        self.push_timeline(format!("{} started", role.as_str()));
+      WorkerEvent::Start { role, skills, .. } => {
+        self.push_transcript(format!(
+          "\n\n◆ {} · fresh context\n  skills: {}\n",
+          role_label(role),
+          skills.join(", ")
+        ));
+        self.push_timeline(format!("{} started · {}", role.as_str(), skills.join(", ")));
       }
       WorkerEvent::Text { delta, .. } => self.push_transcript(sanitize_terminal_text(&delta)),
       WorkerEvent::ToolStart {

@@ -5,6 +5,7 @@ mod events;
 mod model;
 mod prompts;
 mod protection;
+mod skills;
 mod store;
 mod tui;
 mod verifier;

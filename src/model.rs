@@ -91,6 +91,14 @@ pub struct WorkerSummary {
   #[serde(rename = "testsRun")]
   pub tests_run: Vec<String>,
   pub notes: Vec<String>,
+  #[serde(default)]
+  pub decisions: Vec<String>,
+  #[serde(default)]
+  pub discoveries: Vec<String>,
+  #[serde(default)]
+  pub risks: Vec<String>,
+  #[serde(default, rename = "followUps")]
+  pub follow_ups: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,6 +213,7 @@ pub enum WorkerEvent {
   Start {
     role: WorkerRole,
     at: String,
+    skills: Vec<String>,
   },
   Text {
     role: WorkerRole,

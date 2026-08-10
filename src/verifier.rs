@@ -213,7 +213,7 @@ mod tests {
   use super::*;
 
   #[tokio::test]
-  async fn detects_rust_gates() {
+  async fn detects_rust_gates_without_selecting_a_rust_worker_skill() {
     let dir = tempfile::tempdir().unwrap();
     tokio::fs::write(
       dir.path().join("Cargo.toml"),
@@ -226,5 +226,9 @@ mod tests {
     assert!(cmds.iter().any(|v| v == "cargo fmt --check"));
     assert!(cmds.iter().any(|v| v.starts_with("cargo clippy")));
     assert!(cmds.iter().any(|v| v.starts_with("cargo test")));
+
+    let skills =
+      crate::skills::resolve(dir.path(), &cfg.skills, crate::model::WorkerRole::Implement).unwrap();
+    assert_eq!(skills.names(), ["implementation"]);
   }
 }

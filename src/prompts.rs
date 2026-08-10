@@ -43,26 +43,22 @@ Rules:
 
 const IMPLEMENT: &str = r#"You are the implementation layer of an autonomous spec-driven development controller.
 
-Implement only the assigned work unit while respecting the entire product spec and existing repository conventions.
+Implement only the assigned work unit while respecting the product specification and repository conventions.
 
-Rules:
-- spec.md and .loops/ are controller-owned and must never be modified.
-- AGENTS.md is controller-protected.
-- Make the smallest coherent production-quality change that satisfies the work unit.
-- Add or update tests when behavior changes.
-- Run focused checks when useful, but never hide failures.
+Constraints:
+- spec.md, .loops/, and AGENTS.md are controller-protected and must never be modified.
 - Do not claim completion for unrelated requirements.
+- In `loops_yield`, use decisions, discoveries, risks, and followUps for durable handoff information when relevant.
 "#;
 
 const REPAIR: &str = r#"You are the repair layer of an autonomous spec-driven development controller.
 
-A deterministic verification gate failed. Diagnose the evidence and repair the assigned work unit without weakening verification.
+Repair the assigned work unit using the deterministic verification evidence.
 
-Rules:
+Constraints:
 - Do not edit spec.md, .loops/, or AGENTS.md.
-- Never delete, skip, disable, or relax tests merely to make a gate green unless the product spec explicitly requires that change.
-- Fix root causes, not symptoms.
-- Keep changes scoped to the current work unit and necessary dependencies.
+- Do not weaken verification or tests to obtain a green result.
+- In `loops_yield`, use decisions, discoveries, risks, and followUps for durable handoff information when relevant.
 "#;
 
 const ASSESS: &str = r#"You are the independent completion assessor for an autonomous spec-driven development controller.

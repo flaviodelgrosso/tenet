@@ -1,4 +1,4 @@
-use std::{process::Stdio, time::Duration};
+use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -19,6 +19,7 @@ use crate::{
     WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
   },
   prompts::full_role_prompt,
+  skills,
 };
 
 const YIELD_TOOL: &str = "loops_yield";
@@ -140,14 +141,23 @@ impl OmpRpcBackend {
     prompt: &str,
     schema: Value,
   ) -> Result<T> {
+    let resolved = skills::resolve(&ctx.cwd, &ctx.config.skills, role)?;
+    let global_agent_dir = global_omp_agent_dir()?;
+    let worker_environment =
+      skills::prepare_worker_environment(&ctx.runtime_dir, role, &resolved, &global_agent_dir)
+        .await?;
     ctx
       .events
-      .worker(WorkerEvent::Start { role, at: now() })
+      .worker(WorkerEvent::Start {
+        role,
+        at: now(),
+        skills: resolved.names(),
+      })
       .await;
 
-    let mut rpc = RpcProcess::spawn(ctx, role).await?;
+    let mut rpc = RpcProcess::spawn(ctx, role, &worker_environment, &resolved).await?;
     let result = async {
-            rpc.initialize_protocol().await?;
+      rpc.initialize_protocol().await?;
             rpc.install_yield_tool(schema).await?;
             rpc.send(&json!({"id":"prompt-1","type":"prompt","message":prompt})).await?;
 
@@ -296,7 +306,12 @@ struct RpcProcess {
 }
 
 impl RpcProcess {
-  async fn spawn(ctx: &BackendContext, role: WorkerRole) -> Result<Self> {
+  async fn spawn(
+    ctx: &BackendContext,
+    role: WorkerRole,
+    worker_environment: &std::path::Path,
+    resolved_skills: &skills::ResolvedSkills,
+  ) -> Result<Self> {
     let tools = match role {
       WorkerRole::Architect | WorkerRole::Reconcile | WorkerRole::Assess => {
         &ctx.config.agent.read_only_tools
@@ -311,7 +326,8 @@ impl RpcProcess {
       .arg("--tools")
       .arg(tools.join(","))
       .arg("--no-extensions")
-      .arg("--no-skills")
+      .arg("--skills")
+      .arg(resolved_skills.omp_names()?.join(","))
       .arg("--no-rules")
       .arg("--append-system-prompt")
       .arg(full_role_prompt(role));
@@ -329,6 +345,7 @@ impl RpcProcess {
       .stdout(Stdio::piped())
       .stderr(Stdio::piped())
       .kill_on_drop(true);
+    command.env("PI_CODING_AGENT_DIR", worker_environment);
 
     let mut child = command
       .spawn()
@@ -636,6 +653,14 @@ fn now() -> String {
   chrono::Utc::now().to_rfc3339()
 }
 
+fn global_omp_agent_dir() -> Result<PathBuf> {
+  if let Some(path) = std::env::var_os("PI_CODING_AGENT_DIR") {
+    return Ok(path.into());
+  }
+  let home = std::env::var_os("HOME").context("resolve home directory for global OMP state")?;
+  Ok(PathBuf::from(home).join(".omp").join("agent"))
+}
+
 fn string_array_schema() -> Value {
   json!({"type":"array","items":{"type":"string"}})
 }
@@ -714,7 +739,11 @@ fn worker_summary_schema() -> Value {
           "summary":{"type":"string"},
           "changedFiles":string_array_schema(),
           "testsRun":string_array_schema(),
-          "notes":string_array_schema()
+          "notes":string_array_schema(),
+          "decisions":string_array_schema(),
+          "discoveries":string_array_schema(),
+          "risks":string_array_schema(),
+          "followUps":string_array_schema()
       },
       "required":["summary","changedFiles","testsRun","notes"]
   })

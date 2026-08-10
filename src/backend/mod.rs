@@ -18,6 +18,7 @@ use crate::{
 #[derive(Clone)]
 pub struct BackendContext {
   pub cwd: PathBuf,
+  pub runtime_dir: PathBuf,
   pub config: Arc<Config>,
   pub cancel: CancellationToken,
   pub events: EventSink,

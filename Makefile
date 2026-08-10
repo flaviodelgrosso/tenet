@@ -2,10 +2,13 @@
 
 CARGO ?= cargo
 
-.PHONY: help fmt fmt-check check test clippy build ci clean
+.PHONY: help install fmt fmt-check check test clippy build ci clean
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make <target>\n\nTargets:\n"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
+install: ## Install the release binary
+	$(CARGO) install --path . --locked
 
 fmt: ## Format Rust source files
 	$(CARGO) fmt --all

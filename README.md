@@ -100,17 +100,60 @@ DONE
 | **Repair**    | Fixes a deterministic verification failure                    | Read/write/bash  | Only after verification fails                  |
 | **Assess**    | Independently re-verifies completion from scratch              | Read-only        | Only after Reconcile and final gates say "done" |
 
-These are not nested OMP subagents — they're separate OS processes, launched roughly like:
+These are not nested OMP subagents — they are separate OS processes. Each worker receives:
 
-```bash
-omp --mode rpc --no-session --thinking high \
-    --tools <role-specific-tools> \
-    --no-extensions --no-skills --no-rules \
-    --append-system-prompt '<role contract>' \
-    --yolo
+```text
+fresh OMP worker
+    + role prompt
+    + controlled skills
+    + work-unit context
+    + repository
 ```
 
-Workers run **sequentially**, each with tools scoped to its role, none of them aware the others — or the TUI — exist.
+OMP remains the execution backend; the Rust controller remains the deterministic state-machine orchestrator. Workers run **sequentially**, each with tools scoped to its role, none aware of the others or the TUI.
+
+## Worker Skills
+
+Workers previously used `--no-skills` because inherited OMP skills could vary by machine and quietly change worker behavior. Loops now creates an isolated per-worker skill environment under `.loops/runtime/<run>/<role>/skills` and mounts only an explicit allow-list. `--no-extensions` and `--no-rules` remain enabled.
+
+Loops is intentionally language-agnostic. It ships only these role-procedure skills:
+
+| Role | Built-in skill |
+| --- | --- |
+| Architect, Reconcile | `spec-analysis` |
+| Implement | `implementation` |
+| Repair | `debugging` |
+| Assess | `spec-assessment` |
+
+`code-review` is also shipped for a future Review worker, but the current state machine does not add that role.
+
+A **role prompt** states worker identity, scope, protected files, and the `loops_yield` contract. A **built-in skill** describes how that role should work. **User skills** carry project, company, framework, domain, and language expertise. A **work unit** supplies the concrete task; the repository supplies current state.
+
+Configure user skills explicitly, relative to the project root:
+
+```toml
+[skills]
+shared = [
+  ".loops/skills/project"
+]
+
+[skills.roles]
+implement = [
+  ".loops/skills/rust"
+]
+
+repair = [
+  ".loops/skills/rust"
+]
+
+review = [
+  ".loops/skills/security"
+]
+```
+
+Every worker receives its built-in role skill, then `shared`, then its configured role-specific paths. Unconfigured global OMP skills, project OMP skills, skills from other ecosystems, extensions, rules, and MCP-provided capabilities are never discovered or inherited. Invalid configured paths fail before the worker starts.
+
+Loops does not know what a “Rust skill” is. It mounts `.loops/skills/rust` only because the user explicitly assigned that path to a role. Deterministic verification remains language-aware—`Cargo.toml` can select Cargo checks, `pyproject.toml` Python checks, and `package.json` Node checks—but verification detection never selects worker skills.
 
 ### Structured output, not prose-scraping
 
