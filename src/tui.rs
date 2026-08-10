@@ -93,15 +93,8 @@ async fn open(
         }
       }
 
-      if task
-        .as_ref()
-        .is_some_and(tokio::task::JoinHandle::is_finished)
-      {
-        while let Ok(run_event) = rx.try_recv() {
-          app.apply(run_event);
-        }
-        let completed = task.take().expect("finished task is present");
-        return completed.await?;
+      if finish_run(&mut app, &mut task).await? {
+        continue;
       }
     }
   }
@@ -133,6 +126,22 @@ fn spawn_run(
   );
   let task_cancel = cancel.clone();
   tokio::spawn(async move { controller.run(task_cancel).await })
+}
+
+async fn finish_run(
+  app: &mut App,
+  task: &mut Option<tokio::task::JoinHandle<Result<State>>>,
+) -> Result<bool> {
+  let Some(handle) = task.as_ref() else {
+    return Ok(false);
+  };
+  if !handle.is_finished() {
+    return Ok(false);
+  }
+
+  let completed = task.take().expect("finished task is present");
+  app.apply(RunEvent::Finished(completed.await??));
+  Ok(true)
 }
 
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -2152,6 +2161,30 @@ mod tests {
       warnings: Vec::new(),
     }));
     assert_eq!(app.verifications[0].expanded, [true]);
+  }
+
+  #[tokio::test]
+  async fn finished_task_keeps_tui_open_for_restart() {
+    let mut app = app();
+    app.begin_run();
+    let mut state = State::fresh();
+    state.status = RunStatus::Done;
+    state.phase = Phase::Complete;
+    let mut task = Some(tokio::spawn(async move { Ok(state) }));
+    tokio::task::yield_now().await;
+
+    assert!(finish_run(&mut app, &mut task).await.unwrap());
+    assert!(task.is_none() && app.finished && !app.run_active);
+
+    let cancel = CancellationToken::new();
+    assert_eq!(
+      handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        &cancel,
+      ),
+      TuiAction::Start
+    );
   }
 
   #[test]

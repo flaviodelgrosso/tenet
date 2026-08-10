@@ -213,7 +213,7 @@ status = done   only when:
 
 ## The full-screen TUI
 
-`loops` owns the terminal; OMP runs headless in the background. Live LLM text and tool events stream into a Ratatui interface with three views:
+`loops` owns the terminal; OMP runs headless in the background. Live LLM text and tool events stream into a Ratatui interface with three views. When a run completes, the TUI stays open for inspection; press `r` to start another run or `q`/`Ctrl-C` to exit.
 
 - **Run** — live worker activity and requirement progress
 - **Evidence** — current requirement evidence and gaps
@@ -222,7 +222,7 @@ status = done   only when:
 ```text
 Tab                 switch view        Home/g   jump to top
 Up/Down, j/k        scroll             End/G    follow live output
-PageUp/PageDown     scroll faster      q / Ctrl-C   stop an active run
+PageUp/PageDown     scroll faster      q / Ctrl-C   stop active run / exit idle TUI
 ```
 
 For CI or plain logs: `loops run --no-tui`.
