@@ -1,13 +1,13 @@
 use crate::model::WorkerRole;
 
 pub fn role_prompt(role: WorkerRole) -> &'static str {
-    match role {
-        WorkerRole::Architect => ARCHITECT,
-        WorkerRole::Reconcile => RECONCILE,
-        WorkerRole::Implement => IMPLEMENT,
-        WorkerRole::Repair => REPAIR,
-        WorkerRole::Assess => ASSESS,
-    }
+  match role {
+    WorkerRole::Architect => ARCHITECT,
+    WorkerRole::Reconcile => RECONCILE,
+    WorkerRole::Implement => IMPLEMENT,
+    WorkerRole::Repair => REPAIR,
+    WorkerRole::Assess => ASSESS,
+  }
 }
 
 const COMMON_END: &str = r#"
@@ -79,5 +79,5 @@ Rules:
 "#;
 
 pub fn full_role_prompt(role: WorkerRole) -> String {
-    format!("{}{}", role_prompt(role), COMMON_END)
+  format!("{}{}", role_prompt(role), COMMON_END)
 }
