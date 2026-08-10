@@ -13,6 +13,7 @@ use tokio::{
 
 use crate::{
   backend::{AgentBackend, BackendContext},
+  config::AgentConfig,
   events::RunEvent,
   model::{
     ArchitectOutput, CompletedWorkUnit, ReconcileResult, RequirementCatalog, VerificationReport,
@@ -297,6 +298,13 @@ impl OmpRpcBackend {
   }
 }
 
+fn apply_role_selection(command: &mut Command, agent: &AgentConfig, role: WorkerRole) {
+  command.arg("--thinking").arg(agent.thinking_for(role));
+  if let Some(model) = agent.model_for(role) {
+    command.arg("--model").arg(model);
+  }
+}
+
 struct RpcProcess {
   child: Child,
   stdin: Option<ChildStdin>,
@@ -319,10 +327,9 @@ impl RpcProcess {
       WorkerRole::Implement | WorkerRole::Repair => &ctx.config.agent.coding_tools,
     };
     let mut command = Command::new(&ctx.config.agent.command);
+    command.args(["--mode", "rpc", "--no-session"]);
+    apply_role_selection(&mut command, &ctx.config.agent, role);
     command
-      .args(["--mode", "rpc", "--no-session"])
-      .arg("--thinking")
-      .arg(&ctx.config.agent.thinking)
       .arg("--tools")
       .arg(tools.join(","))
       .arg("--no-extensions")
@@ -333,9 +340,6 @@ impl RpcProcess {
       .arg(full_role_prompt(role));
     if ctx.config.agent.auto_approve {
       command.arg("--yolo");
-    }
-    if let Some(model) = &ctx.config.agent.model {
-      command.arg("--model").arg(model);
     }
     command.args(&ctx.config.agent.extra_args);
     command
@@ -764,5 +768,48 @@ mod tests {
   fn chunk_validator_rejects_interleaving() {
     let frame = json!({"type":"rpc_chunk","chunkId":"a","index":0,"count":2,"data":"e30="});
     assert!(chunk_data(&frame, "b", 0, 2).is_err());
+  }
+
+  fn role_selection_args(agent: &AgentConfig, role: WorkerRole) -> Vec<String> {
+    let mut command = Command::new("omp");
+    apply_role_selection(&mut command, agent, role);
+    command
+      .as_std()
+      .get_args()
+      .map(|argument| argument.to_string_lossy().into_owned())
+      .collect()
+  }
+
+  #[test]
+  fn command_selection_uses_independent_role_model_and_thinking() {
+    let mut config = crate::config::Config::default();
+    config.agent.roles.architect.model = Some("architect-model".into());
+    config.agent.roles.architect.thinking = Some("xhigh".into());
+    config.agent.roles.implement.model = Some("implementation-model".into());
+    config.agent.roles.implement.thinking = Some("low".into());
+
+    assert_eq!(
+      role_selection_args(&config.agent, WorkerRole::Architect),
+      ["--thinking", "xhigh", "--model", "architect-model"],
+    );
+    assert_eq!(
+      role_selection_args(&config.agent, WorkerRole::Implement),
+      ["--thinking", "low", "--model", "implementation-model"],
+    );
+  }
+
+  #[test]
+  fn command_selection_limits_model_override_to_configured_role() {
+    let mut config = crate::config::Config::default();
+    config.agent.roles.implement.model = Some("implementation-model".into());
+
+    assert_eq!(
+      role_selection_args(&config.agent, WorkerRole::Assess),
+      ["--thinking", "high"],
+    );
+    assert_eq!(
+      role_selection_args(&config.agent, WorkerRole::Implement),
+      ["--thinking", "high", "--model", "implementation-model"],
+    );
   }
 }

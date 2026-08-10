@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crate::model::WorkerRole;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -27,11 +28,95 @@ pub struct AgentConfig {
   pub command: String,
   pub model: Option<String>,
   pub thinking: String,
+  #[serde(default, skip_serializing_if = "AgentRoleOverrides::is_empty")]
+  pub roles: AgentRoleOverrides,
   pub auto_approve: bool,
   pub turn_timeout_secs: u64,
   pub read_only_tools: Vec<String>,
   pub coding_tools: Vec<String>,
   pub extra_args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentRoleConfig {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub model: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub thinking: Option<String>,
+}
+
+impl AgentRoleConfig {
+  fn is_empty(&self) -> bool {
+    self.model.is_none() && self.thinking.is_none()
+  }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentRoleOverrides {
+  #[serde(skip_serializing_if = "AgentRoleConfig::is_empty")]
+  pub architect: AgentRoleConfig,
+  #[serde(skip_serializing_if = "AgentRoleConfig::is_empty")]
+  pub reconcile: AgentRoleConfig,
+  #[serde(skip_serializing_if = "AgentRoleConfig::is_empty")]
+  pub implement: AgentRoleConfig,
+  #[serde(skip_serializing_if = "AgentRoleConfig::is_empty")]
+  pub repair: AgentRoleConfig,
+  #[serde(skip_serializing_if = "AgentRoleConfig::is_empty")]
+  pub assess: AgentRoleConfig,
+}
+
+impl AgentRoleOverrides {
+  fn is_empty(&self) -> bool {
+    self.architect.is_empty()
+      && self.reconcile.is_empty()
+      && self.implement.is_empty()
+      && self.repair.is_empty()
+      && self.assess.is_empty()
+  }
+
+  fn from_agent_defaults(model: Option<&str>, thinking: &str) -> Self {
+    let role = || AgentRoleConfig {
+      model: model.map(str::to_owned),
+      thinking: Some(thinking.to_owned()),
+    };
+    Self {
+      architect: role(),
+      reconcile: role(),
+      implement: role(),
+      repair: role(),
+      assess: role(),
+    }
+  }
+}
+
+impl AgentConfig {
+  pub fn role(&self, role: WorkerRole) -> &AgentRoleConfig {
+    match role {
+      WorkerRole::Architect => &self.roles.architect,
+      WorkerRole::Reconcile => &self.roles.reconcile,
+      WorkerRole::Implement => &self.roles.implement,
+      WorkerRole::Repair => &self.roles.repair,
+      WorkerRole::Assess => &self.roles.assess,
+    }
+  }
+
+  pub fn model_for(&self, role: WorkerRole) -> Option<&str> {
+    self.role(role).model.as_deref().or(self.model.as_deref())
+  }
+
+  pub fn thinking_for(&self, role: WorkerRole) -> &str {
+    self
+      .role(role)
+      .thinking
+      .as_deref()
+      .unwrap_or(&self.thinking)
+  }
+
+  fn populate_role_defaults(&mut self) {
+    self.roles = AgentRoleOverrides::from_agent_defaults(self.model.as_deref(), &self.thinking);
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +160,7 @@ impl Default for Config {
         command: "omp".into(),
         model: None,
         thinking: "high".into(),
+        roles: AgentRoleOverrides::default(),
         auto_approve: true,
         turn_timeout_secs: 900,
         read_only_tools: vec!["read", "grep", "glob"]
@@ -125,7 +211,8 @@ pub async fn ensure_config(cwd: &Path) -> Result<Config> {
   fs::create_dir_all(cwd.join(LOOPS_DIR)).await?;
   let path = config_path(cwd);
   if !path.exists() {
-    let config = Config::default();
+    let mut config = Config::default();
+    config.agent.populate_role_defaults();
     let text = toml::to_string_pretty(&config)?;
     fs::write(&path, text).await?;
     return Ok(config);
@@ -145,7 +232,24 @@ pub async fn read_config(cwd: &Path) -> Result<Config> {
 mod tests {
   use tempfile::tempdir;
 
-  use super::{config_path, ensure_config};
+  use super::{config_path, ensure_config, Config};
+  use crate::model::WorkerRole;
+
+  const ROLES: [WorkerRole; 5] = [
+    WorkerRole::Architect,
+    WorkerRole::Reconcile,
+    WorkerRole::Implement,
+    WorkerRole::Repair,
+    WorkerRole::Assess,
+  ];
+
+  fn serialized_config(configure: impl FnOnce(&mut Config), role_overrides: &str) -> String {
+    let mut config = Config::default();
+    configure(&mut config);
+    let mut text = toml::to_string_pretty(&config).unwrap();
+    text.push_str(role_overrides);
+    text
+  }
 
   #[tokio::test]
   async fn ensure_config_writes_supported_omp_tools() {
@@ -164,6 +268,141 @@ mod tests {
     assert!(generated.contains("glob"));
     assert!(!generated.contains("\"find\""));
     assert!(!generated.contains("\"ls\""));
+    for role in ROLES {
+      assert_eq!(config.agent.model_for(role), None);
+      assert_eq!(config.agent.thinking_for(role), "high");
+      assert!(generated.contains(&format!("[agent.roles.{}]", role.as_str())));
+    }
+  }
+
+  #[test]
+  fn legacy_agent_config_applies_global_values_to_every_role() {
+    let text = serialized_config(
+      |config| {
+        config.agent.model = Some("legacy-model".into());
+        config.agent.thinking = "medium".into();
+      },
+      "",
+    );
+
+    let loaded: Config = toml::from_str(&text).unwrap();
+
+    for role in ROLES {
+      assert_eq!(loaded.agent.model_for(role), Some("legacy-model"));
+      assert_eq!(loaded.agent.thinking_for(role), "medium");
+    }
+  }
+
+  #[test]
+  fn architect_can_override_model_and_thinking() {
+    let text = serialized_config(
+      |_| {},
+      "\n[agent.roles.architect]\nmodel = \"architect-model\"\nthinking = \"xhigh\"\n",
+    );
+
+    let loaded: Config = toml::from_str(&text).unwrap();
+
+    assert_eq!(
+      (
+        loaded.agent.model_for(WorkerRole::Architect),
+        loaded.agent.thinking_for(WorkerRole::Architect),
+      ),
+      (Some("architect-model"), "xhigh"),
+    );
+  }
+
+  #[test]
+  fn thinking_only_override_inherits_global_model() {
+    let text = serialized_config(
+      |config| {
+        config.agent.model = Some("global-model".into());
+        config.agent.thinking = "medium".into();
+      },
+      "\n[agent.roles.implement]\nthinking = \"low\"\n",
+    );
+
+    let loaded: Config = toml::from_str(&text).unwrap();
+
+    assert_eq!(
+      (
+        loaded.agent.model_for(WorkerRole::Implement),
+        loaded.agent.thinking_for(WorkerRole::Implement),
+      ),
+      (Some("global-model"), "low"),
+    );
+  }
+
+  #[test]
+  fn model_only_override_inherits_global_thinking() {
+    let text = serialized_config(
+      |config| config.agent.thinking = "medium".into(),
+      "\n[agent.roles.assess]\nmodel = \"assessment-model\"\n",
+    );
+
+    let loaded: Config = toml::from_str(&text).unwrap();
+
+    assert_eq!(
+      (
+        loaded.agent.model_for(WorkerRole::Assess),
+        loaded.agent.thinking_for(WorkerRole::Assess),
+      ),
+      (Some("assessment-model"), "medium"),
+    );
+  }
+
+  #[test]
+  fn architect_override_does_not_affect_other_roles() {
+    let text = serialized_config(
+      |config| {
+        config.agent.model = Some("global-model".into());
+        config.agent.thinking = "medium".into();
+      },
+      "\n[agent.roles.architect]\nmodel = \"architect-model\"\nthinking = \"xhigh\"\n",
+    );
+
+    let loaded: Config = toml::from_str(&text).unwrap();
+
+    for role in [
+      WorkerRole::Reconcile,
+      WorkerRole::Implement,
+      WorkerRole::Repair,
+      WorkerRole::Assess,
+    ] {
+      assert_eq!(loaded.agent.model_for(role), Some("global-model"));
+      assert_eq!(loaded.agent.thinking_for(role), "medium");
+    }
+  }
+
+  #[test]
+  fn unknown_worker_role_is_rejected() {
+    let text = serialized_config(|_| {}, "\n[agent.roles.implment]\nthinking = \"high\"\n");
+
+    let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
+
+    assert!(error.contains("implment"), "unexpected error: {error}");
+  }
+
+  #[test]
+  fn missing_global_model_remains_none_except_for_overridden_role() {
+    let text = serialized_config(
+      |_| {},
+      "\n[agent.roles.implement]\nmodel = \"implementation-model\"\n",
+    );
+
+    let loaded: Config = toml::from_str(&text).unwrap();
+
+    for role in [
+      WorkerRole::Architect,
+      WorkerRole::Reconcile,
+      WorkerRole::Repair,
+      WorkerRole::Assess,
+    ] {
+      assert_eq!(loaded.agent.model_for(role), None);
+    }
+    assert_eq!(
+      loaded.agent.model_for(WorkerRole::Implement),
+      Some("implementation-model"),
+    );
   }
 
   #[tokio::test]

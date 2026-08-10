@@ -12,29 +12,23 @@ The default engine behind every worker is **[Oh My Pi (OMP)](https://github.com/
 
 ## The idea in one picture
 
-```text
-                                authoritative
-                                   spec.md
-                                      │
-                                      ▼
-                       ┌─────────────────────────┐
-                       │           loops          │
-                       │                          │
-                       │   state machine          │
-                       │   requirement catalog    │
-                       │   deterministic verify   │
-                       │   evidence + audit trail │
-                       │   retries / circuit break│
-                       │   TUI                    │
-                       └────────────┬─────────────┘
-                                    │
-                          spawns fresh, disposable
-                              OMP processes
-                                    │
-           ┌──────────┬────────────┼────────────┬──────────┐
-           ▼          ▼            ▼             ▼          ▼
-       Architect   Reconcile   Implement       Repair     Assess
-       read-only   read-only    coding         coding    read-only
+```mermaid
+flowchart TD
+    A["authoritative<br/>spec.md"]
+
+    A --> B["loops<br/><br/>
+    state machine<br/>
+    requirement catalog<br/>
+    deterministic verify<br/>
+    evidence + audit trail<br/>
+    retries / circuit break<br/>
+    TUI"]
+
+    B -->|"spawns fresh, disposable<br/>OMP processes"| C1["Architect<br/>read-only"]
+    B -->|"spawns fresh, disposable<br/>OMP processes"| C2["Reconcile<br/>read-only"]
+    B -->|"spawns fresh, disposable<br/>OMP processes"| C3["Implement<br/>coding"]
+    B -->|"spawns fresh, disposable<br/>OMP processes"| C4["Repair<br/>coding"]
+    B -->|"spawns fresh, disposable<br/>OMP processes"| C5["Assess<br/>read-only"]
 ```
 
 There is no permanent "master LLM" carrying the whole run in its head. State survives between workers the boring, reliable way: the repository itself, `spec.md`, `.loops/` state, work-unit summaries, and deterministic verification evidence. Every worker starts cold and leaves nothing but files behind.
@@ -277,13 +271,23 @@ stagnation_limit = 3
 
 [agent]
 command = "omp"
-thinking = "high"
+model = "openai/gpt-5.2" # optional global default
+thinking = "medium"     # global default
 auto_approve = true
 turn_timeout_secs = 900
-read_only_tools = ["read", "grep", "find", "ls"]
-coding_tools = ["read", "grep", "find", "ls", "edit", "write", "bash"]
-model = "openrouter/anthropic/claude-sonnet-4.6"  # optional; pins every role
+read_only_tools = ["read", "grep", "glob"]
+coding_tools = ["read", "grep", "glob", "edit", "write", "bash"]
 extra_args = []
+
+[agent.roles.architect]
+thinking = "xhigh"
+
+[agent.roles.implement]
+model = "anthropic/claude-sonnet-4-5"
+thinking = "medium"
+
+[agent.roles.assess]
+thinking = "xhigh"
 
 [verification]
 auto_detect = true
@@ -298,7 +302,9 @@ auto_commit = false
 require_clean_tree = false
 ```
 
-If `agent.model` is omitted, each fresh OMP process resolves its own default. When set, **every** role — Architect through Assess — runs the same model. That's deliberate for v0.1.0: keeping model selection a non-variable makes it far easier to tell whether a bad outcome is a _role/prompt/tooling_ problem or a _model_ problem. Per-role routing (a stronger model for Architect/Assess, a cheaper one for Implement/Repair) is an obvious next step, not yet built.
+`agent.model` and `agent.thinking` are defaults for all five model-backed workers: Architect, Reconcile, Implement, Repair, and Assess. A table under `agent.roles.<role>` may override `model`, `thinking`, or both without repeating the other field. In the example above, Architect and Assess inherit `openai/gpt-5.2` and use `xhigh`; Implement uses `anthropic/claude-sonnet-4-5` and `medium`; Reconcile and Repair inherit both global values. If neither the role nor global configuration specifies a model, the fresh OMP process resolves its own default.
+
+Verification is deterministic controller logic, not an agent worker, so there is no `agent.roles.verify` configuration.
 
 ---
 
