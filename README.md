@@ -4,7 +4,7 @@
 
 `loops` is a small, obsessively deterministic Rust controller for autonomous, spec-driven development. It doesn't chat with you. It doesn't hold a single sprawling agent conversation and hope the context window forgives it. It runs a state machine that repeatedly reads your repository, decides the one next thing worth doing, hands that — and only that — to a disposable coding-agent worker, checks the result with real build/test commands, and refuses to call anything "done" until an independent, skeptical worker agrees from scratch.
 
-The default engine behind every worker is **[Oh My Pi (OMP)](https://github.com/anthropics)**, driven headlessly through `omp --mode rpc`.
+The default engine behind every worker is **[Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi)**, driven headlessly through `omp --mode rpc`.
 
 > **`loops` is the orchestrator. OMP is the muscle.** Everything that matters about correctness, memory, and control lives in the Rust controller — not in the model.
 
@@ -92,13 +92,13 @@ DONE
 
 ### The five roles
 
-| Role          | Purpose                                                       | Repo access     | Runs when                                     |
-| ------------- | -------------------------------------------------------------- | --------------- | ---------------------------------------------- |
-| **Architect** | Turns `spec.md` prose into a stable `REQ-NNN` requirement catalog | Read-only        | Once, and again if `spec.md`'s hash changes    |
-| **Reconcile** | Compares the real repo against every requirement, picks the next work unit | Read-only        | Start of every project cycle                   |
-| **Implement** | Implements exactly one work unit                              | Read/write/bash  | Once per selected work unit                    |
-| **Repair**    | Fixes a deterministic verification failure                    | Read/write/bash  | Only after verification fails                  |
-| **Assess**    | Independently re-verifies completion from scratch              | Read-only        | Only after Reconcile and final gates say "done" |
+| Role          | Purpose                                                                    | Repo access     | Runs when                                       |
+| ------------- | -------------------------------------------------------------------------- | --------------- | ----------------------------------------------- |
+| **Architect** | Turns `spec.md` prose into a stable `REQ-NNN` requirement catalog          | Read-only       | Once, and again if `spec.md`'s hash changes     |
+| **Reconcile** | Compares the real repo against every requirement, picks the next work unit | Read-only       | Start of every project cycle                    |
+| **Implement** | Implements exactly one work unit                                           | Read/write/bash | Once per selected work unit                     |
+| **Repair**    | Fixes a deterministic verification failure                                 | Read/write/bash | Only after verification fails                   |
+| **Assess**    | Independently re-verifies completion from scratch                          | Read-only       | Only after Reconcile and final gates say "done" |
 
 These are not nested OMP subagents — they are separate OS processes. Each worker receives:
 
@@ -118,12 +118,12 @@ Workers previously used `--no-skills` because inherited OMP skills could vary by
 
 Loops is intentionally language-agnostic. It ships only these role-procedure skills:
 
-| Role | Built-in skill |
-| --- | --- |
-| Architect, Reconcile | `spec-analysis` |
-| Implement | `implementation` |
-| Repair | `debugging` |
-| Assess | `spec-assessment` |
+| Role                 | Built-in skill    |
+| -------------------- | ----------------- |
+| Architect, Reconcile | `spec-analysis`   |
+| Implement            | `implementation`  |
+| Repair               | `debugging`       |
+| Assess               | `spec-assessment` |
 
 `code-review` is also shipped for a future Review worker, but the current state machine does not add that role.
 
@@ -298,7 +298,7 @@ auto_commit = false
 require_clean_tree = false
 ```
 
-If `agent.model` is omitted, each fresh OMP process resolves its own default. When set, **every** role — Architect through Assess — runs the same model. That's deliberate for v0.1.0: keeping model selection a non-variable makes it far easier to tell whether a bad outcome is a *role/prompt/tooling* problem or a *model* problem. Per-role routing (a stronger model for Architect/Assess, a cheaper one for Implement/Repair) is an obvious next step, not yet built.
+If `agent.model` is omitted, each fresh OMP process resolves its own default. When set, **every** role — Architect through Assess — runs the same model. That's deliberate for v0.1.0: keeping model selection a non-variable makes it far easier to tell whether a bad outcome is a _role/prompt/tooling_ problem or a _model_ problem. Per-role routing (a stronger model for Architect/Assess, a cheaper one for Implement/Repair) is an obvious next step, not yet built.
 
 ---
 
