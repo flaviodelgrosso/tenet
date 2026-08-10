@@ -247,6 +247,12 @@ impl Controller {
         .implement(ctx, &catalog, &work_unit)
         .await
         .context("implementation worker")?;
+      ctx
+        .events
+        .emit(RunEvent::RepositoryChanges(
+          store::repository_changes(&self.cwd).await,
+        ))
+        .await;
       store::ensure_gitignore(&self.cwd).await?;
       let changed = protection::restore_changes(&self.cwd, &protected).await?;
       if !changed.is_empty() {
@@ -311,6 +317,7 @@ impl Controller {
     let (spec, spec_hash) = store::spec_text_and_hash(&self.cwd, &ctx.config).await?;
     if let Some(catalog) = store::read_catalog(&self.cwd).await? {
       if catalog.spec_hash == spec_hash {
+        ctx.events.emit(RunEvent::Catalog(catalog.clone())).await;
         return Ok(catalog);
       }
     }
@@ -328,6 +335,7 @@ impl Controller {
       requirements: output.requirements,
     };
     store::write_catalog(&self.cwd, &catalog).await?;
+    ctx.events.emit(RunEvent::Catalog(catalog.clone())).await;
     state.requirement_counts = RequirementCounts {
       total: catalog.requirements.len(),
       ..Default::default()
@@ -394,6 +402,12 @@ impl Controller {
         .repair(ctx, catalog, work_unit, &report)
         .await
         .context("repair worker")?;
+      ctx
+        .events
+        .emit(RunEvent::RepositoryChanges(
+          store::repository_changes(&self.cwd).await,
+        ))
+        .await;
       store::ensure_gitignore(&self.cwd).await?;
       let changed = protection::restore_changes(&self.cwd, &protected).await?;
       if !changed.is_empty() {

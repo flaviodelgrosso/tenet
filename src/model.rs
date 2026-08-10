@@ -114,6 +114,12 @@ pub struct CommandResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RepositoryChange {
+  pub path: String,
+  pub status: char,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VerificationReport {
   pub passed: bool,
   #[serde(rename = "startedAt")]

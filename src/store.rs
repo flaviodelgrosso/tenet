@@ -12,7 +12,7 @@ use tokio::fs;
 
 use crate::{
   config::{Config, LOOPS_DIR},
-  model::{ReconcileResult, RequirementCatalog, State},
+  model::{ReconcileResult, RepositoryChange, RequirementCatalog, State},
 };
 
 pub const STATE_FILE: &str = "state.json";
@@ -131,6 +131,32 @@ pub async fn is_git_clean(cwd: &Path) -> bool {
   output
     .map(|o| o.status.success() && o.stdout.is_empty())
     .unwrap_or(false)
+}
+
+pub async fn repository_changes(cwd: &Path) -> Vec<RepositoryChange> {
+  let output = tokio::process::Command::new("git")
+    .args(["status", "--porcelain", "--untracked-files=all"])
+    .current_dir(cwd)
+    .output()
+    .await;
+  let Ok(output) = output else {
+    return Vec::new();
+  };
+  if !output.status.success() {
+    return Vec::new();
+  }
+  String::from_utf8_lossy(&output.stdout)
+    .lines()
+    .filter_map(|line| {
+      let status = line.chars().find(|ch| !ch.is_whitespace())?;
+      let path = line
+        .get(3..)?
+        .rsplit_once(" -> ")
+        .map_or_else(|| line.get(3..).unwrap_or_default(), |(_, path)| path)
+        .to_owned();
+      Some(RepositoryChange { path, status })
+    })
+    .collect()
 }
 
 pub async fn auto_commit(cwd: &Path, message: &str) -> Result<()> {

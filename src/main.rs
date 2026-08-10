@@ -18,7 +18,7 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use backend::omp_rpc::OmpRpcBackend;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use controller::Controller;
 use events::{EventSink, RunEvent};
 use model::{RunStatus, WorkerEvent};
@@ -70,103 +70,102 @@ enum Command {
 async fn main() -> Result<()> {
   let cli = Cli::parse();
 
-  let Some(command) = cli.command else {
-    Cli::command().print_help()?;
-    println!();
-    return Ok(());
-  };
-
   let cwd = cli
     .cwd
     .unwrap_or(std::env::current_dir().context("current directory")?);
 
   let backend: Arc<dyn backend::AgentBackend> = Arc::new(OmpRpcBackend);
 
-  match command {
-    Command::Init => {
-      let controller = Controller::new(cwd.clone(), backend, EventSink::new(None));
-      let state = controller.initialize().await?;
-      println!("Initialized loops in {}", cwd.display());
-      println!("  spec: {}/spec.md", cwd.display());
-      println!("  state: {}/.loops/state.json", cwd.display());
-      if !command_exists("omp").await {
-        eprintln!("warning: `omp` was not found in PATH; install Oh My Pi before `loops run`");
-      }
-      println!("status: {:?}", state.status);
+  match cli.command {
+    None => {
+      let _ = tui::idle(cwd, backend).await?;
     }
-    Command::Run { no_tui } | Command::Resume { no_tui } => {
-      if !command_exists("omp").await {
-        bail!("`omp` is not available in PATH; loops uses `omp --mode rpc --no-session` as its default coding-agent backend");
-      }
-      let state = if no_tui {
-        run_plain(cwd, backend).await?
-      } else {
-        tui::run(cwd, backend).await?
-      };
-      if matches!(
-        state.status,
-        RunStatus::Blocked | RunStatus::Failed | RunStatus::Stopped
-      ) {
-        std::process::exit(2);
-      }
-    }
-    Command::Status { json } => {
-      let state = store::read_state(&cwd).await?;
-      if json {
-        println!("{}", serde_json::to_string_pretty(&state)?);
-      } else {
+    Some(command) => match command {
+      Command::Init => {
+        let controller = Controller::new(cwd.clone(), backend, EventSink::new(None));
+        let state = controller.initialize().await?;
+        println!("Initialized loops in {}", cwd.display());
+        println!("  spec: {}/spec.md", cwd.display());
+        println!("  state: {}/.loops/state.json", cwd.display());
+        if !command_exists("omp").await {
+          eprintln!("warning: `omp` was not found in PATH; install Oh My Pi before `loops run`");
+        }
         println!("status: {:?}", state.status);
-        println!("phase: {:?}", state.phase);
-        println!("cycle: {}", state.cycle);
-        println!(
-          "requirements: {}/{} satisfied",
-          state.requirement_counts.satisfied, state.requirement_counts.total
-        );
-        if let Some(work) = state.current_work_unit {
-          println!("work unit: {} · {}", work.id, work.title);
+      }
+      Command::Run { no_tui } | Command::Resume { no_tui } => {
+        if !command_exists("omp").await {
+          bail!("`omp` is not available in PATH; loops uses `omp --mode rpc --no-session` as its default coding-agent backend");
         }
-        println!("summary: {}", state.last_summary);
-        if let Some(reason) = state.blocked_reason {
-          println!("blocked: {reason}");
-        }
-        if let Some(error) = state.last_error {
-          println!("error: {error}");
+        let state = if no_tui {
+          run_plain(cwd, backend).await?
+        } else {
+          tui::run(cwd, backend).await?
+        };
+        if matches!(
+          state.status,
+          RunStatus::Blocked | RunStatus::Failed | RunStatus::Stopped
+        ) {
+          std::process::exit(2);
         }
       }
-    }
-    Command::Verify { json } => {
-      let report = controller::manual_verify(&cwd).await?;
-      if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-      } else {
-        for command in &report.commands {
-          let mark = if command.exit_code == Some(0) && !command.timed_out {
-            "PASS"
-          } else {
-            "FAIL"
-          };
-          println!("[{mark}] {} ({} ms)", command.command, command.duration_ms);
-          if mark == "FAIL" {
-            if !command.stderr.trim().is_empty() {
-              eprintln!("{}", command.stderr.trim());
-            }
-            if !command.stdout.trim().is_empty() {
-              eprintln!("{}", command.stdout.trim());
-            }
+      Command::Status { json } => {
+        let state = store::read_state(&cwd).await?;
+        if json {
+          println!("{}", serde_json::to_string_pretty(&state)?);
+        } else {
+          println!("status: {:?}", state.status);
+          println!("phase: {:?}", state.phase);
+          println!("cycle: {}", state.cycle);
+          println!(
+            "requirements: {}/{} satisfied",
+            state.requirement_counts.satisfied, state.requirement_counts.total
+          );
+          if let Some(work) = state.current_work_unit {
+            println!("work unit: {} · {}", work.id, work.title);
+          }
+          println!("summary: {}", state.last_summary);
+          if let Some(reason) = state.blocked_reason {
+            println!("blocked: {reason}");
+          }
+          if let Some(error) = state.last_error {
+            println!("error: {error}");
           }
         }
-        for warning in &report.warnings {
-          eprintln!("warning: {warning}");
+      }
+      Command::Verify { json } => {
+        let report = controller::manual_verify(&cwd).await?;
+        if json {
+          println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+          for command in &report.commands {
+            let mark = if command.exit_code == Some(0) && !command.timed_out {
+              "PASS"
+            } else {
+              "FAIL"
+            };
+            println!("[{mark}] {} ({} ms)", command.command, command.duration_ms);
+            if mark == "FAIL" {
+              if !command.stderr.trim().is_empty() {
+                eprintln!("{}", command.stderr.trim());
+              }
+              if !command.stdout.trim().is_empty() {
+                eprintln!("{}", command.stdout.trim());
+              }
+            }
+          }
+          for warning in &report.warnings {
+            eprintln!("warning: {warning}");
+          }
+          println!(
+            "verification: {}",
+            if report.passed { "PASS" } else { "FAIL" }
+          );
         }
-        println!(
-          "verification: {}",
-          if report.passed { "PASS" } else { "FAIL" }
-        );
+        if !report.passed {
+          std::process::exit(1);
+        }
       }
-      if !report.passed {
-        std::process::exit(1);
-      }
-    }
+    },
   }
   Ok(())
 }
@@ -203,6 +202,12 @@ fn print_plain_event(event: RunEvent) -> Result<()> {
       state.requirement_counts.total,
       state.last_summary
     ),
+    RunEvent::Catalog(catalog) => {
+      eprintln!(
+        "[requirements] {} catalog entries",
+        catalog.requirements.len()
+      )
+    }
     RunEvent::Message(message) => eprintln!("[loops] {message}"),
     RunEvent::Reconcile(result) => eprintln!("[reconcile] {}", result.summary),
     RunEvent::Verification(report) => {
@@ -217,6 +222,9 @@ fn print_plain_event(event: RunEvent) -> Result<()> {
           command.command
         );
       }
+    }
+    RunEvent::RepositoryChanges(changes) => {
+      eprintln!("[repository] {} changed files", changes.len())
     }
     RunEvent::Worker(event) => match event {
       WorkerEvent::Start { role, .. } => {
@@ -284,4 +292,15 @@ fn sanitize_terminal_text(text: &str) -> String {
     }
   }
   out
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn commandless_invocation_selects_tui_launcher() {
+    let cli = Cli::try_parse_from(["loops"]).unwrap();
+    assert!(cli.command.is_none());
+  }
 }

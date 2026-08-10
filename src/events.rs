@@ -7,16 +7,20 @@ use tokio::{
   sync::{mpsc, Mutex},
 };
 
-use crate::model::{ReconcileResult, State, VerificationReport, WorkerEvent};
+use crate::model::{
+  ReconcileResult, RepositoryChange, RequirementCatalog, State, VerificationReport, WorkerEvent,
+};
 
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum RunEvent {
   State(State),
+  Catalog(RequirementCatalog),
   Message(String),
   Worker(WorkerEvent),
   Reconcile(ReconcileResult),
   Verification(VerificationReport),
+  RepositoryChanges(Vec<RepositoryChange>),
   Finished(State),
 }
 
@@ -74,10 +78,14 @@ impl RunLogger {
   async fn write_event(&self, event: &RunEvent) -> Result<()> {
     let value = match event {
       RunEvent::State(v) => serde_json::json!({"type":"state","value":v}),
+      RunEvent::Catalog(v) => serde_json::json!({"type":"catalog","value":v}),
       RunEvent::Message(v) => serde_json::json!({"type":"message","value":v}),
       RunEvent::Worker(v) => serde_json::json!({"type":"worker","value":v}),
       RunEvent::Reconcile(v) => serde_json::json!({"type":"reconcile","value":v}),
       RunEvent::Verification(v) => serde_json::json!({"type":"verification","value":v}),
+      RunEvent::RepositoryChanges(v) => {
+        serde_json::json!({"type":"repository_changes","value":v})
+      }
       RunEvent::Finished(v) => serde_json::json!({"type":"finished","value":v}),
     };
     let mut file = self.events.lock().await;
