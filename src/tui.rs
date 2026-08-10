@@ -18,7 +18,7 @@ use ratatui::{
   layout::{Alignment, Constraint, Direction, Layout, Rect},
   style::{Color, Modifier, Style},
   text::{Line, Span},
-  widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
+  widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
   Frame, Terminal,
 };
 use tokio::sync::mpsc;
@@ -950,180 +950,532 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_overview(frame: &mut Frame, app: &App, area: Rect) {
   if area.width >= 96 {
-    let cols =
-      Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(area);
-    draw_overview_primary(frame, app, cols[0]);
+    let cols = Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
+      .spacing(2)
+      .split(area);
+    draw_overview_primary(frame, app, cols[0], true);
+    draw_overview_secondary(frame, app, cols[1]);
+  } else if area.width >= 70 {
+    let cols = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+      .spacing(2)
+      .split(area);
+    draw_overview_primary(frame, app, cols[0], false);
     draw_overview_secondary(frame, app, cols[1]);
   } else {
-    let rows =
-      Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
-    draw_overview_primary(frame, app, rows[0]);
-    draw_overview_secondary(frame, app, rows[1]);
+    draw_overview_narrow(frame, app, area);
   }
 }
 
-fn draw_overview_primary(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_overview_primary(frame: &mut Frame, app: &App, area: Rect, show_history: bool) {
+  let hero_height = if area.height >= 20 { 9 } else { 7 };
+  let history_height = if show_history && area.height >= 24 {
+    5
+  } else {
+    0
+  };
   let rows = Layout::vertical([
-    Constraint::Length(5),
-    Constraint::Length(6),
-    Constraint::Min(5),
+    Constraint::Length(hero_height),
+    Constraint::Min(3),
+    Constraint::Length(history_height),
   ])
   .split(area);
-  let counts = &app.state.requirement_counts;
-  let ratio = if counts.total == 0 {
-    0.0
-  } else {
-    counts.satisfied as f64 / counts.total as f64
-  };
-  frame.render_widget(
-    Gauge::default()
-      .block(section_block(" SPEC PROGRESS "))
-      .gauge_style(Style::default().fg(Color::Green))
-      .ratio(ratio)
-      .label(format!(
-        "{} / {} requirements",
-        counts.satisfied, counts.total
-      )),
-    rows[0],
-  );
 
-  let mut current = vec![section_heading("CURRENT")];
-  if !app.run_active {
-    current.push(Line::from(Span::styled(
-      "READY · press r to start or resume the autonomous run",
-      Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD),
-    )));
-    current.push(Line::from(Span::styled(
-      &app.state.last_summary,
-      Style::default().fg(QUIET),
-    )));
-  } else if let Some(work) = &app.state.current_work_unit {
-    current.push(Line::from(vec![Span::styled(
-      format!("{} · {}", phase_label(&app.state.phase), work.id),
-      Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD),
-    )]));
-    current.push(Line::from(Span::styled(
-      &work.title,
-      Style::default().add_modifier(Modifier::BOLD),
-    )));
-    current.push(Line::from(work.requirement_ids.join("  ")));
-  } else {
-    current.push(Line::from(Span::styled(
-      &app.state.last_summary,
-      Style::default().fg(Color::Gray),
-    )));
+  draw_overview_current(frame, app, rows[0]);
+  draw_overview_recent(frame, app, rows[1]);
+  if history_height > 0 {
+    draw_overview_loop_history(frame, app, rows[2]);
   }
-  frame.render_widget(Paragraph::new(current).wrap(Wrap { trim: true }), rows[1]);
-
-  let mut recent = vec![section_heading("RECENT WORK")];
-  for completed in app.state.completed_work_units.iter().rev().take(4).rev() {
-    recent.push(Line::from(vec![
-      Span::styled("✓ ", Style::default().fg(Color::Green)),
-      Span::styled(
-        &completed.work_unit.id,
-        Style::default().add_modifier(Modifier::BOLD),
-      ),
-      Span::raw(format!("  {}", completed.work_unit.title)),
-    ]));
-  }
-  if let Some(work) = &app.state.current_work_unit {
-    recent.push(Line::from(vec![
-      Span::styled("● ", Style::default().fg(Color::Cyan)),
-      Span::styled(
-        &work.id,
-        Style::default()
-          .fg(Color::Cyan)
-          .add_modifier(Modifier::BOLD),
-      ),
-      Span::raw(format!("  {}", work.title)),
-    ]));
-  }
-  if recent.len() == 1 {
-    recent.push(Line::from(Span::styled(
-      "No completed work units yet",
-      Style::default().fg(QUIET),
-    )));
-  }
-  frame.render_widget(Paragraph::new(recent).wrap(Wrap { trim: true }), rows[2]);
 }
 
 fn draw_overview_secondary(frame: &mut Frame, app: &App, area: Rect) {
   let rows = Layout::vertical([
-    Constraint::Length(6),
-    Constraint::Length(6),
-    Constraint::Min(5),
+    Constraint::Length(4),
+    Constraint::Length(4),
+    Constraint::Min(3),
   ])
   .split(area);
+  draw_overview_requirements(frame, app, rows[0]);
+  draw_overview_verification(frame, app, rows[1]);
+  draw_overview_loop(frame, app, rows[2], true);
+}
+
+fn draw_overview_narrow(frame: &mut Frame, app: &App, area: Rect) {
+  let compact = area.height < 14;
+  let rows = if compact {
+    Layout::vertical([
+      Constraint::Length(4),
+      Constraint::Length(1),
+      Constraint::Length(1),
+      Constraint::Length(1),
+      Constraint::Min(1),
+    ])
+    .split(area)
+  } else {
+    Layout::vertical([
+      Constraint::Length(if area.height >= 20 { 8 } else { 7 }),
+      Constraint::Length(if area.height >= 20 { 3 } else { 2 }),
+      Constraint::Length(if area.height >= 20 { 3 } else { 2 }),
+      Constraint::Length(if area.height >= 20 { 4 } else { 2 }),
+      Constraint::Min(2),
+    ])
+    .split(area)
+  };
+
+  draw_overview_current(frame, app, rows[0]);
+  draw_overview_requirements(frame, app, rows[1]);
+  draw_overview_verification(frame, app, rows[2]);
+  draw_overview_loop(frame, app, rows[3], !compact);
+  draw_overview_recent(frame, app, rows[4]);
+}
+
+fn draw_overview_current(frame: &mut Frame, app: &App, area: Rect) {
+  if area.width == 0 || area.height == 0 {
+    return;
+  }
+  let inner_width = area.width.saturating_sub(2) as usize;
+  let mut lines = Vec::with_capacity(6);
+  if !app.run_active {
+    lines.push(Line::from(Span::styled(
+      "READY",
+      Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+      "Press r to start or resume",
+      Style::default().fg(Color::Gray),
+    )));
+    if area.height >= 6 {
+      lines.push(Line::from(Span::styled(
+        app.state.last_summary.clone(),
+        Style::default().fg(QUIET),
+      )));
+    }
+  } else if let Some(work) = &app.state.current_work_unit {
+    let phase = phase_label(&app.state.phase);
+    let state = "ACTIVE";
+    let gap = inner_width.saturating_sub(phase.len() + state.len() + 3);
+    lines.push(Line::from(vec![
+      Span::styled(
+        format!("◆ {phase}"),
+        Style::default()
+          .fg(Color::Cyan)
+          .add_modifier(Modifier::BOLD),
+      ),
+      Span::raw(" ".repeat(gap.max(1))),
+      Span::styled(
+        state,
+        Style::default()
+          .fg(Color::Cyan)
+          .add_modifier(Modifier::BOLD),
+      ),
+    ]));
+    lines.push(Line::from(vec![
+      Span::styled(
+        work.id.clone(),
+        Style::default()
+          .fg(Color::Cyan)
+          .add_modifier(Modifier::BOLD),
+      ),
+      Span::styled(" · ", Style::default().fg(QUIET)),
+      Span::raw(work.title.clone()),
+    ]));
+    if area.height >= 6 {
+      lines.push(Line::from(Span::styled(
+        if work.requirement_ids.is_empty() {
+          "No linked requirements".into()
+        } else {
+          work.requirement_ids.join("  ")
+        },
+        Style::default().fg(QUIET),
+      )));
+    }
+  } else {
+    lines.push(Line::from(vec![
+      Span::styled(
+        format!("◆ {}", phase_label(&app.state.phase)),
+        Style::default()
+          .fg(Color::Cyan)
+          .add_modifier(Modifier::BOLD),
+      ),
+      Span::styled("  ACTIVE", Style::default().fg(Color::Cyan)),
+    ]));
+    lines.push(Line::from(Span::styled(
+      app.state.last_summary.clone(),
+      Style::default().fg(Color::Gray),
+    )));
+  }
+
+  let content_height = area.height.saturating_sub(2) as usize;
+  while lines.len() + 1 < content_height && lines.len() < 4 {
+    lines.push(Line::default());
+  }
+  if content_height > 0 {
+    lines.push(progress_line(inner_width, &app.state.requirement_counts));
+  }
+
+  frame.render_widget(
+    Paragraph::new(lines)
+      .block(overview_hero_block())
+      .wrap(Wrap { trim: true }),
+    area,
+  );
+}
+
+fn draw_overview_recent(frame: &mut Frame, app: &App, area: Rect) {
+  if area.width == 0 || area.height == 0 {
+    return;
+  }
+  if area.height == 1 {
+    let mut spans = vec![Span::styled(
+      "RECENT  ",
+      Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(work) = &app.state.current_work_unit {
+      spans.push(Span::styled("● ", Style::default().fg(Color::Cyan)));
+      spans.push(Span::styled(
+        work.id.clone(),
+        Style::default().fg(Color::Cyan),
+      ));
+      spans.push(Span::raw(format!("  {}", work.title)));
+    } else if let Some(completed) = app.state.completed_work_units.last() {
+      spans.push(Span::styled("✓ ", Style::default().fg(Color::Green)));
+      spans.push(Span::styled(
+        completed.work_unit.id.clone(),
+        Style::default().fg(Color::Gray),
+      ));
+      spans.push(Span::raw(format!("  {}", completed.work_unit.title)));
+    } else {
+      spans.push(Span::styled("No work yet", Style::default().fg(QUIET)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    return;
+  }
+  let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+  frame.render_widget(Paragraph::new(overview_heading("RECENT WORK")), rows[0]);
+  if rows[1].height == 0 {
+    return;
+  }
+
+  let include_current = app.state.current_work_unit.is_some() && rows[1].height >= 4;
+  let completed_limit = (rows[1].height as usize).saturating_sub(usize::from(include_current));
+  let end = app
+    .state
+    .completed_work_units
+    .len()
+    .saturating_sub(app.scroll as usize);
+  let start = end.saturating_sub(completed_limit.min(4));
+  let mut lines = Vec::with_capacity(rows[1].height as usize);
+  for completed in &app.state.completed_work_units[start..end] {
+    lines.push(Line::from(vec![
+      Span::styled("✓ ", Style::default().fg(Color::Green)),
+      Span::styled(
+        completed.work_unit.id.clone(),
+        Style::default().fg(Color::Gray),
+      ),
+      Span::styled("  ", Style::default().fg(QUIET)),
+      Span::raw(completed.work_unit.title.clone()),
+    ]));
+  }
+  if include_current {
+    if let Some(work) = &app.state.current_work_unit {
+      lines.push(Line::from(vec![
+        Span::styled("● ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+          work.id.clone(),
+          Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default().fg(QUIET)),
+        Span::raw(work.title.clone()),
+      ]));
+    }
+  }
+  if lines.is_empty() {
+    lines.push(Line::from(Span::styled(
+      "No completed work units yet",
+      Style::default().fg(QUIET),
+    )));
+  }
+  frame.render_widget(Paragraph::new(lines), rows[1]);
+}
+
+fn draw_overview_requirements(frame: &mut Frame, app: &App, area: Rect) {
+  if area.width == 0 || area.height == 0 {
+    return;
+  }
   let counts = &app.state.requirement_counts;
-  let requirements = vec![
-    section_heading("REQUIREMENTS"),
-    metric_line("✓", Color::Green, counts.satisfied, "satisfied"),
-    metric_line("◐", Color::Yellow, counts.partial, "partial"),
-    metric_line("○", QUIET, counts.missing, "missing"),
-  ];
-  frame.render_widget(Paragraph::new(requirements), rows[0]);
+  let missing_color = if counts.missing > 0 {
+    Color::Yellow
+  } else {
+    QUIET
+  };
+  if area.height == 1 {
+    frame.render_widget(
+      Paragraph::new(Line::from(vec![
+        Span::styled(
+          "REQ  ",
+          Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+        ),
+        health_metric(counts.satisfied, "✓", Color::Green),
+        Span::raw("  "),
+        health_metric(counts.partial, "◐", Color::Yellow),
+        Span::raw("  "),
+        health_metric(counts.missing, "○", missing_color),
+      ])),
+      area,
+    );
+    return;
+  }
+  let mut lines = vec![overview_heading("REQUIREMENTS")];
+  lines.push(Line::from(vec![
+    health_metric(counts.satisfied, "✓", Color::Green),
+    Span::styled("   ", Style::default().fg(QUIET)),
+    health_metric(counts.partial, "◐", Color::Yellow),
+    Span::styled("   ", Style::default().fg(QUIET)),
+    health_metric(counts.missing, "○", missing_color),
+  ]));
+  if area.height >= 3 {
+    lines.push(Line::from(Span::styled(
+      "satisfied   partial   missing",
+      Style::default().fg(QUIET),
+    )));
+  }
+  frame.render_widget(Paragraph::new(lines), area);
+}
 
-  let last_verify = app.verifications.last();
-  let verification = vec![
-    section_heading("VERIFICATION"),
-    label_value(
-      "Last run",
-      last_verify.map_or("—", |attempt| {
-        if attempt.report.passed {
-          "PASS"
-        } else {
-          "FAIL"
-        }
-      }),
-      last_verify.map_or(QUIET, |attempt| {
-        if attempt.report.passed {
-          Color::Green
-        } else {
-          Color::Red
-        }
-      }),
-    ),
-    label_value(
-      "Attempts",
-      &app.verifications.len().to_string(),
-      Color::Gray,
-    ),
-    label_value("Cycle", &app.state.cycle.to_string(), Color::Gray),
-  ];
-  frame.render_widget(Paragraph::new(verification), rows[1]);
+fn draw_overview_verification(frame: &mut Frame, app: &App, area: Rect) {
+  if area.width == 0 || area.height == 0 {
+    return;
+  }
+  if area.height == 1 {
+    let status = match app.verifications.last() {
+      Some(attempt) if attempt.report.passed => {
+        Span::styled("✓ PASS", Style::default().fg(Color::Green))
+      }
+      Some(_) => Span::styled(
+        "✗ FAIL",
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+      ),
+      None => Span::styled("— Not run", Style::default().fg(QUIET)),
+    };
+    frame.render_widget(
+      Paragraph::new(Line::from(vec![
+        Span::styled(
+          "VERIFY  ",
+          Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+        ),
+        status,
+      ])),
+      area,
+    );
+    return;
+  }
+  let mut lines = vec![overview_heading("VERIFICATION")];
+  match app.verifications.last() {
+    Some(attempt) => {
+      let (mark, status, color) = if attempt.report.passed {
+        ("✓", "PASS", Color::Green)
+      } else {
+        ("✗", "FAIL", Color::Red)
+      };
+      lines.push(Line::from(Span::styled(
+        format!("{mark} {status}"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+      )));
+      if area.height >= 3 {
+        lines.push(Line::from(Span::styled(
+          format!(
+            "{} {} · cycle {}",
+            app.verifications.len(),
+            if app.verifications.len() == 1 {
+              "attempt"
+            } else {
+              "attempts"
+            },
+            app.state.cycle
+          ),
+          Style::default().fg(QUIET),
+        )));
+      }
+    }
+    None => lines.push(Line::from(Span::styled(
+      "— Not run yet",
+      Style::default().fg(QUIET),
+    ))),
+  }
+  frame.render_widget(Paragraph::new(lines), area);
+}
 
-  let mut loop_lines = vec![section_heading("ENGINEERING LOOP")];
-  for (cycle, steps) in app.cycles.iter().rev().take(3).rev() {
+fn draw_overview_loop(frame: &mut Frame, app: &App, area: Rect, show_history: bool) {
+  if area.width == 0 || area.height == 0 {
+    return;
+  }
+  let current = app.cycles.get(&app.state.cycle);
+  if area.height == 1 {
+    let mut spans = vec![Span::styled(
+      format!("CYCLE {}  ", app.state.cycle),
+      Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(steps) = current {
+      spans.extend(loop_spans(steps, false));
+    } else {
+      spans.push(Span::styled("Waiting", Style::default().fg(QUIET)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    return;
+  }
+  let mut lines = vec![overview_heading(&format!("CYCLE {}", app.state.cycle))];
+  if let Some(steps) = current {
+    lines.push(loop_line(steps, false));
+  } else {
+    lines.push(Line::from(Span::styled(
+      "Waiting for first step",
+      Style::default().fg(QUIET),
+    )));
+  }
+
+  if show_history && area.height >= 4 {
+    for (cycle, steps) in app
+      .cycles
+      .iter()
+      .rev()
+      .filter(|(cycle, _)| **cycle != app.state.cycle)
+      .take(2)
+    {
+      let mut spans = vec![Span::styled(
+        format!("Cycle {cycle}  "),
+        Style::default().fg(QUIET),
+      )];
+      spans.extend(loop_spans(steps, true));
+      lines.push(Line::from(spans));
+    }
+  }
+  frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_overview_loop_history(frame: &mut Frame, app: &App, area: Rect) {
+  if area.width == 0 || area.height == 0 {
+    return;
+  }
+  let mut lines = vec![overview_heading("LOOP HISTORY")];
+  for (cycle, steps) in app
+    .cycles
+    .iter()
+    .rev()
+    .filter(|(cycle, _)| **cycle != app.state.cycle)
+    .take(3)
+  {
     let mut spans = vec![Span::styled(
       format!("Cycle {cycle:<3} "),
       Style::default().fg(QUIET),
     )];
-    for (index, step) in steps.iter().enumerate() {
-      if index > 0 {
-        spans.push(Span::styled(" → ", Style::default().fg(QUIET)));
-      }
-      let (mark, color) = step_mark(step.outcome);
-      spans.push(Span::styled(
-        format!("{} {mark}", phase_short(&step.phase)),
-        Style::default().fg(color),
-      ));
-    }
-    loop_lines.push(Line::from(spans));
+    spans.extend(loop_spans(steps, true));
+    lines.push(Line::from(spans));
   }
-  if loop_lines.len() == 1 {
-    loop_lines.push(Line::from(Span::styled(
-      "Waiting for first cycle",
+  if lines.len() == 1 {
+    lines.push(Line::from(Span::styled(
+      "No earlier cycles",
       Style::default().fg(QUIET),
     )));
   }
-  frame.render_widget(
-    Paragraph::new(loop_lines).wrap(Wrap { trim: true }),
-    rows[2],
-  );
+  frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn progress_line(width: usize, counts: &crate::model::RequirementCounts) -> Line<'static> {
+  let satisfied = counts.satisfied.min(counts.total);
+  let percent = if counts.total == 0 {
+    0
+  } else {
+    ((satisfied as u128 * 100) / counts.total as u128) as usize
+  };
+  let label = if width >= 34 { "Requirements" } else { "Req" };
+  let prefix = format!("{label}  {}/{}  ", counts.satisfied, counts.total);
+  let suffix = format!("  {percent}%");
+  let bar_width = width.saturating_sub(prefix.chars().count() + suffix.chars().count());
+  if bar_width < 3 {
+    return Line::from(vec![
+      Span::styled(format!("{label}  "), Style::default().fg(QUIET)),
+      Span::styled(
+        format!("{}/{}", counts.satisfied, counts.total),
+        Style::default().add_modifier(Modifier::BOLD),
+      ),
+      Span::styled(suffix, Style::default().fg(Color::Green)),
+    ]);
+  }
+  let filled = bar_width.saturating_mul(percent).saturating_div(100);
+  Line::from(vec![
+    Span::styled(format!("{label}  "), Style::default().fg(QUIET)),
+    Span::styled(
+      format!("{}/{}  ", counts.satisfied, counts.total),
+      Style::default().add_modifier(Modifier::BOLD),
+    ),
+    Span::styled("█".repeat(filled), Style::default().fg(Color::Green)),
+    Span::styled("░".repeat(bar_width - filled), Style::default().fg(QUIET)),
+    Span::styled(suffix, Style::default().fg(Color::Green)),
+  ])
+}
+
+fn health_metric(value: usize, mark: &str, color: Color) -> Span<'static> {
+  Span::styled(
+    format!("{value} {mark}"),
+    Style::default().fg(color).add_modifier(Modifier::BOLD),
+  )
+}
+
+fn loop_line(steps: &[LoopStep], muted: bool) -> Line<'static> {
+  Line::from(loop_spans(steps, muted))
+}
+
+fn loop_spans(steps: &[LoopStep], muted: bool) -> Vec<Span<'static>> {
+  let mut spans = Vec::with_capacity(steps.len().saturating_mul(2));
+  for (index, step) in steps.iter().enumerate() {
+    if index > 0 {
+      spans.push(Span::styled(" → ", Style::default().fg(QUIET)));
+    }
+    let (mark, color) = step_mark(step.outcome);
+    let mut style = Style::default().fg(color);
+    if muted {
+      style = style.add_modifier(Modifier::DIM);
+    } else if step.outcome == StepOutcome::Active {
+      style = style.add_modifier(Modifier::BOLD);
+    }
+    spans.push(Span::styled(
+      format!("{} {mark}", phase_short(&step.phase)),
+      style,
+    ));
+  }
+  spans
+}
+
+fn overview_heading(text: &str) -> Line<'static> {
+  Line::from(Span::styled(
+    text.to_owned(),
+    Style::default()
+      .fg(Color::Gray)
+      .add_modifier(Modifier::BOLD),
+  ))
+}
+
+fn overview_hero_block() -> Block<'static> {
+  Block::default()
+    .borders(Borders::ALL)
+    .border_style(Style::default().fg(Color::Cyan))
+    .title(Span::styled(
+      " CURRENT ",
+      Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD),
+    ))
 }
 
 fn draw_worker(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1730,27 +2082,6 @@ fn section_heading(text: &str) -> Line<'static> {
   ))
 }
 
-fn metric_line(mark: &str, color: Color, value: usize, label: &str) -> Line<'static> {
-  Line::from(vec![
-    Span::styled(format!("{mark} "), Style::default().fg(color)),
-    Span::styled(
-      format!("{value:>3}"),
-      Style::default().add_modifier(Modifier::BOLD),
-    ),
-    Span::raw(format!(" {label}")),
-  ])
-}
-
-fn label_value(label: &str, value: &str, color: Color) -> Line<'static> {
-  Line::from(vec![
-    Span::styled(format!("{label:<16}"), Style::default().fg(QUIET)),
-    Span::styled(
-      value.to_owned(),
-      Style::default().fg(color).add_modifier(Modifier::BOLD),
-    ),
-  ])
-}
-
 fn requirement_mark(status: Option<&RequirementStatus>) -> (&'static str, Color) {
   match status {
     Some(RequirementStatus::Satisfied) => ("✓", Color::Green),
@@ -1819,11 +2150,11 @@ fn phase_label(phase: &Phase) -> &'static str {
 
 fn phase_short(phase: &Phase) -> &'static str {
   match phase {
-    Phase::Reconciling => "R",
-    Phase::Implementing => "I",
-    Phase::Verifying => "V",
-    Phase::Repairing => "P",
-    Phase::Assessing => "A",
+    Phase::Reconciling => "REC",
+    Phase::Implementing => "IMP",
+    Phase::Verifying => "VER",
+    Phase::Repairing => "REP",
+    Phase::Assessing => "ASS",
     _ => "·",
   }
 }
@@ -1981,10 +2312,13 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+  use ratatui::backend::TestBackend;
   use serde_json::json;
 
   use super::*;
-  use crate::model::{CommandResult, RequirementCatalog, RequirementCounts, WorkUnit};
+  use crate::model::{
+    CommandResult, CompletedWorkUnit, RequirementCatalog, RequirementCounts, WorkUnit,
+  };
 
   fn app() -> App {
     App::new("test-project".into(), State::fresh())
@@ -1996,6 +2330,103 @@ mod tests {
       at: "2026-08-10T10:00:00Z".into(),
       skills: vec!["implementation".into(), "rust".into()],
     }
+  }
+
+  fn work_unit(id: &str, title: &str) -> WorkUnit {
+    WorkUnit {
+      id: id.into(),
+      title: title.into(),
+      objective: String::new(),
+      requirement_ids: vec!["REQ-12".into(), "REQ-18".into()],
+      acceptance_criteria: Vec::new(),
+      suggested_checks: Vec::new(),
+    }
+  }
+
+  fn verification_report(passed: bool) -> VerificationReport {
+    VerificationReport {
+      passed,
+      started_at: "2026-08-10T10:00:00Z".into(),
+      finished_at: "2026-08-10T10:00:01Z".into(),
+      commands: Vec::new(),
+      warnings: Vec::new(),
+    }
+  }
+
+  fn active_overview(passed: Option<bool>) -> App {
+    let mut app = app();
+    app.begin_run();
+    app.state.status = RunStatus::Running;
+    app.state.phase = Phase::Implementing;
+    app.state.cycle = 3;
+    app.state.requirement_counts = RequirementCounts {
+      total: 24,
+      satisfied: 18,
+      partial: 3,
+      missing: 3,
+    };
+    app.state.current_work_unit = Some(work_unit("W-013", "Add retry-aware task execution"));
+    for (id, title) in [
+      ("W-011", "Persist worker state"),
+      ("W-012", "Retry failed verification"),
+    ] {
+      app.state.completed_work_units.push(CompletedWorkUnit {
+        work_unit: work_unit(id, title),
+        completed_at: "2026-08-10T09:59:00Z".into(),
+        verification_evidence: "cargo test".into(),
+      });
+    }
+    app.cycles.insert(
+      2,
+      vec![
+        LoopStep {
+          phase: Phase::Reconciling,
+          outcome: StepOutcome::Pass,
+        },
+        LoopStep {
+          phase: Phase::Implementing,
+          outcome: StepOutcome::Pass,
+        },
+        LoopStep {
+          phase: Phase::Verifying,
+          outcome: StepOutcome::Fail,
+        },
+        LoopStep {
+          phase: Phase::Repairing,
+          outcome: StepOutcome::Pass,
+        },
+      ],
+    );
+    app.cycles.insert(
+      3,
+      vec![
+        LoopStep {
+          phase: Phase::Reconciling,
+          outcome: StepOutcome::Pass,
+        },
+        LoopStep {
+          phase: Phase::Implementing,
+          outcome: StepOutcome::Active,
+        },
+      ],
+    );
+    if let Some(passed) = passed {
+      app.apply(RunEvent::Verification(verification_report(passed)));
+    }
+    app
+  }
+
+  fn render_screen(mut app: App, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    terminal
+      .backend()
+      .buffer()
+      .content
+      .iter()
+      .map(|cell| cell.symbol())
+      .collect()
   }
 
   #[test]
@@ -2226,27 +2657,47 @@ mod tests {
     );
   }
   #[test]
-  fn idle_overview_shows_ready_start_action() {
-    use ratatui::backend::TestBackend;
+  fn idle_overview_shows_ready_progress_and_neutral_verification() {
+    let screen = render_screen(app(), 100, 30);
+    assert!(
+      screen.contains("READY")
+        && screen.contains("0/0")
+        && screen.contains("Not run yet")
+        && screen.contains("r start run")
+    );
+  }
 
-    let backend = TestBackend::new(100, 30);
-    let mut terminal = Terminal::new(backend).unwrap();
-    let mut app = app();
-    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    let screen = terminal
-      .backend()
-      .buffer()
-      .content
-      .iter()
-      .map(|cell| cell.symbol())
-      .collect::<String>();
-    assert!(screen.contains("READY") && screen.contains("r start run"));
+  #[test]
+  fn active_overview_emphasizes_work_progress_failure_and_cycle() {
+    let screen = render_screen(active_overview(Some(false)), 120, 35);
+    assert!(
+      screen.contains("W-013")
+        && screen.contains("Add retry-aware task execution")
+        && screen.contains("18/24")
+        && screen.contains("FAIL")
+        && screen.contains("CYCLE 3")
+        && screen.contains("Cycle 2")
+        && screen.contains("REC ✓")
+        && screen.contains("IMP ●")
+    );
+  }
+
+  #[test]
+  fn successful_verification_is_scannable_in_medium_layout() {
+    let screen = render_screen(active_overview(Some(true)), 96, 28);
+    assert!(screen.contains("✓ PASS") && screen.contains("1 attempt · cycle 3"));
+  }
+
+  #[test]
+  fn overview_renders_without_panicking_at_representative_sizes() {
+    for (width, height) in [(120, 35), (96, 28), (80, 24), (60, 20), (42, 12)] {
+      let _ = render_screen(app(), width, height);
+      let _ = render_screen(active_overview(Some(false)), width, height);
+    }
   }
 
   #[test]
   fn every_view_renders_at_minimum_supported_size() {
-    use ratatui::backend::TestBackend;
-
     let backend = TestBackend::new(42, 12);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut app = app();
