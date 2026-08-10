@@ -14,21 +14,37 @@ The default engine behind every worker is **[Oh My Pi (OMP)](https://github.com/
 
 ```mermaid
 flowchart TD
-    A["authoritative<br/>spec.md"]
+    A["`authoritative
+spec.md`"]
 
-    A --> B["loops<br/><br/>
-    state machine<br/>
-    requirement catalog<br/>
-    deterministic verify<br/>
-    evidence + audit trail<br/>
-    retries / circuit break<br/>
-    TUI"]
+    A --> B["`loops
 
-    B -->|"spawns fresh, disposable<br/>OMP processes"| C1["Architect<br/>read-only"]
-    B -->|"spawns fresh, disposable<br/>OMP processes"| C2["Reconcile<br/>read-only"]
-    B -->|"spawns fresh, disposable<br/>OMP processes"| C3["Implement<br/>coding"]
-    B -->|"spawns fresh, disposable<br/>OMP processes"| C4["Repair<br/>coding"]
-    B -->|"spawns fresh, disposable<br/>OMP processes"| C5["Assess<br/>read-only"]
+state machine
+requirement catalog
+deterministic verify
+evidence + audit trail
+retries / circuit break
+TUI`"]
+
+    B -- "`spawns fresh, disposable
+OMP processes`" --> C1["`Architect
+read-only`"]
+
+    B -- "`spawns fresh, disposable
+OMP processes`" --> C2["`Reconcile
+read-only`"]
+
+    B -- "`spawns fresh, disposable
+OMP processes`" --> C3["`Implement
+coding`"]
+
+    B -- "`spawns fresh, disposable
+OMP processes`" --> C4["`Repair
+coding`"]
+
+    B -- "`spawns fresh, disposable
+OMP processes`" --> C5["`Assess
+read-only`"]
 ```
 
 There is no permanent "master LLM" carrying the whole run in its head. State survives between workers the boring, reliable way: the repository itself, `spec.md`, `.loops/` state, work-unit summaries, and deterministic verification evidence. Every worker starts cold and leaves nothing but files behind.
