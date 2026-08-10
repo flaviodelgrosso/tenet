@@ -1,15 +1,21 @@
 use std::{
   collections::BTreeSet,
   path::{Path, PathBuf},
+  sync::{Mutex, OnceLock},
   time::Duration,
 };
 
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use include_dir::{include_dir, Dir};
 use rusqlite::{backup::Backup, Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 
 use crate::{config::SkillsConfig, model::WorkerRole};
+static BUILT_IN_SKILLS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
+static MATERIALIZE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,11 +79,11 @@ pub async fn prepare_worker_environment(
         role.as_str()
       );
     }
-    let target = skills_dir.join(directory).join("SKILL.md");
-    let parent = target.parent().context("skill target has no parent")?;
-    fs::create_dir_all(parent).await?;
-    fs::copy(&skill.path, &target)
+    let target = skills_dir.join(&directory);
+    let source = skill.path.clone();
+    tokio::task::spawn_blocking(move || copy_skill_directory(&source, &target))
       .await
+      .context("wait for skill directory copy")?
       .with_context(|| format!("load {} worker skill `{}`", role.as_str(), skill.name))?;
   }
   snapshot_global_agent_database(global_agent_dir, &worker_dir).await?;
@@ -108,21 +114,15 @@ fn snapshot_database(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn built_in_skill(role: WorkerRole) -> Result<SkillSpec> {
-  let (name, contents) = match role {
-    WorkerRole::Architect | WorkerRole::Reconcile => (
-      "spec-analysis",
-      include_str!("../skills/spec-analysis/SKILL.md"),
-    ),
-    WorkerRole::Implement => (
-      "implementation",
-      include_str!("../skills/implementation/SKILL.md"),
-    ),
-    WorkerRole::Repair => ("debugging", include_str!("../skills/debugging/SKILL.md")),
-    WorkerRole::Assess => (
-      "spec-assessment",
-      include_str!("../skills/spec-assessment/SKILL.md"),
-    ),
+  let name = match role {
+    WorkerRole::Architect | WorkerRole::Reconcile => "spec-analysis",
+    WorkerRole::Implement => "implementation",
+    WorkerRole::Repair => "debugging",
+    WorkerRole::Assess => "spec-assessment",
   };
+  let contents = BUILT_IN_SKILLS
+    .get_dir(name)
+    .with_context(|| format!("embedded built-in skill `{name}` is missing"))?;
   Ok(SkillSpec {
     name: name.into(),
     path: materialize(name, contents)?,
@@ -147,34 +147,86 @@ fn user_skill(cwd: &Path, configured_path: &str, role: WorkerRole) -> Result<Ski
   }
   Ok(SkillSpec {
     name: configured_path.into(),
-    path,
+    path: root,
     source: SkillSource::User,
   })
 }
 
 fn skill_directory_name(skill: &SkillSpec) -> Result<String> {
-  if skill.source == SkillSource::BuiltIn {
-    return Ok(skill.name.clone());
-  }
   skill
     .path
-    .parent()
-    .and_then(Path::file_name)
+    .file_name()
     .and_then(|name| name.to_str())
     .map(str::to_owned)
-    .context("configured skill directory must have a valid UTF-8 name")
+    .context("skill directory must have a valid UTF-8 name")
 }
 
-fn materialize(name: &str, contents: &'static str) -> Result<PathBuf> {
+fn materialize(name: &str, contents: &Dir<'_>) -> Result<PathBuf> {
+  let _guard = MATERIALIZE_LOCK
+    .get_or_init(|| Mutex::new(()))
+    .lock()
+    .map_err(|_| anyhow::anyhow!("built-in skill materialization lock is poisoned"))?;
+  let mut hasher = Sha256::new();
+  hash_embedded_directory(contents, &mut hasher);
   let path = std::env::temp_dir()
     .join("loops-built-in-skills")
-    .join(name)
-    .join("SKILL.md");
-  if !path.is_file() {
-    std::fs::create_dir_all(path.parent().context("built-in skill has no parent")?)?;
-    std::fs::write(&path, contents)?;
+    .join(URL_SAFE_NO_PAD.encode(hasher.finalize()))
+    .join(name);
+  if !path.is_dir() {
+    write_embedded_directory(contents, &path)?;
   }
   Ok(path)
+}
+
+fn hash_embedded_directory(source: &Dir<'_>, hasher: &mut Sha256) {
+  for file in source.files() {
+    hasher.update(file.path().to_string_lossy().as_bytes());
+    hasher.update(file.contents());
+  }
+  for directory in source.dirs() {
+    hasher.update(directory.path().to_string_lossy().as_bytes());
+    hash_embedded_directory(directory, hasher);
+  }
+}
+
+fn write_embedded_directory(source: &Dir<'_>, target: &Path) -> Result<()> {
+  std::fs::create_dir_all(target)?;
+  for file in source.files() {
+    let name = file
+      .path()
+      .file_name()
+      .context("embedded skill file has no name")?;
+    std::fs::write(target.join(name), file.contents())?;
+  }
+  for directory in source.dirs() {
+    let name = directory
+      .path()
+      .file_name()
+      .context("embedded skill directory has no name")?;
+    write_embedded_directory(directory, &target.join(name))?;
+  }
+  Ok(())
+}
+
+fn copy_skill_directory(source: &Path, target: &Path) -> Result<()> {
+  std::fs::create_dir_all(target)?;
+  for entry in std::fs::read_dir(source)? {
+    let entry = entry?;
+    let source_path = entry.path();
+    let target_path = target.join(entry.file_name());
+    let file_type = entry.file_type()?;
+    if file_type.is_dir() {
+      copy_skill_directory(&source_path, &target_path)?;
+    } else if file_type.is_file() {
+      std::fs::copy(&source_path, &target_path)?;
+    } else {
+      bail!(
+        "skill contains unsupported non-file entry {}",
+        source_path.display()
+      );
+    }
+  }
+  Ok(())
 }
 
 #[cfg(test)]
@@ -305,6 +357,9 @@ mod tests {
       shared: vec![".loops/skills/project".into()],
       roles: BTreeMap::from([("implement".into(), vec![".loops/skills/rust".into()])]),
     };
+    let project_references = project.path().join(".loops/skills/project/references");
+    std::fs::create_dir_all(&project_references).unwrap();
+    std::fs::write(project_references.join("guide.md"), "# Project guide").unwrap();
     let resolved = resolve(project.path(), &config, WorkerRole::Implement).unwrap();
     let worker = prepare_worker_environment(
       project.path(),
@@ -320,6 +375,18 @@ mod tests {
       .collect::<Vec<_>>();
     names.sort();
     assert_eq!(names, ["implementation", "project", "rust"]);
+    assert_eq!(
+      std::fs::read_to_string(worker.join("skills/project/references/guide.md")).unwrap(),
+      "# Project guide"
+    );
+    assert_eq!(
+      std::fs::read_to_string(worker.join("skills/implementation/references/quality.md")).unwrap(),
+      include_str!("../skills/implementation/references/quality.md")
+    );
+    assert_eq!(
+      std::fs::read_to_string(worker.join("skills/implementation/references/handoff.md")).unwrap(),
+      include_str!("../skills/implementation/references/handoff.md")
+    );
   }
 
   #[tokio::test]

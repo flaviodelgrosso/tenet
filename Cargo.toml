@@ -11,6 +11,7 @@ async-trait = "0.1"
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+include_dir = "0.7"
 crossterm = "0.29"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
