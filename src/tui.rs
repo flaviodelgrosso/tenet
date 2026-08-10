@@ -1116,7 +1116,7 @@ fn draw_overview_current(frame: &mut Frame, app: &App, area: Rect) {
 
   frame.render_widget(
     Paragraph::new(lines)
-      .block(overview_hero_block())
+      .block(focus_block(" CURRENT "))
       .wrap(Wrap { trim: true }),
     area,
   );
@@ -1466,12 +1466,12 @@ fn overview_heading(text: &str) -> Line<'static> {
   ))
 }
 
-fn overview_hero_block() -> Block<'static> {
+fn focus_block(title: &str) -> Block<'static> {
   Block::default()
     .borders(Borders::ALL)
     .border_style(Style::default().fg(Color::Cyan))
     .title(Span::styled(
-      " CURRENT ",
+      title.to_owned(),
       Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD),
@@ -1486,39 +1486,68 @@ fn draw_worker(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     return;
   };
-  let context_height = if area.height >= 22 { 6 } else { 3 };
-  let rows = Layout::vertical([
-    Constraint::Length(4),
-    Constraint::Min(5),
-    Constraint::Length(context_height),
-  ])
-  .split(area);
-  let elapsed = duration_between(&worker.started_at, worker.finished_at.as_deref());
+  let hero_height = if area.height >= 18 { 5 } else { 4 };
+  let context_height = if area.height >= 22 { 5 } else { 3 };
+  let rows = if area.height >= 12 {
+    Layout::vertical([
+      Constraint::Length(hero_height),
+      Constraint::Min(4),
+      Constraint::Length(context_height),
+    ])
+    .split(area)
+  } else {
+    Layout::vertical([Constraint::Length(hero_height), Constraint::Min(4)]).split(area)
+  };
+
+  let elapsed = duration_between(&worker.started_at, worker.finished_at.as_deref())
+    .unwrap_or_else(|| "elapsed unavailable".into());
   let work = app.state.current_work_unit.as_ref();
-  let heading = vec![
+  let (mark, status_color) = match worker.status {
+    WorkerUiStatus::Running => ("●", Color::Cyan),
+    WorkerUiStatus::Succeeded => ("✓", Color::Green),
+    WorkerUiStatus::Failed => ("✗", Color::Red),
+  };
+  let mut hero = vec![Line::from(vec![
+    Span::styled(format!("{mark} "), Style::default().fg(status_color)),
+    Span::styled(
+      work.map_or_else(
+        || app.state.last_summary.clone(),
+        |unit| format!("{} · {}", unit.id, unit.title),
+      ),
+      Style::default().add_modifier(Modifier::BOLD),
+    ),
+  ])];
+  let requirements = work.map_or_else(String::new, |unit| unit.requirement_ids.join("  "));
+  let inner_width = rows[0].width.saturating_sub(2) as usize;
+  let metadata_width = requirements.chars().count() + elapsed.chars().count();
+  let metadata = if requirements.is_empty() || metadata_width + 2 > inner_width {
+    Line::from(Span::styled(elapsed, Style::default().fg(QUIET)))
+  } else {
     Line::from(vec![
-      Span::styled(
-        format!("{} {}", role_symbol(worker.role), role_label(worker.role)),
-        Style::default()
-          .fg(role_color(worker.role))
-          .add_modifier(Modifier::BOLD),
-      ),
-      Span::styled(
-        format!(
-          " · {} · {}",
-          worker_status(worker.status),
-          elapsed.as_deref().unwrap_or("elapsed unavailable")
-        ),
-        Style::default().fg(QUIET),
-      ),
-    ]),
-    Line::from(work.map_or_else(
-      || app.state.last_summary.clone(),
-      |unit| format!("{} · {}", unit.id, unit.title),
-    )),
-    Line::from(work.map_or_else(String::new, |unit| unit.requirement_ids.join("  "))),
-  ];
-  frame.render_widget(Paragraph::new(heading), rows[0]);
+      Span::styled(requirements, Style::default().fg(QUIET)),
+      Span::raw(" ".repeat(inner_width.saturating_sub(metadata_width).max(2))),
+      Span::styled(elapsed, Style::default().fg(QUIET)),
+    ])
+  };
+  hero.push(metadata);
+  frame.render_widget(
+    Paragraph::new(hero)
+      .block(if worker.status == WorkerUiStatus::Running {
+        focus_block(&format!(
+          " {} · {} ",
+          role_label(worker.role),
+          worker_status(worker.status)
+        ))
+      } else {
+        panel_block(&format!(
+          " {} · {} ",
+          role_label(worker.role),
+          worker_status(worker.status)
+        ))
+      })
+      .wrap(Wrap { trim: true }),
+    rows[0],
+  );
 
   let selected = app.selected.min(worker.activities.len().saturating_sub(1));
   let items: Vec<ListItem> = worker
@@ -1537,30 +1566,35 @@ fn draw_worker(frame: &mut Frame, app: &mut App, area: Rect) {
   } else {
     items
   })
-  .block(section_block(" ACTIVITY "))
+  .block(panel_block(" ACTIVITY "))
   .highlight_style(Style::default().bg(Color::Rgb(30, 38, 46)));
   frame.render_stateful_widget(list, rows[1], &mut list_state);
 
-  let mut context = vec![section_heading("CONTEXT")];
-  context.push(Line::from(vec![
-    Span::styled("skills   ", Style::default().fg(QUIET)),
-    Span::raw(if worker.skills.is_empty() {
-      "—".into()
-    } else {
-      worker.skills.join(", ")
-    }),
-  ]));
-  context.push(Line::from(vec![
-    Span::styled("changes  ", Style::default().fg(QUIET)),
-    Span::raw(format_changes_summary(&app.repository_changes)),
-  ]));
-  if context_height >= 6 {
+  if let Some(context_area) = rows.get(2).copied() {
+    let mut context = vec![section_heading("CONTEXT")];
     context.push(Line::from(vec![
-      Span::styled("tools    ", Style::default().fg(QUIET)),
-      Span::raw("structured invocations · Enter/Space expands output"),
+      Span::styled("skills   ", Style::default().fg(QUIET)),
+      Span::raw(if worker.skills.is_empty() {
+        "—".into()
+      } else {
+        worker.skills.join(", ")
+      }),
     ]));
+    context.push(Line::from(vec![
+      Span::styled("changes  ", Style::default().fg(QUIET)),
+      Span::raw(format_changes_summary(&app.repository_changes)),
+    ]));
+    if context_height >= 5 {
+      context.push(Line::from(vec![
+        Span::styled("tools    ", Style::default().fg(QUIET)),
+        Span::raw("structured invocations · Enter/Space expands output"),
+      ]));
+    }
+    frame.render_widget(
+      Paragraph::new(context).wrap(Wrap { trim: true }),
+      context_area,
+    );
   }
-  frame.render_widget(Paragraph::new(context).wrap(Wrap { trim: true }), rows[2]);
 }
 
 fn activity_matches(app: &App, activity: &WorkerActivity) -> bool {
@@ -1689,7 +1723,7 @@ fn draw_requirements(frame: &mut Frame, app: &mut App, area: Rect) {
   );
   frame.render_stateful_widget(
     List::new(items)
-      .block(section_block(&title))
+      .block(panel_block(&title))
       .highlight_symbol("›")
       .highlight_style(Style::default().bg(Color::Rgb(30, 38, 46))),
     area,
@@ -1764,7 +1798,7 @@ fn draw_requirement_detail(frame: &mut Frame, app: &App, area: Rect) {
   }
   frame.render_widget(
     Paragraph::new(lines)
-      .block(section_block(" REQUIREMENT DETAIL "))
+      .block(panel_block(" REQUIREMENT DETAIL "))
       .wrap(Wrap { trim: true })
       .scroll((app.scroll, 0)),
     area,
@@ -1779,7 +1813,8 @@ fn draw_verify(frame: &mut Frame, app: &mut App, area: Rect) {
     );
     return;
   };
-  let rows = Layout::vertical([Constraint::Length(4), Constraint::Min(5)]).split(area);
+  let summary_height = if area.height >= 10 { 4 } else { 2 };
+  let rows = Layout::vertical([Constraint::Length(summary_height), Constraint::Min(4)]).split(area);
   let status = if attempt.report.passed {
     "PASS"
   } else {
@@ -1877,7 +1912,7 @@ fn draw_verify(frame: &mut Frame, app: &mut App, area: Rect) {
   list_state.select(Some(app.selected.min(items.len().saturating_sub(1))));
   frame.render_stateful_widget(
     List::new(items)
-      .block(section_block(" DETERMINISTIC GATES "))
+      .block(panel_block(" DETERMINISTIC GATES "))
       .highlight_style(Style::default().bg(Color::Rgb(30, 38, 46))),
     rows[1],
     &mut list_state,
@@ -1925,7 +1960,7 @@ fn draw_timeline(frame: &mut Frame, app: &App, area: Rect) {
     } else {
       lines
     })
-    .block(section_block(&format!(" TIMELINE · {filter} ")))
+    .block(panel_block(&format!(" TIMELINE · {filter} ")))
     .wrap(Wrap { trim: true })
     .scroll((scroll, 0)),
     area,
@@ -1968,7 +2003,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     format!(" {contextual}   r start run   q close")
   };
   frame.render_widget(
-    Paragraph::new(mode).style(Style::default().fg(Color::Gray)),
+    Paragraph::new(mode).style(Style::default().fg(QUIET)),
     rows[1],
   );
 }
@@ -1998,7 +2033,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
   ];
   frame.render_widget(
     Paragraph::new(lines)
-      .block(Block::default().borders(Borders::ALL).title(" loops help "))
+      .block(modal_block(" loops help "))
       .wrap(Wrap { trim: true }),
     popup,
   );
@@ -2029,11 +2064,7 @@ fn draw_changes_overlay(frame: &mut Frame, app: &App, area: Rect) {
   )));
   frame.render_widget(
     Paragraph::new(lines)
-      .block(
-        Block::default()
-          .borders(Borders::ALL)
-          .title(" repository changes · Esc close "),
-      )
+      .block(modal_block(" repository changes · Esc close "))
       .wrap(Wrap { trim: true }),
     popup,
   );
@@ -2054,10 +2085,10 @@ fn centered_rect(width_percent: u16, height_percent: u16, area: Rect) -> Rect {
   .split(vertical[1])[1]
 }
 
-fn section_block(title: &str) -> Block<'static> {
+fn panel_block(title: &str) -> Block<'static> {
   Block::default()
-    .borders(Borders::TOP)
-    .border_style(Style::default().fg(Color::Rgb(55, 65, 75)))
+    .borders(Borders::ALL)
+    .border_style(Style::default().fg(QUIET))
     .title(Span::styled(
       title.to_owned(),
       Style::default()
@@ -2066,9 +2097,19 @@ fn section_block(title: &str) -> Block<'static> {
     ))
 }
 
+fn modal_block(title: &str) -> Block<'static> {
+  Block::default()
+    .borders(Borders::ALL)
+    .border_style(Style::default().fg(QUIET))
+    .title(Span::styled(
+      title.to_owned(),
+      Style::default().add_modifier(Modifier::BOLD),
+    ))
+}
+
 fn empty_state(title: &str, message: &str) -> Paragraph<'static> {
   Paragraph::new(format!("\n{message}"))
-    .block(section_block(&format!(" {title} ")))
+    .block(panel_block(&format!(" {title} ")))
     .alignment(Alignment::Center)
     .style(Style::default().fg(QUIET))
 }
@@ -2106,24 +2147,6 @@ fn role_label(role: WorkerRole) -> &'static str {
     WorkerRole::Implement => "IMPLEMENT",
     WorkerRole::Repair => "REPAIR",
     WorkerRole::Assess => "ASSESS",
-  }
-}
-
-fn role_symbol(role: WorkerRole) -> &'static str {
-  match role {
-    WorkerRole::Architect => "◇",
-    WorkerRole::Reconcile => "⌕",
-    WorkerRole::Implement => "◆",
-    WorkerRole::Repair => "⚒",
-    WorkerRole::Assess => "◆",
-  }
-}
-
-fn role_color(role: WorkerRole) -> Color {
-  match role {
-    WorkerRole::Repair => Color::Yellow,
-    WorkerRole::Implement => Color::Cyan,
-    _ => Color::Gray,
   }
 }
 
@@ -2312,7 +2335,7 @@ fn format_duration(duration: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-  use ratatui::backend::TestBackend;
+  use ratatui::{backend::TestBackend, buffer::Buffer};
   use serde_json::json;
 
   use super::*;
@@ -2416,17 +2439,118 @@ mod tests {
     app
   }
 
-  fn render_screen(mut app: App, width: u16, height: u16) -> String {
+  fn operational_app(passed: bool) -> App {
+    let mut app = active_overview(None);
+    app.apply(RunEvent::Catalog(RequirementCatalog {
+      spec_hash: "hash".into(),
+      requirements: vec![
+        Requirement {
+          id: "REQ-12".into(),
+          title: "Role-specific configuration".into(),
+          description: "Load model configuration for each worker role.".into(),
+          acceptance_criteria: vec!["Each role resolves its configured model.".into()],
+        },
+        Requirement {
+          id: "REQ-18".into(),
+          title: "Editor schema support".into(),
+          description: "Expose the configuration schema to editors.".into(),
+          acceptance_criteria: Vec::new(),
+        },
+      ],
+    }));
+    app.apply(RunEvent::Reconcile(ReconcileResult {
+      complete: false,
+      summary: "one partial requirement".into(),
+      requirements: vec![
+        RequirementAssessment {
+          id: "REQ-12".into(),
+          status: RequirementStatus::Satisfied,
+          evidence: vec!["role loader covered by tests".into()],
+          gaps: Vec::new(),
+        },
+        RequirementAssessment {
+          id: "REQ-18".into(),
+          status: RequirementStatus::Partial,
+          evidence: Vec::new(),
+          gaps: vec!["schema publication is incomplete".into()],
+        },
+      ],
+      next_work_unit: None,
+    }));
+    app.apply(RunEvent::Worker(worker_start()));
+    app.apply(RunEvent::Worker(WorkerEvent::Text {
+      role: WorkerRole::Implement,
+      at: "2026-08-10T10:00:01Z".into(),
+      delta: "Inspecting the configuration loader.".into(),
+    }));
+    app.apply(RunEvent::Worker(WorkerEvent::ToolStart {
+      role: WorkerRole::Implement,
+      at: "2026-08-10T10:00:02Z".into(),
+      tool_name: "bash".into(),
+      args: json!({"command":"cargo test"}),
+    }));
+    app.apply(RunEvent::Worker(WorkerEvent::ToolEnd {
+      role: WorkerRole::Implement,
+      at: "2026-08-10T10:00:03Z".into(),
+      tool_name: "bash".into(),
+      is_error: !passed,
+      output: Some(if passed {
+        "all tests passed".into()
+      } else {
+        "failed assertion".into()
+      }),
+    }));
+    app.apply(RunEvent::Verification(VerificationReport {
+      passed,
+      started_at: "2026-08-10T10:00:04Z".into(),
+      finished_at: "2026-08-10T10:00:09Z".into(),
+      commands: vec![CommandResult {
+        command: "cargo test".into(),
+        exit_code: Some(i32::from(!passed)),
+        timed_out: false,
+        duration_ms: 4_800,
+        stdout: if passed {
+          "all tests passed".into()
+        } else {
+          String::new()
+        },
+        stderr: if passed {
+          String::new()
+        } else {
+          "failed assertion".into()
+        },
+      }],
+      warnings: Vec::new(),
+    }));
+    app.apply(RunEvent::RepositoryChanges(vec![RepositoryChange {
+      path: "src/tui.rs".into(),
+      status: 'M',
+    }]));
+    app
+  }
+
+  fn finish_worker(app: &mut App, ok: bool) {
+    app.apply(RunEvent::Worker(WorkerEvent::End {
+      role: WorkerRole::Implement,
+      at: "2026-08-10T10:00:10Z".into(),
+      ok,
+      message: (!ok).then(|| "verification needs repair".into()),
+    }));
+  }
+
+  fn render_buffer(mut app: App, width: u16, height: u16) -> Buffer {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-    terminal
-      .backend()
-      .buffer()
-      .content
-      .iter()
-      .map(|cell| cell.symbol())
-      .collect()
+    terminal.backend().buffer().clone()
+  }
+
+  fn buffer_text(buffer: &Buffer) -> String {
+    buffer.content.iter().map(|cell| cell.symbol()).collect()
+  }
+
+  fn render_screen(app: App, width: u16, height: u16) -> String {
+    buffer_text(&render_buffer(app, width, height))
   }
 
   #[test]
@@ -2693,6 +2817,149 @@ mod tests {
     for (width, height) in [(120, 35), (96, 28), (80, 24), (60, 20), (42, 12)] {
       let _ = render_screen(app(), width, height);
       let _ = render_screen(active_overview(Some(false)), width, height);
+    }
+  }
+
+  #[test]
+  fn overview_keeps_one_dominant_box_at_wide_and_narrow_sizes() {
+    for (width, height) in [(120, 35), (60, 20), (42, 12)] {
+      let screen = render_screen(active_overview(Some(false)), width, height);
+      assert_eq!(screen.matches('┌').count(), 1);
+    }
+  }
+
+  #[test]
+  fn worker_uses_focus_hero_neutral_activity_and_borderless_context() {
+    let mut app = operational_app(true);
+    app.switch_view(View::Worker);
+    let buffer = render_buffer(app, 120, 35);
+    let screen = buffer_text(&buffer);
+
+    assert!(
+      screen.contains("IMPLEMENT · ACTIVE")
+        && screen.contains("ACTIVITY")
+        && screen.contains("CONTEXT")
+        && screen.matches('┌').count() == 2
+        && buffer.content[2 * 120].fg == Color::Cyan
+    );
+  }
+
+  #[test]
+  fn completed_and_failed_worker_heroes_keep_neutral_borders() {
+    for (ok, status, mark) in [(true, "COMPLETED", "✓"), (false, "FAILED", "✗")] {
+      let mut app = operational_app(ok);
+      finish_worker(&mut app, ok);
+      app.switch_view(View::Worker);
+      let buffer = render_buffer(app, 120, 35);
+      let screen = buffer_text(&buffer);
+
+      assert!(
+        screen.contains(status)
+          && screen.contains(mark)
+          && screen.matches('┌').count() == 2
+          && buffer.content[2 * 120].fg == QUIET
+      );
+    }
+  }
+
+  #[test]
+  fn requirements_list_and_detail_each_use_one_outer_panel() {
+    let mut app = operational_app(true);
+    app.switch_view(View::Requirements);
+    let list = render_screen(app, 120, 35);
+    assert!(
+      list.contains("REQUIREMENTS")
+        && list.contains("REQ-12")
+        && list.contains("Role-specific configuration")
+        && list.matches('┌').count() == 1
+    );
+
+    let mut app = operational_app(true);
+    app.switch_view(View::Requirements);
+    app.requirement_detail = true;
+    let detail = render_screen(app, 120, 35);
+    assert!(
+      detail.contains("REQUIREMENT DETAIL")
+        && detail.contains("ACCEPTANCE")
+        && detail.contains("EVIDENCE")
+        && detail.contains("CURRENT WORK")
+        && detail.matches('┌').count() == 1
+    );
+  }
+
+  #[test]
+  fn passing_and_failing_verify_keep_status_inside_neutral_gates_panel() {
+    for (passed, status) in [(true, "PASS"), (false, "FAIL")] {
+      let mut app = operational_app(passed);
+      app.switch_view(View::Verify);
+      let buffer = render_buffer(app, 120, 35);
+      let screen = buffer_text(&buffer);
+
+      assert!(
+        screen.contains(status)
+          && screen.contains("DETERMINISTIC GATES")
+          && screen.contains("cargo test")
+          && screen.matches('┌').count() == 1
+          && buffer.content[6 * 120].fg == QUIET
+      );
+    }
+  }
+
+  #[test]
+  fn timeline_uses_one_scrollable_workspace_panel() {
+    let mut app = operational_app(false);
+    app.switch_view(View::Timeline);
+    let screen = render_screen(app, 120, 35);
+    assert!(
+      screen.contains("TIMELINE · all")
+        && screen.contains("IMPLEMENT")
+        && screen.contains("VERIFY")
+        && screen.matches('┌').count() == 1
+    );
+  }
+
+  #[test]
+  fn overlays_use_shared_full_modal_panels() {
+    let mut help = operational_app(true);
+    help.show_help = true;
+    let help = render_screen(help, 120, 35);
+    assert!(help.contains("loops help") && help.matches('┌').count() == 2);
+
+    let mut changes = operational_app(true);
+    changes.show_diff = true;
+    let changes = render_screen(changes, 120, 35);
+    assert!(
+      changes.contains("repository changes · Esc close")
+        && changes.contains("src/tui.rs")
+        && changes.matches('┌').count() == 2
+    );
+  }
+
+  #[test]
+  fn operational_views_render_at_all_representative_sizes() {
+    for (width, height) in [(120, 35), (96, 28), (80, 24), (60, 20), (42, 12)] {
+      for view in [
+        View::Worker,
+        View::Requirements,
+        View::Verify,
+        View::Timeline,
+      ] {
+        let mut app = operational_app(false);
+        app.switch_view(view);
+        let _ = render_screen(app, width, height);
+      }
+
+      let mut detail = operational_app(true);
+      detail.switch_view(View::Requirements);
+      detail.requirement_detail = true;
+      let _ = render_screen(detail, width, height);
+
+      for ok in [true, false] {
+        let mut worker = operational_app(ok);
+        finish_worker(&mut worker, ok);
+        worker.switch_view(View::Worker);
+        let _ = render_screen(worker, width, height);
+      }
     }
   }
 
