@@ -145,7 +145,7 @@ pub struct SkillsConfig {
 }
 
 impl SkillsConfig {
-  pub fn role_paths(&self, role: crate::model::WorkerRole) -> impl Iterator<Item = &String> {
+  pub fn role_paths(&self, role: WorkerRole) -> impl Iterator<Item = &String> {
     self.roles.get(role.as_str()).into_iter().flatten()
   }
 }
@@ -254,7 +254,7 @@ mod tests {
   }
 
   fn config_schema() -> serde_json::Value {
-    serde_json::from_str(include_str!("../schemas/config.schema.json")).unwrap()
+    serde_json::from_str(include_str!("../../schemas/config.schema.json")).unwrap()
   }
 
   #[test]

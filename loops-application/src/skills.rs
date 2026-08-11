@@ -13,8 +13,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
-use crate::{config::SkillsConfig, model::WorkerRole};
-static BUILT_IN_SKILLS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
+use loops_domain::{config::SkillsConfig, model::WorkerRole};
+
+static BUILT_IN_SKILLS: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../skills");
 static MATERIALIZE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,7 +238,7 @@ mod tests {
   use tempfile::tempdir;
 
   use super::{prepare_worker_environment, resolve};
-  use crate::{config::SkillsConfig, model::WorkerRole};
+  use loops_domain::{config::SkillsConfig, model::WorkerRole};
 
   #[test]
   fn defaults_are_only_role_specific_built_ins_even_for_rust_and_python_projects() {
@@ -381,11 +382,11 @@ mod tests {
     );
     assert_eq!(
       std::fs::read_to_string(worker.join("skills/implementation/references/quality.md")).unwrap(),
-      include_str!("../skills/implementation/references/quality.md")
+      include_str!("../../skills/implementation/references/quality.md")
     );
     assert_eq!(
       std::fs::read_to_string(worker.join("skills/implementation/references/handoff.md")).unwrap(),
-      include_str!("../skills/implementation/references/handoff.md")
+      include_str!("../../skills/implementation/references/handoff.md")
     );
   }
 

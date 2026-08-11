@@ -1,30 +1,36 @@
-[package]
-name = "loops"
+[workspace]
+resolver = "2"
+members = [
+  "loops-domain",
+  "loops-application",
+  "loops-tui",
+  "loops-cli",
+]
+default-members = ["loops-cli"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 description = "Autonomous spec-driven development loops powered by headless coding agents"
 license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-include_dir = "0.7"
 crossterm = "0.29"
+include_dir = "0.7"
 ratatui = "0.30"
+rusqlite = { version = "0.38", features = ["backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.38", features = ["backup"] }
 sha2 = "0.11"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-toml = "1.1.4+spec-1.1.0"
+toml = "1.1.4"
 uuid = { version = "1", features = ["v4", "serde"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "thin"

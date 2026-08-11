@@ -678,7 +678,7 @@ You need:
 Install locally:
 
 ```bash
-cargo install --path .
+cargo install --path loops-cli
 ```
 
 Verify dependencies:

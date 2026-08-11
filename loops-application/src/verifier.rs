@@ -8,7 +8,7 @@ use tokio::{
   time::{timeout, Duration},
 };
 
-use crate::{
+use loops_domain::{
   config::Config,
   model::{CommandResult, VerificationReport},
 };
@@ -227,8 +227,12 @@ mod tests {
     assert!(cmds.iter().any(|v| v.starts_with("cargo clippy")));
     assert!(cmds.iter().any(|v| v.starts_with("cargo test")));
 
-    let skills =
-      crate::skills::resolve(dir.path(), &cfg.skills, crate::model::WorkerRole::Implement).unwrap();
+    let skills = crate::skills::resolve(
+      dir.path(),
+      &cfg.skills,
+      loops_domain::model::WorkerRole::Implement,
+    )
+    .unwrap();
     assert_eq!(skills.names(), ["implementation"]);
   }
 }

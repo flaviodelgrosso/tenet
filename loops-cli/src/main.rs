@@ -1,15 +1,3 @@
-mod backend;
-mod config;
-mod controller;
-mod events;
-mod model;
-mod prompts;
-mod protection;
-mod skills;
-mod store;
-mod tui;
-mod verifier;
-
 use std::{
   io::{self, Write},
   path::PathBuf,
@@ -17,11 +5,17 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use backend::omp_rpc::OmpRpcBackend;
 use clap::{Parser, Subcommand};
-use controller::Controller;
-use events::{EventSink, RunEvent};
-use model::{RunStatus, WorkerEvent};
+use loops_application::{
+  backend::{omp_rpc::OmpRpcBackend, AgentBackend},
+  controller::Controller,
+  store,
+};
+use loops_domain::{
+  events::{EventSink, RunEvent},
+  model::{RunStatus, State, WorkerEvent},
+};
+use loops_tui::tui;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -74,7 +68,7 @@ async fn main() -> Result<()> {
     .cwd
     .unwrap_or(std::env::current_dir().context("current directory")?);
 
-  let backend: Arc<dyn backend::AgentBackend> = Arc::new(OmpRpcBackend);
+  let backend: Arc<dyn AgentBackend> = Arc::new(OmpRpcBackend);
 
   match cli.command {
     None => {
@@ -133,7 +127,7 @@ async fn main() -> Result<()> {
         }
       }
       Command::Verify { json } => {
-        let report = controller::manual_verify(&cwd).await?;
+        let report = loops_application::controller::manual_verify(&cwd).await?;
         if json {
           println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
@@ -170,7 +164,7 @@ async fn main() -> Result<()> {
   Ok(())
 }
 
-async fn run_plain(cwd: PathBuf, backend: Arc<dyn backend::AgentBackend>) -> Result<model::State> {
+async fn run_plain(cwd: PathBuf, backend: Arc<dyn AgentBackend>) -> Result<State> {
   let (tx, mut rx) = mpsc::unbounded_channel();
   let controller = Controller::new(cwd, backend, EventSink::new(Some(tx)));
   let cancel = CancellationToken::new();

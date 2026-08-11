@@ -10,7 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
-use crate::{
+use loops_domain::{
   config::{Config, LOOPS_DIR},
   model::{ReconcileResult, RepositoryChange, RequirementCatalog, State},
 };

@@ -11,14 +11,17 @@ use tokio::{
   time::timeout,
 };
 
-use crate::{
-  backend::{AgentBackend, BackendContext},
+use loops_domain::{
   config::AgentConfig,
   events::RunEvent,
   model::{
     ArchitectOutput, CompletedWorkUnit, ReconcileResult, RequirementCatalog, VerificationReport,
     WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
   },
+};
+
+use crate::{
+  backend::{AgentBackend, BackendContext},
   prompts::full_role_prompt,
   skills,
 };
@@ -782,7 +785,7 @@ mod tests {
 
   #[test]
   fn command_selection_uses_independent_role_model_and_thinking() {
-    let mut config = crate::config::Config::default();
+    let mut config = loops_domain::config::Config::default();
     config.agent.roles.architect.model = Some("architect-model".into());
     config.agent.roles.architect.thinking = Some("xhigh".into());
     config.agent.roles.implement.model = Some("implementation-model".into());
@@ -800,7 +803,7 @@ mod tests {
 
   #[test]
   fn command_selection_limits_model_override_to_configured_role() {
-    let mut config = crate::config::Config::default();
+    let mut config = loops_domain::config::Config::default();
     config.agent.roles.implement.model = Some("implementation-model".into());
 
     assert_eq!(

@@ -1,4 +1,4 @@
-use crate::model::WorkerRole;
+use loops_domain::model::WorkerRole;
 
 pub fn role_prompt(role: WorkerRole) -> &'static str {
   match role {

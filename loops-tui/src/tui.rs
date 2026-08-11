@@ -24,15 +24,13 @@ use ratatui::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-  backend::AgentBackend,
-  controller::Controller,
+use loops_application::{backend::AgentBackend, controller::Controller, store};
+use loops_domain::{
   events::{EventSink, RunEvent},
   model::{
     Phase, ReconcileResult, RepositoryChange, Requirement, RequirementAssessment,
     RequirementStatus, RunStatus, State, VerificationReport, WorkerEvent, WorkerRole,
   },
-  store,
 };
 
 const MAX_ACTIVITIES: usize = 2_000;
@@ -1391,7 +1389,7 @@ fn draw_overview_loop_history(frame: &mut Frame, app: &App, area: Rect) {
   frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn progress_line(width: usize, counts: &crate::model::RequirementCounts) -> Line<'static> {
+fn progress_line(width: usize, counts: &loops_domain::model::RequirementCounts) -> Line<'static> {
   let satisfied = counts.satisfied.min(counts.total);
   let percent = if counts.total == 0 {
     0
@@ -2339,7 +2337,7 @@ mod tests {
   use serde_json::json;
 
   use super::*;
-  use crate::model::{
+  use loops_domain::model::{
     CommandResult, CompletedWorkUnit, RequirementCatalog, RequirementCounts, WorkUnit,
   };
 

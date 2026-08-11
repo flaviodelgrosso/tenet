@@ -924,17 +924,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "loops"
+name = "loops-application"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.23.1",
  "chrono",
- "clap",
- "crossterm",
  "include_dir",
- "ratatui",
+ "loops-domain",
  "rusqlite",
  "serde",
  "serde_json",
@@ -942,8 +940,50 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "toml",
  "uuid",
+]
+
+[[package]]
+name = "loops-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "loops-application",
+ "loops-domain",
+ "loops-tui",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "loops-domain"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "loops-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossterm",
+ "loops-application",
+ "loops-domain",
+ "ratatui",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

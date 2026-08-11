@@ -6,7 +6,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::{
+use loops_domain::{
   config::Config,
   events::EventSink,
   model::{

@@ -1,0 +1,20 @@
+[package]
+name = "loops-tui"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+crossterm.workspace = true
+loops-application = { path = "../loops-application" }
+loops-domain = { path = "../loops-domain" }
+ratatui.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

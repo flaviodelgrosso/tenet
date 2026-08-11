@@ -9,14 +9,17 @@ use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{
-  backend::{AgentBackend, BackendContext},
+use loops_domain::{
   config::{ensure_config, Config, LOOPS_DIR},
   events::{EventSink, RunEvent, RunLogger},
   model::{
     CompletedWorkUnit, Phase, ReconcileResult, RequirementCatalog, RequirementCounts,
     RequirementStatus, RunStatus, State, VerificationReport, WorkUnit,
   },
+};
+
+use crate::{
+  backend::{AgentBackend, BackendContext},
   protection,
   store::{self, RunLock},
   verifier,
@@ -468,7 +471,7 @@ impl Controller {
   }
 }
 
-fn validate_requirements(requirements: &[crate::model::Requirement]) -> Result<()> {
+fn validate_requirements(requirements: &[loops_domain::model::Requirement]) -> Result<()> {
   if requirements.is_empty() {
     bail!("architect produced no requirements");
   }
