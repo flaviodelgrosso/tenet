@@ -1,0 +1,61 @@
+#:schema https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json
+
+version = 1
+spec_file = "spec.md"
+max_cycles = 25
+max_repair_attempts = 3
+stagnation_limit = 3
+protected_paths = [
+  "spec.md",
+  "AGENTS.md",
+  ".loops/config.toml",
+  ".loops/state.json",
+  ".loops/requirements.json",
+  ".loops/roadmap.json",
+  ".loops/STOP",
+  ".loops/run.lock",
+]
+
+[agent]
+command = "omp"
+model = "openai-codex/gpt-5.6-terra"
+thinking = "high"
+auto_approve = true
+turn_timeout_secs = 900
+read_only_tools = ["read", "grep", "glob"]
+coding_tools = ["read", "grep", "glob", "edit", "write", "bash"]
+extra_args = []
+
+[agent.roles.architect]
+model = "openai-codex/gpt-5.6-sol"
+thinking = "high"
+
+[agent.roles.reconcile]
+thinking = "medium"
+
+[agent.roles.implement]
+model = "openai-codex/gpt-5.6-luna"
+thinking = "medium"
+
+[agent.roles.repair]
+thinking = "medium"
+
+[agent.roles.assess]
+thinking = "medium"
+
+[verification]
+auto_detect = true
+require_project_gate = true
+commands = []
+timeout_secs = 120
+max_output_bytes = 65536
+
+[git]
+init = true
+auto_commit = false
+require_clean_tree = false
+
+[skills]
+shared = []
+
+[skills.roles]
