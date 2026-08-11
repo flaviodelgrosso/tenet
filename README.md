@@ -2,6 +2,8 @@
 
 **Give it a spec. Walk away. Come back to a repository that satisfies it — verified by machines, not by an agent's word.**
 
+<img width="1792" height="1094" alt="tui" src="https://github.com/user-attachments/assets/0484b206-170f-4c2c-b508-26f0ae77a60b" />
+
 `loops` is a small, obsessively deterministic Rust controller for autonomous, spec-driven development. It doesn't chat with you. It doesn't hold a single sprawling agent conversation and hope the context window forgives it. It runs a state machine that repeatedly reads your repository, decides the one next thing worth doing, hands that — and only that — to a disposable coding-agent worker, checks the result with real build/test commands, and refuses to call anything "done" until an independent, skeptical worker agrees from scratch.
 
 The default engine behind every worker is **[Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi)**, driven headlessly through `omp --mode rpc`.
