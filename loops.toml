@@ -1,14 +1,14 @@
 #:schema https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json
 
 version = 1
-spec_file = "spec.md"
+spec_file = ".loops/spec.md"
 max_cycles = 25
 max_repair_attempts = 3
 stagnation_limit = 3
 protected_paths = [
-  "spec.md",
+  ".loops/spec.md",
   "AGENTS.md",
-  ".loops/config.toml",
+  "loops.toml",
   ".loops/state.json",
   ".loops/requirements.json",
   ".loops/roadmap.json",
