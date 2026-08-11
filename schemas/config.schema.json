@@ -25,9 +25,9 @@
     },
     "spec_file": {
       "type": "string",
-      "default": "spec.md",
+      "default": ".loops/spec.md",
       "description": "Project-relative path to the specification that drives the run.",
-      "examples": ["spec.md"]
+      "examples": [".loops/spec.md"]
     },
     "max_cycles": {
       "type": "integer",
@@ -59,7 +59,7 @@
     "protected_paths": {
       "$ref": "#/$defs/stringList",
       "default": [
-        "spec.md",
+        ".loops/spec.md",
         "AGENTS.md",
         "loops.toml",
         ".loops/state.json",
@@ -69,7 +69,7 @@
         ".loops/run.lock"
       ],
       "description": "Project-relative paths restored if a coding worker modifies them.",
-      "examples": [["spec.md", "AGENTS.md", "loops.toml"]]
+      "examples": [[".loops/spec.md", "AGENTS.md", "loops.toml"]]
     },
     "skills": {
       "$ref": "#/$defs/skillsConfig",

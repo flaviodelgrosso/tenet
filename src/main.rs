@@ -41,7 +41,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-  /// Initialize spec.md, loops.toml, and .loops/ in the current project.
+  /// Initialize loops.toml and .loops/ in the current project.
   Init,
   /// Start or continue autonomous development.
   Run {
@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
         let controller = Controller::new(cwd.clone(), backend, EventSink::new(None));
         let state = controller.initialize().await?;
         println!("Initialized loops in {}", cwd.display());
-        println!("  spec: {}/spec.md", cwd.display());
+        println!("  spec: {}/.loops/spec.md", cwd.display());
         println!("  state: {}/.loops/state.json", cwd.display());
         if !command_exists("omp").await {
           eprintln!("warning: `omp` was not found in PATH; install Oh My Pi before `loops run`");

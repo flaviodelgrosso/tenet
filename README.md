@@ -82,7 +82,7 @@ If you use `loops` today, treat it as experimental engineering tooling rather th
 ```mermaid
 flowchart TD
     A["`authoritative
-spec.md`"]
+.loops/spec.md`"]
 
     A --> B["`loops
 
@@ -119,7 +119,7 @@ There is no permanent "master LLM" carrying the entire run in conversational mem
 State survives between workers through explicit artifacts:
 
 - the repository,
-- `spec.md`,
+- `.loops/spec.md`,
 - `.loops/` controller state,
 - the requirement catalog,
 - work-unit summaries,
@@ -204,7 +204,7 @@ Invalid structured output, protected-file mutation, repeated stagnation, exhaust
 A `loops run` is a hierarchy of loops rather than a linear generated task list:
 
 ```text
-spec.md
+.loops/spec.md
    │
    ▼
 ARCHITECT                 when the requirement catalog is missing/stale
@@ -250,7 +250,7 @@ DONE
 
 | Role          | Purpose                                                                         | Repo access     | Runs when                                                      |
 | ------------- | ------------------------------------------------------------------------------- | --------------- | -------------------------------------------------------------- |
-| **Architect** | Converts `spec.md` into a stable `REQ-NNN` requirement catalog                  | Read-only       | Initially and when the spec changes                            |
+| **Architect** | Converts `.loops/spec.md` into a stable `REQ-NNN` requirement catalog           | Read-only       | Initially and when the spec changes                            |
 | **Reconcile** | Compares the repository against all requirements and selects the next work unit | Read-only       | At the beginning of every project cycle                        |
 | **Implement** | Implements one bounded work unit                                                | Read/write/bash | Once per selected work unit                                    |
 | **Repair**    | Responds to deterministic verification failures                                 | Read/write/bash | After verification fails                                       |
@@ -497,7 +497,7 @@ Autonomous execution needs explicit stopping conditions.
 
 Controller-owned files such as:
 
-- `spec.md`,
+- `.loops/spec.md`,
 - `loops.toml`,
 - `.loops/state.json`,
 - and related state,
@@ -615,8 +615,8 @@ Controller state is stored on disk and intended to remain human-inspectable.
 ```text
 project/
 ├── loops.toml
-├── spec.md
 └── .loops/
+    ├── spec.md
     ├── state.json
     ├── requirements.json
     ├── roadmap.json
@@ -627,7 +627,7 @@ project/
         └── transcript.log
 ```
 
-### `spec.md`
+### `.loops/spec.md`
 
 The human-authored product contract.
 
@@ -699,13 +699,13 @@ loops init
 This creates:
 
 loops.toml
-spec.md
 .loops/
+  └── spec.md
 
 Write the specification:
 
 ```bash
-$EDITOR spec.md
+$EDITOR .loops/spec.md
 ```
 
 Run:
@@ -742,7 +742,7 @@ Example `loops.toml`:
 #:schema https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json
 
 version = 1
-spec_file = "spec.md"
+spec_file = ".loops/spec.md"
 
 max_cycles = 25
 max_repair_attempts = 3

@@ -322,7 +322,7 @@ impl Controller {
       }
     }
     state.phase = Phase::Architecting;
-    state.last_summary = "Deriving requirement catalog from spec.md".into();
+    state.last_summary = "Deriving requirement catalog from .loops/spec.md".into();
     self.publish(&ctx.events, state).await?;
     let output = self
       .backend

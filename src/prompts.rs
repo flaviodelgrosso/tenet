@@ -46,7 +46,7 @@ const IMPLEMENT: &str = r#"You are the implementation layer of an autonomous spe
 Implement only the assigned work unit while respecting the product specification and repository conventions.
 
 Constraints:
-- spec.md, loops.toml, .loops/, and AGENTS.md are controller-protected and must never be modified.
+- .loops/spec.md, loops.toml, .loops/, and AGENTS.md are controller-protected and must never be modified.
 - Do not claim completion for unrelated requirements.
 - In `loops_yield`, use decisions, discoveries, risks, and followUps for durable handoff information when relevant.
 "#;
@@ -56,7 +56,7 @@ const REPAIR: &str = r#"You are the repair layer of an autonomous spec-driven de
 Repair the assigned work unit using the deterministic verification evidence.
 
 Constraints:
-- Do not edit spec.md, loops.toml, .loops/, or AGENTS.md.
+- Do not edit .loops/spec.md, loops.toml, .loops/, or AGENTS.md.
 - Do not weaken verification or tests to obtain a green result.
 - In `loops_yield`, use decisions, discoveries, risks, and followUps for durable handoff information when relevant.
 "#;

@@ -154,7 +154,7 @@ impl Default for Config {
   fn default() -> Self {
     Self {
       version: 1,
-      spec_file: "spec.md".into(),
+      spec_file: ".loops/spec.md".into(),
       max_cycles: 25,
       max_repair_attempts: 3,
       stagnation_limit: 3,
@@ -188,7 +188,7 @@ impl Default for Config {
         require_clean_tree: false,
       },
       protected_paths: vec![
-        "spec.md",
+        ".loops/spec.md",
         "AGENTS.md",
         "loops.toml",
         ".loops/state.json",
@@ -412,6 +412,7 @@ mod tests {
 
     assert_eq!(path, project.path().join("loops.toml"));
     assert!(!project.path().join(LOOPS_DIR).join("config.toml").exists());
+    assert!(generated.contains("spec_file = \".loops/spec.md\""));
     assert!(generated.starts_with(&format!("#:schema {CONFIG_SCHEMA_URL}\n\n")));
     assert_eq!(loaded.version, Config::default().version);
   }
