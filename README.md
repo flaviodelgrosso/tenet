@@ -1,6 +1,24 @@
+<div align="center">
+
 # loops
 
+<img
+src="https://github.com/user-attachments/assets/471ab52d-866b-4a5e-bdd9-8f1ecaeb4940"
+alt="loops logo"
+width="320"
+/>
+
+<br />
+
+[![CI](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml/badge.svg)](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust\&logoColor=white)](https://www.rust-lang.org/)
+[![Status: MVP](https://img.shields.io/badge/status-MVP-orange)](#status-mvp)
+[![Coding Agents](https://img.shields.io/badge/coding-agents-blueviolet)](#)
+
 **A deterministic control loop for autonomous, spec-driven software development with coding agents.**
+
+</div>
 
 Give `loops` a spec and it will work toward satisfying it through isolated coding-agent workers, repository-backed state, deterministic verification, repair loops, and an independent final assessment.
 
