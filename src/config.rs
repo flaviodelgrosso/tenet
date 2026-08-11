@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 pub const LOOPS_DIR: &str = ".loops";
-pub const CONFIG_FILE: &str = "config.toml";
+pub const CONFIG_FILE: &str = "loops.toml";
 pub const CONFIG_SCHEMA_URL: &str =
   "https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json";
 
@@ -190,7 +190,7 @@ impl Default for Config {
       protected_paths: vec![
         "spec.md",
         "AGENTS.md",
-        ".loops/config.toml",
+        "loops.toml",
         ".loops/state.json",
         ".loops/requirements.json",
         ".loops/roadmap.json",
@@ -206,11 +206,10 @@ impl Default for Config {
 }
 
 pub fn config_path(cwd: &Path) -> PathBuf {
-  cwd.join(LOOPS_DIR).join(CONFIG_FILE)
+  cwd.join(CONFIG_FILE)
 }
 
 pub async fn ensure_config(cwd: &Path) -> Result<Config> {
-  fs::create_dir_all(cwd.join(LOOPS_DIR)).await?;
   let path = config_path(cwd);
   if !path.exists() {
     let mut config = Config::default();
@@ -235,7 +234,7 @@ pub async fn read_config(cwd: &Path) -> Result<Config> {
 mod tests {
   use tempfile::tempdir;
 
-  use super::{config_path, ensure_config, read_config, Config, CONFIG_SCHEMA_URL};
+  use super::{config_path, ensure_config, read_config, Config, CONFIG_SCHEMA_URL, LOOPS_DIR};
   use crate::model::WorkerRole;
 
   const ROLES: [WorkerRole; 5] = [
@@ -403,15 +402,16 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn generated_config_starts_with_schema_directive_and_remains_parseable() {
+  async fn generated_config_is_created_at_the_project_root_and_remains_parseable() {
     let project = tempdir().unwrap();
 
     ensure_config(project.path()).await.unwrap();
-    let generated = tokio::fs::read_to_string(config_path(project.path()))
-      .await
-      .unwrap();
+    let path = config_path(project.path());
+    let generated = tokio::fs::read_to_string(&path).await.unwrap();
     let loaded = read_config(project.path()).await.unwrap();
 
+    assert_eq!(path, project.path().join("loops.toml"));
+    assert!(!project.path().join(LOOPS_DIR).join("config.toml").exists());
     assert!(generated.starts_with(&format!("#:schema {CONFIG_SCHEMA_URL}\n\n")));
     assert_eq!(loaded.version, Config::default().version);
   }

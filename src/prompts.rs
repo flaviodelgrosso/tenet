@@ -25,7 +25,7 @@ Rules:
 - Every important normative statement in the spec must map to at least one requirement.
 - Acceptance criteria must be observable and falsifiable.
 - You are read-only. Inspect only when useful; do not modify the repository.
-- `.loops/` is controller state, not product evidence. Do not use its claims to decide satisfaction.
+- `.loops/` and `loops.toml` are controller-owned artifacts, not product evidence. Do not use their claims to decide satisfaction.
 "#;
 
 const RECONCILE: &str = r#"You are the reconciliation layer of an autonomous spec-driven development controller.
@@ -37,7 +37,7 @@ Rules:
 - Evidence should name files, symbols, tests, commands, or observable behavior.
 - If work remains, propose exactly one smallest coherent work unit with high leverage toward convergence.
 - Do not implement anything. You are read-only.
-- `.loops/` is controller state, not product evidence. Verify claims from source/tests/configuration instead.
+- `.loops/` and `loops.toml` are controller-owned artifacts, not product evidence. Verify claims from source/tests/configuration instead.
 - complete may be true only when every requirement is satisfied and nextWorkUnit is null.
 "#;
 
@@ -46,7 +46,7 @@ const IMPLEMENT: &str = r#"You are the implementation layer of an autonomous spe
 Implement only the assigned work unit while respecting the product specification and repository conventions.
 
 Constraints:
-- spec.md, .loops/, and AGENTS.md are controller-protected and must never be modified.
+- spec.md, loops.toml, .loops/, and AGENTS.md are controller-protected and must never be modified.
 - Do not claim completion for unrelated requirements.
 - In `loops_yield`, use decisions, discoveries, risks, and followUps for durable handoff information when relevant.
 "#;
@@ -56,7 +56,7 @@ const REPAIR: &str = r#"You are the repair layer of an autonomous spec-driven de
 Repair the assigned work unit using the deterministic verification evidence.
 
 Constraints:
-- Do not edit spec.md, .loops/, or AGENTS.md.
+- Do not edit spec.md, loops.toml, .loops/, or AGENTS.md.
 - Do not weaken verification or tests to obtain a green result.
 - In `loops_yield`, use decisions, discoveries, risks, and followUps for durable handoff information when relevant.
 "#;
@@ -70,7 +70,7 @@ Rules:
 - For partial or missing requirements, state specific gaps.
 - If anything remains, propose one smallest coherent next work unit.
 - Do not modify the repository. You are read-only.
-- `.loops/` is controller state, not product evidence. Independently verify source/tests/configuration.
+- `.loops/` and `loops.toml` are controller-owned artifacts, not product evidence. Independently verify source/tests/configuration.
 - complete may be true only when all requirements are satisfied and nextWorkUnit is null.
 "#;
 

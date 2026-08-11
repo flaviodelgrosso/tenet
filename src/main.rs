@@ -41,7 +41,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-  /// Initialize spec.md and .loops/ in the current project.
+  /// Initialize spec.md, loops.toml, and .loops/ in the current project.
   Init,
   /// Start or continue autonomous development.
   Run {

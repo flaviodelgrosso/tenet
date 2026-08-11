@@ -498,7 +498,7 @@ Autonomous execution needs explicit stopping conditions.
 Controller-owned files such as:
 
 - `spec.md`,
-- `.loops/config.toml`,
+- `loops.toml`,
 - `.loops/state.json`,
 - and related state,
 
@@ -614,9 +614,9 @@ Controller state is stored on disk and intended to remain human-inspectable.
 
 ```text
 project/
+├── loops.toml
 ├── spec.md
 └── .loops/
-    ├── config.toml
     ├── state.json
     ├── requirements.json
     ├── roadmap.json
@@ -698,10 +698,9 @@ loops init
 
 This creates:
 
-```text
+loops.toml
 spec.md
 .loops/
-```
 
 Write the specification:
 
@@ -737,7 +736,7 @@ loops verify --json
 
 ## Configuration
 
-Example `.loops/config.toml`:
+Example `loops.toml`:
 
 ```toml
 #:schema https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json
@@ -826,7 +825,7 @@ agent.roles.verify
 
 ## Schema-aware editor support
 
-Generated `.loops/config.toml` files include:
+Generated `loops.toml` files include:
 
 ```toml
 #:schema https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json
