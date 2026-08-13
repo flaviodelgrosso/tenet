@@ -2,7 +2,7 @@
 
 # loops
 
-<img width="2172" height="724" alt="logo" src="https://github.com/user-attachments/assets/547d2c65-3204-42c4-9404-0d2371cb9982" />
+<img width="2066" height="761" alt="logo" src="https://github.com/user-attachments/assets/83d2961d-be43-4e8e-a68c-5f4958cafdbb" />
 
 <br />
 <br />
