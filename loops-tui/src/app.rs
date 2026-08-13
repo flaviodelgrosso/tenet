@@ -1,42 +1,13 @@
-use std::{
-  collections::{BTreeMap, VecDeque},
-  time::Instant,
+use loops_domain::model::{
+  RepositoryChange, Requirement, RequirementAssessment, RequirementStatus, VerificationReport,
 };
 
-use loops_domain::{
-  events::RunEvent,
-  model::{
-    Phase, ReconcileResult, RepositoryChange, Requirement, RequirementAssessment,
-    RequirementCatalog, RequirementStatus, RunStatus, State, VerificationReport, WorkerEvent,
-    WorkerRole,
-  },
+use crate::tui::action::{Action, Effect, HistoryFilter, Overlay, Screen};
+
+pub use loops_projection::{
+  check_detail, failure_preview, phase_label, requirement_status, status_label, Activity,
+  ActivityCategory, RunProjection, WorkerSession,
 };
-
-use crate::tui::action::{
-  role_label, Action, ActivityCategory, Effect, HistoryFilter, Overlay, Screen,
-};
-
-const MAX_ACTIVITY: usize = 2_000;
-const MAX_DETAIL_BYTES: usize = 4_096;
-
-#[derive(Debug, Clone)]
-pub struct Activity {
-  pub at: String,
-  pub category: ActivityCategory,
-  pub title: String,
-  pub summary: String,
-  pub detail: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkerSession {
-  pub role: WorkerRole,
-  pub started_at: String,
-  pub ended_at: Option<String>,
-  pub ok: Option<bool>,
-  pub summary: Option<String>,
-  pub detail: String,
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct FeedState {
@@ -123,32 +94,20 @@ impl Default for UiState {
 
 pub struct Application {
   project_name: String,
-  state: State,
-  catalog: Vec<Requirement>,
-  assessments: BTreeMap<String, RequirementAssessment>,
-  activities: VecDeque<Activity>,
-  workers: VecDeque<WorkerSession>,
-  checks: Vec<VerificationReport>,
-  changes: Vec<RepositoryChange>,
+  run: RunProjection,
   ui: UiState,
-  running: bool,
-  started: Instant,
 }
 
 impl Application {
-  pub fn new(project_name: String, state: State, catalog: Vec<Requirement>) -> Self {
+  pub fn new(
+    project_name: String,
+    state: loops_domain::model::State,
+    catalog: Vec<Requirement>,
+  ) -> Self {
     Self {
       project_name,
-      running: matches!(state.status, RunStatus::Running),
-      state,
-      catalog,
-      assessments: BTreeMap::new(),
-      activities: VecDeque::new(),
-      workers: VecDeque::new(),
-      checks: Vec::new(),
-      changes: Vec::new(),
+      run: RunProjection::new(state, catalog),
       ui: UiState::default(),
-      started: Instant::now(),
     }
   }
 
@@ -156,32 +115,32 @@ impl Application {
     &self.project_name
   }
 
-  pub fn state(&self) -> &State {
-    &self.state
+  pub fn state(&self) -> &loops_domain::model::State {
+    self.run.state()
   }
 
   pub fn catalog(&self) -> &[Requirement] {
-    &self.catalog
+    self.run.catalog()
   }
 
-  pub fn assessments(&self) -> &BTreeMap<String, RequirementAssessment> {
-    &self.assessments
+  pub fn assessments(&self) -> &std::collections::BTreeMap<String, RequirementAssessment> {
+    self.run.assessments()
   }
 
-  pub fn activities(&self) -> &VecDeque<Activity> {
-    &self.activities
+  pub fn activities(&self) -> &std::collections::VecDeque<Activity> {
+    self.run.activities()
   }
 
   pub fn current_worker(&self) -> Option<&WorkerSession> {
-    self.workers.back()
+    self.run.current_worker()
   }
 
   pub fn checks(&self) -> &[VerificationReport] {
-    &self.checks
+    self.run.checks()
   }
 
   pub fn changes(&self) -> &[RepositoryChange] {
-    &self.changes
+    self.run.changes()
   }
 
   pub fn ui(&self) -> &UiState {
@@ -189,272 +148,32 @@ impl Application {
   }
 
   pub fn running(&self) -> bool {
-    self.running
+    self.run.running()
   }
 
   pub fn elapsed_seconds(&self) -> u64 {
-    self.started.elapsed().as_secs()
+    self.run.elapsed_seconds()
   }
 
   pub fn begin_run(&mut self) {
-    self.running = true;
-    self.started = Instant::now();
-    self.activities.clear();
-    self.workers.clear();
-    self.checks.clear();
-    self.changes.clear();
-    self.assessments.clear();
+    self.run.begin_run();
     self.ui.run = FeedState {
       follow: true,
       ..FeedState::default()
     };
     self.ui.history = HistoryState::default();
-    self.push_activity(
-      "now".into(),
-      ActivityCategory::Controller,
-      "RUN STARTED",
-      "Controller started autonomous execution".into(),
-      String::new(),
-    );
+    self.sync_follow();
   }
 
-  pub fn apply(&mut self, event: RunEvent) {
-    match event {
-      RunEvent::State(state) => self.apply_state(state),
-      RunEvent::Catalog(RequirementCatalog { requirements, .. }) => self.catalog = requirements,
-      RunEvent::Message(message) => {
-        let category = if message.to_ascii_lowercase().contains("error") {
-          ActivityCategory::Error
-        } else {
-          ActivityCategory::Controller
-        };
-        self.push_activity(now(), category, "CONTROLLER", message.clone(), message);
-      }
-      RunEvent::Worker(event) => self.apply_worker(event),
-      RunEvent::Reconcile(result) => self.apply_reconcile(result),
-      RunEvent::Verification(report) => self.apply_check(report),
-      RunEvent::RepositoryChanges(changes) => {
-        self.changes = changes;
-      }
-      RunEvent::Finished(state) => {
-        self.apply_state(state);
-        self.running = false;
-      }
+  pub fn apply(&mut self, event: loops_domain::events::RunEvent) {
+    let count = self.run.activities().len();
+    self.run.apply(event);
+    if self.run.activities().len() != count {
+      self.sync_follow();
     }
   }
 
-  fn apply_state(&mut self, next: State) {
-    let changed = self.state.phase != next.phase
-      || self.state.cycle != next.cycle
-      || self.state.status != next.status;
-    if changed {
-      let category = if matches!(next.status, RunStatus::Blocked | RunStatus::Failed) {
-        ActivityCategory::Error
-      } else {
-        ActivityCategory::Controller
-      };
-      self.push_activity(
-        next.updated_at.clone(),
-        category,
-        phase_label(&next.phase),
-        next.last_summary.clone(),
-        state_detail(&next),
-      );
-    }
-    self.state = next;
-  }
-
-  fn apply_reconcile(&mut self, result: ReconcileResult) {
-    for assessment in result.requirements {
-      self.assessments.insert(assessment.id.clone(), assessment);
-    }
-    let summary = result.next_work_unit.as_ref().map_or_else(
-      || result.summary.clone(),
-      |work| format!("Selected {} · {}", work.id, work.title),
-    );
-    let detail = result
-      .next_work_unit
-      .map_or(result.summary, |work| work_detail(&work));
-    self.push_activity(
-      now(),
-      ActivityCategory::Controller,
-      "RECONCILE",
-      summary,
-      detail,
-    );
-  }
-
-  fn apply_check(&mut self, report: VerificationReport) {
-    let passed = report.passed;
-    let summary = if passed {
-      "PASS · deterministic checks passed".into()
-    } else {
-      format!("FAIL · {}", failure_preview(&report))
-    };
-    let detail = check_detail(&report);
-    self.push_activity(
-      report.finished_at.clone(),
-      if passed {
-        ActivityCategory::Check
-      } else {
-        ActivityCategory::Error
-      },
-      if passed { "CHECKS PASS" } else { "CHECKS FAIL" },
-      summary,
-      detail,
-    );
-    self.checks.push(report);
-  }
-
-  fn apply_worker(&mut self, event: WorkerEvent) {
-    match event {
-      WorkerEvent::Start { role, at } => {
-        self.workers.push_back(WorkerSession {
-          role,
-          started_at: at.clone(),
-          ended_at: None,
-          ok: None,
-          summary: None,
-          detail: String::new(),
-        });
-        self.push_activity(
-          at,
-          ActivityCategory::Worker,
-          format!("{} STARTED", role_label(role).to_uppercase()),
-          "Worker session started".into(),
-          String::new(),
-        );
-      }
-      WorkerEvent::Text { role, at, delta } => {
-        let text = sanitize(&delta);
-        let worker = self.worker_mut(role, &at);
-        append_bounded(&mut worker.detail, &text);
-        self.push_activity(
-          at,
-          ActivityCategory::Worker,
-          role_label(role).to_uppercase(),
-          compact(&text, 160),
-          text,
-        );
-      }
-      WorkerEvent::ToolStart {
-        role,
-        at,
-        tool_name,
-        args,
-      } => {
-        let detail = format!(
-          "Tool: {tool_name}\nArguments:\n{}",
-          serde_json::to_string_pretty(&args).unwrap_or_else(|_| "{}".into())
-        );
-        self.push_activity(
-          at,
-          ActivityCategory::Worker,
-          format!("{} · TOOL", role_label(role).to_uppercase()),
-          tool_name,
-          detail,
-        );
-      }
-      WorkerEvent::ToolEnd {
-        role,
-        at,
-        tool_name,
-        is_error,
-        output,
-      } => {
-        let output = output.map(|value| sanitize(&value)).unwrap_or_default();
-        let title = if is_error {
-          "TOOL FAILED"
-        } else {
-          "TOOL COMPLETE"
-        };
-        self.push_activity(
-          at,
-          if is_error {
-            ActivityCategory::Error
-          } else {
-            ActivityCategory::Worker
-          },
-          format!("{} · {title}", role_label(role).to_uppercase()),
-          tool_name.clone(),
-          format!("Tool: {tool_name}\n\n{output}"),
-        );
-      }
-      WorkerEvent::End {
-        role,
-        at,
-        ok,
-        message,
-      } => {
-        let worker = self.worker_mut(role, &at);
-        worker.ended_at = Some(at.clone());
-        worker.ok = Some(ok);
-        worker.summary = message.clone();
-        let summary = message.unwrap_or_else(|| {
-          if ok {
-            "Worker completed".into()
-          } else {
-            "Worker failed".into()
-          }
-        });
-        self.push_activity(
-          at,
-          if ok {
-            ActivityCategory::Worker
-          } else {
-            ActivityCategory::Error
-          },
-          format!(
-            "{} {}",
-            role_label(role).to_uppercase(),
-            if ok { "COMPLETE" } else { "FAILED" }
-          ),
-          summary.clone(),
-          summary,
-        );
-      }
-    }
-  }
-
-  fn worker_mut(&mut self, role: WorkerRole, at: &str) -> &mut WorkerSession {
-    let new = self
-      .workers
-      .back()
-      .is_none_or(|worker| worker.role != role || worker.ended_at.is_some());
-    if new {
-      self.workers.push_back(WorkerSession {
-        role,
-        started_at: at.into(),
-        ended_at: None,
-        ok: None,
-        summary: None,
-        detail: String::new(),
-      });
-    }
-    self
-      .workers
-      .back_mut()
-      .expect("worker session was inserted")
-  }
-
-  fn push_activity(
-    &mut self,
-    at: String,
-    category: ActivityCategory,
-    title: impl Into<String>,
-    summary: String,
-    detail: String,
-  ) {
-    self.activities.push_back(Activity {
-      at,
-      category,
-      title: title.into(),
-      summary,
-      detail: compact(&detail, MAX_DETAIL_BYTES),
-    });
-    while self.activities.len() > MAX_ACTIVITY {
-      self.activities.pop_front();
-    }
+  fn sync_follow(&mut self) {
     if self.ui.run.follow {
       self.ui.run.selected = self.visible_feed().len().saturating_sub(1);
       self.ui.run.scroll = self
@@ -486,7 +205,7 @@ impl Application {
     match action {
       Action::None => Effect::None,
       Action::Exit => {
-        if self.running {
+        if self.running() {
           self.ui.overlay = Some(Overlay::ConfirmStop);
           Effect::None
         } else {
@@ -494,7 +213,7 @@ impl Application {
         }
       }
       Action::Start => {
-        if self.running {
+        if self.running() {
           Effect::None
         } else {
           Effect::Start
@@ -693,7 +412,7 @@ impl Application {
   pub fn visible_feed(&self) -> Vec<usize> {
     filtered_indexes(
       self
-        .activities
+        .activities()
         .iter()
         .map(|item| format!("{} {} {}", item.title, item.summary, item.detail)),
       &self.ui.run.query,
@@ -703,7 +422,7 @@ impl Application {
   pub fn visible_requirements(&self) -> Vec<usize> {
     filtered_indexes(
       self
-        .catalog
+        .catalog()
         .iter()
         .map(|item| format!("{} {} {}", item.id, item.title, item.description)),
       &self.ui.requirements.query,
@@ -712,7 +431,7 @@ impl Application {
 
   pub fn visible_checks(&self) -> Vec<usize> {
     filtered_indexes(
-      self.checks.iter().map(|item| {
+      self.checks().iter().map(|item| {
         format!(
           "{} {}",
           if item.passed { "pass" } else { "fail" },
@@ -726,7 +445,7 @@ impl Application {
   pub fn visible_changes(&self) -> Vec<usize> {
     filtered_indexes(
       self
-        .changes
+        .changes()
         .iter()
         .map(|item| format!("{} {}", item.status, item.path)),
       &self.ui.changes.query,
@@ -735,7 +454,7 @@ impl Application {
 
   pub fn visible_history(&self) -> Vec<usize> {
     self
-      .activities
+      .activities()
       .iter()
       .enumerate()
       .filter(|(_, item)| history_match(item, self.ui.history.filter, &self.ui.history.query))
@@ -747,21 +466,21 @@ impl Application {
     self
       .visible_requirements()
       .get(self.ui.requirements.selected)
-      .and_then(|index| self.catalog.get(*index))
+      .and_then(|index| self.catalog().get(*index))
   }
 
   pub fn selected_check(&self) -> Option<&VerificationReport> {
     self
       .visible_checks()
       .get(self.ui.checks.selected)
-      .and_then(|index| self.checks.get(*index))
+      .and_then(|index| self.checks().get(*index))
   }
 
   pub fn selected_change(&self) -> Option<&RepositoryChange> {
     self
       .visible_changes()
       .get(self.ui.changes.selected)
-      .and_then(|index| self.changes.get(*index))
+      .and_then(|index| self.changes().get(*index))
   }
 
   pub fn selected_activity(&self) -> Option<&Activity> {
@@ -772,7 +491,7 @@ impl Application {
     };
     visible
       .get(self.current_selected())
-      .and_then(|index| self.activities.get(*index))
+      .and_then(|index| self.activities().get(*index))
   }
 
   fn current_selected(&self) -> usize {
@@ -880,8 +599,8 @@ impl Application {
           format!("Requirement {}", item.id),
           requirement_detail(
             item,
-            self.assessments.get(&item.id),
-            self.state.current_work_unit.as_ref(),
+            self.assessments().get(&item.id),
+            self.state().current_work_unit.as_ref(),
           ),
         )
       }),
@@ -946,100 +665,6 @@ fn history_match(item: &Activity, filter: HistoryFilter, query: &str) -> bool {
         .contains(&query.to_ascii_lowercase()))
 }
 
-pub fn phase_label(phase: &Phase) -> &'static str {
-  match phase {
-    Phase::Initialized => "READY",
-    Phase::Architecting => "ARCHITECT",
-    Phase::Reconciling => "RECONCILE",
-    Phase::Implementing => "IMPLEMENT",
-    Phase::Verifying => "VERIFY",
-    Phase::Repairing => "REPAIR",
-    Phase::Assessing => "ASSESS",
-    Phase::Complete => "COMPLETE",
-  }
-}
-
-pub fn status_label(status: &RunStatus) -> &'static str {
-  match status {
-    RunStatus::Idle => "READY",
-    RunStatus::Running => "RUNNING",
-    RunStatus::Done => "COMPLETED",
-    RunStatus::Blocked => "BLOCKED",
-    RunStatus::Failed => "FAILED",
-    RunStatus::Stopped => "STOPPED",
-  }
-}
-
-pub fn requirement_status(assessment: Option<&RequirementAssessment>) -> RequirementStatus {
-  assessment.map_or(RequirementStatus::Missing, |item| item.status.clone())
-}
-
-pub fn failure_preview(report: &VerificationReport) -> String {
-  report
-    .commands
-    .iter()
-    .find(|command| command.exit_code != Some(0) || command.timed_out)
-    .map(|command| {
-      compact(
-        if command.stderr.is_empty() {
-          &command.stdout
-        } else {
-          &command.stderr
-        },
-        120,
-      )
-    })
-    .unwrap_or_else(|| {
-      report
-        .warnings
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "No failure output emitted".into())
-    })
-}
-
-fn state_detail(state: &State) -> String {
-  format!(
-    "Status: {}\nPhase: {}\nCycle: {}\n\n{}{}",
-    status_label(&state.status),
-    phase_label(&state.phase),
-    state.cycle,
-    state.last_summary,
-    state
-      .blocked_reason
-      .as_ref()
-      .map_or_else(String::new, |reason| format!("\n\nBlocked: {reason}"))
-  )
-}
-
-fn work_detail(work: &loops_domain::model::WorkUnit) -> String {
-  format!("{} · {}\n\nObjective\n{}\n\nRequirements\n{}\n\nAcceptance criteria\n{}\n\nSuggested checks\n{}", work.id, work.title, work.objective, bullets(&work.requirement_ids), bullets(&work.acceptance_criteria), bullets(&work.suggested_checks))
-}
-
-fn check_detail(report: &VerificationReport) -> String {
-  format!(
-    "Overall: {}\nStarted: {}\nFinished: {}\nWarnings:\n{}\n\n{}",
-    if report.passed { "PASS" } else { "FAIL" },
-    report.started_at,
-    report.finished_at,
-    bullets(&report.warnings),
-    report
-      .commands
-      .iter()
-      .map(|command| format!(
-        "$ {}\nexit: {:?} · timeout: {} · {} ms\nstdout:\n{}\nstderr:\n{}",
-        command.command,
-        command.exit_code,
-        command.timed_out,
-        command.duration_ms,
-        sanitize(&command.stdout),
-        sanitize(&command.stderr)
-      ))
-      .collect::<Vec<_>>()
-      .join("\n\n")
-  )
-}
-
 fn requirement_detail(
   requirement: &Requirement,
   assessment: Option<&RequirementAssessment>,
@@ -1059,13 +684,23 @@ fn activity_detail(item: &Activity) -> String {
   )
 }
 
+fn work_detail(work: &loops_domain::model::WorkUnit) -> String {
+  format!(
+    "{} · {}\n\nObjective\n{}\n\nRequirements\n{}",
+    work.id,
+    work.title,
+    work.objective,
+    bullets(&work.requirement_ids)
+  )
+}
+
 fn context_detail(app: &Application) -> String {
   let state = app.state();
   let work = state
     .current_work_unit
     .as_ref()
     .map_or_else(|| "No work unit selected".into(), work_detail);
-  let checks = app.checks.last().map_or_else(
+  let checks = app.checks().last().map_or_else(
     || "No deterministic check recorded".into(),
     |check| {
       if check.passed {
@@ -1075,7 +710,7 @@ fn context_detail(app: &Application) -> String {
       }
     },
   );
-  format!("Current work\n{work}\n\nRequirement health\n{}/{} satisfied · {} partial · {} missing\n\nCycle\n{}\n\nLatest verification\n{checks}\n\nRepository changes\n{} changed paths", state.requirement_counts.satisfied, state.requirement_counts.total, state.requirement_counts.partial, state.requirement_counts.missing, state.cycle, app.changes.len())
+  format!("Current work\n{work}\n\nRequirement health\n{}/{} satisfied · {} partial · {} missing\n\nCycle\n{}\n\nLatest verification\n{checks}\n\nRepository changes\n{} changed paths", state.requirement_counts.satisfied, state.requirement_counts.total, state.requirement_counts.partial, state.requirement_counts.missing, state.cycle, app.changes().len())
 }
 
 fn bullets(items: &[String]) -> String {
@@ -1088,34 +723,4 @@ fn bullets(items: &[String]) -> String {
       .collect::<Vec<_>>()
       .join("\n")
   }
-}
-
-fn sanitize(text: &str) -> String {
-  text
-    .chars()
-    .filter(|character| *character == '\n' || *character == '\t' || !character.is_control())
-    .collect()
-}
-
-fn compact(text: &str, max: usize) -> String {
-  if text.len() <= max {
-    text.into()
-  } else {
-    let mut end = max;
-    while !text.is_char_boundary(end) {
-      end -= 1;
-    }
-    format!("{}…", &text[..end])
-  }
-}
-
-fn append_bounded(target: &mut String, text: &str) {
-  target.push_str(text);
-  if target.len() > MAX_DETAIL_BYTES {
-    *target = compact(target, MAX_DETAIL_BYTES);
-  }
-}
-
-fn now() -> String {
-  chrono::Local::now().format("%H:%M:%S").to_string()
 }

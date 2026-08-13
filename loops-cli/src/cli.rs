@@ -27,14 +27,27 @@ pub(crate) enum Command {
   },
   /// Start or continue autonomous development.
   Run {
-    /// Print a linear transcript instead of opening the full-screen TUI.
+    /// Run without the interactive TUI and stream progress to the console.
     #[arg(long)]
-    no_tui: bool,
+    headless: bool,
+    /// Only print controller milestones, verification, errors, and the final state.
+    #[arg(long, short)]
+    quiet: bool,
+    /// Include worker narrative and diagnostic tool details.
+    #[arg(long, short)]
+    verbose: bool,
   },
   /// Alias for run; state is always resumed from .loops/.
   Resume {
+    /// Run without the interactive TUI and stream progress to the console.
     #[arg(long)]
-    no_tui: bool,
+    headless: bool,
+    /// Only print controller milestones, verification, errors, and the final state.
+    #[arg(long, short)]
+    quiet: bool,
+    /// Include worker narrative and diagnostic tool details.
+    #[arg(long, short)]
+    verbose: bool,
   },
   /// Show persisted controller state.
   Status {
@@ -75,11 +88,20 @@ pub(crate) enum AgentCommand {
 mod tests {
   use clap::Parser;
 
-  use super::Cli;
+  use super::{Cli, Command};
 
   #[test]
   fn commandless_invocation_selects_tui_launcher() {
     let cli = Cli::try_parse_from(["loops"]).unwrap();
     assert!(cli.command.is_none());
+  }
+
+  #[test]
+  fn headless_and_hidden_compatibility_alias_select_console_mode() {
+    let cli = Cli::try_parse_from(["loops", "run", "--headless"]).unwrap();
+    assert!(matches!(
+      cli.command,
+      Some(Command::Run { headless: true, .. })
+    ));
   }
 }

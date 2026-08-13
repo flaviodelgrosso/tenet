@@ -500,11 +500,17 @@ q / Ctrl-C          stop active run / exit when idle
 
 When a run completes, the TUI remains available for inspection.
 
-For CI and non-interactive environments:
+For CI, SSH, automation, and log capture, headless mode provides a controller-oriented
+line stream without claiming the terminal:
 
 ```bash
-loops run --no-tui
+loops run --headless
 ```
+
+Progress and the final summary are written to stdout, so `loops run --headless > loops.log`
+creates a coherent run log. Runtime diagnostics remain on stderr. Use `--quiet` for
+milestones only or `--verbose` to include worker narrative and tool diagnostics. Terminal
+states preserve the normal exit semantics: blocked, failed, and stopped runs exit non-zero.
 
 ---
 
@@ -620,10 +626,10 @@ Run:
 loops run
 ```
 
-Or without the TUI:
+Or as a console run suitable for CI or a remote shell:
 
 ```bash
-loops run --no-tui
+loops run --headless
 ```
 
 Inspect controller state:

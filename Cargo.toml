@@ -4,6 +4,7 @@ members = [
   "loops-domain",
   "loops-runtime",
   "loops-acp",
+  "loops-projection",
   "loops-tui",
   "loops-cli",
 ]

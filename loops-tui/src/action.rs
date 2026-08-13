@@ -1,4 +1,4 @@
-use loops_domain::model::WorkerRole;
+pub use loops_projection::{role_label, ActivityCategory};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -89,33 +89,4 @@ pub enum Effect {
   Start,
   Stop,
   Exit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivityCategory {
-  Controller,
-  Worker,
-  Check,
-  Error,
-}
-
-impl ActivityCategory {
-  pub fn label(self) -> &'static str {
-    match self {
-      Self::Controller => "CONTROLLER",
-      Self::Worker => "WORKER",
-      Self::Check => "CHECK",
-      Self::Error => "ATTENTION",
-    }
-  }
-}
-
-pub fn role_label(role: WorkerRole) -> &'static str {
-  match role {
-    WorkerRole::Architect => "Architect",
-    WorkerRole::Reconcile => "Reconcile",
-    WorkerRole::Implement => "Implement",
-    WorkerRole::Repair => "Repair",
-    WorkerRole::Assess => "Assess",
-  }
 }

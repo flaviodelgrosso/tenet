@@ -1356,9 +1356,11 @@ name = "loops-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "loops-acp",
  "loops-domain",
+ "loops-projection",
  "loops-runtime",
  "loops-tui",
  "serde_json",
@@ -1378,6 +1380,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "loops-projection"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "loops-domain",
+ "serde_json",
 ]
 
 [[package]]
@@ -1404,6 +1415,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "loops-domain",
+ "loops-projection",
  "loops-runtime",
  "ratatui",
  "serde_json",

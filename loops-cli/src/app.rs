@@ -10,7 +10,7 @@ use loops_tui::tui;
 use crate::{
   agents,
   cli::{Cli, Command},
-  plain,
+  headless::{self, ConsoleOptions},
 };
 
 pub(crate) struct App {
@@ -41,9 +41,20 @@ impl App {
         self.initialize().await?;
         ExitCode::SUCCESS
       }
-      Some(Command::Run { no_tui } | Command::Resume { no_tui }) => {
-        let state = if no_tui {
-          plain::run(self.cwd, self.backend).await?
+      Some(
+        Command::Run {
+          headless: is_headless,
+          quiet,
+          verbose,
+        }
+        | Command::Resume {
+          headless: is_headless,
+          quiet,
+          verbose,
+        },
+      ) => {
+        let state = if is_headless {
+          headless::run(self.cwd, self.backend, ConsoleOptions { quiet, verbose }).await?
         } else {
           tui::run(self.cwd, self.backend).await?
         };

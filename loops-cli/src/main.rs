@@ -1,7 +1,7 @@
 mod agents;
 mod app;
 mod cli;
-mod plain;
+mod headless;
 
 use std::process::ExitCode;
 
