@@ -2,12 +2,9 @@
 
 # loops
 
-<img
-src="https://github.com/user-attachments/assets/471ab52d-866b-4a5e-bdd9-8f1ecaeb4940"
-alt="loops logo"
-width="320"
-/>
+<img width="2172" height="724" alt="logo" src="https://github.com/user-attachments/assets/547d2c65-3204-42c4-9404-0d2371cb9982" />
 
+<br />
 <br />
 
 [![CI](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml/badge.svg)](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml)
