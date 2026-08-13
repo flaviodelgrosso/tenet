@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::Result;
 use tokio::fs;
-
 #[derive(Debug, Clone)]
 pub struct Snapshot {
   files: BTreeMap<PathBuf, Option<Vec<u8>>>,
@@ -27,28 +26,51 @@ pub async fn snapshot(cwd: &Path, paths: &[String]) -> Result<Snapshot> {
 
 pub async fn restore_changes(cwd: &Path, snapshot: &Snapshot) -> Result<Vec<String>> {
   let mut changed = Vec::new();
+  let mut first_error = None;
   for (rel, before) in &snapshot.files {
     let path = cwd.join(rel);
     let after = match fs::read(&path).await {
       Ok(bytes) => Some(bytes),
       Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-      Err(err) => return Err(err.into()),
+      Err(err) => {
+        if first_error.is_none() {
+          first_error = Some(
+            anyhow::Error::from(err).context(format!("reading protected path {}", rel.display())),
+          );
+        }
+        continue;
+      }
     };
     if &after == before {
       continue;
     }
     changed.push(rel.to_string_lossy().to_string());
-    match before {
+    let restore_result = match before {
       Some(bytes) => {
-        if let Some(parent) = path.parent() {
-          fs::create_dir_all(parent).await?;
+        async {
+          if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+          }
+          fs::write(&path, bytes).await
         }
-        fs::write(&path, bytes).await?;
+        .await
       }
-      None => {
-        let _ = fs::remove_file(&path).await;
+      None => match fs::remove_file(&path).await {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+      },
+    };
+    if let Err(err) = restore_result {
+      if first_error.is_none() {
+        first_error = Some(
+          anyhow::Error::from(err).context(format!("restoring protected path {}", rel.display())),
+        );
       }
     }
+  }
+  if let Some(error) = first_error {
+    return Err(error);
   }
   Ok(changed)
 }

@@ -1,5 +1,5 @@
 [package]
-name = "loops-application"
+name = "loops-runtime"
 version.workspace = true
 edition.workspace = true
 description.workspace = true
@@ -8,17 +8,11 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-base64.workspace = true
 chrono.workspace = true
-include_dir.workspace = true
 loops-domain = { path = "../loops-domain" }
-rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
-
-[dev-dependencies]
-tempfile = "3"

@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::model::WorkerRole;
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de, ser::SerializeStruct, Deserialize, Serialize};
 use tokio::fs;
 
 pub const LOOPS_DIR: &str = ".loops";
@@ -11,6 +11,7 @@ pub const CONFIG_SCHEMA_URL: &str =
   "https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
   pub version: u32,
   pub spec_file: String,
@@ -21,109 +22,278 @@ pub struct Config {
   pub verification: VerificationConfig,
   pub git: GitConfig,
   pub protected_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RolePreference {
+  pub model: Option<String>,
+  pub thought_level: Option<String>,
+  pub mode: Option<String>,
+  pub required: bool,
+  required_is_set: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RolePreferenceWire {
+  model: Option<String>,
+  thought_level: Option<String>,
+  mode: Option<String>,
+  required: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for RolePreference {
+  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+  where
+    D: de::Deserializer<'de>,
+  {
+    let wire = RolePreferenceWire::deserialize(deserializer)?;
+    Ok(Self {
+      model: wire.model,
+      thought_level: wire.thought_level,
+      mode: wire.mode,
+      required: wire.required.unwrap_or(false),
+      required_is_set: wire.required.is_some(),
+    })
+  }
+}
+impl Serialize for RolePreference {
+  fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    let field_count = usize::from(self.model.is_some())
+      + usize::from(self.thought_level.is_some())
+      + usize::from(self.mode.is_some())
+      + usize::from(self.required_is_set || self.required);
+    let mut state = serializer.serialize_struct("RolePreference", field_count)?;
+    if let Some(model) = &self.model {
+      state.serialize_field("model", model)?;
+    }
+    if let Some(thought_level) = &self.thought_level {
+      state.serialize_field("thought_level", thought_level)?;
+    }
+    if let Some(mode) = &self.mode {
+      state.serialize_field("mode", mode)?;
+    }
+    if self.required_is_set || self.required {
+      state.serialize_field("required", &self.required)?;
+    }
+    state.end()
+  }
+}
+
+fn default_completion_retries() -> u32 {
+  2
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+  pub id: Option<String>,
+  pub custom: Option<CustomAgentConfig>,
+  pub completion_retries: u32,
+  pub preferences: AgentPreferences,
+  pub turn_timeout_secs: u64,
+}
+
+impl Serialize for AgentConfig {
+  fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    let preferences = &self.preferences;
+
+    let mut state = serializer.serialize_struct("AgentConfig", 5)?;
+    if let Some(id) = &self.id {
+      state.serialize_field("id", id)?;
+    }
+    if let Some(custom) = &self.custom {
+      state.serialize_field("custom", custom)?;
+    }
+    state.serialize_field("completion_retries", &self.completion_retries)?;
+    state.serialize_field("preferences", &preferences)?;
+    state.serialize_field("turn_timeout_secs", &self.turn_timeout_secs)?;
+    state.end()
+  }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentConfigWire {
+  id: Option<String>,
+  custom: Option<CustomAgentConfig>,
+  #[serde(default = "default_completion_retries")]
+  completion_retries: u32,
   #[serde(default)]
-  pub skills: SkillsConfig,
+  preferences: AgentPreferences,
+  turn_timeout_secs: u64,
+}
+
+impl<'de> Deserialize<'de> for AgentConfig {
+  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+  where
+    D: de::Deserializer<'de>,
+  {
+    let wire = AgentConfigWire::deserialize(deserializer)?;
+    let config = Self {
+      id: wire.id,
+      custom: wire.custom,
+      completion_retries: wire.completion_retries,
+      preferences: wire.preferences,
+      turn_timeout_secs: wire.turn_timeout_secs,
+    };
+    config.validate_launch_source().map_err(de::Error::custom)?;
+    Ok(config)
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentConfig {
+#[serde(deny_unknown_fields)]
+pub struct CustomAgentConfig {
   pub command: String,
-  pub model: Option<String>,
-  pub thinking: String,
-  #[serde(default, skip_serializing_if = "AgentRoleOverrides::is_empty")]
-  pub roles: AgentRoleOverrides,
-  pub auto_approve: bool,
-  pub turn_timeout_secs: u64,
-  pub read_only_tools: Vec<String>,
-  pub coding_tools: Vec<String>,
-  pub extra_args: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AgentRoleConfig {
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub model: Option<String>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub thinking: Option<String>,
-}
-
-impl AgentRoleConfig {
-  fn is_empty(&self) -> bool {
-    self.model.is_none() && self.thinking.is_none()
-  }
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct AgentRoleOverrides {
-  #[serde(skip_serializing_if = "AgentRoleConfig::is_empty")]
-  pub architect: AgentRoleConfig,
-  #[serde(skip_serializing_if = "AgentRoleConfig::is_empty")]
-  pub reconcile: AgentRoleConfig,
-  #[serde(skip_serializing_if = "AgentRoleConfig::is_empty")]
-  pub implement: AgentRoleConfig,
-  #[serde(skip_serializing_if = "AgentRoleConfig::is_empty")]
-  pub repair: AgentRoleConfig,
-  #[serde(skip_serializing_if = "AgentRoleConfig::is_empty")]
-  pub assess: AgentRoleConfig,
-}
-
-impl AgentRoleOverrides {
-  fn is_empty(&self) -> bool {
-    self.architect.is_empty()
-      && self.reconcile.is_empty()
-      && self.implement.is_empty()
-      && self.repair.is_empty()
-      && self.assess.is_empty()
-  }
-
-  fn from_agent_defaults(model: Option<&str>, thinking: &str) -> Self {
-    let role = || AgentRoleConfig {
-      model: model.map(str::to_owned),
-      thinking: Some(thinking.to_owned()),
-    };
-    Self {
-      architect: role(),
-      reconcile: role(),
-      implement: role(),
-      repair: role(),
-      assess: role(),
-    }
-  }
+  #[serde(default)]
+  pub args: Vec<String>,
+  #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+  pub env: std::collections::BTreeMap<String, String>,
 }
 
 impl AgentConfig {
-  pub fn role(&self, role: WorkerRole) -> &AgentRoleConfig {
-    match role {
-      WorkerRole::Architect => &self.roles.architect,
-      WorkerRole::Reconcile => &self.roles.reconcile,
-      WorkerRole::Implement => &self.roles.implement,
-      WorkerRole::Repair => &self.roles.repair,
-      WorkerRole::Assess => &self.roles.assess,
-    }
+  pub fn has_launch_source(&self) -> bool {
+    self.id.as_deref().is_some_and(|id| !id.trim().is_empty())
+      || self
+        .custom
+        .as_ref()
+        .is_some_and(|custom| !custom.command.trim().is_empty())
   }
 
+  pub fn validate_launch_source(&self) -> Result<()> {
+    if self.id.as_deref().is_some_and(|id| id.trim().is_empty()) {
+      anyhow::bail!("agent.id must not be blank");
+    }
+    if self
+      .custom
+      .as_ref()
+      .is_some_and(|custom| custom.command.trim().is_empty())
+    {
+      anyhow::bail!("agent.custom.command must not be blank");
+    }
+    match (&self.id, &self.custom) {
+      (Some(_), Some(_)) => anyhow::bail!("ambiguous ACP launch source: choose either agent.id or agent.custom.command, not both"),
+      (None, None) => anyhow::bail!("no ACP launch source configured: select a Registry agent with agent.id or configure agent.custom.command"),
+      _ => Ok(()),
+    }
+  }
   pub fn model_for(&self, role: WorkerRole) -> Option<&str> {
-    self.role(role).model.as_deref().or(self.model.as_deref())
+    self
+      .preferences
+      .roles
+      .get(role.as_str())
+      .and_then(|p| p.model.as_deref())
+      .or(self.preferences.default.model.as_deref())
   }
 
   pub fn thinking_for(&self, role: WorkerRole) -> &str {
     self
-      .role(role)
-      .thinking
-      .as_deref()
-      .unwrap_or(&self.thinking)
+      .preferences
+      .roles
+      .get(role.as_str())
+      .and_then(|p| p.thought_level.as_deref())
+      .or(self.preferences.default.thought_level.as_deref())
+      .unwrap_or("high")
+  }
+
+  pub fn preferences_for(&self, role: WorkerRole) -> RolePreference {
+    self.preferences.for_role(role)
   }
 
   fn populate_role_defaults(&mut self) {
-    self.roles = AgentRoleOverrides::from_agent_defaults(self.model.as_deref(), &self.thinking);
+    self
+      .preferences
+      .default
+      .thought_level
+      .get_or_insert_with(|| "high".into());
+  }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AgentPreferences {
+  pub default: RolePreference,
+  pub roles: std::collections::BTreeMap<String, RolePreference>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct AgentPreferencesWire {
+  default: RolePreference,
+  roles: std::collections::BTreeMap<String, RolePreference>,
+}
+
+impl<'de> Deserialize<'de> for AgentPreferences {
+  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+  where
+    D: de::Deserializer<'de>,
+  {
+    let wire = AgentPreferencesWire::deserialize(deserializer)?;
+    let preferences = Self {
+      default: wire.default,
+      roles: wire.roles,
+    };
+    preferences
+      .validate_role_names()
+      .map_err(de::Error::custom)?;
+    Ok(preferences)
+  }
+}
+
+impl Default for AgentPreferences {
+  fn default() -> Self {
+    Self {
+      default: RolePreference {
+        thought_level: Some("high".into()),
+        ..RolePreference::default()
+      },
+      roles: std::collections::BTreeMap::new(),
+    }
+  }
+}
+
+impl AgentPreferences {
+  pub fn for_role(&self, role: WorkerRole) -> RolePreference {
+    let mut preference = self.default.clone();
+    if let Some(override_) = self.roles.get(role.as_str()) {
+      if override_.model.is_some() {
+        preference.model = override_.model.clone();
+      }
+      if override_.thought_level.is_some() {
+        preference.thought_level = override_.thought_level.clone();
+      }
+      if override_.mode.is_some() {
+        preference.mode = override_.mode.clone();
+      }
+      if override_.required_is_set {
+        preference.required = override_.required;
+        preference.required_is_set = true;
+      }
+    }
+    preference
+  }
+
+  fn validate_role_names(&self) -> Result<()> {
+    for role in self.roles.keys() {
+      if !matches!(
+        role.as_str(),
+        "architect" | "reconcile" | "implement" | "repair" | "assess"
+      ) {
+        anyhow::bail!("unknown agent worker role {role:?}");
+      }
+    }
+    Ok(())
   }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationConfig {
-  pub auto_detect: bool,
   pub require_project_gate: bool,
   pub commands: Vec<String>,
   pub timeout_secs: u64,
@@ -131,23 +301,11 @@ pub struct VerificationConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GitConfig {
   pub init: bool,
   pub auto_commit: bool,
   pub require_clean_tree: bool,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SkillsConfig {
-  pub shared: Vec<String>,
-  pub roles: std::collections::BTreeMap<String, Vec<String>>,
-}
-
-impl SkillsConfig {
-  pub fn role_paths(&self, role: WorkerRole) -> impl Iterator<Item = &String> {
-    self.roles.get(role.as_str()).into_iter().flatten()
-  }
 }
 
 impl Default for Config {
@@ -159,24 +317,19 @@ impl Default for Config {
       max_repair_attempts: 3,
       stagnation_limit: 3,
       agent: AgentConfig {
-        command: "omp".into(),
-        model: None,
-        thinking: "high".into(),
-        roles: AgentRoleOverrides::default(),
-        auto_approve: true,
+        id: None,
+        custom: None,
+        completion_retries: 2,
+        preferences: AgentPreferences {
+          default: RolePreference {
+            thought_level: Some("high".into()),
+            ..RolePreference::default()
+          },
+          roles: std::collections::BTreeMap::new(),
+        },
         turn_timeout_secs: 900,
-        read_only_tools: vec!["read", "grep", "glob"]
-          .into_iter()
-          .map(str::to_owned)
-          .collect(),
-        coding_tools: vec!["read", "grep", "glob", "edit", "write", "bash"]
-          .into_iter()
-          .map(str::to_owned)
-          .collect(),
-        extra_args: Vec::new(),
       },
       verification: VerificationConfig {
-        auto_detect: true,
         require_project_gate: true,
         commands: Vec::new(),
         timeout_secs: 120,
@@ -200,7 +353,6 @@ impl Default for Config {
       .into_iter()
       .map(str::to_owned)
       .collect(),
-      skills: SkillsConfig::default(),
     }
   }
 }
@@ -227,7 +379,10 @@ pub async fn read_config(cwd: &Path) -> Result<Config> {
   let text = fs::read_to_string(&path)
     .await
     .with_context(|| format!("read {}", path.display()))?;
-  toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
+  let config: Config =
+    toml::from_str(&text).map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))?;
+  config.agent.validate_launch_source()?;
+  Ok(config)
 }
 
 #[cfg(test)]
@@ -247,10 +402,19 @@ mod tests {
 
   fn serialized_config(configure: impl FnOnce(&mut Config), role_overrides: &str) -> String {
     let mut config = Config::default();
+    config.agent.id = Some("test-agent".into());
     configure(&mut config);
     let mut text = toml::to_string_pretty(&config).unwrap();
     text.push_str(role_overrides);
     text
+  }
+
+  async fn read_error(text: String) -> String {
+    let project = tempdir().unwrap();
+    tokio::fs::write(config_path(project.path()), text)
+      .await
+      .unwrap();
+    read_config(project.path()).await.unwrap_err().to_string()
   }
 
   fn config_schema() -> serde_json::Value {
@@ -282,11 +446,10 @@ mod tests {
       "verification",
       "git",
       "protected_paths",
-      "skills",
     ];
     expected_root.sort_unstable();
 
-    let mut role_properties = schema["$defs"]["agentRoleOverrides"]["properties"]
+    let mut role_properties = schema["$defs"]["agentPreferenceRoles"]["properties"]
       .as_object()
       .unwrap()
       .keys()
@@ -299,13 +462,15 @@ mod tests {
     assert_eq!(root_properties, expected_root);
     assert_eq!(role_properties, expected_roles);
     assert_eq!(
-      schema["$defs"]["agentRoleOverride"]["properties"]
+      schema["$defs"]["rolePreference"]["properties"]
         .as_object()
         .unwrap()
         .keys()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>(),
-      ["model", "thinking"].into_iter().collect(),
+      ["model", "thought_level", "mode", "required"]
+        .into_iter()
+        .collect(),
     );
   }
 
@@ -335,37 +500,19 @@ mod tests {
       schema["properties"]["protected_paths"]["default"],
       serde_json::to_value(config.protected_paths).unwrap()
     );
+    assert!(schema["$defs"]["agentConfig"]["properties"]["id"].is_object());
+    assert!(schema["$defs"]["agentConfig"]["properties"]["custom"].is_object());
     assert_eq!(
-      schema["$defs"]["agentConfig"]["properties"]["command"]["default"],
-      config.agent.command
+      schema["$defs"]["agentConfig"]["properties"]["completion_retries"]["default"],
+      config.agent.completion_retries
     );
     assert_eq!(
-      schema["$defs"]["agentConfig"]["properties"]["thinking"]["default"],
-      config.agent.thinking
-    );
-    assert_eq!(
-      schema["$defs"]["agentConfig"]["properties"]["auto_approve"]["default"],
-      config.agent.auto_approve
+      schema["$defs"]["agentConfig"]["properties"]["preferences"]["default"],
+      serde_json::to_value(&config.agent.preferences).unwrap()
     );
     assert_eq!(
       schema["$defs"]["agentConfig"]["properties"]["turn_timeout_secs"]["default"],
       config.agent.turn_timeout_secs
-    );
-    assert_eq!(
-      schema["$defs"]["agentConfig"]["properties"]["read_only_tools"]["default"],
-      serde_json::to_value(config.agent.read_only_tools).unwrap()
-    );
-    assert_eq!(
-      schema["$defs"]["agentConfig"]["properties"]["coding_tools"]["default"],
-      serde_json::to_value(config.agent.coding_tools).unwrap()
-    );
-    assert_eq!(
-      schema["$defs"]["agentConfig"]["properties"]["extra_args"]["default"],
-      serde_json::to_value(config.agent.extra_args).unwrap()
-    );
-    assert_eq!(
-      schema["$defs"]["verificationConfig"]["properties"]["auto_detect"]["default"],
-      config.verification.auto_detect
     );
     assert_eq!(
       schema["$defs"]["verificationConfig"]["properties"]["require_project_gate"]["default"],
@@ -395,33 +542,29 @@ mod tests {
       schema["$defs"]["gitConfig"]["properties"]["require_clean_tree"]["default"],
       config.git.require_clean_tree
     );
-    assert_eq!(
-      schema["properties"]["skills"]["default"],
-      serde_json::json!({"shared": config.skills.shared, "roles": config.skills.roles})
-    );
   }
 
   #[tokio::test]
-  async fn generated_config_is_created_at_the_project_root_and_remains_parseable() {
+  async fn generated_config_is_created_at_the_project_root_and_requires_a_source() {
     let project = tempdir().unwrap();
 
     ensure_config(project.path()).await.unwrap();
     let path = config_path(project.path());
     let generated = tokio::fs::read_to_string(&path).await.unwrap();
-    let loaded = read_config(project.path()).await.unwrap();
+    let error = read_config(project.path()).await.unwrap_err().to_string();
 
     assert_eq!(path, project.path().join("loops.toml"));
     assert!(!project.path().join(LOOPS_DIR).join("config.toml").exists());
     assert!(generated.contains("spec_file = \".loops/spec.md\""));
     assert!(generated.starts_with(&format!("#:schema {CONFIG_SCHEMA_URL}\n\n")));
-    assert_eq!(loaded.version, Config::default().version);
+    assert!(error.contains("no ACP launch source configured"));
   }
 
   #[tokio::test]
   async fn existing_config_without_schema_directive_is_not_rewritten() {
     let project = tempdir().unwrap();
     ensure_config(project.path()).await.unwrap();
-    let legacy = toml::to_string_pretty(&Config::default()).unwrap();
+    let legacy = serialized_config(|_| {}, "");
     tokio::fs::write(config_path(project.path()), &legacy)
       .await
       .unwrap();
@@ -440,11 +583,11 @@ mod tests {
     let text = serialized_config(
       |_| {},
       concat!(
-        "\n[agent.roles.architect]\nmodel = \"architect-model\"\n",
-        "[agent.roles.reconcile]\nthinking = \"medium\"\n",
-        "[agent.roles.implement]\nmodel = \"implement-model\"\nthinking = \"high\"\n",
-        "[agent.roles.repair]\nthinking = \"low\"\n",
-        "[agent.roles.assess]\nmodel = \"assess-model\"\n",
+        "\n[agent.preferences.roles.architect]\nmodel = \"architect-model\"\n",
+        "[agent.preferences.roles.reconcile]\nthought_level = \"medium\"\n",
+        "[agent.preferences.roles.implement]\nmodel = \"implement-model\"\nthought_level = \"high\"\n",
+        "[agent.preferences.roles.repair]\nthought_level = \"low\"\n",
+        "[agent.preferences.roles.assess]\nmodel = \"assess-model\"\n",
       ),
     );
 
@@ -460,7 +603,7 @@ mod tests {
     );
     for role in ROLES {
       assert!(
-        schema["$defs"]["agentRoleOverrides"]["properties"]
+        schema["$defs"]["agentPreferenceRoles"]["properties"]
           .get(role.as_str())
           .is_some(),
         "schema is missing the {} role",
@@ -468,132 +611,115 @@ mod tests {
       );
     }
   }
-
-  #[tokio::test]
-  async fn ensure_config_writes_supported_omp_tools() {
-    let project = tempdir().unwrap();
-
-    let config = ensure_config(project.path()).await.unwrap();
-    let generated = tokio::fs::read_to_string(config_path(project.path()))
-      .await
-      .unwrap();
-
-    assert_eq!(config.agent.read_only_tools, ["read", "grep", "glob"]);
-    assert_eq!(
-      config.agent.coding_tools,
-      ["read", "grep", "glob", "edit", "write", "bash"]
-    );
-    assert!(generated.contains("glob"));
-    assert!(!generated.contains("\"find\""));
-    assert!(!generated.contains("\"ls\""));
-    for role in ROLES {
-      assert_eq!(config.agent.model_for(role), None);
-      assert_eq!(config.agent.thinking_for(role), "high");
-      assert!(generated.contains(&format!("[agent.roles.{}]", role.as_str())));
-    }
+  #[test]
+  fn launch_sources_are_exclusive_and_required() {
+    let mut config = Config::default();
+    assert!(config.agent.validate_launch_source().is_err());
+    config.agent.id = Some("pi-acp".into());
+    assert!(config.agent.validate_launch_source().is_ok());
+    config.agent.custom = Some(super::CustomAgentConfig {
+      command: "omp".into(),
+      args: vec!["acp".into()],
+      env: Default::default(),
+    });
+    let error = config
+      .agent
+      .validate_launch_source()
+      .unwrap_err()
+      .to_string();
+    assert!(error.contains("ambiguous ACP launch source"));
   }
 
-  #[test]
-  fn legacy_agent_config_applies_global_values_to_every_role() {
+  #[tokio::test]
+  async fn read_config_rejects_missing_launch_source() {
+    let error = read_error(toml::to_string_pretty(&Config::default()).unwrap()).await;
+
+    assert!(error.contains("no ACP launch source configured"));
+  }
+
+  #[tokio::test]
+  async fn read_config_rejects_ambiguous_launch_sources() {
     let text = serialized_config(
       |config| {
-        config.agent.model = Some("legacy-model".into());
-        config.agent.thinking = "medium".into();
+        config.agent.custom = Some(super::CustomAgentConfig {
+          command: "agent".into(),
+          args: Vec::new(),
+          env: Default::default(),
+        });
       },
       "",
     );
+    let error = read_error(text).await;
 
-    let loaded: Config = toml::from_str(&text).unwrap();
-
-    for role in ROLES {
-      assert_eq!(loaded.agent.model_for(role), Some("legacy-model"));
-      assert_eq!(loaded.agent.thinking_for(role), "medium");
-    }
+    assert!(error.contains("ambiguous ACP launch source"));
   }
 
-  #[test]
-  fn architect_can_override_model_and_thinking() {
-    let text = serialized_config(
-      |_| {},
-      "\n[agent.roles.architect]\nmodel = \"architect-model\"\nthinking = \"xhigh\"\n",
-    );
+  #[tokio::test]
+  async fn read_config_rejects_blank_registry_identity() {
+    let text = serialized_config(|config| config.agent.id = Some(" \t".into()), "");
+    let error = read_error(text).await;
 
-    let loaded: Config = toml::from_str(&text).unwrap();
-
-    assert_eq!(
-      (
-        loaded.agent.model_for(WorkerRole::Architect),
-        loaded.agent.thinking_for(WorkerRole::Architect),
-      ),
-      (Some("architect-model"), "xhigh"),
-    );
+    assert!(error.contains("agent.id must not be blank"));
   }
 
-  #[test]
-  fn thinking_only_override_inherits_global_model() {
+  #[tokio::test]
+  async fn read_config_rejects_blank_custom_command() {
     let text = serialized_config(
       |config| {
-        config.agent.model = Some("global-model".into());
-        config.agent.thinking = "medium".into();
+        config.agent.id = None;
+        config.agent.custom = Some(super::CustomAgentConfig {
+          command: " \t".into(),
+          args: Vec::new(),
+          env: Default::default(),
+        });
       },
-      "\n[agent.roles.implement]\nthinking = \"low\"\n",
+      "",
     );
+    let error = read_error(text).await;
 
-    let loaded: Config = toml::from_str(&text).unwrap();
-
-    assert_eq!(
-      (
-        loaded.agent.model_for(WorkerRole::Implement),
-        loaded.agent.thinking_for(WorkerRole::Implement),
-      ),
-      (Some("global-model"), "low"),
-    );
+    assert!(error.contains("agent.custom.command must not be blank"));
   }
 
-  #[test]
-  fn model_only_override_inherits_global_thinking() {
-    let text = serialized_config(
-      |config| config.agent.thinking = "medium".into(),
-      "\n[agent.roles.assess]\nmodel = \"assessment-model\"\n",
+  #[tokio::test]
+  async fn read_config_rejects_unknown_agent_fields() {
+    let text = serialized_config(|_| {}, "").replacen(
+      "turn_timeout_secs = 900\n",
+      "turn_timeout_secs = 900\nauto_approve = true\n",
+      1,
     );
+    let error = read_error(text).await;
 
-    let loaded: Config = toml::from_str(&text).unwrap();
-
-    assert_eq!(
-      (
-        loaded.agent.model_for(WorkerRole::Assess),
-        loaded.agent.thinking_for(WorkerRole::Assess),
-      ),
-      (Some("assessment-model"), "medium"),
-    );
+    assert!(error.contains("auto_approve"));
   }
-
   #[test]
-  fn architect_override_does_not_affect_other_roles() {
-    let text = serialized_config(
-      |config| {
-        config.agent.model = Some("global-model".into());
-        config.agent.thinking = "medium".into();
-      },
-      "\n[agent.roles.architect]\nmodel = \"architect-model\"\nthinking = \"xhigh\"\n",
-    );
-
-    let loaded: Config = toml::from_str(&text).unwrap();
-
-    for role in [
-      WorkerRole::Reconcile,
-      WorkerRole::Implement,
-      WorkerRole::Repair,
-      WorkerRole::Assess,
+  fn legacy_agent_preference_fields_are_rejected() {
+    for (legacy_field, expected_error) in [
+      ("model = \"legacy-model\"", "model"),
+      ("thinking = \"medium\"", "thinking"),
+      ("roles = {}", "roles"),
     ] {
-      assert_eq!(loaded.agent.model_for(role), Some("global-model"));
-      assert_eq!(loaded.agent.thinking_for(role), "medium");
+      let text = serialized_config(|_| {}, "").replacen(
+        "turn_timeout_secs = 900\n",
+        &format!("turn_timeout_secs = 900\n{legacy_field}\n"),
+        1,
+      );
+
+      let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
+      assert!(error.contains(expected_error), "unexpected error: {error}");
     }
+
+    let text =
+      serialized_config(|_| {}, "").replacen("thought_level = \"high\"", "thinking = \"high\"", 1);
+    let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
+    assert!(error.contains("thinking"), "unexpected error: {error}");
   }
 
   #[test]
   fn unknown_worker_role_is_rejected() {
-    let text = serialized_config(|_| {}, "\n[agent.roles.implment]\nthinking = \"high\"\n");
+    let text = serialized_config(
+      |_| {},
+      "\n[agent.preferences.roles.implment]\nthought_level = \"high\"\n",
+    );
 
     let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
 
@@ -604,7 +730,7 @@ mod tests {
   fn missing_global_model_remains_none_except_for_overridden_role() {
     let text = serialized_config(
       |_| {},
-      "\n[agent.roles.implement]\nmodel = \"implementation-model\"\n",
+      "\n[agent.preferences.roles.implement]\nmodel = \"implementation-model\"\n",
     );
 
     let loaded: Config = toml::from_str(&text).unwrap();
@@ -624,20 +750,25 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn missing_skills_section_uses_reproducible_defaults() {
+  async fn checked_in_sample_uses_custom_acp_and_retains_preferences() {
     let project = tempdir().unwrap();
-    let config = ensure_config(project.path()).await.unwrap();
-    let generated = tokio::fs::read_to_string(config_path(project.path()))
-      .await
-      .unwrap();
-    let legacy = generated.split("\n[skills]\n").next().unwrap();
-    tokio::fs::write(config_path(project.path()), legacy)
-      .await
-      .unwrap();
+    tokio::fs::write(
+      config_path(project.path()),
+      include_str!("../../loops.toml"),
+    )
+    .await
+    .unwrap();
 
-    let loaded = super::read_config(project.path()).await.unwrap();
-    assert!(loaded.skills.shared.is_empty());
-    assert!(loaded.skills.roles.is_empty());
-    assert_eq!(loaded.spec_file, config.spec_file);
+    let loaded = read_config(project.path()).await.unwrap();
+    let custom = loaded.agent.custom.as_ref().unwrap();
+
+    assert_eq!(custom.command, "omp");
+    assert_eq!(custom.args, vec!["acp".to_owned()]);
+    assert_eq!(loaded.agent.thinking_for(WorkerRole::Architect), "high");
+    assert_eq!(loaded.agent.turn_timeout_secs, 900);
+    assert_eq!(
+      loaded.agent.model_for(WorkerRole::Architect),
+      Some("openai-codex/gpt-5.6-sol"),
+    );
   }
 }

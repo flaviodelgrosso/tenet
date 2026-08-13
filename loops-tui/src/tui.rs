@@ -24,7 +24,6 @@ use ratatui::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use loops_application::{backend::AgentBackend, controller::Controller, store};
 use loops_domain::{
   events::{EventSink, RunEvent},
   model::{
@@ -32,6 +31,7 @@ use loops_domain::{
     RequirementStatus, RunStatus, State, VerificationReport, WorkerEvent, WorkerRole,
   },
 };
+use loops_runtime::{backend::AgentBackend, controller::Controller, store};
 
 const MAX_ACTIVITIES: usize = 2_000;
 const MAX_TEXT_BYTES: usize = 500_000;
@@ -218,7 +218,6 @@ struct WorkerSession {
   role: WorkerRole,
   started_at: String,
   finished_at: Option<String>,
-  skills: Vec<String>,
   activities: Vec<WorkerActivity>,
   status: WorkerUiStatus,
   message: Option<String>,
@@ -415,12 +414,11 @@ impl App {
 
   fn apply_worker(&mut self, event: WorkerEvent) {
     match event {
-      WorkerEvent::Start { role, at, skills } => {
+      WorkerEvent::Start { role, at } => {
         self.workers.push(WorkerSession {
           role,
           started_at: at.clone(),
           finished_at: None,
-          skills,
           activities: Vec::new(),
           status: WorkerUiStatus::Running,
           message: None,
@@ -549,7 +547,6 @@ impl App {
         role,
         started_at: at.to_owned(),
         finished_at: None,
-        skills: Vec::new(),
         activities: Vec::new(),
         status: WorkerUiStatus::Running,
         message: None,
@@ -1571,14 +1568,6 @@ fn draw_worker(frame: &mut Frame, app: &mut App, area: Rect) {
   if let Some(context_area) = rows.get(2).copied() {
     let mut context = vec![section_heading("CONTEXT")];
     context.push(Line::from(vec![
-      Span::styled("skills   ", Style::default().fg(QUIET)),
-      Span::raw(if worker.skills.is_empty() {
-        "—".into()
-      } else {
-        worker.skills.join(", ")
-      }),
-    ]));
-    context.push(Line::from(vec![
       Span::styled("changes  ", Style::default().fg(QUIET)),
       Span::raw(format_changes_summary(&app.repository_changes)),
     ]));
@@ -2349,7 +2338,6 @@ mod tests {
     WorkerEvent::Start {
       role: WorkerRole::Implement,
       at: "2026-08-10T10:00:00Z".into(),
-      skills: vec!["implementation".into(), "rust".into()],
     }
   }
 

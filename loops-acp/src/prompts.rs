@@ -11,7 +11,9 @@ pub fn role_prompt(role: WorkerRole) -> &'static str {
 }
 
 const COMMON_END: &str = r#"
-When your work for this turn is complete, call the host tool `loops_yield` exactly once with an object matching its schema. Do not use prose as a substitute for that call.
+When your work for this turn is complete, return exactly one JSON value matching the supplied output schema as your entire final answer.
+Do not use markdown or add prose around the JSON value.
+Use an MCP `loops_yield` tool only if it is supplied and available; it is optional and never mandatory.
 "#;
 
 const ARCHITECT: &str = r#"You are the architecture layer of an autonomous spec-driven development controller.

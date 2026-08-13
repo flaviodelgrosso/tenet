@@ -33,6 +33,7 @@ pub enum RequirementStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Requirement {
   pub id: String,
   pub title: String,
@@ -47,13 +48,14 @@ pub struct RequirementCatalog {
   pub spec_hash: String,
   pub requirements: Vec<Requirement>,
 }
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ArchitectOutput {
   pub requirements: Vec<Requirement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RequirementAssessment {
   pub id: String,
   pub status: RequirementStatus,
@@ -62,6 +64,7 @@ pub struct RequirementAssessment {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkUnit {
   pub id: String,
   pub title: String,
@@ -75,6 +78,7 @@ pub struct WorkUnit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ReconcileResult {
   pub complete: bool,
   pub summary: String,
@@ -84,6 +88,7 @@ pub struct ReconcileResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerSummary {
   pub summary: String,
   #[serde(rename = "changedFiles")]
@@ -219,7 +224,6 @@ pub enum WorkerEvent {
   Start {
     role: WorkerRole,
     at: String,
-    skills: Vec<String>,
   },
   Text {
     role: WorkerRole,

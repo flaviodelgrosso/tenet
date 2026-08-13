@@ -1,5 +1,6 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
+  future::Future,
   path::{Path, PathBuf},
   sync::Arc,
 };
@@ -10,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use loops_domain::{
-  config::{ensure_config, Config, LOOPS_DIR},
+  config::{config_path, ensure_config, read_config, Config, LOOPS_DIR},
   events::{EventSink, RunEvent, RunLogger},
   model::{
     CompletedWorkUnit, Phase, ReconcileResult, RequirementCatalog, RequirementCounts,
@@ -24,7 +25,6 @@ use crate::{
   store::{self, RunLock},
   verifier,
 };
-
 pub struct Controller {
   cwd: PathBuf,
   backend: Arc<dyn AgentBackend>,
@@ -55,6 +55,13 @@ impl Controller {
   }
 
   pub async fn run(&self, cancel: CancellationToken) -> Result<State> {
+    let path = config_path(&self.cwd);
+    if !path.exists() {
+      bail!("no loops.toml launch source configured; run `loops init`, then select a Registry agent or configure a custom ACP command")
+    }
+    let configured = read_config(&self.cwd).await?;
+    configured.agent.validate_launch_source()?;
+    let launch = self.backend.resolve_launch(&self.cwd, &configured).await?;
     self.initialize().await?;
     let _lock = RunLock::acquire(&self.cwd)?;
     let config = Arc::new(ensure_config(&self.cwd).await?);
@@ -72,8 +79,8 @@ impl Controller {
       config: config.clone(),
       cancel: cancel.clone(),
       events: events.clone(),
+      launch,
     };
-
     let mut state = store::read_state(&self.cwd)
       .await
       .unwrap_or_else(|_| State::fresh());
@@ -136,10 +143,12 @@ impl Controller {
       self.publish(&ctx.events, state).await?;
 
       let reconciliation = self
-        .backend
-        .reconcile(ctx, &catalog, &state.completed_work_units)
-        .await
-        .context("reconciliation worker")?;
+        .read_only_worker(ctx, "reconciliation", || {
+          self
+            .backend
+            .reconcile(ctx, &catalog, &state.completed_work_units)
+        })
+        .await?;
       validate_reconcile(&catalog, &reconciliation)?;
       store::write_roadmap(&self.cwd, &reconciliation).await?;
       state.requirement_counts = requirement_counts(&catalog, &reconciliation);
@@ -170,10 +179,8 @@ impl Controller {
         state.last_summary = "Independent fresh-context completion assessment".into();
         self.publish(&ctx.events, state).await?;
         let assessment = self
-          .backend
-          .assess(ctx, &catalog)
-          .await
-          .context("assessment worker")?;
+          .read_only_worker(ctx, "assessment", || self.backend.assess(ctx, &catalog))
+          .await?;
         validate_reconcile(&catalog, &assessment)?;
         store::write_roadmap(&self.cwd, &assessment).await?;
         state.requirement_counts = requirement_counts(&catalog, &assessment);
@@ -328,10 +335,8 @@ impl Controller {
     state.last_summary = "Deriving requirement catalog from .loops/spec.md".into();
     self.publish(&ctx.events, state).await?;
     let output = self
-      .backend
-      .architect(ctx, &spec)
-      .await
-      .context("architect worker")?;
+      .read_only_worker(ctx, "architect", || self.backend.architect(ctx, &spec))
+      .await?;
     validate_requirements(&output.requirements)?;
     let catalog = RequirementCatalog {
       spec_hash,
@@ -345,6 +350,35 @@ impl Controller {
     };
     self.publish(&ctx.events, state).await?;
     Ok(catalog)
+  }
+
+  async fn read_only_worker<T, F, Fut>(
+    &self,
+    ctx: &BackendContext,
+    name: &str,
+    call: F,
+  ) -> Result<T>
+  where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<T>>,
+  {
+    let protected = protection::snapshot(&self.cwd, &protected_paths(&ctx.config)).await?;
+    let result = call().await;
+    let restoration = protection::restore_changes(&self.cwd, &protected).await;
+    match (result, restoration) {
+      (Ok(value), Ok(changed)) if changed.is_empty() => Ok(value),
+      (Ok(_), Ok(changed)) => bail!(
+        "{name} worker violated read-only contract; restored: {}",
+        changed.join(", ")
+      ),
+      (Ok(_), Err(cleanup_error)) => Err(cleanup_error).context(format!(
+        "{name} worker cleanup failed while enforcing read-only contract"
+      )),
+      (Err(worker_error), Ok(_)) => Err(worker_error).context(format!("{name} worker")),
+      (Err(worker_error), Err(cleanup_error)) => Err(worker_error).context(format!(
+        "{name} worker; read-only cleanup also failed: {cleanup_error:#}"
+      )),
+    }
   }
 
   async fn refresh_catalog_if_spec_changed(
@@ -582,7 +616,7 @@ fn final_gate_work_unit(catalog: &RequirementCatalog) -> WorkUnit {
         title: "Final deterministic acceptance".into(),
         objective: "Repair any remaining issue that prevents the project's deterministic acceptance gates from passing.".into(),
         requirement_ids: catalog.requirements.iter().map(|r| r.id.clone()).collect(),
-        acceptance_criteria: vec!["All configured and auto-detected deterministic gates pass without weakening them.".into()],
+        acceptance_criteria: vec!["All configured deterministic gates pass without weakening them.".into()],
         suggested_checks: Vec::new(),
     }
 }

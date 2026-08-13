@@ -1,4 +1,4 @@
-#:schema https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json
+#:schema ./schemas/config.schema.json
 
 version = 1
 spec_file = ".loops/spec.md"
@@ -17,34 +17,25 @@ protected_paths = [
 ]
 
 [agent]
-command = "omp"
-model = "openai-codex/gpt-5.6-terra"
-thinking = "high"
-auto_approve = true
+completion_retries = 2
 turn_timeout_secs = 900
-read_only_tools = ["read", "grep", "glob"]
-coding_tools = ["read", "grep", "glob", "edit", "write", "bash"]
-extra_args = []
 
-[agent.roles.architect]
+[agent.custom]
+command = "omp"
+args = ["acp"]
+
+[agent.preferences.default]
+thought_level = "high"
 model = "openai-codex/gpt-5.6-sol"
-thinking = "high"
 
-[agent.roles.reconcile]
-thinking = "medium"
-
-[agent.roles.implement]
-model = "openai-codex/gpt-5.6-luna"
-thinking = "medium"
-
-[agent.roles.repair]
-thinking = "medium"
-
-[agent.roles.assess]
-thinking = "medium"
+[agent.preferences.roles]
+architect = { thought_level = "xhigh" }
+reconcile = { model = "openai-codex/gpt-5.6-terra" }
+implement = { thought_level = "medium", model = "openai-codex/gpt-5.6-luna" }
+repair = { model = "openai-codex/gpt-5.6-luna" }
+assess = { thought_level = "medium", model = "openai-codex/gpt-5.6-terra" }
 
 [verification]
-auto_detect = true
 require_project_gate = true
 commands = []
 timeout_secs = 120
@@ -54,8 +45,3 @@ max_output_bytes = 65536
 init = true
 auto_commit = false
 require_clean_tree = false
-
-[skills]
-shared = []
-
-[skills.roles]

@@ -9,7 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
-loops-application = { path = "../loops-application" }
+loops-runtime = { path = "../loops-runtime" }
 loops-domain = { path = "../loops-domain" }
 ratatui.workspace = true
 serde_json.workspace = true

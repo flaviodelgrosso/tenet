@@ -42,10 +42,10 @@ Instead, it runs a state machine that repeatedly:
 6. reconciles the repository against the spec again,
 7. and requires an independent assessment before considering the run complete.
 
-The default execution backend is **[Oh My Pi (OMP)](https://github.com/can1357/oh-my-pi)**, driven headlessly through `omp --mode rpc`.
+The production runtime speaks the **[Agent Client Protocol (ACP)](https://agentclientprotocol.com/)**. Choose an agent through its canonical Registry identity, or use an advanced custom ACP command.
 
-> **`loops` is the orchestrator. OMP is the execution backend.**
-> Workflow state, transitions, verification, retries, evidence, and completion rules are owned by the Rust controller rather than left entirely to the model.
+> **Bring your agent. Loops supplies the engineering process.**
+> Workflow state, transitions, verification, retries, evidence, and completion rules are owned by the Rust controller rather than left entirely to the agent.
 
 ---
 
@@ -63,8 +63,7 @@ The core control loop is implemented and usable, including:
 - persistent state and evidence,
 - stagnation and cycle limits,
 - independent final assessment,
-- per-role model and thinking configuration,
-- configurable worker skills,
+- per-role model and thought-level configuration,
 - TUI and non-interactive execution.
 
 What has **not** been proven yet is more important:
@@ -80,11 +79,9 @@ If you use `loops` today, treat it as experimental engineering tooling rather th
 ## The idea in one picture
 
 ```mermaid
-flowchart TD
+flowchart LR
     A["`authoritative
-.loops/spec.md`"]
-
-    A --> B["`loops
+.loops/spec.md`"] --> B["`loops
 
 state machine
 requirement catalog
@@ -93,26 +90,13 @@ evidence + audit trail
 retries / circuit break
 TUI`"]
 
-    B -- "`fresh, isolated
-OMP process`" --> C1["`Architect
-read-only`"]
-
-    B -- "`fresh, isolated
-OMP process`" --> C2["`Reconcile
-read-only`"]
-
-    B -- "`fresh, isolated
-OMP process`" --> C3["`Implement
-coding`"]
-
-    B -- "`fresh, isolated
-OMP process`" --> C4["`Repair
-coding`"]
-
-    B -- "`fresh, isolated
-OMP process`" --> C5["`Assess
-read-only`"]
+    B --> C["`single ACP boundary`"]
+    C --> D1["`Registry ACP agent`"]
+    C --> D2["`another Registry ACP agent`"]
+    C --> D3["`custom ACP command`"]
 ```
+
+The diagram shows interchangeable ACP launch choices, not multiple agents running in one project at once. A project configures exactly one source; each role receives a fresh session through the same ACP boundary.
 
 There is no permanent "master LLM" carrying the entire run in conversational memory.
 
@@ -151,7 +135,7 @@ A single agent can be very effective at implementing a bounded task. Over longer
 
 ### Disposable context, durable state
 
-Architect, Reconcile, Implement, Repair, and Assess run in separate OMP processes with fresh context.
+Architect, Reconcile, Implement, Repair, and Assess run in separate ACP sessions with fresh context.
 
 Workers do not inherit a long conversational history from previous workers.
 
@@ -256,14 +240,14 @@ DONE
 | **Repair**    | Responds to deterministic verification failures                                 | Read/write/bash | After verification fails                                       |
 | **Assess**    | Independently evaluates final repository state against the requirements         | Read-only       | After reconciliation and deterministic gates report completion |
 
-These are separate OS processes, not nested OMP subagents.
+These are separate ACP sessions, not nested agent subagents.
 
 Each worker receives a deliberately limited environment:
 
 ```text
-fresh OMP worker
+fresh ACP worker
     + role prompt
-    + controlled skills
+    + built-in role procedure
     + relevant work-unit context
     + repository
 ```
@@ -276,99 +260,43 @@ Parallel execution introduces coordination, merge, dependency, and verification 
 
 ---
 
-## Worker skills
+## Worker procedures
 
-`loops` creates an isolated per-worker skill environment under:
+`loops` creates an isolated per-worker procedure environment under:
 
 ```text
 .loops/runtime/<run>/<role>/skills
 ```
 
-and mounts only explicitly allowed skills.
+Agent-native extensions and global configuration are not implicitly inherited.
 
-`--no-extensions` and `--no-rules` remain enabled so worker behavior does not silently depend on machine-specific OMP configuration.
+`loops` ships role procedures rather than language-specific expertise:
 
-`loops` ships role-procedure skills rather than language-specific expertise:
+| Role                 | Built-in procedure |
+| -------------------- | ------------------ |
+| Architect, Reconcile | `spec-analysis`    |
+| Implement            | `implementation`   |
+| Repair               | `debugging`        |
+| Assess               | `spec-assessment`  |
 
-| Role                 | Built-in skill    |
-| -------------------- | ----------------- |
-| Architect, Reconcile | `spec-analysis`   |
-| Implement            | `implementation`  |
-| Repair               | `debugging`       |
-| Assess               | `spec-assessment` |
+A `code-review` procedure is also included for a possible future Review role, but Review is not currently part of the state machine.
 
-A `code-review` skill is also included for a possible future Review role, but Review is not currently part of the state machine.
+A **role prompt** defines worker identity, permissions, protected files, and a strict output schema. When an ACP MCP server is actually attached, it can additionally offer the optional `loops_yield` tool.
 
-A **role prompt** defines worker identity, permissions, protected files, and the `loops_yield` contract.
-
-A **built-in skill** describes the procedure expected from that role.
-
-**User skills** can provide project, company, framework, language, or domain-specific expertise.
+A **built-in procedure** describes the workflow expected from that role.
 
 A **work unit** describes the concrete task.
 
 The repository provides current reality.
 
-### User-defined skills
-
-Configure skills explicitly relative to the project root:
-
-```toml
-[skills]
-shared = [
-  ".loops/skills/project"
-]
-
-[skills.roles]
-implement = [
-  ".loops/skills/rust"
-]
-
-repair = [
-  ".loops/skills/rust"
-]
-```
-
-Every worker receives:
-
-1. its built-in role skill,
-2. configured shared skills,
-3. configured role-specific skills.
-
-Unconfigured global OMP skills, unrelated project skills, extensions, rules, and external capabilities are not implicitly inherited.
-
-Invalid configured skill paths fail before the worker starts.
-
-`loops` does not infer that a project needs a "Rust skill" because it sees `Cargo.toml`.
-
-Worker expertise is explicit configuration.
-
-Verification detection and worker skill selection are intentionally separate concerns.
-
 ---
-
 ## Structured completion, not prose parsing
 
-Workers do not finish by printing a JSON block that the controller attempts to recover from free-form output.
+The portable completion baseline is one whole-response JSON value: no markdown or surrounding prose. `loops` validates that value against the role's schema and then deserializes it into the controller's typed result.
 
-Each worker receives a host-owned RPC tool:
+This strict JSON path is required for every worker and is used whenever MCP is unavailable or the agent does not call the completion tool. Invalid output is retried according to `completion_retries`; continued invalid output fails the worker.
 
-```text
-loops_yield
-```
-
-with role-specific structured output that the Rust controller can deserialize and validate.
-
-Examples include:
-
-- `ArchitectOutput`,
-- `ReconcileResult`,
-- `WorkerSummary`,
-- assessment results.
-
-A worker turn is not considered complete until it produces valid structured output through the expected contract.
-
-If the worker fails to yield correctly after the configured reminders, the run treats that as a worker failure.
+When an ACP agent advertises client MCP support, Loops attaches a per-worker `loops_yield` server through the official ACP SDK. The tool accepts the same role schema, accepts exactly one valid result, and becomes the worker result; malformed, schema-invalid, or duplicate yields are rejected. Agents that do not support or use MCP—including adapters that ignore supplied MCP servers—continue through the portable strict-JSON path.
 
 This does not make the model deterministic.
 
@@ -378,34 +306,7 @@ It makes the boundary between probabilistic model behavior and deterministic con
 
 ## Verification
 
-`loops verify` and internal verification gates execute real project commands.
-
-Auto-detection currently supports common workflows such as:
-
-```bash
-# Rust
-cargo build
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-
-# Go
-go test ./...
-
-# Python
-python -m pytest -q
-
-# Node
-test
-typecheck
-lint
-build
-
-# Git
-git diff --check
-```
-
-The exact checks depend on detected project structure and available scripts.
+`loops verify` and internal verification gates execute the configured project commands.
 
 Additional hard gates can be configured:
 
@@ -579,7 +480,7 @@ It does not mean formal proof that the software is correct.
 
 ## TUI
 
-`loops` owns the terminal while OMP workers execute headlessly in the background.
+`loops` owns the terminal while ACP workers execute headlessly in the background.
 
 The Ratatui interface exposes three main views:
 
@@ -667,40 +568,46 @@ Continuation is reconstructed from repository and `.loops/` state rather than fr
 
 ### Requirements
 
-You need:
+Bring an ACP-compatible coding agent. `loops` supplies the control loop; it does not supply an agent account, credentials, or a coding-agent runtime.
 
-- a Rust toolchain to build `loops`,
-- [Oh My Pi](https://github.com/can1357/oh-my-pi),
-- authentication for at least one model supported by OMP,
+You also need:
+
+- a Rust toolchain to install `loops` from this checkout,
 - your project's own build/test tooling,
 - Git, strongly recommended.
 
-Install locally:
+### Install and run
+
+Install Loops:
 
 ```bash
 cargo install --path loops-cli
 ```
 
-Verify dependencies:
+Initialize the project:
 
 ```bash
-loops --version
-omp --version
-```
-
-Initialize a project:
-
-```bash
-cd your-project
-
 loops init
 ```
 
 This creates:
 
+```text
 loops.toml
 .loops/
   └── spec.md
+```
+
+Choose a Registry agent, or use the custom ACP command created by `loops init`.
+
+To choose a Registry agent, remove the `[agent.custom]` block from `loops.toml`, then:
+
+```bash
+loops agents list
+loops agents select <registry-agent-id>
+```
+
+Authenticate only if the selected agent asks you to; follow that agent's normal authentication flow. Loops neither collects those credentials nor performs sign-in on the agent's behalf.
 
 Write the specification:
 
@@ -726,7 +633,7 @@ Inspect controller state:
 loops status --json
 ```
 
-Run deterministic verification without invoking an LLM:
+Run deterministic verification without invoking an agent:
 
 ```bash
 loops verify --json
@@ -743,47 +650,29 @@ Example `loops.toml`:
 
 version = 1
 spec_file = ".loops/spec.md"
-
 max_cycles = 25
 max_repair_attempts = 3
 stagnation_limit = 3
 
 [agent]
-command = "omp"
-model = "openai/gpt-5.2"
-thinking = "medium"
-auto_approve = true
 turn_timeout_secs = 900
+completion_retries = 2
 
-read_only_tools = [
-  "read",
-  "grep",
-  "glob"
-]
+# Registry source, written by `loops agents select <id>`:
+id = "registry-agent-id"
 
-coding_tools = [
-  "read",
-  "grep",
-  "glob",
-  "edit",
-  "write",
-  "bash"
-]
+[agent.preferences.default]
+thought_level = "medium"
 
-extra_args = []
+[agent.preferences.roles.architect]
+thought_level = "xhigh"
 
-[agent.roles.architect]
-thinking = "xhigh"
-
-[agent.roles.implement]
-model = "anthropic/claude-sonnet-4-5"
-thinking = "medium"
-
-[agent.roles.assess]
-thinking = "xhigh"
+# Instead of `agent.id`, an unregistered ACP command is also valid:
+# [agent.custom]
+# command = "omp"
+# args = ["acp"]
 
 [verification]
-auto_detect = true
 require_project_gate = true
 commands = []
 timeout_secs = 120
@@ -795,35 +684,15 @@ auto_commit = false
 require_clean_tree = false
 ```
 
-`agent.model` and `agent.thinking` provide defaults for the five model-backed roles:
+Registry selection is data-driven. `loops agents list` reads the Registry and caches its metadata; `loops agents select <id>` records the authoritative `agent.id`. At launch, Loops resolves that entry's declared distribution and launch arguments. It refreshes Registry metadata when it can, reuses a valid cached index when offline, and can fall back to a cached resolved launch when a refresh is unavailable.
 
-- Architect,
-- Reconcile,
-- Implement,
-- Repair,
-- Assess.
+Package distributions are resolved automatically. A Registry binary is different: `loops run` uses only a previously installed, checksum-verified binary. Installing one is an explicit, machine-changing action:
 
-A role can override either value:
-
-```toml
-[agent.roles.implement]
-model = "anthropic/claude-sonnet-4-5"
-thinking = "medium"
+```bash
+loops agents setup <registry-agent-id> --yes
 ```
 
-Values that are not overridden inherit the global agent configuration.
-
-If neither global nor role-specific configuration selects a model, the fresh OMP process resolves its own default.
-
-Verification is deterministic controller logic, not an agent role, so there is no:
-
-```text
-agent.roles.verify
-```
-
----
-
-## Schema-aware editor support
+The advanced `[agent.custom]` block launches any ACP-compatible process with ordered arguments and optional environment values. `omp acp` above is simply one unregistered custom-command example; it has no special integration. `agent.id` and `agent.custom` are mutually exclusive, so configure exactly one before `loops run`.
 
 Generated `loops.toml` files include:
 
@@ -842,50 +711,15 @@ Editors without schema support treat the directive as a normal comment.
 
 ---
 
-## Safety: context isolation is not sandboxing
+## Security boundary
 
-This distinction matters.
+Fresh ACP sessions provide **context isolation**, not a sandbox. The selected agent owns its authentication flow, credentials, and any agent-level permission or sandbox policy; Loops does not collect credentials or make authentication or security decisions for it.
 
-Fresh OMP processes provide **context isolation**.
+ACP is an interoperability protocol, not a security boundary for arbitrary local tool execution. Process isolation, filesystem permissions, containers, OS sandboxes, and network controls are separate controls provided by the environment in which you run the agent.
 
-They do **not** provide an operating-system security boundary.
+Implement and Repair workers can receive real shell access. Run autonomous workloads in an environment whose blast radius you accept, such as an isolated container, VM, restricted development environment, dedicated worktree, or minimally privileged account.
 
-Implement and Repair workers can receive real shell access.
-
-With:
-
-```toml
-auto_approve = true
-```
-
-headless execution may run OMP with automatic tool approval so the worker does not block waiting for user interaction.
-
-That is useful for autonomous execution and dangerous in an untrusted environment.
-
-### Do not assume
-
-- prompts are a filesystem boundary,
-- tool allow-lists are equivalent to OS isolation,
-- protected controller files prevent arbitrary shell behavior,
-- fresh contexts prevent access to environment credentials,
-- an autonomous worker cannot make destructive changes outside the intended repository.
-
-### Recommended practice
-
-Run autonomous workloads inside an environment whose blast radius you are prepared to accept.
-
-Depending on the project, that may mean:
-
-- an isolated container,
-- a VM,
-- a restricted development environment,
-- a dedicated worktree,
-- credentials with minimal privileges,
-- controlled or disabled network access.
-
-Protected-file snapshotting is designed to protect controller integrity from accidental changes.
-
-It is not a replacement for real sandboxing.
+Protected-file snapshotting protects controller integrity from accidental changes; it is not a replacement for real sandboxing.
 
 ---
 
@@ -898,7 +732,7 @@ Not implemented yet:
 - parallel or fleet execution of independent work units,
 - branch/worktree isolation per coding worker,
 - cost and token accounting,
-- coding-agent backends beyond OMP,
+- alternative non-ACP protocols,
 - OS-level sandbox management,
 - remote worker execution,
 - interactive steering of an in-flight worker,
@@ -908,7 +742,6 @@ Some of these may turn out not to belong in `loops` itself.
 
 For example, sandboxing may be better handled by an execution environment around `loops` rather than deeply embedded into the orchestrator.
 
-The controller already separates the execution backend through an `AgentBackend` abstraction, so additional coding-agent integrations should not require rewriting the core state machine.
 
 ---
 
@@ -928,9 +761,6 @@ A useful benchmark should hold the underlying model and task set as constant and
 A. single coding-agent session
 
 B. simple retry / Ralph-style loop
-
-C. loops
-```
 
 Across real software tasks.
 
@@ -1031,7 +861,7 @@ Areas where contributions would be particularly useful:
 - worktree/container isolation,
 - additional deterministic verification,
 - real-world repository case studies,
-- additional `AgentBackend` implementations,
+- ACP conformance coverage,
 - cost/token telemetry,
 - stagnation and recovery analysis,
 - documentation corrections,

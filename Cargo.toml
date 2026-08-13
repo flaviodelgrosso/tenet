@@ -2,7 +2,8 @@
 resolver = "2"
 members = [
   "loops-domain",
-  "loops-application",
+  "loops-runtime",
+  "loops-acp",
   "loops-tui",
   "loops-cli",
 ]
@@ -13,8 +14,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Autonomous spec-driven development loops powered by headless coding agents"
 license = "MIT"
-
 [workspace.dependencies]
+agent-client-protocol = "2"
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.23"

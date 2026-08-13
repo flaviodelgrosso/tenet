@@ -13,95 +13,24 @@ use loops_domain::{
   model::{CommandResult, VerificationReport},
 };
 
-pub async fn verification_commands(cwd: &Path, config: &Config) -> Result<Vec<String>> {
+pub async fn verification_commands(config: &Config) -> Result<Vec<String>> {
   let mut out = Vec::new();
   out.extend(config.verification.commands.iter().cloned());
-  if config.verification.auto_detect {
-    out.extend(auto_detect(cwd).await?);
-  }
   let mut seen = BTreeSet::new();
   out.retain(|cmd| !cmd.trim().is_empty() && seen.insert(cmd.trim().to_owned()));
   Ok(out)
 }
 
-async fn auto_detect(cwd: &Path) -> Result<Vec<String>> {
-  let mut commands = Vec::new();
-  if is_git_repo(cwd).await {
-    commands.push("git diff --check".into());
-  }
-
-  let package_json = cwd.join("package.json");
-  if package_json.exists() {
-    if let Ok(text) = tokio::fs::read_to_string(&package_json).await {
-      if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-        let scripts = value.get("scripts").and_then(|v| v.as_object());
-        let manager = if cwd.join("pnpm-lock.yaml").exists() {
-          "pnpm"
-        } else if cwd.join("yarn.lock").exists() {
-          "yarn"
-        } else if cwd.join("bun.lock").exists() || cwd.join("bun.lockb").exists() {
-          "bun"
-        } else {
-          "npm"
-        };
-        for name in ["test", "typecheck", "lint", "build"] {
-          if scripts.and_then(|s| s.get(name)).is_some() {
-            let cmd = match manager {
-              "yarn" => format!("yarn {name}"),
-              "bun" => format!("bun run {name}"),
-              _ => format!("{manager} run {name}"),
-            };
-            commands.push(cmd);
-          }
-        }
-      }
-    }
-  }
-
-  if (cwd.join("pyproject.toml").exists()
-    || cwd.join("setup.py").exists()
-    || cwd.join("requirements.txt").exists())
-    && cwd.join("tests").exists()
-  {
-    commands.push("python -m pytest -q".into());
-  }
-  if cwd.join("go.mod").exists() {
-    commands.push("go test ./...".into());
-  }
-  if cwd.join("Cargo.toml").exists() {
-    commands.push("cargo build".into());
-    commands.push("cargo fmt --check".into());
-    commands.push("cargo clippy --all-targets --all-features -- -D warnings".into());
-    commands.push("cargo test --all-targets".into());
-  }
-  Ok(commands)
-}
-
-async fn is_git_repo(cwd: &Path) -> bool {
-  if cwd.join(".git").exists() {
-    return true;
-  }
-  Command::new("git")
-    .args(["rev-parse", "--is-inside-work-tree"])
-    .current_dir(cwd)
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .status()
-    .await
-    .map(|s| s.success())
-    .unwrap_or(false)
-}
-
 pub async fn run_verification(cwd: &Path, config: &Config) -> Result<VerificationReport> {
   let started_at = Utc::now().to_rfc3339();
-  let commands = verification_commands(cwd, config).await?;
+  let commands = verification_commands(config).await?;
   let project_gate_count = commands
     .iter()
     .filter(|cmd| cmd.as_str() != "git diff --check")
     .count();
   let mut warnings = Vec::new();
   if commands.is_empty() {
-    warnings.push("No deterministic verification commands detected or configured.".into());
+    warnings.push("No deterministic verification commands configured.".into());
   }
   if config.verification.require_project_gate && project_gate_count == 0 {
     warnings.push(
@@ -140,6 +69,25 @@ pub async fn run_verification(cwd: &Path, config: &Config) -> Result<Verificatio
   })
 }
 
+fn shell_command(command: &str) -> Command {
+  #[cfg(windows)]
+  {
+    // `ComSpec` points to the user's configured Windows command interpreter;
+    // `cmd.exe` remains a stable fallback for stripped-down environments.
+    let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+    let mut command_process = Command::new(shell);
+    command_process.args(["/D", "/C", command]);
+    command_process
+  }
+
+  #[cfg(not(windows))]
+  {
+    let mut command_process = Command::new("sh");
+    command_process.args(["-lc", command]);
+    command_process
+  }
+}
+
 async fn run_shell(
   cwd: &Path,
   command: &str,
@@ -147,9 +95,7 @@ async fn run_shell(
   max_output: usize,
 ) -> Result<CommandResult> {
   let start = Instant::now();
-  let mut child = Command::new("sh")
-    .arg("-lc")
-    .arg(command)
+  let mut child = shell_command(command)
     .current_dir(cwd)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -213,26 +159,18 @@ mod tests {
   use super::*;
 
   #[tokio::test]
-  async fn detects_rust_gates_without_selecting_a_rust_worker_skill() {
-    let dir = tempfile::tempdir().unwrap();
-    tokio::fs::write(
-      dir.path().join("Cargo.toml"),
-      "[package]\nname='x'\nversion='0.1.0'\n",
+  async fn run_shell_executes_command_with_platform_shell() {
+    let result = run_shell(
+      Path::new("."),
+      "echo loops-shell-test",
+      Duration::from_secs(5),
+      1024,
     )
     .await
-    .unwrap();
-    let cfg = Config::default();
-    let cmds = verification_commands(dir.path(), &cfg).await.unwrap();
-    assert!(cmds.iter().any(|v| v == "cargo fmt --check"));
-    assert!(cmds.iter().any(|v| v.starts_with("cargo clippy")));
-    assert!(cmds.iter().any(|v| v.starts_with("cargo test")));
+    .expect("platform shell should start");
 
-    let skills = crate::skills::resolve(
-      dir.path(),
-      &cfg.skills,
-      loops_domain::model::WorkerRole::Implement,
-    )
-    .unwrap();
-    assert_eq!(skills.names(), ["implementation"]);
+    assert_eq!(result.exit_code, Some(0));
+    assert!(!result.timed_out);
+    assert!(result.stdout.contains("loops-shell-test"));
   }
 }
