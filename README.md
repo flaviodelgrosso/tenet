@@ -12,7 +12,7 @@ width="320"
 
 [![CI](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml/badge.svg)](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust\&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Status: MVP](https://img.shields.io/badge/status-MVP-orange)](#status-mvp)
 [![Coding Agents](https://img.shields.io/badge/coding-agents-blueviolet)](#)
 
@@ -25,8 +25,6 @@ Give `loops` a spec and it will work toward satisfying it through isolated codin
 The important distinction is this:
 
 > **Agents do the work. The controller owns the process.**
-
-<img width="1792" height="1094" alt="tui" src="https://github.com/user-attachments/assets/0484b206-170f-4c2c-b508-26f0ae77a60b" />
 
 `loops` is a small Rust controller for autonomous, spec-driven development.
 
@@ -290,6 +288,7 @@ A **work unit** describes the concrete task.
 The repository provides current reality.
 
 ---
+
 ## Structured completion, not prose parsing
 
 The portable completion baseline is one whole-response JSON value: no markdown or surrounding prose. `loops` validates that value against the role's schema and then deserializes it into the controller's typed result.
@@ -742,7 +741,6 @@ Some of these may turn out not to belong in `loops` itself.
 
 For example, sandboxing may be better handled by an execution environment around `loops` rather than deeply embedded into the orchestrator.
 
-
 ---
 
 ## What still needs to be proven
@@ -898,3 +896,4 @@ It is that a deterministic controller around fresh, narrowly scoped coding agent
 Whether that structure also makes autonomous delivery **more reliable, more cost-effective, or more successful than simpler coding-agent loops remains to be demonstrated empirically.**
 
 That is what this project is here to test.
+```

@@ -764,7 +764,7 @@ mod tests {
 
     assert_eq!(custom.command, "omp");
     assert_eq!(custom.args, vec!["acp".to_owned()]);
-    assert_eq!(loaded.agent.thinking_for(WorkerRole::Architect), "high");
+    assert_eq!(loaded.agent.thinking_for(WorkerRole::Architect), "xhigh");
     assert_eq!(loaded.agent.turn_timeout_secs, 900);
     assert_eq!(
       loaded.agent.model_for(WorkerRole::Architect),
