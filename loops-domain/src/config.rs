@@ -291,13 +291,47 @@ impl AgentPreferences {
   }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
 pub struct VerificationConfig {
   pub require_project_gate: bool,
   pub commands: Vec<String>,
   pub timeout_secs: u64,
   pub max_output_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerificationConfigWire {
+  require_project_gate: bool,
+  commands: Vec<String>,
+  timeout_secs: u64,
+  max_output_bytes: usize,
+}
+
+impl<'de> Deserialize<'de> for VerificationConfig {
+  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+  where
+    D: de::Deserializer<'de>,
+  {
+    let wire = VerificationConfigWire::deserialize(deserializer)?;
+    let config = Self {
+      require_project_gate: wire.require_project_gate,
+      commands: wire.commands,
+      timeout_secs: wire.timeout_secs,
+      max_output_bytes: wire.max_output_bytes,
+    };
+    config.validate().map_err(de::Error::custom)?;
+    Ok(config)
+  }
+}
+
+impl VerificationConfig {
+  fn validate(&self) -> Result<()> {
+    if self.require_project_gate && self.commands.is_empty() {
+      anyhow::bail!("verification.commands must contain at least one command when verification.require_project_gate is enabled");
+    }
+    Ok(())
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,7 +364,7 @@ impl Default for Config {
         turn_timeout_secs: 900,
       },
       verification: VerificationConfig {
-        require_project_gate: true,
+        require_project_gate: false,
         commands: Vec::new(),
         timeout_secs: 120,
         max_output_bytes: 64 * 1024,
@@ -544,6 +578,21 @@ mod tests {
     );
   }
 
+  #[test]
+  fn config_schema_requires_commands_when_project_gate_is_enabled() {
+    let schema = config_schema();
+
+    assert_eq!(
+      (
+        &schema["$defs"]["verificationConfig"]["allOf"][0]["if"]["properties"]
+          ["require_project_gate"]["const"],
+        &schema["$defs"]["verificationConfig"]["allOf"][0]["then"]["properties"]["commands"]
+          ["minItems"],
+      ),
+      (&serde_json::json!(true), &serde_json::json!(1)),
+    );
+  }
+
   #[tokio::test]
   async fn generated_config_is_created_at_the_project_root_and_requires_a_source() {
     let project = tempdir().unwrap();
@@ -652,6 +701,21 @@ mod tests {
     let error = read_error(text).await;
 
     assert!(error.contains("ambiguous ACP launch source"));
+  }
+
+  #[tokio::test]
+  async fn read_config_rejects_empty_commands_when_project_gate_is_required() {
+    let text = serialized_config(|config| config.verification.require_project_gate = true, "");
+    let error = read_error(text).await;
+
+    assert!(error.contains("verification.commands must contain at least one command"));
+  }
+
+  #[test]
+  fn empty_commands_are_allowed_when_project_gate_is_disabled() {
+    let text = serialized_config(|_| {}, "");
+
+    assert!(toml::from_str::<Config>(&text).is_ok());
   }
 
   #[tokio::test]

@@ -151,7 +151,7 @@
       "properties": {
         "require_project_gate": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "Requires at least one project-specific verification command before work can pass."
         },
         "commands": {
@@ -172,7 +172,21 @@
           "default": 65536,
           "description": "Maximum number of output bytes retained from each verification command."
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "require_project_gate": { "const": true }
+            }
+          },
+          "then": {
+            "properties": {
+              "commands": { "minItems": 1 }
+            }
+          }
+        }
+      ]
     },
     "gitConfig": {
       "type": "object",

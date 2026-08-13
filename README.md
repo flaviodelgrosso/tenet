@@ -678,7 +678,7 @@ thought_level = "xhigh"
 # args = ["acp"]
 
 [verification]
-require_project_gate = true
+require_project_gate = false
 commands = []
 timeout_secs = 120
 max_output_bytes = 65536

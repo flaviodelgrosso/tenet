@@ -36,7 +36,7 @@ repair = { model = "openai-codex/gpt-5.6-luna" }
 assess = { thought_level = "medium", model = "openai-codex/gpt-5.6-terra" }
 
 [verification]
-require_project_gate = true
+require_project_gate = false
 commands = []
 timeout_secs = 120
 max_output_bytes = 65536
