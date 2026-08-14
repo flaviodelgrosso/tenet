@@ -1,17 +1,17 @@
 <div align="center">
 
-<img width="2066" height="761" alt="loops" src="https://github.com/user-attachments/assets/83d2961d-be43-4e8e-a68c-5f4958cafdbb" />
+<img width="1530" height="689" alt="logo" src="https://github.com/user-attachments/assets/4c078e90-69f5-44d9-a634-91eefbc4470f" />
 
 <br />
 
-[![CI](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml/badge.svg)](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml)
+[![CI](https://github.com/flaviodelgrosso/tenet/actions/workflows/ci.yml/badge.svg)](https://github.com/flaviodelgrosso/tenet/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Status: MVP](https://img.shields.io/badge/status-MVP-orange)](#mvp-read-this-first)
 
 ### Give an agent a task and it can write code
 
-### Give **Loops** a spec and it keeps asking whether the software is actually done
+### Give **Tenet** a spec and it keeps asking whether the software is actually done
 
 **A deterministic control loop for autonomous, spec-driven software development.**
 
@@ -32,7 +32,7 @@ Long-running agent workflows have a different problem:
 - the agent that wrote the code is often the same agent deciding whether it worked;
 - and eventually something says _“done”_.
 
-**Loops is an experiment in moving that responsibility out of the conversation.**
+**Tenet is an experiment in moving that responsibility out of the conversation.**
 
 The model writes code.
 
@@ -80,7 +80,7 @@ Agent context is disposable.
 
 ## The idea
 
-Loops starts from a simple observation:
+Tenet starts from a simple observation:
 
 > **Autonomous coding is partly an intelligence problem, but it is also a control problem.**
 
@@ -100,14 +100,14 @@ But an autonomous engineering system also needs to answer questions like:
 
 Those decisions should not live only inside model context.
 
-Loops puts them in a Rust controller.
+Tenet puts them in a Rust controller.
 
 ```text
 probabilistic workers
         │
         ▼
 ┌──────────────────────────────┐
-│            LOOPS             │
+│            TENET             │
 │                              │
 │ requirements                 │
 │ state transitions            │
@@ -154,7 +154,7 @@ An agent may carry forward:
 - compressed summaries of previous failures;
 - confidence inherited from its own earlier reasoning.
 
-Loops deliberately uses fresh sessions for different roles.
+Tenet deliberately uses fresh sessions for different roles.
 
 The next worker does not need to believe the previous worker.
 
@@ -172,15 +172,15 @@ This is the central bet behind the project:
 
 > **Keep engineering state explicit. Keep model context replaceable.**
 
-Whether that architecture ultimately beats simpler agent loops is something that still needs to be measured.
+Whether that architecture ultimately beats simpler agent workflows is something that still needs to be measured.
 
-Loops does **not** claim that result today.
+Tenet does **not** claim that result today.
 
 ---
 
 ## What happens during a run
 
-A run is a sequence of bounded engineering loops.
+A run is a sequence of bounded engineering cycles.
 
 ### 1. Architect
 
@@ -196,7 +196,7 @@ A fresh worker compares those requirements with the repository **as it exists no
 
 It proposes the work that remains.
 
-Loops validates that work before execution.
+Tenet validates that work before execution.
 
 The plan is therefore allowed to change as the code changes.
 
@@ -218,7 +218,7 @@ make ci
 
 Whatever your project considers meaningful evidence.
 
-An agent saying _“tests pass”_ is not evidence when Loops can run the tests itself.
+An agent saying _“tests pass”_ is not evidence when Tenet can run the tests itself.
 
 ### 5. Repair
 
@@ -239,7 +239,7 @@ stdout / stderr
 
 Retries are bounded.
 
-Loops is designed to block rather than spend forever rediscovering the same failure.
+Tenet is designed to block rather than spend forever rediscovering the same failure.
 
 ### 6. Integrate
 
@@ -259,7 +259,7 @@ The worker that wrote the implementation does not get the final vote by default.
 
 ## `DONE` is a state, not a sentence
 
-This is one of the most important ideas in Loops.
+This is one of the most important ideas in Tenet.
 
 A coding model can always emit:
 
@@ -267,7 +267,7 @@ A coding model can always emit:
 Everything is implemented successfully.
 ```
 
-Loops does not treat that sentence as completion.
+Tenet does not treat that sentence as completion.
 
 Conceptually, completion looks more like:
 
@@ -297,7 +297,7 @@ If your specification is ambiguous, the result can still be wrong.
 
 If the model misses something, assessment can still be wrong.
 
-Loops cannot remove uncertainty from software engineering.
+Tenet cannot remove uncertainty from software engineering.
 
 The goal is to make that uncertainty **visible, bounded, and harder to hand-wave away**.
 
@@ -305,7 +305,7 @@ The goal is to make that uncertainty **visible, bounded, and harder to hand-wave
 
 # MVP: read this first
 
-**Loops is an MVP.**
+**Tenet is an MVP.**
 
 It is real software and the core control loop exists.
 
@@ -334,9 +334,9 @@ That is the promising part.
 
 Here is the equally important part.
 
-## What Loops has **not** proven
+## What Tenet has **not** proven
 
-There is not yet enough comparative evaluation to claim that Loops is:
+There is not yet enough comparative evaluation to claim that Tenet is:
 
 - more reliable than a strong single-agent workflow;
 - better than a simple Ralph-style loop;
@@ -361,7 +361,7 @@ That is where this project should earn its claims.
 
 ## Expect rough edges
 
-If you try Loops today, expect bugs.
+If you try Tenet today, expect bugs.
 
 Particularly around the places where real systems get messy:
 
@@ -421,11 +421,11 @@ Software engineering already has machinery:
 - rollback;
 - observability.
 
-Loops asks:
+Tenet asks:
 
 > **What happens if autonomous coding starts looking more like an engineering system and less like one very long chat?**
 
-If the answer is “nothing, simpler loops work just as well,” that is useful to learn.
+If the answer is “nothing, simpler tenet work just as well,” that is useful to learn.
 
 If the answer is that explicit control substantially reduces false completion, regressions, drift, or wasted retries, that is much more interesting.
 
@@ -435,17 +435,17 @@ The project exists to find out.
 
 ## Agent-neutral by design
 
-Loops communicates with coding agents through the **[Agent Client Protocol (ACP)](https://agentclientprotocol.com/)**.
+Tenet communicates with coding agents through the **[Agent Client Protocol (ACP)](https://agentclientprotocol.com/)**.
 
 The controller should not need to become a different product every time a better coding model appears.
 
 Bring an ACP-compatible agent.
 
-Loops provides the surrounding process.
+Tenet provides the surrounding process.
 
 ```text
                          ┌───────────────────┐
-                         │       Loops       │
+                         │       Tenet       │
                          │                   │
 spec ───────────────────►│ controller        │
 repo ───────────────────►│ verification      │
@@ -461,19 +461,19 @@ repo ───────────────────►│ verificatio
 
 A project selects an agent source.
 
-Different Loops roles can then use fresh sessions and role-specific model preferences while preserving the same controller semantics.
+Different Tenet roles can then use fresh sessions and role-specific model preferences while preserving the same controller semantics.
 
 ---
 
 # Quick start
 
-## 1. Build Loops
+## 1. Build Tenet
 
-Loops is currently a Rust project distributed from source.
+Tenet is currently a Rust project distributed from source.
 
 ```bash
-git clone https://github.com/flaviodelgrosso/loops.git
-cd loops
+git clone https://github.com/flaviodelgrosso/tenet.git
+cd tenet
 
 make install
 ```
@@ -486,21 +486,21 @@ A current stable Rust toolchain is required.
 
 ## 2. Initialize a project
 
-From the repository you want Loops to work on:
+From the repository you want Tenet to work on:
 
 ```bash
-loops init
+tenet init
 ```
 
-This creates the project configuration and Loops state directory.
+This creates the project configuration and Tenet state directory.
 
-Loops runs require an existing Git repository with at least one commit and a clean canonical working tree. Worker changes execute in isolated worktrees and are integrated back into that canonical checkout.
+Tenet runs require an existing Git repository with at least one commit and a clean canonical working tree. Worker changes execute in isolated worktrees and are integrated back into that canonical checkout.
 
 ---
 
 ## 3. Write the specification
 
-Tell Loops what should be true when the work is finished.
+Tell Tenet what should be true when the work is finished.
 
 For example:
 
@@ -524,7 +524,7 @@ The spec is not a prompt asking an agent to “please implement this.”
 
 It is the reference against which the repository keeps being reconsidered.
 
-The spec path is configurable in `loops.toml`.
+The spec path is configurable in `tenet.toml`.
 
 ---
 
@@ -533,18 +533,18 @@ The spec path is configurable in `loops.toml`.
 Explore ACP Registry agents:
 
 ```bash
-loops agents list
-loops agents search <query>
-loops agents select <id>
+tenet agents list
+tenet agents search <query>
+tenet agents select <id>
 ```
 
 Check the configured runtime:
 
 ```bash
-loops agents doctor
+tenet agents doctor
 ```
 
-Loops also supports an advanced custom ACP command in `loops.toml`.
+Tenet also supports an advanced custom ACP command in `tenet.toml`.
 
 ---
 
@@ -561,7 +561,7 @@ commands = [
 ]
 ```
 
-The stronger your verification, the stronger the evidence Loops can use.
+The stronger your verification, the stronger the evidence Tenet can use.
 
 A perfectly orchestrated agent cannot compensate for a test suite that proves nothing.
 
@@ -570,38 +570,38 @@ A perfectly orchestrated agent cannot compensate for a test suite that proves no
 ## 6. Run
 
 ```bash
-loops run
+tenet run
 ```
 
 For non-interactive execution:
 
 ```bash
-loops run --headless
+tenet run --headless
 ```
 
 For less output:
 
 ```bash
-loops run --headless --quiet
+tenet run --headless --quiet
 ```
 
 For more worker diagnostics:
 
 ```bash
-loops run --headless --verbose
+tenet run --headless --verbose
 ```
 
 State is persisted, so execution can be resumed:
 
 ```bash
-loops resume
+tenet resume
 ```
 
 ---
 
 # The terminal UI
 
-By default Loops provides an interactive terminal interface for watching the controller rather than staring at an opaque agent stream.
+By default Tenet provides an interactive terminal interface for watching the controller rather than staring at an opaque agent stream.
 
 The important views are about **process**, not just tokens:
 
@@ -626,14 +626,14 @@ q / Ctrl-C          stop / exit
 For servers, CI, SSH sessions, or log capture, use headless mode instead.
 
 ```bash
-loops run --headless > loops.log
+tenet run --headless > tenet.log
 ```
 
 ---
 
 # Configuration
 
-A project is controlled through `loops.toml`.
+A project is controlled through `tenet.toml`.
 
 A simplified example:
 
@@ -677,48 +677,48 @@ instead of converting more tokens into more confidence.
 ## Useful commands
 
 ```bash
-loops init
+tenet init
 ```
 
-Initialize Loops in a project.
+Initialize Tenet in a project.
 
 ```bash
-loops run
-loops resume
+tenet run
+tenet resume
 ```
 
 Start or continue autonomous development.
 
 ```bash
-loops status
-loops status --json
+tenet status
+tenet status --json
 ```
 
 Inspect persisted controller state.
 
 ```bash
-loops verify
-loops verify --json
+tenet verify
+tenet verify --json
 ```
 
 Run the configured deterministic verification **without invoking an LLM**.
 
 ```bash
-loops agents list
-loops agents search <query>
-loops agents select <id>
-loops agents setup
-loops agents doctor
-loops agents login
+tenet agents list
+tenet agents search <query>
+tenet agents select <id>
+tenet agents setup
+tenet agents doctor
+tenet agents login
 ```
 
 Discover, configure, install, inspect, and authenticate ACP agents.
 
 ---
 
-# What Loops is not
+# What Tenet is not
 
-Loops is **not**:
+Tenet is **not**:
 
 ### A coding model
 
@@ -740,7 +740,7 @@ It does not make arbitrary model-generated commands safe.
 
 If the desired behavior is unclear, the controller cannot manufacture product truth.
 
-### Proven better than simpler loops
+### Proven better than simpler tenet
 
 Not yet.
 
@@ -754,7 +754,7 @@ Also not yet.
 
 # The project principles
 
-A few rules shape Loops.
+A few rules shape Tenet.
 
 ### The repository outranks the conversation
 
@@ -792,7 +792,7 @@ BLOCKED
 
 ---
 
-# Where Loops needs to go
+# Where Tenet needs to go
 
 The most valuable next steps are not more impressive demos.
 
@@ -801,7 +801,7 @@ They are better evidence.
 Important directions include:
 
 **Evaluation.**
-Run the same tasks through single-agent, simple-loop, and Loops workflows. Measure completion, false-DONE rate, regressions, cost, wall time, and variance.
+Run the same tasks through single-agent, simple-loop, and Tenet workflows. Measure completion, false-DONE rate, regressions, cost, wall time, and variance.
 
 **Replayability.**
 Make complete autonomous runs inspectable as structured episodes rather than terminal archaeology.
@@ -832,7 +832,7 @@ It is a better autonomous engineering process.
 
 # Contributing
 
-Loops is early enough that experiments are unusually valuable.
+Tenet is early enough that experiments are unusually valuable.
 
 Useful contributions include:
 
@@ -851,7 +851,7 @@ Useful contributions include:
 
 Especially negative results.
 
-If a simpler architecture consistently beats Loops, that is something this project should discover rather than hide.
+If a simpler architecture consistently beats Tenet, that is something this project should discover rather than hide.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -861,7 +861,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Autonomous development tools should be judged by what they can demonstrate, not by how confidently they describe themselves.
 
-Loops is built around that idea.
+Tenet is built around that idea.
 
 The project should be held to the same standard.
 
@@ -875,10 +875,10 @@ That is enough.
 
 ## Agents write the code
 
-## **Loops makes them prove the work.**
+## **Tenet makes them prove the work.**
 
 If that idea is useful to you, try it, break it, measure it, and help make the loop harder to fool.
 
-[Report a bug](https://github.com/flaviodelgrosso/loops/issues) · [Contribute](CONTRIBUTING.md) · [MIT License](LICENSE)
+[Report a bug](https://github.com/flaviodelgrosso/tenet/issues) · [Contribute](CONTRIBUTING.md) · [MIT License](LICENSE)
 
 </div>

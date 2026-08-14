@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json",
-  "title": "loops configuration",
-  "description": "Configuration for autonomous loops runs.",
+  "$id": "https://raw.githubusercontent.com/flaviodelgrosso/tenet/main/schemas/config.schema.json",
+  "title": "Tenet configuration",
+  "description": "Configuration for autonomous Tenet runs.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -22,13 +22,13 @@
       "type": "integer",
       "minimum": 0,
       "default": 1,
-      "description": "Configuration format version read by loops."
+      "description": "Configuration format version read by tenet."
     },
     "spec_file": {
       "type": "string",
-      "default": ".loops/spec.md",
+      "default": ".tenet/spec.md",
       "description": "Project-relative path to the specification that drives the run.",
-      "examples": [".loops/spec.md"]
+      "examples": [".tenet/spec.md"]
     },
     "max_cycles": {
       "type": "integer",
@@ -63,17 +63,17 @@
     "protected_paths": {
       "$ref": "#/$defs/stringList",
       "default": [
-        ".loops/spec.md",
+        ".tenet/spec.md",
         "AGENTS.md",
-        "loops.toml",
-        ".loops/state.json",
-        ".loops/requirements.json",
-        ".loops/roadmap.json",
-        ".loops/STOP",
-        ".loops/run.lock"
+        "tenet.toml",
+        ".tenet/state.json",
+        ".tenet/requirements.json",
+        ".tenet/roadmap.json",
+        ".tenet/STOP",
+        ".tenet/run.lock"
       ],
       "description": "Project-relative paths restored if a coding worker modifies them.",
-      "examples": [[".loops/spec.md", "AGENTS.md", "loops.toml"]]
+      "examples": [[".tenet/spec.md", "AGENTS.md", "tenet.toml"]]
     }
   },
   "$defs": {

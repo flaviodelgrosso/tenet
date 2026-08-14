@@ -2,7 +2,7 @@
 
 ## Our pledge
 
-We are committed to making participation in the `loops` project a welcoming, respectful, and harassment-free experience for everyone, regardless of age, disability, ethnicity, gender identity or expression, level of experience, nationality, personal appearance, race, religion, sexual identity or orientation, or other characteristic protected by applicable law.
+We are committed to making participation in the `tenet` project a welcoming, respectful, and harassment-free experience for everyone, regardless of age, disability, ethnicity, gender identity or expression, level of experience, nationality, personal appearance, race, religion, sexual identity or orientation, or other characteristic protected by applicable law.
 
 We welcome contributions that challenge the project's assumptions and improve its reliability. Disagreement about ideas is expected; personal attacks and exclusionary behavior are not.
 

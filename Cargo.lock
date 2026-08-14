@@ -1369,103 +1369,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
-name = "loops-acp"
-version = "0.1.0"
-dependencies = [
- "agent-client-protocol",
- "anyhow",
- "async-trait",
- "chrono",
- "flate2",
- "loops-domain",
- "loops-runtime",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tar",
- "tempfile",
- "tokio",
- "uuid",
- "zip",
-]
-
-[[package]]
-name = "loops-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "loops-acp",
- "loops-domain",
- "loops-projection",
- "loops-runtime",
- "loops-tui",
- "serde_json",
- "tokio",
- "tokio-util",
- "toml",
-]
-
-[[package]]
-name = "loops-domain"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
-]
-
-[[package]]
-name = "loops-projection"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "loops-domain",
- "serde_json",
-]
-
-[[package]]
-name = "loops-runtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "globset",
- "loops-domain",
- "petgraph",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "tokio-util",
- "toml",
- "uuid",
-]
-
-[[package]]
-name = "loops-tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "crossterm",
- "loops-domain",
- "loops-projection",
- "loops-runtime",
- "ratatui",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "lru"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2429,6 +2332,103 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "tenet-acp"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "flate2",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "tempfile",
+ "tenet-domain",
+ "tenet-runtime",
+ "tokio",
+ "uuid",
+ "zip",
+]
+
+[[package]]
+name = "tenet-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "serde_json",
+ "tenet-acp",
+ "tenet-domain",
+ "tenet-projection",
+ "tenet-runtime",
+ "tenet-tui",
+ "tokio",
+ "tokio-util",
+ "toml",
+]
+
+[[package]]
+name = "tenet-domain"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "tenet-projection"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "tenet-domain",
+]
+
+[[package]]
+name = "tenet-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "globset",
+ "petgraph",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tenet-domain",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "uuid",
+]
+
+[[package]]
+name = "tenet-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "tempfile",
+ "tenet-domain",
+ "tenet-projection",
+ "tenet-runtime",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

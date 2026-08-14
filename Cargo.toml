@@ -1,19 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-  "loops-domain",
-  "loops-runtime",
-  "loops-acp",
-  "loops-projection",
-  "loops-tui",
-  "loops-cli",
+  "tenet-domain",
+  "tenet-runtime",
+  "tenet-acp",
+  "tenet-projection",
+  "tenet-tui",
+  "tenet-cli",
 ]
-default-members = ["loops-cli"]
+default-members = ["tenet-cli"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Autonomous spec-driven development loops powered by headless coding agents"
+description = "Autonomous spec-driven development powered by headless coding agents"
 license = "MIT"
 [workspace.dependencies]
 agent-client-protocol = "2"

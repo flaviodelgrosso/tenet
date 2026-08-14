@@ -1,0 +1,21 @@
+[package]
+name = "tenet-tui"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+crossterm.workspace = true
+tenet-runtime = { path = "../tenet-runtime" }
+tenet-domain = { path = "../tenet-domain" }
+tenet-projection = { path = "../tenet-projection" }
+ratatui.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

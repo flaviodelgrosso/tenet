@@ -1,6 +1,6 @@
-# Contributing to loops
+# Contributing to tenet
 
-Thank you for helping improve `loops`. Contributions that test its assumptions are especially valuable: benchmarks, adversarial cases, deterministic verification, isolation, recovery behavior, documentation, and negative results are all welcome.
+Thank you for helping improve `tenet`. Contributions that test its assumptions are especially valuable: benchmarks, adversarial cases, deterministic verification, isolation, recovery behavior, documentation, and negative results are all welcome.
 
 Please read the [Code of Conduct](CODE_OF_CONDUCT.md) before participating.
 
@@ -9,15 +9,15 @@ Please read the [Code of Conduct](CODE_OF_CONDUCT.md) before participating.
 - Search existing issues and pull requests before opening a new one.
 - For a substantial change, open an issue first so the scope and design can be discussed.
 - Keep changes focused. Separate unrelated fixes into separate pull requests.
-- Do not include secrets, credentials, generated controller state, or unrelated `.loops/` artifacts in commits.
+- Do not include secrets, credentials, generated controller state, or unrelated `.tenet/` artifacts in commits.
 
 ## Development setup
 
-`loops` is a Rust project. Install a current stable Rust toolchain, then clone the repository and work from the checkout:
+`tenet` is a Rust project. Install a current stable Rust toolchain, then clone the repository and work from the checkout:
 
 ```bash
-git clone https://github.com/flaviodelgrosso/loops.git
-cd loops
+git clone https://github.com/flaviodelgrosso/tenet.git
+cd tenet
 ```
 
 The repository provides Make targets for the standard checks:
@@ -66,14 +66,14 @@ Pull requests should be reviewable, scoped to one concern, and ready for discuss
 
 ## Reporting bugs and proposing ideas
 
-Open an issue at <https://github.com/flaviodelgrosso/loops/issues> with a clear title and enough detail to reproduce or evaluate the report. For bugs, include:
+Open an issue at <https://github.com/flaviodelgrosso/tenet/issues> with a clear title and enough detail to reproduce or evaluate the report. For bugs, include:
 
-- the `loops` version and Rust toolchain;
+- the `tenet` version and Rust toolchain;
 - operating system and relevant backend versions;
 - the command and configuration used;
 - expected and actual behavior;
 - minimal reproduction steps;
-- logs or `.loops/` evidence with secrets removed.
+- logs or `.tenet/` evidence with secrets removed.
 
 For security vulnerabilities or reports involving harassment, do not use a public issue. Contact the repository maintainers privately through GitHub and avoid disclosing the issue publicly until a fix or disclosure plan is agreed.
 

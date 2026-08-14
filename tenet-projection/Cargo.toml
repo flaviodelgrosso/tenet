@@ -1,0 +1,11 @@
+[package]
+name = "tenet-projection"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+tenet-domain = { path = "../tenet-domain" }
+serde_json.workspace = true

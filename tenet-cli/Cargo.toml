@@ -1,0 +1,24 @@
+[package]
+name = "tenet-cli"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tenet"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+tenet-acp = { path = "../tenet-acp" }
+tenet-runtime = { path = "../tenet-runtime" }
+tenet-domain = { path = "../tenet-domain" }
+tenet-projection = { path = "../tenet-projection" }
+tenet-tui = { path = "../tenet-tui" }
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
