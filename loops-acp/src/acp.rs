@@ -784,17 +784,22 @@ where
   let mut text = String::new();
   let mut tool_calls = HashMap::new();
   if has_selector_preference {
-    if preferences.model.is_some() && options.is_empty() {
-      options = read_config_options(
+    if preferences.model.is_some()
+      && !has_option_category(&options, &SessionConfigOptionCategory::Model)
+    {
+      if let Some(updated) = read_config_options(
         session,
         role,
         &identity,
         events.clone(),
         &mut text,
         &mut tool_calls,
+        &SessionConfigOptionCategory::Model,
       )
       .await?
-      .unwrap_or_default();
+      {
+        options = updated;
+      }
     }
     if !options.is_empty() || preferences.model.is_some() {
       apply_preferences(session, options, &preferences).await?;
@@ -1031,9 +1036,18 @@ async fn map_update(
   }
 }
 
+fn has_option_category(
+  options: &[SessionConfigOption],
+  category: &SessionConfigOptionCategory,
+) -> bool {
+  options
+    .iter()
+    .any(|option| option.category.as_ref() == Some(category))
+}
+
 async fn apply_preferences<Link>(
   session: &mut agent_client_protocol::ActiveSession<'_, Link>,
-  options: Vec<SessionConfigOption>,
+  mut options: Vec<SessionConfigOption>,
   preferences: &loops_domain::config::RolePreference,
 ) -> std::result::Result<(), agent_client_protocol::Error>
 where
@@ -1054,6 +1068,18 @@ where
     ),
   ] {
     let Some(value) = configured else { continue };
+    if options.is_empty() && matches!(&category, SessionConfigOptionCategory::Model) {
+      let response = session
+        .connection()
+        .send_request_to(
+          Agent,
+          SetSessionConfigOptionRequest::new(session.session_id().clone(), "model", value),
+        )
+        .block_task()
+        .await?;
+      options = response.config_options;
+      continue;
+    }
 
     let selected = resolve_preference_option(&options, &category, value)
       .map_err(|message| agent_client_protocol::Error::internal_error().data(message))?;
@@ -1104,9 +1130,32 @@ fn resolve_preference_option<'a>(
 
   match option.zip(selected) {
     Some(selection) => Ok(Some(selection)),
-    None if matches!(category, SessionConfigOptionCategory::Model) => Err(format!(
-      "requested {category:?} preference {value:?} is not exposed by this ACP session"
-    )),
+    None if matches!(category, SessionConfigOptionCategory::Model) => {
+      let available = option
+        .and_then(|option| match &option.kind {
+          SessionConfigKind::Select(select) => Some(match &select.options {
+            SessionConfigSelectOptions::Ungrouped(values) => values
+              .iter()
+              .map(|candidate| candidate.value.to_string())
+              .collect::<Vec<_>>(),
+            SessionConfigSelectOptions::Grouped(groups) => groups
+              .iter()
+              .flat_map(|group| group.options.iter())
+              .map(|candidate| candidate.value.to_string())
+              .collect(),
+            _ => Vec::new(),
+          }),
+          _ => None,
+        })
+        .unwrap_or_default();
+      let categories = options
+        .iter()
+        .map(|option| option.category.as_ref())
+        .collect::<Vec<_>>();
+      Err(format!(
+        "requested {category:?} preference {value:?} is not exposed by this ACP session; available values: {available:?}; received categories: {categories:?}"
+      ))
+    }
     None => Ok(None),
   }
 }
@@ -1118,11 +1167,12 @@ async fn read_config_options<Link>(
   events: Option<EventSink>,
   text: &mut String,
   tool_calls: &mut HashMap<ToolCallId, ToolCall>,
+  required_category: &SessionConfigOptionCategory,
 ) -> std::result::Result<Option<Vec<SessionConfigOption>>, agent_client_protocol::Error>
 where
   Link: agent_client_protocol::role::HasPeer<Agent>,
 {
-  let deadline = Instant::now() + Duration::from_millis(100);
+  let deadline = Instant::now() + Duration::from_secs(2);
   loop {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
@@ -1153,7 +1203,10 @@ where
       })
       .await
       .otherwise_ignore()?;
-    if options.is_some() {
+    if options
+      .as_ref()
+      .is_some_and(|options| has_option_category(options, required_category))
+    {
       return Ok(options);
     }
   }
@@ -1229,6 +1282,41 @@ mod tests {
         "scope": {"paths": ["src/**"]}
       }]
     })
+  }
+
+  #[test]
+  fn model_options_are_requested_when_initial_options_only_contain_other_categories() {
+    let options = vec![SessionConfigOption::select(
+      "thinking",
+      "Thinking",
+      "medium",
+      vec![SessionConfigSelectOption::new("medium", "Medium")],
+    )
+    .category(SessionConfigOptionCategory::ThoughtLevel)];
+
+    assert!(!has_option_category(
+      &options,
+      &SessionConfigOptionCategory::Model
+    ));
+  }
+
+  #[test]
+  fn model_options_are_not_requested_when_initial_options_include_models() {
+    let options = vec![SessionConfigOption::select(
+      "model",
+      "Model",
+      "available-model",
+      vec![SessionConfigSelectOption::new(
+        "available-model",
+        "Available model",
+      )],
+    )
+    .category(SessionConfigOptionCategory::Model)];
+
+    assert!(has_option_category(
+      &options,
+      &SessionConfigOptionCategory::Model
+    ));
   }
 
   #[test]
