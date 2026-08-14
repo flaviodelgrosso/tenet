@@ -104,6 +104,10 @@ impl ConsoleRenderer {
       ("WORK", item.summary.as_str())
     } else if item.title.starts_with("CHECKS") {
       ("VERIFY", item.summary.as_str())
+    } else if item.title.ends_with("TOOL COMPLETE") {
+      ("TOOL DONE", item.summary.as_str())
+    } else if item.title.ends_with("TOOL FAILED") {
+      ("TOOL FAILED", item.summary.as_str())
     } else if item.title.contains("TOOL") {
       ("TOOL", item.summary.as_str())
     } else {
@@ -228,11 +232,8 @@ fn should_render(options: ConsoleOptions, item: &Activity) -> bool {
     );
   }
 
-  if !options.verbose
-    && item.category == ActivityCategory::Worker
-    && item.title.ends_with("TOOL COMPLETE")
-  {
-    return false;
+  if item.title.ends_with("TOOL COMPLETE") {
+    return options.verbose;
   }
 
   options.verbose
@@ -286,6 +287,15 @@ mod tests {
       title: "IMPLEMENT · TOOL".into(),
       ..narrative.clone()
     };
+    let completed_tool = Activity {
+      title: "IMPLEMENT · TOOL COMPLETE".into(),
+      ..tool.clone()
+    };
+    let failed_tool = Activity {
+      category: ActivityCategory::Error,
+      title: "IMPLEMENT · TOOL FAILED".into(),
+      ..tool.clone()
+    };
     assert!(!should_render(
       ConsoleOptions {
         quiet: false,
@@ -299,6 +309,27 @@ mod tests {
         verbose: false
       },
       &tool
+    ));
+    assert!(!should_render(
+      ConsoleOptions {
+        quiet: false,
+        verbose: false
+      },
+      &completed_tool
+    ));
+    assert!(should_render(
+      ConsoleOptions {
+        quiet: false,
+        verbose: true
+      },
+      &completed_tool
+    ));
+    assert!(should_render(
+      ConsoleOptions {
+        quiet: false,
+        verbose: false
+      },
+      &failed_tool
     ));
     assert!(should_render(
       ConsoleOptions {
@@ -314,28 +345,5 @@ mod tests {
       },
       &tool
     ));
-  }
-
-  #[test]
-  fn default_renders_tool_lifecycle_once_and_keeps_failures() {
-    let options = ConsoleOptions {
-      quiet: false,
-      verbose: false,
-    };
-    let activity = |title: &str, category| Activity {
-      at: "10:00:00".into(),
-      category,
-      title: title.into(),
-      summary: "Inspecting repository root".into(),
-      detail: String::new(),
-    };
-    let rendered = [
-      activity("IMPLEMENT · TOOL", ActivityCategory::Worker),
-      activity("IMPLEMENT · TOOL COMPLETE", ActivityCategory::Worker),
-      activity("IMPLEMENT · TOOL FAILED", ActivityCategory::Error),
-    ]
-    .map(|item| should_render(options, &item));
-
-    assert_eq!(rendered, [true, false, true]);
   }
 }
