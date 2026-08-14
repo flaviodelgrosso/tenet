@@ -22,13 +22,13 @@ use agent_client_protocol::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
 use tenet_domain::events::EventSink;
 use tenet_domain::model::{
   ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, RequirementCatalog,
   VerificationReport, WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
 };
-use serde::de::DeserializeOwned;
-use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
 use crate::registry::RegistryClient;

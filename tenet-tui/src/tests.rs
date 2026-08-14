@@ -1,3 +1,4 @@
+use ratatui::{backend::TestBackend, Terminal};
 use tenet_domain::{
   events::RunEvent,
   model::{
@@ -6,7 +7,6 @@ use tenet_domain::{
     WorkUnit, WorkerEvent, WorkerRole,
   },
 };
-use ratatui::{backend::TestBackend, Terminal};
 
 use crate::tui::{
   action::{Action, ActivityCategory, Overlay, Screen},
