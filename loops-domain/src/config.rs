@@ -20,7 +20,6 @@ pub struct Config {
   pub stagnation_limit: u32,
   pub agent: AgentConfig,
   pub verification: VerificationConfig,
-  pub git: GitConfig,
   pub execution: ExecutionConfig,
   pub integration: IntegrationConfig,
   pub protected_paths: Vec<String>,
@@ -286,24 +285,8 @@ impl VerificationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GitConfig {
-  pub init: bool,
-  pub auto_commit: bool,
-  pub require_clean_tree: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceKind {
-  Worktree,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ExecutionConfig {
   pub max_parallel_workers: usize,
-  pub workspace: WorkspaceKind,
-  pub require_clean_base: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -346,15 +329,8 @@ impl Default for Config {
         timeout_secs: 120,
         max_output_bytes: 64 * 1024,
       },
-      git: GitConfig {
-        init: true,
-        auto_commit: false,
-        require_clean_tree: false,
-      },
       execution: ExecutionConfig {
         max_parallel_workers: 1,
-        workspace: WorkspaceKind::Worktree,
-        require_clean_base: true,
       },
       integration: IntegrationConfig {
         strategy: IntegrationStrategy::CherryPick,
@@ -467,7 +443,6 @@ mod tests {
       "stagnation_limit",
       "agent",
       "verification",
-      "git",
       "execution",
       "integration",
       "protected_paths",
@@ -494,6 +469,15 @@ mod tests {
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>(),
       ["model", "thought_level", "mode"].into_iter().collect(),
+    );
+    assert_eq!(
+      schema["$defs"]["executionConfig"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>(),
+      ["max_parallel_workers"].into_iter().collect(),
     );
   }
 
@@ -554,28 +538,8 @@ mod tests {
       config.verification.max_output_bytes
     );
     assert_eq!(
-      schema["$defs"]["gitConfig"]["properties"]["init"]["default"],
-      config.git.init
-    );
-    assert_eq!(
-      schema["$defs"]["gitConfig"]["properties"]["auto_commit"]["default"],
-      config.git.auto_commit
-    );
-    assert_eq!(
-      schema["$defs"]["gitConfig"]["properties"]["require_clean_tree"]["default"],
-      config.git.require_clean_tree
-    );
-    assert_eq!(
       schema["$defs"]["executionConfig"]["properties"]["max_parallel_workers"]["default"],
       config.execution.max_parallel_workers
-    );
-    assert_eq!(
-      schema["$defs"]["executionConfig"]["properties"]["workspace"]["default"],
-      serde_json::to_value(config.execution.workspace).unwrap()
-    );
-    assert_eq!(
-      schema["$defs"]["executionConfig"]["properties"]["require_clean_base"]["default"],
-      config.execution.require_clean_base
     );
     assert_eq!(
       schema["$defs"]["integrationConfig"]["properties"]["strategy"]["default"],
@@ -614,6 +578,9 @@ mod tests {
     assert_eq!(path, project.path().join("loops.toml"));
     assert!(!project.path().join(LOOPS_DIR).join("config.toml").exists());
     assert!(generated.contains("spec_file = \".loops/spec.md\""));
+    assert!(!generated.contains("[git]"));
+    assert!(!generated.contains("workspace"));
+    assert!(!generated.contains("require_clean_base"));
     assert!(generated.starts_with(&format!("#:schema {CONFIG_SCHEMA_URL}\n\n")));
     assert!(error.contains("no ACP launch source configured"));
   }

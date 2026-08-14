@@ -13,7 +13,6 @@
     "stagnation_limit",
     "agent",
     "verification",
-    "git",
     "execution",
     "integration",
     "protected_paths"
@@ -54,9 +53,6 @@
     },
     "verification": {
       "$ref": "#/$defs/verificationConfig"
-    },
-    "git": {
-      "$ref": "#/$defs/gitConfig"
     },
     "execution": {
       "$ref": "#/$defs/executionConfig"
@@ -198,11 +194,9 @@
     "executionConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["max_parallel_workers", "workspace", "require_clean_base"],
+      "required": ["max_parallel_workers"],
       "properties": {
-        "max_parallel_workers": { "type": "integer", "minimum": 1, "default": 1 },
-        "workspace": { "type": "string", "const": "worktree", "default": "worktree" },
-        "require_clean_base": { "type": "boolean", "default": true }
+        "max_parallel_workers": { "type": "integer", "minimum": 1, "default": 1 }
       }
     },
     "integrationConfig": {
@@ -212,29 +206,6 @@
       "properties": {
         "strategy": { "type": "string", "const": "cherry_pick", "default": "cherry_pick" },
         "verify_each_candidate": { "type": "boolean", "default": true }
-      }
-    },
-    "gitConfig": {
-      "type": "object",
-      "additionalProperties": false,
-      "description": "Repository initialization, commit, and cleanliness safeguards.",
-      "required": ["init", "auto_commit", "require_clean_tree"],
-      "properties": {
-        "init": {
-          "type": "boolean",
-          "default": true,
-          "description": "Initializes a Git repository when the project is not already inside one."
-        },
-        "auto_commit": {
-          "type": "boolean",
-          "default": false,
-          "description": "Creates loops-managed commits for accepted autonomous changes."
-        },
-        "require_clean_tree": {
-          "type": "boolean",
-          "default": false,
-          "description": "Refuses to start a run when the Git working tree already has changes."
-        }
       }
     }
   }

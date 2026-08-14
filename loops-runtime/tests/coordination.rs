@@ -424,6 +424,24 @@ async fn concurrency_one_preserves_sequential_execution() {
 }
 
 #[tokio::test]
+async fn dirty_canonical_tree_is_rejected_before_worktree_execution() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend, 1).await;
+  std::fs::write(repository.path().join("dirty.txt"), "uncommitted\n")
+    .expect("dirty canonical tree");
+
+  let error = controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("dirty canonical tree must be rejected");
+
+  assert!(error
+    .to_string()
+    .contains("worktree execution requires a clean canonical working tree"));
+}
+
+#[tokio::test]
 async fn worker_failure_fails_closed_and_cleans_worktrees() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::FailB));

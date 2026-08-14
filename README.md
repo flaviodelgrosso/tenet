@@ -494,6 +494,8 @@ loops init
 
 This creates the project configuration and Loops state directory.
 
+Loops runs require an existing Git repository with at least one commit and a clean canonical working tree. Worker changes execute in isolated worktrees and are integrated back into that canonical checkout.
+
 ---
 
 ## 3. Write the specification
@@ -654,8 +656,6 @@ timeout_secs = 120
 
 [execution]
 max_parallel_workers = 1
-workspace = "worktree"
-require_clean_base = true
 
 [integration]
 strategy = "cherry_pick"

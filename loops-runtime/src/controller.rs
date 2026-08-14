@@ -51,9 +51,6 @@ impl Controller {
     let config = ensure_config(&self.cwd).await?;
     store::ensure_spec(&self.cwd, &config).await?;
     store::ensure_gitignore(&self.cwd).await?;
-    if config.git.init {
-      git::initialize(&self.cwd).await?;
-    }
     let state_path = self.cwd.join(LOOPS_DIR).join(store::STATE_FILE);
     if !state_path.exists() {
       store::write_state(&self.cwd, &State::fresh()).await?;
@@ -72,10 +69,10 @@ impl Controller {
     self.initialize().await?;
     let _lock = RunLock::acquire(&self.cwd)?;
     let config = Arc::new(ensure_config(&self.cwd).await?);
-    if config.execution.require_clean_base && !git::is_clean(&self.cwd).await? {
+    git::head(&self.cwd).await?;
+    if !git::is_clean(&self.cwd).await? {
       bail!("worktree execution requires a clean canonical working tree");
     }
-    git::head(&self.cwd).await?;
 
     let run_id = format!(
       "{}-{}",
@@ -232,7 +229,7 @@ impl Controller {
       }
 
       let base_revision = git::head(&self.cwd).await?;
-      if context.config.execution.require_clean_base && !git::is_clean(&self.cwd).await? {
+      if !git::is_clean(&self.cwd).await? {
         return self
           .block(
             context,
@@ -431,7 +428,7 @@ impl Controller {
       self.publish(&context.events, state).await?;
       return Ok(None);
     }
-    if context.config.git.require_clean_tree && !git::is_clean(&self.cwd).await? {
+    if !git::is_clean(&self.cwd).await? {
       return Ok(Some(
         self
           .block(

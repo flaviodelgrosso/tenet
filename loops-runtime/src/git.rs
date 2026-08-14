@@ -5,17 +5,10 @@ use tokio::process::Command;
 
 use loops_domain::model::RepositoryChange;
 
-pub async fn initialize(cwd: &Path) -> Result<()> {
-  if run(cwd, &["rev-parse", "--git-dir"]).await.is_ok() {
-    return Ok(());
-  }
-  run(cwd, &["init"]).await.map(|_| ())
-}
-
 pub async fn head(cwd: &Path) -> Result<String> {
   run(cwd, &["rev-parse", "--verify", "HEAD"])
     .await
-    .context("repository has no resolvable HEAD")
+    .context("worktree execution requires an existing Git repository with at least one commit")
 }
 
 pub async fn is_clean(cwd: &Path) -> Result<bool> {
@@ -153,4 +146,23 @@ fn parse_status(output: &str) -> Vec<RepositoryChange> {
       Some(RepositoryChange { path, status })
     })
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+  use uuid::Uuid;
+
+  use super::head;
+
+  #[tokio::test]
+  async fn head_requires_an_existing_repository_with_a_commit() {
+    let path = std::env::temp_dir().join(format!("loops-non-repository-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&path).unwrap();
+
+    let error = head(&path).await.unwrap_err().to_string();
+    std::fs::remove_dir_all(path).unwrap();
+
+    assert!(error
+      .contains("worktree execution requires an existing Git repository with at least one commit"));
+  }
 }
