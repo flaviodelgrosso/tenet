@@ -72,6 +72,7 @@ struct ConsoleRenderer {
   options: ConsoleOptions,
   stdout: io::Stdout,
 }
+
 impl ConsoleRenderer {
   fn new(options: ConsoleOptions) -> Self {
     Self {
@@ -79,6 +80,7 @@ impl ConsoleRenderer {
       stdout: io::stdout(),
     }
   }
+
   fn line(&mut self, label: &str, message: &str) -> Result<()> {
     writeln!(
       self.stdout,
@@ -90,6 +92,7 @@ impl ConsoleRenderer {
     self.stdout.flush()?;
     Ok(())
   }
+
   fn activity(&mut self, item: &Activity) -> Result<()> {
     if !should_render(self.options, item) {
       return Ok(());
@@ -107,6 +110,7 @@ impl ConsoleRenderer {
       (item.title.as_str(), item.summary.as_str())
     };
     writeln!(self.stdout, "{at}  {label:<10} {text}")?;
+
     if item.title == "CHANGES" {
       for path in item.detail.lines().take(8) {
         writeln!(self.stdout, "                    {path}")?;
@@ -116,6 +120,7 @@ impl ConsoleRenderer {
         writeln!(self.stdout, "                    … {extra} more")?;
       }
     }
+
     if item.title.starts_with("CHECKS") {
       for line in item
         .detail
@@ -128,11 +133,13 @@ impl ConsoleRenderer {
         writeln!(self.stdout, "                    {line}")?;
       }
     }
+
     if matches!(item.category, ActivityCategory::Error) {
       if let Some(detail) = item.detail.lines().find(|line| !line.trim().is_empty()) {
         writeln!(self.stdout, "                    {detail}")?;
       }
     }
+
     if self.options.verbose && item.category == ActivityCategory::Worker && !item.detail.is_empty()
     {
       writeln!(
@@ -144,6 +151,7 @@ impl ConsoleRenderer {
     self.stdout.flush()?;
     Ok(())
   }
+
   fn summary(&mut self, presentation: &RunProjection, state: &State) -> Result<()> {
     let elapsed = format_duration(presentation.elapsed_seconds());
     let state_label = status_label(&state.status);
@@ -156,16 +164,19 @@ impl ConsoleRenderer {
         "✕"
       }
     )?;
+
     writeln!(
       self.stdout,
       "  Requirements   {}/{} satisfied",
       state.requirement_counts.satisfied, state.requirement_counts.total
     )?;
+
     writeln!(
       self.stdout,
       "  Work units     {} completed",
       state.completed_work_units.len()
     )?;
+
     writeln!(self.stdout, "  Cycle          {}", state.cycle)?;
     for lease in state.active_leases.values() {
       writeln!(
@@ -174,9 +185,11 @@ impl ConsoleRenderer {
         lease.work_unit.id, lease.work_unit.title, lease.worker_id
       )?;
     }
+
     if let Some(reason) = state.blocked_reason.as_ref().or(state.last_error.as_ref()) {
       writeln!(self.stdout, "\n  Reason\n  {reason}")?;
     }
+
     if !presentation.checks().is_empty() {
       writeln!(
         self.stdout,
@@ -192,6 +205,7 @@ impl ConsoleRenderer {
         }
       )?;
     }
+
     if matches!(
       state.status,
       RunStatus::Blocked | RunStatus::Failed | RunStatus::Stopped
@@ -213,6 +227,14 @@ fn should_render(options: ConsoleOptions, item: &Activity) -> bool {
       ActivityCategory::Error | ActivityCategory::Check
     );
   }
+
+  if !options.verbose
+    && item.category == ActivityCategory::Worker
+    && item.title.ends_with("TOOL COMPLETE")
+  {
+    return false;
+  }
+
   options.verbose
     || item.category != ActivityCategory::Worker
     || item.title.contains("TOOL")
@@ -292,5 +314,28 @@ mod tests {
       },
       &tool
     ));
+  }
+
+  #[test]
+  fn default_renders_tool_lifecycle_once_and_keeps_failures() {
+    let options = ConsoleOptions {
+      quiet: false,
+      verbose: false,
+    };
+    let activity = |title: &str, category| Activity {
+      at: "10:00:00".into(),
+      category,
+      title: title.into(),
+      summary: "Inspecting repository root".into(),
+      detail: String::new(),
+    };
+    let rendered = [
+      activity("IMPLEMENT · TOOL", ActivityCategory::Worker),
+      activity("IMPLEMENT · TOOL COMPLETE", ActivityCategory::Worker),
+      activity("IMPLEMENT · TOOL FAILED", ActivityCategory::Error),
+    ]
+    .map(|item| should_render(options, &item));
+
+    assert_eq!(rendered, [true, false, true]);
   }
 }
