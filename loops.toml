@@ -1,12 +1,12 @@
 #:schema ./schemas/config.schema.json
 
 version = 1
-spec_file = ".loops/spec.md"
+spec_file = "spec.md"
 max_cycles = 25
 max_repair_attempts = 3
 stagnation_limit = 3
 protected_paths = [
-  ".loops/spec.md",
+  "spec.md",
   "AGENTS.md",
   "loops.toml",
   ".loops/state.json",
