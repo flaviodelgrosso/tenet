@@ -1,665 +1,656 @@
 <div align="center">
 
-<img width="2066" height="761" alt="logo" src="https://github.com/user-attachments/assets/83d2961d-be43-4e8e-a68c-5f4958cafdbb" />
+<img width="2066" height="761" alt="loops" src="https://github.com/user-attachments/assets/83d2961d-be43-4e8e-a68c-5f4958cafdbb" />
 
-<br />
 <br />
 
 [![CI](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml/badge.svg)](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Status: MVP](https://img.shields.io/badge/status-MVP-orange)](#status-mvp)
-[![Coding Agents](https://img.shields.io/badge/coding-agents-blueviolet)](#)
+[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust\&logoColor=white)](https://www.rust-lang.org/)
+[![Status: MVP](https://img.shields.io/badge/status-MVP-orange)](#mvp-read-this-first)
 
-**A deterministic control loop for autonomous, spec-driven software development with coding agents.**
+### Give an agent a task and it can write code.
+
+### Give **Loops** a spec and it keeps asking whether the software is actually done.
+
+**A deterministic control loop for autonomous, spec-driven software development.**
 
 </div>
 
-Give `loops` a spec and it will work toward satisfying it through isolated coding-agent workers, repository-backed state, deterministic verification, repair loops, and an independent final assessment.
-
-The important distinction is this:
-
-> **Agents do the work. The controller owns the process.**
-
-`loops` is a small Rust controller for autonomous, spec-driven development.
-
-It does not rely on one long-running agent conversation to remember the project, decide what to do next, modify the code, judge its own work, and eventually declare itself finished.
-
-Instead, it runs a state machine that repeatedly:
-
-1. inspects the repository against an authoritative specification,
-2. validates a proposed dependency graph of coherent work units,
-3. leases dependency-ready, scope-compatible units to fresh coding-agent workers,
-4. executes those workers in isolated Git worktrees with bounded concurrency,
-5. verifies and commits each candidate independently,
-6. integrates candidates in deterministic work-unit order with regression gates,
-7. reconciles the integrated repository against the spec again,
-8. and requires an independent assessment before considering the run complete.
-
-The production runtime speaks the **[Agent Client Protocol (ACP)](https://agentclientprotocol.com/)**. Choose an agent through its canonical Registry identity, or use an advanced custom ACP command.
-
-> **Bring your agent. Loops supplies the engineering process.**
-> Workflow state, transitions, verification, retries, evidence, and completion rules are owned by the Rust controller rather than left entirely to the agent.
-
 ---
 
-## Status: MVP
+Coding agents are getting very good at changing code.
 
-`loops` is currently an **MVP**.
+That is not the same thing as being good at **finishing software autonomously**.
 
-The core control loop is implemented and usable, including:
+Long-running agent workflows have a different problem:
 
-- spec-to-requirement analysis,
-- repository reconciliation,
-- isolated implementation workers,
-- deterministic verification,
-- repair loops,
-- persistent state and evidence,
-- stagnation and cycle limits,
-- independent final assessment,
-- per-role model and thought-level configuration,
-- TUI and non-interactive execution.
+* context accumulates;
+* assumptions become stale;
+* plans drift away from the repository;
+* failed tests become another paragraph in a conversation;
+* the agent that wrote the code is often the same agent deciding whether it worked;
+* and eventually something says *“done”*.
 
-What has **not** been proven yet is more important:
+**Loops is an experiment in moving that responsibility out of the conversation.**
 
-`loops` does not yet have enough comparative evaluation to claim that this architecture is more reliable, cheaper, or more effective than strong single-agent workflows, Ralph-style loops, or other coding-agent orchestrators.
+The model writes code.
 
-That is the main hypothesis this project now needs to test.
-
-If you use `loops` today, treat it as experimental engineering tooling rather than a production-ready autonomous software factory.
-
----
-
-## The idea in one picture
-
-```mermaid
-flowchart LR
-    A["`authoritative
-.loops/spec.md`"] --> B["`loops
-
-state machine
-requirement catalog
-deterministic verify
-evidence + audit trail
-retries / circuit break
-TUI`"]
-
-    B --> C["`single ACP boundary`"]
-    C --> D1["`Registry ACP agent`"]
-    C --> D2["`another Registry ACP agent`"]
-    C --> D3["`custom ACP command`"]
-```
-
-The diagram shows interchangeable ACP launch choices, not multiple agents running in one project at once. A project configures exactly one source; each role receives a fresh session through the same ACP boundary.
-
-There is no permanent "master LLM" carrying the entire run in conversational memory.
-
-State survives between workers through explicit artifacts:
-
-- the repository,
-- `.loops/spec.md`,
-- `.loops/` controller state,
-- the requirement catalog,
-- work-unit summaries,
-- reconciliation evidence,
-- deterministic verification reports.
-
-Each worker starts with fresh context.
-
-That isolation is intentional.
-
-The repository and controller state are durable. Agent context is disposable.
-
----
-
-## The hypothesis
-
-Long-running autonomous coding has a control problem as much as it has a model problem.
-
-A single agent can be very effective at implementing a bounded task. Over longer runs, however, several failure modes become increasingly important:
-
-- conversational context grows,
-- assumptions become stale,
-- earlier reasoning becomes hard to inspect,
-- task plans diverge from repository reality,
-- failed verification gets summarized instead of used directly,
-- and the same agent that wrote the change is often asked to judge whether it succeeded.
-
-`loops` experiments with a different structure.
-
-### Disposable context, durable state
-
-Architect, Reconcile, Implement, Repair, and Assess run in separate ACP sessions with fresh context.
-
-Workers do not inherit a long conversational history from previous workers.
-
-What survives is explicit state written to disk.
-
-This does not guarantee better results, but it makes dependencies between iterations more visible and reduces reliance on hidden conversational memory.
-
-### Agents propose; deterministic code controls transitions
-
-An agent saying "tests pass" is not enough.
-
-`loops` runs actual processes and checks actual exit codes.
-
-Builds, tests, linters, typecheckers, acceptance scripts, and other configured commands provide deterministic evidence used by the controller.
-
-Deterministic verification is still only as good as the checks available in the project. A green test suite does **not** prove that the specification has been implemented correctly.
-
-The goal is narrower:
-
-> never substitute an agent's claim for evidence that the controller can obtain directly.
-
-### Reconcile against the repository
-
-After verified candidates are integrated, `loops` does not blindly advance through an old plan.
-
-A fresh Reconcile worker inspects the current repository and proposes work units, dependencies, and conservative path scopes. Rust validates the resulting DAG and computes the ready frontier. The agent never decides concurrency.
-
-The roadmap is a current interpretation of repository reality, not immutable controller state.
-
-### Independent assessment at the finish line
-
-The worker that implemented the code does not certify overall completion.
-
-When deterministic gates pass and reconciliation reports no remaining work, a fresh, read-only Assess worker evaluates the repository against the requirement catalog.
-
-Assess is an additional skeptical check, not an oracle.
-
-It is still a model and can still be wrong.
-
-Its purpose is to reduce self-certification by separating implementation context from final evaluation.
-
-### Fail closed
-
-Invalid structured output, protected-file mutation, repeated stagnation, exhausted repair attempts, or failed deterministic gates block the run rather than silently converting uncertainty into success.
-
----
-
-## What actually happens
-
-A `loops run` is a hierarchy of deterministic coordination loops:
+**The controller owns the process.**
 
 ```text
-.loops/spec.md
-   │
-   ▼
-ARCHITECT                 when the requirement catalog is missing/stale
-   │
-   ▼
-┌──────────────────── PROJECT LOOP ─────────────────────┐
-│  RECONCILE ──► validate DAG ──► ready frontier        │
-│                              │                        │
-│                    bounded worker leases              │
-│                  ┌───────────┼───────────┐             │
-│                  ▼           ▼           ▼             │
-│             worktree A  worktree B  worktree C         │
-│                  │           │           │             │
-│             verify+commit verify+commit verify+commit  │
-│                  └───────────┼───────────┘             │
-│                              ▼                        │
-│             deterministic integration queue           │
-│                              │                        │
-│                cherry-pick + verification             │
-│                              │                        │
-│          next cycle → inspect integrated repo          │
-└───────────────────────────────────────────────────────┘
-   │ reconciliation reports complete
-   ▼
-FINAL DETERMINISTIC GATES ──► ASSESS ──► DONE
+spec
+ │
+ ▼
+understand what must be true
+ │
+ ▼
+inspect the repository
+ │
+ ▼
+choose the next bounded work
+ │
+ ▼
+fresh coding-agent session
+ │
+ ▼
+isolated Git worktree
+ │
+ ▼
+run real verification
+ │
+ ├── failed ──► repair with actual failure evidence ──┐
+ │                                                  │
+ └── passed ──► integrate ──► inspect again ◄───────┘
+                              │
+                              ▼
+                     independent assessment
+                              │
+                              ▼
+                            DONE?
 ```
 
----
+There is no immortal master conversation that has to remember everything.
 
-## The five roles
+Agent context is disposable.
 
-| Role          | Purpose                                                                                | Repo access                | Runs when                                                       |
-| ------------- | -------------------------------------------------------------------------------------- | -------------------------- | --------------------------------------------------------------- |
-| **Architect** | Converts `.loops/spec.md` into a stable `REQ-NNN` requirement catalog                  | Read-only canonical        | Initially and when the spec changes                             |
-| **Reconcile** | Assesses requirements and proposes a dependency graph; Rust validates and schedules it | Read-only canonical        | At the beginning of every project cycle                         |
-| **Implement** | Implements one controller-issued work lease                                           | Isolated worktree          | For each ready, scope-compatible work unit                      |
-| **Repair**    | Responds to deterministic verification failures for the same lease                     | Same isolated worktree     | After candidate verification fails                              |
-| **Assess**    | Independently evaluates final repository state against the requirements                | Read-only canonical        | After reconciliation and deterministic gates report completion |
-
-These are separate ACP sessions, not nested agent subagents. Agents do not communicate with peers; leases, revisions, events, discoveries, verification, and persisted state are the coordination protocol.
-
-Each coding worker receives `BackendContext.cwd` pointing at `.loops/worktrees/<run-id>/<lease-id>/`. Worker completion order does not control integration order: candidates are integrated by ascending work-unit ID.
-
-`execution.max_parallel_workers` bounds concurrency and defaults to `1`, preserving sequential behavior. Declared path scopes prevent obvious overlap, but scopes are only an advisory safeguard; dependency readiness remains mandatory.
+**The repository, specification, evidence, and controller state are not.**
 
 ---
 
-## Worker procedures
+## The idea
 
-`loops` creates an isolated per-worker procedure environment under:
+Loops starts from a simple observation:
+
+> **Autonomous coding is partly an intelligence problem, but it is also a control problem.**
+
+A strong model can already solve surprisingly difficult bounded coding tasks.
+
+But an autonomous engineering system also needs to answer questions like:
+
+* What are we actually trying to satisfy?
+* What is already implemented?
+* What should happen next?
+* Which work can safely run?
+* Did the change really pass the project's checks?
+* Did the fix break something that was already working?
+* Are we repeating ourselves?
+* Should we retry, repair, stop, or reassess?
+* Who decides that the repository is finished?
+
+Those decisions should not live only inside model context.
+
+Loops puts them in a Rust controller.
 
 ```text
-.loops/runtime/<run>/<role>/skills
+probabilistic workers
+        │
+        ▼
+┌──────────────────────────────┐
+│            LOOPS             │
+│                              │
+│ requirements                 │
+│ state transitions            │
+│ dependency validation        │
+│ worktree isolation           │
+│ verification                 │
+│ retries                      │
+│ integration                  │
+│ evidence                     │
+│ stopping conditions          │
+└──────────────────────────────┘
+        │
+        ▼
+      repository
 ```
 
-Agent-native extensions and global configuration are not implicitly inherited.
+Agents reason.
 
-`loops` ships role procedures rather than language-specific expertise:
+Agents implement.
 
-| Role                 | Built-in procedure |
-| -------------------- | ------------------ |
-| Architect, Reconcile | `spec-analysis`    |
-| Implement            | `implementation`   |
-| Repair               | `debugging`        |
-| Assess               | `spec-assessment`  |
+Agents repair.
 
-A `code-review` procedure is also included for a possible future Review role, but Review is not currently part of the state machine.
+Agents assess.
 
-A **role prompt** defines worker identity, permissions, protected files, and a strict output schema. When an ACP MCP server is actually attached, it can additionally offer the optional `loops_yield` tool.
-
-A **built-in procedure** describes the workflow expected from that role.
-
-A **work unit** describes the concrete task.
-
-The repository provides current reality.
+But **agents do not get to redefine the process just because the conversation drifted there**.
 
 ---
 
-## Structured completion, not prose parsing
+## Why fresh agents?
 
-The portable completion baseline is one whole-response JSON value: no markdown or surrounding prose. `loops` validates that value against the role's schema and then deserializes it into the controller's typed result.
+A long-running coding conversation has memory.
 
-This strict JSON path is required for every worker and is used whenever MCP is unavailable or the agent does not call the completion tool. Invalid output is retried according to `completion_retries`; continued invalid output fails the worker.
+That sounds like an advantage.
 
-When an ACP agent advertises client MCP support, Loops attaches a per-worker `loops_yield` server through the official ACP SDK. The tool accepts the same role schema, accepts exactly one valid result, and becomes the worker result; malformed, schema-invalid, or duplicate yields are rejected. Agents that do not support or use MCP—including adapters that ignore supplied MCP servers—continue through the portable strict-JSON path.
+Sometimes it is.
 
-This does not make the model deterministic.
+It can also become baggage.
 
-It makes the boundary between probabilistic model behavior and deterministic controller state explicit.
+An agent may carry forward:
 
----
+* an obsolete mental model of the codebase;
+* a plan that made sense three changes ago;
+* assumptions it never re-checked;
+* compressed summaries of previous failures;
+* confidence inherited from its own earlier reasoning.
 
-## Verification
+Loops deliberately uses fresh sessions for different roles.
 
-`loops verify` and internal verification gates execute the configured project commands.
+The next worker does not need to believe the previous worker.
 
-Additional hard gates can be configured:
-
-```toml
-[verification]
-commands = [
-  "cargo test --all-features",
-  "./scripts/acceptance.sh"
-]
-```
-
-Every attempt — successful or failed — is persisted under:
+It can inspect what actually exists.
 
 ```text
-.loops/evidence/
+previous reasoning    → disposable
+repository changes    → durable
+verification results  → durable
+requirements          → durable
+controller state      → durable
 ```
 
-including information such as:
+This is the central bet behind the project:
 
-- command,
-- exit code,
-- stdout,
-- stderr.
+> **Keep engineering state explicit. Keep model context replaceable.**
 
-### Verification has limits
+Whether that architecture ultimately beats simpler agent loops is something that still needs to be measured.
 
-Deterministic verification is one of the strongest parts of the control loop, but it should not be confused with proof of correctness.
-
-An agent can produce software that passes the existing tests while still violating the intended behavior.
-
-A weak project test suite produces weak evidence.
-
-For serious autonomous delivery, projects should provide strong acceptance gates that reflect product behavior rather than only implementation health.
-
-Useful examples include:
-
-- integration tests,
-- acceptance tests,
-- contract tests,
-- browser or UI checks,
-- security scanners,
-- architectural constraints,
-- performance thresholds,
-- project-specific validation scripts.
-
-Improving verification quality is one of the most important directions for the project.
+Loops does **not** claim that result today.
 
 ---
 
-## Repair
+## What happens during a run
 
-A deterministic verification failure does not become "one more message" in the Implement worker's existing conversation.
+A run is a sequence of bounded engineering loops.
 
-Instead, `loops` starts a fresh Repair worker.
+### 1. Architect
 
-That worker receives the current repository plus the actual verification failure.
+The specification is turned into explicit requirements.
 
-For example:
+Not a vague todo list.
+
+A concrete catalog of what the repository is supposed to satisfy.
+
+### 2. Reconcile
+
+A fresh worker compares those requirements with the repository **as it exists now**.
+
+It proposes the work that remains.
+
+Loops validates that work before execution.
+
+The plan is therefore allowed to change as the code changes.
+
+### 3. Implement
+
+A coding worker receives a bounded unit of work.
+
+Implementation happens inside an isolated Git worktree rather than treating the canonical checkout as scratch space.
+
+### 4. Verify
+
+The controller executes real project commands.
+
+```bash
+cargo test
+make ci
+./scripts/acceptance.sh
+```
+
+Whatever your project considers meaningful evidence.
+
+An agent saying *“tests pass”* is not evidence when Loops can run the tests itself.
+
+### 5. Repair
+
+If deterministic verification fails, the failure becomes input to a fresh repair attempt:
 
 ```text
-repository after implementation
-        +
-actual failing command
-        +
-stdout / stderr
-        +
+changed repository
++
+failing command
++
 exit code
-        ↓
-fresh Repair worker
++
+stdout / stderr
+        │
+        ▼
+   repair worker
 ```
 
-Repair attempt #2 does not need Repair attempt #1's reasoning.
+Retries are bounded.
 
-It sees the repository as Repair #1 left it and the newest deterministic evidence.
+Loops is designed to block rather than spend forever rediscovering the same failure.
 
-Repair is bounded by `max_repair_attempts`.
+### 6. Integrate
 
-When attempts are exhausted, the run blocks rather than retrying indefinitely.
+Verified candidate work is integrated into the repository through the controller.
+
+Then the repository is examined again.
+
+Because after code changes, yesterday's plan is only a hypothesis.
+
+### 7. Assess
+
+When reconciliation believes the work is complete and deterministic gates pass, another fresh worker performs an independent assessment.
+
+The worker that wrote the implementation does not get the final vote by default.
 
 ---
 
-## Guardrails against runaway loops
+## `DONE` is a state, not a sentence
 
-Autonomous execution needs explicit stopping conditions.
+This is one of the most important ideas in Loops.
 
-`loops` currently includes:
-
-### Protected-file snapshotting
-
-Controller-owned files such as:
-
-- `.loops/spec.md`,
-- `loops.toml`,
-- `.loops/state.json`,
-- and related state,
-
-are protected around coding workers.
-
-Unexpected modification can cause restoration and block the run.
-
-This protects controller state from accidental mutation.
-
-It is **not** a security sandbox.
-
-### Stagnation detection
-
-If Reconcile repeatedly proposes effectively the same work unit without requirement progress, a circuit breaker eventually trips.
-
-Default:
-
-```toml
-stagnation_limit = 3
-```
-
-### Hard cycle ceiling
-
-A project run cannot loop forever.
-
-Default:
-
-```toml
-max_cycles = 25
-```
-
-### Repair ceiling
-
-Repeated deterministic failures stop after a bounded number of repair attempts.
-
-Default:
-
-```toml
-max_repair_attempts = 3
-```
-
-These limits exist to turn runaway behavior into an explicit blocked state instead of unlimited token and compute consumption.
-
----
-
-## What `DONE` means
-
-`DONE` is a controller state, not a sentence emitted by a coding agent.
-
-Conceptually:
+A coding model can always emit:
 
 ```text
-status = done only when:
-
-  1. a valid requirement catalog exists
-
-  2. Reconcile reports every requirement satisfied
-     and proposes an empty work graph
-  3. final deterministic verification passes
-     on the integrated repository
-
-  4. a fresh read-only Assess worker independently
-     reports no remaining requirement gaps
-
-  5. configured Git cleanliness policy passes
+Everything is implemented successfully.
 ```
 
-> **Agent claims are hypotheses. Evidence determines controller transitions.**
+Loops does not treat that sentence as completion.
 
-Even then, `DONE` should be interpreted correctly:
+Conceptually, completion looks more like:
 
-it means the repository satisfied the evidence and assessment mechanisms currently available to `loops`.
+```text
+requirements accounted for
+        +
+no remaining reconciled work
+        +
+deterministic verification passes
+        +
+independent assessment finds no remaining gap
+        +
+controller policies pass
+        =
+DONE
+```
 
-It does not mean formal proof that the software is correct.
+Even then, `DONE` does **not** mean mathematically proven correct.
+
+It means:
+
+> the repository satisfied the evidence and assessment mechanisms available to this run.
+
+If your tests are weak, your evidence is weak.
+
+If your specification is ambiguous, the result can still be wrong.
+
+If the model misses something, assessment can still be wrong.
+
+Loops cannot remove uncertainty from software engineering.
+
+The goal is to make that uncertainty **visible, bounded, and harder to hand-wave away**.
 
 ---
 
-## TUI
+# MVP: read this first
 
-`loops` owns the terminal while ACP workers execute headlessly in the background.
+**Loops is an MVP.**
 
-The Ratatui interface exposes three main views:
+It is real software and the core control loop exists.
 
-- **Run** — worker activity and requirement progress
-- **Evidence** — requirement evidence and current gaps
-- **Timeline** — state transitions, worker boundaries, and verification events
+It is also young, experimental software that is changing quickly.
 
-Keyboard controls:
+Today, the project already contains the foundations for:
+
+* spec-driven requirement analysis;
+* repository reconciliation;
+* separate Architect, Reconcile, Implement, Repair, and Assess sessions;
+* ACP-based coding-agent execution;
+* isolated Git worktrees for coding workers;
+* deterministic project verification;
+* bounded repair attempts;
+* bounded project cycles;
+* persistent controller state;
+* evidence capture;
+* dependency-aware scheduling;
+* controlled integration;
+* protected controller-owned paths;
+* role-specific model configuration;
+* interactive terminal UI;
+* headless execution for automation and logs.
+
+That is the promising part.
+
+Here is the equally important part.
+
+## What Loops has **not** proven
+
+There is not yet enough comparative evaluation to claim that Loops is:
+
+* more reliable than a strong single-agent workflow;
+* better than a simple Ralph-style loop;
+* cheaper;
+* faster;
+* safer for unattended production development;
+* or less likely to produce false completion.
+
+Those are hypotheses.
+
+They need benchmarks.
+
+They need failed runs.
+
+They need ugly repositories.
+
+They need adversarial specs.
+
+They need real evidence.
+
+That is where this project should earn its claims.
+
+## Expect rough edges
+
+If you try Loops today, expect bugs.
+
+Particularly around the places where real systems get messy:
+
+* different ACP agents and their capabilities;
+* model/configuration compatibility;
+* unusual Git repository states;
+* worktree lifecycle edge cases;
+* terminal rendering and streaming output;
+* cancellation and recovery;
+* incomplete or misleading verification suites;
+* agent output that violates the expected structure;
+* workflows nobody has tested yet.
+
+Do not point it at an important repository, walk away, and assume autonomous perfection.
+
+Use Git.
+
+Use backups.
+
+Review the result.
+
+Give it strong acceptance tests.
+
+And when it breaks, open an issue.
+
+**The current product is an engineering experiment, not an autonomous software factory.**
+
+That distinction matters.
+
+---
+
+## Why this could become interesting
+
+The interesting future for coding agents is probably not just:
 
 ```text
-Tab                 switch view
-Home / g            jump to top
-Up / Down, j / k    scroll
-End / G             follow live output
-PageUp / PageDown   scroll faster
-q / Ctrl-C          stop active run / exit when idle
+bigger model
++
+bigger context window
++
+longer conversation
 ```
 
-When a run completes, the TUI remains available for inspection.
+It may also require better machinery around the model.
 
-For CI, SSH, automation, and log capture, headless mode provides a controller-oriented
-line stream without claiming the terminal:
+Software engineering already has machinery:
+
+* version control;
+* CI;
+* tests;
+* dependency graphs;
+* transaction boundaries;
+* schedulers;
+* logs;
+* state machines;
+* review;
+* rollback;
+* observability.
+
+Loops asks:
+
+> **What happens if autonomous coding starts looking more like an engineering system and less like one very long chat?**
+
+If the answer is “nothing, simpler loops work just as well,” that is useful to learn.
+
+If the answer is that explicit control substantially reduces false completion, regressions, drift, or wasted retries, that is much more interesting.
+
+The project exists to find out.
+
+---
+
+## Agent-neutral by design
+
+Loops communicates with coding agents through the **[Agent Client Protocol (ACP)](https://agentclientprotocol.com/)**.
+
+The controller should not need to become a different product every time a better coding model appears.
+
+Bring an ACP-compatible agent.
+
+Loops provides the surrounding process.
+
+```text
+                         ┌───────────────────┐
+                         │       Loops       │
+                         │                   │
+spec ───────────────────►│ controller        │
+repo ───────────────────►│ verification      │
+                         │ state + evidence  │
+                         └─────────┬─────────┘
+                                   │
+                                  ACP
+                                   │
+                 ┌─────────────────┼─────────────────┐
+                 ▼                 ▼                 ▼
+              Agent A           Agent B        custom ACP
+```
+
+A project selects an agent source.
+
+Different Loops roles can then use fresh sessions and role-specific model preferences while preserving the same controller semantics.
+
+---
+
+# Quick start
+
+## 1. Build Loops
+
+Loops is currently a Rust project distributed from source.
 
 ```bash
-loops run --headless
+git clone https://github.com/flaviodelgrosso/loops.git
+cd loops
+
+make install
 ```
 
-Progress and the final summary are written to stdout, so `loops run --headless > loops.log`
-creates a coherent run log. Runtime diagnostics remain on stderr. Use `--quiet` for
-milestones only or `--verbose` to include worker narrative and tool diagnostics. Terminal
-states preserve the normal exit semantics: blocked, failed, and stopped runs exit non-zero.
+Or work directly from the repository during development.
+
+A current stable Rust toolchain is required.
 
 ---
 
-## Project state
+## 2. Initialize a project
 
-Controller state is stored on disk and intended to remain human-inspectable.
-
-```text
-project/
-├── loops.toml
-└── .loops/
-    ├── spec.md
-    ├── state.json
-    ├── requirements.json
-    ├── roadmap.json
-    ├── evidence/
-    └── runs/<run-id>/
-        ├── events.jsonl
-        ├── worker-events.jsonl
-        └── transcript.log
-```
-
-### `.loops/spec.md`
-
-The human-authored product contract.
-
-### `requirements.json`
-
-The Architect worker's normalized requirement catalog, tied to the current spec.
-
-### `roadmap.json`
-
-The latest reconciliation or assessment view of requirement status, evidence, and gaps.
-
-### `state.json`
-
-Controller state such as:
-
-- phase,
-- cycle,
-- current work unit,
-- completed work units,
-- blocked/done status.
-
-### `evidence/`
-
-Deterministic verification reports.
-
-### `runs/`
-
-Per-run event streams and transcripts for inspection and debugging.
-
-`resume` is deliberately equivalent to `run`.
-
-Continuation is reconstructed from repository and `.loops/` state rather than from a preserved conversational session.
-
----
-
-## Getting started
-
-### Requirements
-
-Bring an ACP-compatible coding agent. `loops` supplies the control loop; it does not supply an agent account, credentials, or a coding-agent runtime.
-
-You also need:
-
-- a Rust toolchain to install `loops` from this checkout,
-- your project's own build/test tooling,
-- Git, strongly recommended.
-
-### Install and run
-
-Install Loops:
-
-```bash
-cargo install --path loops-cli
-```
-
-Initialize the project:
+From the repository you want Loops to work on:
 
 ```bash
 loops init
 ```
 
-This creates:
+This creates the project configuration and Loops state directory.
 
-```text
-loops.toml
-.loops/
-  └── spec.md
+---
+
+## 3. Write the specification
+
+Tell Loops what should be true when the work is finished.
+
+For example:
+
+```markdown
+# Product specification
+
+Build a JSON API for bookmarks.
+
+## Requirements
+
+- Users can create a bookmark with a URL and title.
+- URLs must be unique.
+- Users can list bookmarks ordered by creation time.
+- Users can delete bookmarks.
+- Invalid URLs return a 400 response.
+- The API must have integration tests.
+- `cargo test` must pass.
 ```
 
-Choose a Registry agent, or use the custom ACP command created by `loops init`.
+The spec is not a prompt asking an agent to “please implement this.”
 
-To choose a Registry agent, remove the `[agent.custom]` block from `loops.toml`, then:
+It is the reference against which the repository keeps being reconsidered.
+
+The spec path is configurable in `loops.toml`.
+
+---
+
+## 4. Configure an agent
+
+Explore ACP Registry agents:
 
 ```bash
 loops agents list
-loops agents select <registry-agent-id>
+loops agents search <query>
+loops agents select <id>
 ```
 
-Authenticate only if the selected agent asks you to; follow that agent's normal authentication flow. Loops neither collects those credentials nor performs sign-in on the agent's behalf.
-
-Write the specification:
+Check the configured runtime:
 
 ```bash
-$EDITOR .loops/spec.md
+loops agents doctor
 ```
 
-Run:
+Loops also supports an advanced custom ACP command in `loops.toml`.
+
+---
+
+## 5. Configure real verification
+
+This part matters more than almost anything else.
+
+```toml
+[verification]
+require_project_gate = true
+commands = [
+  "cargo test",
+  "./scripts/acceptance.sh",
+]
+```
+
+The stronger your verification, the stronger the evidence Loops can use.
+
+A perfectly orchestrated agent cannot compensate for a test suite that proves nothing.
+
+---
+
+## 6. Run
 
 ```bash
 loops run
 ```
 
-Or as a console run suitable for CI or a remote shell:
+For non-interactive execution:
 
 ```bash
 loops run --headless
 ```
 
-Inspect controller state:
+For less output:
 
 ```bash
-loops status --json
+loops run --headless --quiet
 ```
 
-Run deterministic verification without invoking an agent:
+For more worker diagnostics:
 
 ```bash
-loops verify --json
+loops run --headless --verbose
+```
+
+State is persisted, so execution can be resumed:
+
+```bash
+loops resume
 ```
 
 ---
 
-## Configuration
+# The terminal UI
 
-Example `loops.toml`:
+By default Loops provides an interactive terminal interface for watching the controller rather than staring at an opaque agent stream.
+
+The important views are about **process**, not just tokens:
+
+* current worker activity;
+* requirement progress;
+* evidence;
+* verification;
+* state transitions;
+* timeline.
+
+Useful controls:
+
+```text
+Tab                 switch view
+Home / g            top
+Up / Down, j / k    scroll
+End / G             follow
+PageUp / PageDown   faster scroll
+q / Ctrl-C          stop / exit
+```
+
+For servers, CI, SSH sessions, or log capture, use headless mode instead.
+
+```bash
+loops run --headless > loops.log
+```
+
+---
+
+# Configuration
+
+A project is controlled through `loops.toml`.
+
+A simplified example:
 
 ```toml
-#:schema https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json
-
 version = 1
-spec_file = ".loops/spec.md"
+spec_file = "spec.md"
+
 max_cycles = 25
 max_repair_attempts = 3
 stagnation_limit = 3
 
 [agent]
-turn_timeout_secs = 900
 completion_retries = 2
-
-# Registry source, written by `loops agents select <id>`:
-id = "registry-agent-id"
-
-[agent.preferences.default]
-thought_level = "medium"
-
-[agent.preferences.roles.architect]
-thought_level = "xhigh"
-
-Configured model IDs must be advertised by the ACP session. Loops fails the worker session instead of silently using the agent's default model when a configured model is unavailable.
-
-# Instead of `agent.id`, an unregistered ACP command is also valid:
-# [agent.custom]
-# command = "omp"
-# args = ["acp"]
+turn_timeout_secs = 900
 
 [verification]
-require_project_gate = false
-commands = []
+require_project_gate = true
+commands = ["make ci"]
 timeout_secs = 120
-max_output_bytes = 65536
-
-[git]
-init = true
-auto_commit = false
-require_clean_tree = false
 
 [execution]
 max_parallel_workers = 1
@@ -671,218 +662,223 @@ strategy = "cherry_pick"
 verify_each_candidate = true
 ```
 
-Registry selection is data-driven. `loops agents list` reads the Registry and caches its metadata; `loops agents select <id>` records the authoritative `agent.id`. At launch, Loops resolves that entry's declared distribution and launch arguments. It refreshes Registry metadata when it can, reuses a valid cached index when offline, and can fall back to a cached resolved launch when a refresh is unavailable.
+These limits are intentional.
 
-Package distributions are resolved automatically. A Registry binary is different: `loops run` uses only a previously installed, checksum-verified binary. Installing one is an explicit, machine-changing action:
-
-```bash
-loops agents setup <registry-agent-id> --yes
-```
-
-The advanced `[agent.custom]` block launches any ACP-compatible process with ordered arguments and optional environment values. `omp acp` above is simply one unregistered custom-command example; it has no special integration. `agent.id` and `agent.custom` are mutually exclusive, so configure exactly one before `loops run`.
-
-Generated `loops.toml` files include:
-
-```toml
-#:schema https://raw.githubusercontent.com/flaviodelgrosso/loops/main/schemas/config.schema.json
-```
-
-Editors and language servers with TOML/JSON Schema integration can use the repository-hosted schema for:
-
-- completion,
-- hover documentation,
-- validation,
-- value suggestions.
-
-Editors without schema support treat the directive as a normal comment.
-
----
-
-## Security boundary
-
-Fresh ACP sessions provide **context isolation**, not a sandbox. The selected agent owns its authentication flow, credentials, and any agent-level permission or sandbox policy; Loops does not collect credentials or make authentication or security decisions for it.
-
-ACP is an interoperability protocol, not a security boundary for arbitrary local tool execution. Process isolation, filesystem permissions, containers, OS sandboxes, and network controls are separate controls provided by the environment in which you run the agent.
-
-Implement and Repair workers can receive real shell access. Run autonomous workloads in an environment whose blast radius you accept, such as an isolated container, VM, restricted development environment, dedicated worktree, or minimally privileged account.
-
-Protected-file snapshotting protects controller integrity from accidental changes; it is not a replacement for real sandboxing.
-
----
-
-## MVP boundaries
-
-The current implementation intentionally leaves several problems unsolved.
-
-Not implemented yet:
-
-- distributed or remote worker execution,
-- semantic independence inference beyond explicit dependencies and declared path scopes,
-- cost and token accounting,
-- alternative non-ACP protocols,
-- OS-level sandbox management,
-- interactive steering or agent-to-agent conversation,
-- automatic merge-conflict resolution,
-- affected-test selection,
-- full production-grade policy and permission isolation.
-
-Some of these may turn out not to belong in `loops` itself.
-
-For example, sandboxing may be better handled by an execution environment around `loops` rather than deeply embedded into the orchestrator.
-
----
-
-## What still needs to be proven
-
-This is currently the most important section of the project.
-
-The architecture is implemented.
-
-Its claimed advantages are **not yet sufficiently measured**.
-
-The project needs comparative evaluation against simpler approaches.
-
-A useful benchmark should hold the underlying model and task set as constant and compare approaches such as:
+An autonomous system needs a way to say:
 
 ```text
-A. single coding-agent session
-
-B. simple retry / Ralph-style loop
-
-Across real software tasks.
-
-Useful metrics include:
-
-- requirement completion rate,
-- hidden acceptance-test pass rate,
-- deterministic gate pass rate,
-- false-completion rate,
-- regressions introduced,
-- number of repair attempts,
-- recovery rate after initial failure,
-- human interventions,
-- total tokens,
-- cost per successful task,
-- wall-clock time,
-- behavior as task duration increases.
-
-The most important question is not:
-
-> Did an agent generate a plausible implementation?
-
-It is:
-
-> **Did the resulting repository independently satisfy the intended requirements without human correction?**
-
-Until there is meaningful evidence here, statements that `loops` is more reliable, cheaper, or more effective than simpler agent workflows should be treated as hypotheses.
-
----
-
-## Design principles
-
-1. **The spec is authoritative.**
-   Completing a generated task is not equivalent to satisfying the product requirement.
-
-2. **Context is disposable.**
-   Durable state should live in inspectable artifacts rather than depend entirely on an ever-growing conversation.
-
-3. **Repository reality beats stale plans.**
-   Reconcile again after verified changes instead of assuming the original task decomposition remains correct.
-
-4. **LLMs propose; deterministic code controls transitions.**
-   Models can reason and act without owning the workflow state machine.
-
-5. **Use real failure evidence.**
-   When verification fails, give Repair the actual failure rather than asking it to reconstruct one from a summary.
-
-6. **Separate implementation from final assessment.**
-   The worker that changed the repository should not be the only mechanism deciding whether the project is complete.
-
-7. **Fail closed.**
-   Invalid output, deterministic failures, unexpected controller-state mutation, stagnation, and exhausted retries should produce explicit failure states.
-
-8. **Keep the controller understandable.**
-   More agents and more orchestration are not automatically better.
-
-9. **Measure before claiming superiority.**
-   Architectural intuition is not a substitute for comparative evaluation.
-
----
-
-## Why Rust?
-
-The orchestration layer is deliberately boring.
-
-It needs to:
-
-- own state transitions,
-- spawn and supervise processes,
-- validate structured outputs,
-- run deterministic commands,
-- persist evidence,
-- enforce bounded retries,
-- restore protected state,
-- and make failure conditions explicit.
-
-Rust is a good fit for that kind of controller.
-
-The intelligence remains in the workers.
-
-The orchestration layer should aim to be predictable.
-
----
-
-## Contributing
-
-Contributions are genuinely welcome.
-
-`loops` is early enough that challenging its assumptions is at least as valuable as adding features.
-
-Areas where contributions would be particularly useful:
-
-- evaluation harnesses,
-- comparative benchmarks,
-- adversarial test cases,
-- hidden acceptance-test strategies,
-- sandboxing approaches,
-- worktree/container isolation,
-- additional deterministic verification,
-- real-world repository case studies,
-- ACP conformance coverage,
-- cost/token telemetry,
-- stagnation and recovery analysis,
-- documentation corrections,
-- negative results.
-
-If an architectural assumption looks wrong, open an issue.
-
-If you find a case where a simpler loop consistently beats `loops`, document it.
-
-If an agent can trick the completion mechanism, reproduce it.
-
-If a requirement can be marked satisfied while the product is clearly wrong, that is valuable information.
-
-The goal is not to defend the architecture.
-
-The goal is to find out where it actually works.
-
----
-
-## The bet
-
-`loops` is intentionally small.
-
-The hypothesis is not that adding more agents automatically produces better software.
-
-It is that a deterministic controller around fresh, narrowly scoped coding agents can make long-running autonomous development more:
-
-- observable,
-- inspectable,
-- recoverable,
-- bounded,
-- and verifiable.
-
-Whether that structure also makes autonomous delivery **more reliable, more cost-effective, or more successful than simpler coding-agent loops remains to be demonstrated empirically.**
-
-That is what this project is here to test.
+this is not making progress
 ```
+
+instead of converting more tokens into more confidence.
+
+---
+
+## Useful commands
+
+```bash
+loops init
+```
+
+Initialize Loops in a project.
+
+```bash
+loops run
+loops resume
+```
+
+Start or continue autonomous development.
+
+```bash
+loops status
+loops status --json
+```
+
+Inspect persisted controller state.
+
+```bash
+loops verify
+loops verify --json
+```
+
+Run the configured deterministic verification **without invoking an LLM**.
+
+```bash
+loops agents list
+loops agents search <query>
+loops agents select <id>
+loops agents setup
+loops agents doctor
+loops agents login
+```
+
+Discover, configure, install, inspect, and authenticate ACP agents.
+
+---
+
+# What Loops is not
+
+Loops is **not**:
+
+### A coding model
+
+It does not compete with coding agents.
+
+It orchestrates them.
+
+### A magic correctness machine
+
+Passing tests can still mean shipping the wrong thing.
+
+### A security sandbox
+
+Git worktree isolation protects workflow boundaries.
+
+It does not make arbitrary model-generated commands safe.
+
+### A replacement for specifications
+
+If the desired behavior is unclear, the controller cannot manufacture product truth.
+
+### Proven better than simpler loops
+
+Not yet.
+
+That claim should be earned with data.
+
+### Production-ready
+
+Also not yet.
+
+---
+
+# The project principles
+
+A few rules shape Loops.
+
+### The repository outranks the conversation
+
+If a previous worker believed something that the repository contradicts, inspect the repository again.
+
+### Agent claims are hypotheses
+
+If the controller can obtain deterministic evidence, obtain it.
+
+### Context should be cheap to throw away
+
+Important engineering state should not exist only in hidden conversational memory.
+
+### Planning is provisional
+
+A roadmap should change when repository reality changes.
+
+### Failure should become structured input
+
+A failing command, exit code, stdout, and stderr are more useful than “something went wrong.”
+
+### Completion should be difficult to fake
+
+The implementation worker should not be able to end the entire process by confidently declaring success.
+
+### Autonomous execution needs stopping conditions
+
+Infinite persistence is not intelligence.
+
+Sometimes the correct controller action is:
+
+```text
+BLOCKED
+```
+
+---
+
+# Where Loops needs to go
+
+The most valuable next steps are not more impressive demos.
+
+They are better evidence.
+
+Important directions include:
+
+**Evaluation.**
+Run the same tasks through single-agent, simple-loop, and Loops workflows. Measure completion, false-DONE rate, regressions, cost, wall time, and variance.
+
+**Replayability.**
+Make complete autonomous runs inspectable as structured episodes rather than terminal archaeology.
+
+**Requirement evidence.**
+Make it obvious why each requirement is considered satisfied and what deterministic evidence supports that conclusion.
+
+**Regression obligations.**
+Do not allow later work to quietly invalidate earlier progress.
+
+**Better failure routing.**
+A code defect, broken environment, flaky test, and misunderstood requirement should not all produce the same retry behavior.
+
+**Safer concurrency.**
+Parallel agents are useful only when independence is established and integration remains controlled.
+
+**Engineering memory.**
+Preserve useful repository knowledge without recreating one giant permanent conversation.
+
+**CI and pull-request workflows.**
+Turn a run into an evidence-backed merge-readiness report.
+
+The long-term goal is not “more agents.”
+
+It is a better autonomous engineering process.
+
+---
+
+# Contributing
+
+Loops is early enough that experiments are unusually valuable.
+
+Useful contributions include:
+
+* bug reports with reproducible runs;
+* weird repositories that break assumptions;
+* ACP compatibility fixes;
+* verification improvements;
+* failure cases;
+* benchmark tasks;
+* benchmark infrastructure;
+* run observability;
+* Git/worktree edge cases;
+* controller correctness;
+* documentation;
+* negative results.
+
+Especially negative results.
+
+If a simpler architecture consistently beats Loops, that is something this project should discover rather than hide.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+---
+
+# A note on trust
+
+Autonomous development tools should be judged by what they can demonstrate, not by how confidently they describe themselves.
+
+Loops is built around that idea.
+
+The project should be held to the same standard.
+
+Right now there is an interesting architecture, a functioning MVP, and a lot left to prove.
+
+That is enough.
+
+---
+
+<div align="center">
+
+## Agents write the code.
+
+## **Loops makes them prove the work.**
+
+If that idea is useful to you, try it, break it, measure it, and help make the loop harder to fool.
+
+[Report a bug](https://github.com/flaviodelgrosso/loops/issues) · [Contribute](CONTRIBUTING.md) · [MIT License](LICENSE)
+
+</div>
