@@ -88,6 +88,51 @@ fn projection_builds_causal_activity_feed() {
 }
 
 #[test]
+fn run_feed_shows_each_successful_tool_once_and_keeps_failures() {
+  let mut app = app();
+  let tool_start = WorkerEvent::ToolStart {
+    role: WorkerRole::Implement,
+    worker_id: "worker-1".into(),
+    lease_id: Some("lease-1".into()),
+    work_unit_id: Some("W1".into()),
+    at: "10:00:01".into(),
+    tool_name: "cargo test".into(),
+    args: serde_json::json!({"all": true}),
+  };
+  app.apply(RunEvent::Worker(tool_start));
+  app.apply(RunEvent::Worker(WorkerEvent::ToolEnd {
+    role: WorkerRole::Implement,
+    worker_id: "worker-1".into(),
+    lease_id: Some("lease-1".into()),
+    work_unit_id: Some("W1".into()),
+    at: "10:00:02".into(),
+    tool_name: "cargo test".into(),
+    is_error: false,
+    output: None,
+  }));
+  app.apply(RunEvent::Worker(WorkerEvent::ToolEnd {
+    role: WorkerRole::Implement,
+    worker_id: "worker-1".into(),
+    lease_id: Some("lease-1".into()),
+    work_unit_id: Some("W1".into()),
+    at: "10:00:03".into(),
+    tool_name: "cargo clippy".into(),
+    is_error: true,
+    output: Some("failed".into()),
+  }));
+
+  let visible_titles = app
+    .visible_feed()
+    .into_iter()
+    .map(|index| app.activities()[index].title.as_str())
+    .collect::<Vec<_>>();
+  assert_eq!(
+    visible_titles,
+    ["IMPLEMENT · TOOL", "IMPLEMENT · TOOL FAILED"]
+  );
+}
+
+#[test]
 fn requirements_selection_is_screen_local_and_filtered() {
   let mut app = app();
   app.dispatch(Action::Go(Screen::Requirements));

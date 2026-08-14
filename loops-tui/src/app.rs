@@ -413,13 +413,20 @@ impl Application {
   }
 
   pub fn visible_feed(&self) -> Vec<usize> {
-    filtered_indexes(
-      self
-        .activities()
-        .iter()
-        .map(|item| format!("{} {} {}", item.title, item.summary, item.detail)),
-      &self.ui.run.query,
-    )
+    let query = self.ui.run.query.to_lowercase();
+    self
+      .activities()
+      .iter()
+      .enumerate()
+      .filter(|(_, item)| !item.title.ends_with("TOOL COMPLETE"))
+      .filter(|(_, item)| {
+        query.is_empty()
+          || format!("{} {} {}", item.title, item.summary, item.detail)
+            .to_lowercase()
+            .contains(&query)
+      })
+      .map(|(index, _)| index)
+      .collect()
   }
 
   pub fn visible_requirements(&self) -> Vec<usize> {
