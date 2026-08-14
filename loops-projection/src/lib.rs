@@ -72,6 +72,7 @@ pub struct RunProjection {
   completed_units: BTreeSet<String>,
   blocked_units: BTreeSet<String>,
   running: bool,
+  streaming_worker: Option<String>,
   started: Instant,
 }
 
@@ -96,6 +97,7 @@ impl RunProjection {
       current_integration: None,
       completed_units,
       blocked_units: BTreeSet::new(),
+      streaming_worker: None,
       started: Instant::now(),
     }
   }
@@ -160,6 +162,7 @@ impl RunProjection {
     self.workers.clear();
     self.checks.clear();
     self.changes.clear();
+    self.streaming_worker = None;
     self.assessments.clear();
     self.push_activity(
       "now".into(),
@@ -171,6 +174,9 @@ impl RunProjection {
   }
 
   pub fn apply(&mut self, event: RunEvent) {
+    if !matches!(&event, RunEvent::Worker(WorkerEvent::Text { .. })) {
+      self.streaming_worker = None;
+    }
     match event {
       RunEvent::State(state) => self.apply_state(state),
       RunEvent::Catalog(RequirementCatalog { requirements, .. }) => self.catalog = requirements,
@@ -426,13 +432,22 @@ impl RunProjection {
             .detail,
           &text,
         );
-        self.push_activity(
-          at,
-          ActivityCategory::Worker,
-          role_label(role),
-          compact(&text, 160),
-          text,
-        );
+        let continues_stream = self.streaming_worker.as_deref() == Some(&worker_id);
+        if continues_stream {
+          if let Some(activity) = self.activities.back_mut() {
+            append_bounded(&mut activity.detail, &text);
+            activity.summary = compact(&activity.detail, 160);
+          }
+        } else {
+          self.push_activity(
+            at,
+            ActivityCategory::Worker,
+            role_label(role),
+            compact(&text, 160),
+            text,
+          );
+        }
+        self.streaming_worker = Some(worker_id);
       }
       WorkerEvent::ToolStart {
         role,
@@ -663,9 +678,6 @@ pub fn compact(text: &str, max: usize) -> String {
 }
 
 fn append_bounded(target: &mut String, text: &str) {
-  if !target.is_empty() {
-    target.push('\n');
-  }
   target.push_str(text);
   *target = compact(target, MAX_DETAIL_BYTES);
 }
@@ -862,6 +874,50 @@ mod tests {
       .activities()
       .iter()
       .any(|item| item.title == "CHANGES"));
+  }
+
+  #[test]
+  fn coalesces_text_chunks_until_the_next_worker_response() {
+    let mut projection = RunProjection::new(State::fresh(), Vec::new());
+    for delta in ["Starting ", "deterministic run"] {
+      projection.apply(RunEvent::Worker(WorkerEvent::Text {
+        role: WorkerRole::Architect,
+        worker_id: "architect-1".into(),
+        lease_id: None,
+        work_unit_id: None,
+        at: "10:00:00".into(),
+        delta: delta.into(),
+      }));
+    }
+
+    assert_eq!(projection.activities().len(), 1);
+    assert_eq!(
+      projection.activities()[0].summary,
+      "Starting deterministic run"
+    );
+
+    projection.apply(RunEvent::Worker(WorkerEvent::ToolStart {
+      role: WorkerRole::Architect,
+      worker_id: "architect-1".into(),
+      lease_id: None,
+      work_unit_id: None,
+      at: "10:00:01".into(),
+      tool_name: "read".into(),
+      args: serde_json::json!({}),
+    }));
+    for delta in ["Second ", "response"] {
+      projection.apply(RunEvent::Worker(WorkerEvent::Text {
+        role: WorkerRole::Architect,
+        worker_id: "architect-1".into(),
+        lease_id: None,
+        work_unit_id: None,
+        at: "10:00:02".into(),
+        delta: delta.into(),
+      }));
+    }
+
+    assert_eq!(projection.activities().len(), 3);
+    assert_eq!(projection.activities()[2].summary, "Second response");
   }
 
   #[test]
