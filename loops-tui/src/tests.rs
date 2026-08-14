@@ -379,6 +379,20 @@ fn active_run_renders_phase_tool_and_focus_at_wide_and_narrow_sizes() {
 }
 
 #[test]
+fn activity_feed_preserves_full_event_titles() {
+  let mut app = app();
+  app.begin_run();
+  app.apply(RunEvent::IntegrationAccepted {
+    work_unit_id: "ACWU-001".into(),
+    revision: "abc123".into(),
+  });
+
+  let output = rendered(&app, 90, 22);
+
+  assert!(output.contains("INTEGRATION ACCEPTED"), "{output}");
+}
+
+#[test]
 fn failure_repair_and_checks_render_structured_evidence() {
   let mut app = app();
   app.begin_run();

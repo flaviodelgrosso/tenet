@@ -1086,7 +1086,7 @@ fn short_title(title: &str, tool: bool) -> String {
   if tool {
     "TOOL".into()
   } else {
-    title.chars().take(14).collect()
+    title.to_owned()
   }
 }
 
