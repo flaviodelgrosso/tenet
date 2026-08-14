@@ -14,6 +14,8 @@
     "agent",
     "verification",
     "git",
+    "execution",
+    "integration",
     "protected_paths"
   ],
   "properties": {
@@ -55,6 +57,12 @@
     },
     "git": {
       "$ref": "#/$defs/gitConfig"
+    },
+    "execution": {
+      "$ref": "#/$defs/executionConfig"
+    },
+    "integration": {
+      "$ref": "#/$defs/integrationConfig"
     },
     "protected_paths": {
       "$ref": "#/$defs/stringList",
@@ -187,6 +195,25 @@
           }
         }
       ]
+    },
+    "executionConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_parallel_workers", "workspace", "require_clean_base"],
+      "properties": {
+        "max_parallel_workers": { "type": "integer", "minimum": 1, "default": 1 },
+        "workspace": { "type": "string", "const": "worktree", "default": "worktree" },
+        "require_clean_base": { "type": "boolean", "default": true }
+      }
+    },
+    "integrationConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "verify_each_candidate"],
+      "properties": {
+        "strategy": { "type": "string", "const": "cherry_pick", "default": "cherry_pick" },
+        "verify_each_candidate": { "type": "boolean", "default": true }
+      }
     },
     "gitConfig": {
       "type": "object",

@@ -17,9 +17,11 @@ pub enum Phase {
   Initialized,
   Architecting,
   Reconciling,
+  Scheduling,
   Implementing,
   Verifying,
   Repairing,
+  Integrating,
   Assessing,
   Complete,
 }
@@ -65,6 +67,12 @@ pub struct RequirementAssessment {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct WorkScope {
+  pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkUnit {
   pub id: String,
   pub title: String,
@@ -75,6 +83,9 @@ pub struct WorkUnit {
   pub acceptance_criteria: Vec<String>,
   #[serde(rename = "suggestedChecks")]
   pub suggested_checks: Vec<String>,
+  #[serde(rename = "dependsOn")]
+  pub depends_on: Vec<String>,
+  pub scope: WorkScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,8 +94,27 @@ pub struct ReconcileResult {
   pub complete: bool,
   pub summary: String,
   pub requirements: Vec<RequirementAssessment>,
-  #[serde(rename = "nextWorkUnit")]
-  pub next_work_unit: Option<WorkUnit>,
+  #[serde(rename = "workUnits")]
+  pub work_units: Vec<WorkUnit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Discovery {
+  Dependency {
+    #[serde(rename = "workUnitId")]
+    work_unit_id: String,
+    #[serde(rename = "dependsOn")]
+    depends_on: String,
+    reason: String,
+  },
+  Blocker {
+    description: String,
+  },
+  ScopeExpansion {
+    paths: Vec<String>,
+    reason: String,
+  },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -99,7 +129,7 @@ pub struct WorkerSummary {
   #[serde(default)]
   pub decisions: Vec<String>,
   #[serde(default)]
-  pub discoveries: Vec<String>,
+  pub discoveries: Vec<Discovery>,
   #[serde(default)]
   pub risks: Vec<String>,
   #[serde(default, rename = "followUps")]
@@ -154,6 +184,51 @@ pub struct CompletedWorkUnit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkStatus {
+  Pending,
+  Ready,
+  Running,
+  Candidate,
+  Integrating,
+  Completed,
+  Failed,
+  Blocked,
+  Invalidated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkLease {
+  pub id: String,
+  #[serde(rename = "workerId")]
+  pub worker_id: String,
+  #[serde(rename = "workUnit")]
+  pub work_unit: WorkUnit,
+  #[serde(rename = "baseRevision")]
+  pub base_revision: String,
+  pub workspace: std::path::PathBuf,
+  #[serde(rename = "issuedAt")]
+  pub issued_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecution {
+  pub lease: WorkLease,
+  #[serde(rename = "workerSummary")]
+  pub worker_summary: WorkerSummary,
+  pub verification: VerificationReport,
+  #[serde(rename = "baseRevision")]
+  pub base_revision: String,
+  #[serde(rename = "candidateRevision")]
+  pub candidate_revision: String,
+  #[serde(rename = "changedPaths")]
+  pub changed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct State {
   pub version: u32,
   pub status: RunStatus,
@@ -161,12 +236,17 @@ pub struct State {
   #[serde(rename = "runId")]
   pub run_id: Option<String>,
   pub cycle: u32,
-  #[serde(rename = "currentWorkUnit")]
-  pub current_work_unit: Option<WorkUnit>,
+  #[serde(rename = "activeLeases")]
+  pub active_leases: std::collections::BTreeMap<String, WorkLease>,
+  #[serde(rename = "candidateIntegrations")]
+  pub candidate_integrations: Vec<WorkExecution>,
+  #[serde(rename = "workStatuses")]
+  pub work_statuses: std::collections::BTreeMap<String, WorkStatus>,
   #[serde(rename = "requirementCounts")]
   pub requirement_counts: RequirementCounts,
   #[serde(rename = "completedWorkUnits")]
   pub completed_work_units: Vec<CompletedWorkUnit>,
+  pub discoveries: Vec<Discovery>,
   #[serde(rename = "lastSummary")]
   pub last_summary: String,
   #[serde(rename = "blockedReason")]
@@ -178,16 +258,21 @@ pub struct State {
 }
 
 impl State {
+  pub const VERSION: u32 = 2;
+
   pub fn fresh() -> Self {
     Self {
-      version: 1,
+      version: Self::VERSION,
       status: RunStatus::Idle,
       phase: Phase::Initialized,
       run_id: None,
       cycle: 0,
-      current_work_unit: None,
+      active_leases: std::collections::BTreeMap::new(),
+      candidate_integrations: Vec::new(),
+      work_statuses: std::collections::BTreeMap::new(),
       requirement_counts: RequirementCounts::default(),
       completed_work_units: Vec::new(),
+      discoveries: Vec::new(),
       last_summary: "Initialized".into(),
       blocked_reason: None,
       last_error: None,
@@ -223,21 +308,45 @@ impl WorkerRole {
 pub enum WorkerEvent {
   Start {
     role: WorkerRole,
+    #[serde(rename = "workerId")]
+    worker_id: String,
+    #[serde(rename = "leaseId")]
+    lease_id: Option<String>,
+    #[serde(rename = "workUnitId")]
+    work_unit_id: Option<String>,
     at: String,
   },
   Text {
     role: WorkerRole,
+    #[serde(rename = "workerId")]
+    worker_id: String,
+    #[serde(rename = "leaseId")]
+    lease_id: Option<String>,
+    #[serde(rename = "workUnitId")]
+    work_unit_id: Option<String>,
     at: String,
     delta: String,
   },
   ToolStart {
     role: WorkerRole,
+    #[serde(rename = "workerId")]
+    worker_id: String,
+    #[serde(rename = "leaseId")]
+    lease_id: Option<String>,
+    #[serde(rename = "workUnitId")]
+    work_unit_id: Option<String>,
     at: String,
     tool_name: String,
     args: serde_json::Value,
   },
   ToolEnd {
     role: WorkerRole,
+    #[serde(rename = "workerId")]
+    worker_id: String,
+    #[serde(rename = "leaseId")]
+    lease_id: Option<String>,
+    #[serde(rename = "workUnitId")]
+    work_unit_id: Option<String>,
     at: String,
     tool_name: String,
     is_error: bool,
@@ -245,6 +354,12 @@ pub enum WorkerEvent {
   },
   End {
     role: WorkerRole,
+    #[serde(rename = "workerId")]
+    worker_id: String,
+    #[serde(rename = "leaseId")]
+    lease_id: Option<String>,
+    #[serde(rename = "workUnitId")]
+    work_unit_id: Option<String>,
     at: String,
     ok: bool,
     message: Option<String>,

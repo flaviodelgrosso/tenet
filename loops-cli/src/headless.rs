@@ -167,8 +167,12 @@ impl ConsoleRenderer {
       state.completed_work_units.len()
     )?;
     writeln!(self.stdout, "  Cycle          {}", state.cycle)?;
-    if let Some(work) = &state.current_work_unit {
-      writeln!(self.stdout, "  Work           {} · {}", work.id, work.title)?;
+    for lease in state.active_leases.values() {
+      writeln!(
+        self.stdout,
+        "  Active work    {} · {} ({})",
+        lease.work_unit.id, lease.work_unit.title, lease.worker_id
+      )?;
     }
     if let Some(reason) = state.blocked_reason.as_ref().or(state.last_error.as_ref()) {
       writeln!(self.stdout, "\n  Reason\n  {reason}")?;

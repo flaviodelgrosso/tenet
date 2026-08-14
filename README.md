@@ -28,12 +28,13 @@ It does not rely on one long-running agent conversation to remember the project,
 Instead, it runs a state machine that repeatedly:
 
 1. inspects the repository against an authoritative specification,
-2. selects one coherent next unit of work,
-3. gives that work to a fresh coding-agent worker,
-4. runs real build, test, lint, and project verification commands,
-5. repairs deterministic failures when possible,
-6. reconciles the repository against the spec again,
-7. and requires an independent assessment before considering the run complete.
+2. validates a proposed dependency graph of coherent work units,
+3. leases dependency-ready, scope-compatible units to fresh coding-agent workers,
+4. executes those workers in isolated Git worktrees with bounded concurrency,
+5. verifies and commits each candidate independently,
+6. integrates candidates in deterministic work-unit order with regression gates,
+7. reconciles the integrated repository against the spec again,
+8. and requires an independent assessment before considering the run complete.
 
 The production runtime speaks the **[Agent Client Protocol (ACP)](https://agentclientprotocol.com/)**. Choose an agent through its canonical Registry identity, or use an advanced custom ACP command.
 
@@ -152,11 +153,11 @@ The goal is narrower:
 
 ### Reconcile against the repository
 
-After a verified change, `loops` does not blindly advance to the next item in an old plan.
+After verified candidates are integrated, `loops` does not blindly advance through an old plan.
 
-A fresh Reconcile worker inspects the current repository against the full requirement catalog and decides what remains.
+A fresh Reconcile worker inspects the current repository and proposes work units, dependencies, and conservative path scopes. Rust validates the resulting DAG and computes the ready frontier. The agent never decides concurrency.
 
-The roadmap is treated as a current interpretation of the repository, not as immutable truth.
+The roadmap is a current interpretation of repository reality, not immutable controller state.
 
 ### Independent assessment at the finish line
 
@@ -178,7 +179,7 @@ Invalid structured output, protected-file mutation, repeated stagnation, exhaust
 
 ## What actually happens
 
-A `loops run` is a hierarchy of loops rather than a linear generated task list:
+A `loops run` is a hierarchy of deterministic coordination loops:
 
 ```text
 .loops/spec.md
@@ -188,68 +189,44 @@ ARCHITECT                 when the requirement catalog is missing/stale
    │
    ▼
 ┌──────────────────── PROJECT LOOP ─────────────────────┐
-│                                                      │
-│  RECONCILE                                           │
-│      │                                               │
-│      ├── gaps ──► IMPLEMENT ──► VERIFY               │
-│      │                            │                   │
-│      │                            ├─ PASS ─────┐      │
-│      │                            │            │      │
-│      │                            └─ FAIL      │      │
-│      │                                │        │      │
-│      │                             REPAIR       │      │
-│      │                                │        │      │
-│      │                             VERIFY       │      │
-│      │                                │        │      │
-│      └────────────────────────────────┴────────┘      │
-│                                                      │
-│          next cycle → inspect the repo again          │
-└──────────────────────────────────────────────────────┘
-   │
+│  RECONCILE ──► validate DAG ──► ready frontier        │
+│                              │                        │
+│                    bounded worker leases              │
+│                  ┌───────────┼───────────┐             │
+│                  ▼           ▼           ▼             │
+│             worktree A  worktree B  worktree C         │
+│                  │           │           │             │
+│             verify+commit verify+commit verify+commit  │
+│                  └───────────┼───────────┘             │
+│                              ▼                        │
+│             deterministic integration queue           │
+│                              │                        │
+│                cherry-pick + verification             │
+│                              │                        │
+│          next cycle → inspect integrated repo          │
+└───────────────────────────────────────────────────────┘
    │ reconciliation reports complete
    ▼
-FINAL DETERMINISTIC GATES
-   │
-   ├── fail ──► REPAIR ──► verify again
-   │
-   ▼
-ASSESS
-   │
-   ├── gaps ──► PROJECT LOOP
-   │
-   ▼
-DONE
+FINAL DETERMINISTIC GATES ──► ASSESS ──► DONE
 ```
 
 ---
 
 ## The five roles
 
-| Role          | Purpose                                                                         | Repo access     | Runs when                                                      |
-| ------------- | ------------------------------------------------------------------------------- | --------------- | -------------------------------------------------------------- |
-| **Architect** | Converts `.loops/spec.md` into a stable `REQ-NNN` requirement catalog           | Read-only       | Initially and when the spec changes                            |
-| **Reconcile** | Compares the repository against all requirements and selects the next work unit | Read-only       | At the beginning of every project cycle                        |
-| **Implement** | Implements one bounded work unit                                                | Read/write/bash | Once per selected work unit                                    |
-| **Repair**    | Responds to deterministic verification failures                                 | Read/write/bash | After verification fails                                       |
-| **Assess**    | Independently evaluates final repository state against the requirements         | Read-only       | After reconciliation and deterministic gates report completion |
+| Role          | Purpose                                                                                | Repo access                | Runs when                                                       |
+| ------------- | -------------------------------------------------------------------------------------- | -------------------------- | --------------------------------------------------------------- |
+| **Architect** | Converts `.loops/spec.md` into a stable `REQ-NNN` requirement catalog                  | Read-only canonical        | Initially and when the spec changes                             |
+| **Reconcile** | Assesses requirements and proposes a dependency graph; Rust validates and schedules it | Read-only canonical        | At the beginning of every project cycle                         |
+| **Implement** | Implements one controller-issued work lease                                           | Isolated worktree          | For each ready, scope-compatible work unit                      |
+| **Repair**    | Responds to deterministic verification failures for the same lease                     | Same isolated worktree     | After candidate verification fails                              |
+| **Assess**    | Independently evaluates final repository state against the requirements                | Read-only canonical        | After reconciliation and deterministic gates report completion |
 
-These are separate ACP sessions, not nested agent subagents.
+These are separate ACP sessions, not nested agent subagents. Agents do not communicate with peers; leases, revisions, events, discoveries, verification, and persisted state are the coordination protocol.
 
-Each worker receives a deliberately limited environment:
+Each coding worker receives `BackendContext.cwd` pointing at `.loops/worktrees/<run-id>/<lease-id>/`. Worker completion order does not control integration order: candidates are integrated by ascending work-unit ID.
 
-```text
-fresh ACP worker
-    + role prompt
-    + built-in role procedure
-    + relevant work-unit context
-    + repository
-```
-
-Workers currently execute **sequentially**.
-
-That is deliberate.
-
-Parallel execution introduces coordination, merge, dependency, and verification problems that are not solved by simply spawning more agents. Parallelism may be added later where work units can be shown to be sufficiently independent.
+`execution.max_parallel_workers` bounds concurrency and defaults to `1`, preserving sequential behavior. Declared path scopes prevent obvious overlap, but scopes are only an advisory safeguard; dependency readiness remains mandatory.
 
 ---
 
@@ -451,8 +428,7 @@ status = done only when:
   1. a valid requirement catalog exists
 
   2. Reconcile reports every requirement satisfied
-     and selects no next work unit
-
+     and proposes an empty work graph
   3. final deterministic verification passes
      on the integrated repository
 
@@ -682,6 +658,15 @@ max_output_bytes = 65536
 init = true
 auto_commit = false
 require_clean_tree = false
+
+[execution]
+max_parallel_workers = 1
+workspace = "worktree"
+require_clean_base = true
+
+[integration]
+strategy = "cherry_pick"
+verify_each_candidate = true
 ```
 
 Registry selection is data-driven. `loops agents list` reads the Registry and caches its metadata; `loops agents select <id>` records the authoritative `agent.id`. At launch, Loops resolves that entry's declared distribution and launch arguments. It refreshes Registry metadata when it can, reuses a valid cached index when offline, and can fall back to a cached resolved launch when a refresh is unavailable.
@@ -729,13 +714,14 @@ The current implementation intentionally leaves several problems unsolved.
 
 Not implemented yet:
 
-- parallel or fleet execution of independent work units,
-- branch/worktree isolation per coding worker,
+- distributed or remote worker execution,
+- semantic independence inference beyond explicit dependencies and declared path scopes,
 - cost and token accounting,
 - alternative non-ACP protocols,
 - OS-level sandbox management,
-- remote worker execution,
-- interactive steering of an in-flight worker,
+- interactive steering or agent-to-agent conversation,
+- automatic merge-conflict resolution,
+- affected-test selection,
 - full production-grade policy and permission isolation.
 
 Some of these may turn out not to belong in `loops` itself.

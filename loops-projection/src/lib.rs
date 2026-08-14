@@ -1,5 +1,5 @@
 use std::{
-  collections::{BTreeMap, VecDeque},
+  collections::{BTreeMap, BTreeSet, VecDeque},
   time::Instant,
 };
 
@@ -7,8 +7,8 @@ use loops_domain::{
   events::RunEvent,
   model::{
     Phase, ReconcileResult, RepositoryChange, Requirement, RequirementAssessment,
-    RequirementCatalog, RequirementStatus, RunStatus, State, VerificationReport, WorkerEvent,
-    WorkerRole,
+    RequirementCatalog, RequirementStatus, RunStatus, State, VerificationReport, WorkExecution,
+    WorkUnit, WorkerEvent, WorkerRole,
   },
 };
 
@@ -47,6 +47,9 @@ pub struct Activity {
 #[derive(Debug, Clone)]
 pub struct WorkerSession {
   pub role: WorkerRole,
+  pub worker_id: String,
+  pub lease_id: Option<String>,
+  pub work_unit_id: Option<String>,
   pub started_at: String,
   pub ended_at: Option<String>,
   pub ok: Option<bool>,
@@ -63,12 +66,22 @@ pub struct RunProjection {
   workers: VecDeque<WorkerSession>,
   checks: Vec<VerificationReport>,
   changes: Vec<RepositoryChange>,
+  ready_work_units: Vec<WorkUnit>,
+  candidate_queue: Vec<WorkExecution>,
+  current_integration: Option<String>,
+  completed_units: BTreeSet<String>,
+  blocked_units: BTreeSet<String>,
   running: bool,
   started: Instant,
 }
 
 impl RunProjection {
   pub fn new(state: State, catalog: Vec<Requirement>) -> Self {
+    let completed_units = state
+      .completed_work_units
+      .iter()
+      .map(|item| item.work_unit.id.clone())
+      .collect();
     Self {
       running: matches!(state.status, RunStatus::Running),
       state,
@@ -78,6 +91,11 @@ impl RunProjection {
       workers: VecDeque::new(),
       checks: Vec::new(),
       changes: Vec::new(),
+      ready_work_units: Vec::new(),
+      candidate_queue: Vec::new(),
+      current_integration: None,
+      completed_units,
+      blocked_units: BTreeSet::new(),
       started: Instant::now(),
     }
   }
@@ -105,6 +123,28 @@ impl RunProjection {
   }
   pub fn changes(&self) -> &[RepositoryChange] {
     &self.changes
+  }
+  pub fn ready_work_units(&self) -> &[WorkUnit] {
+    &self.ready_work_units
+  }
+  pub fn candidate_queue(&self) -> &[WorkExecution] {
+    &self.candidate_queue
+  }
+  pub fn current_integration(&self) -> Option<&str> {
+    self.current_integration.as_deref()
+  }
+  pub fn completed_units(&self) -> &BTreeSet<String> {
+    &self.completed_units
+  }
+  pub fn blocked_units(&self) -> &BTreeSet<String> {
+    &self.blocked_units
+  }
+  pub fn active_work_units(&self) -> impl Iterator<Item = &WorkUnit> {
+    self
+      .state
+      .active_leases
+      .values()
+      .map(|lease| &lease.work_unit)
   }
   pub fn running(&self) -> bool {
     self.running
@@ -144,6 +184,94 @@ impl RunProjection {
       }
       RunEvent::Worker(event) => self.apply_worker(event),
       RunEvent::Reconcile(result) => self.apply_reconcile(result),
+      RunEvent::ReadyFrontier(units) => self.ready_work_units = units,
+      RunEvent::LeaseIssued(lease) => self.push_activity(
+        lease.issued_at,
+        ActivityCategory::Controller,
+        "LEASE ISSUED",
+        format!("{} · {}", lease.work_unit.id, lease.worker_id),
+        lease.workspace.display().to_string(),
+      ),
+      RunEvent::WorkerStarted {
+        worker_id,
+        work_unit_id,
+        ..
+      } => self.push_activity(
+        now(),
+        ActivityCategory::Worker,
+        "WORKER STARTED",
+        format!("{work_unit_id} · {worker_id}"),
+        String::new(),
+      ),
+      RunEvent::CandidateProduced(candidate) => self.candidate_queue.push(candidate),
+      RunEvent::IntegrationStarted {
+        work_unit_id,
+        candidate_revision,
+      } => {
+        self.current_integration = Some(work_unit_id.clone());
+        self.push_activity(
+          now(),
+          ActivityCategory::Controller,
+          "INTEGRATION",
+          work_unit_id,
+          candidate_revision,
+        );
+      }
+      RunEvent::IntegrationAccepted {
+        work_unit_id,
+        revision,
+      } => {
+        self.current_integration = None;
+        self.completed_units.insert(work_unit_id.clone());
+        self
+          .candidate_queue
+          .retain(|candidate| candidate.lease.work_unit.id != work_unit_id);
+        self.push_activity(
+          now(),
+          ActivityCategory::Check,
+          "INTEGRATION ACCEPTED",
+          work_unit_id,
+          revision,
+        );
+      }
+      RunEvent::IntegrationRejected {
+        work_unit_id,
+        reason,
+      } => {
+        self.current_integration = None;
+        self.blocked_units.insert(work_unit_id.clone());
+        self.push_activity(
+          now(),
+          ActivityCategory::Error,
+          "INTEGRATION REJECTED",
+          work_unit_id,
+          reason,
+        );
+      }
+      RunEvent::DependencyDiscovered {
+        lease_id,
+        discovery,
+      } => self.push_activity(
+        now(),
+        ActivityCategory::Controller,
+        "DISCOVERY",
+        lease_id,
+        format!("{discovery:?}"),
+      ),
+      RunEvent::WorkspaceCreated { lease_id, path } => self.push_activity(
+        now(),
+        ActivityCategory::Controller,
+        "WORKSPACE CREATED",
+        lease_id,
+        path.display().to_string(),
+      ),
+      RunEvent::WorkspaceRemoved { lease_id, path } => self.push_activity(
+        now(),
+        ActivityCategory::Controller,
+        "WORKSPACE REMOVED",
+        lease_id,
+        path.display().to_string(),
+      ),
       RunEvent::Verification(report) => self.apply_check(report),
       RunEvent::RepositoryChanges(changes) => {
         let summary = format!("{} files changed", changes.len());
@@ -186,6 +314,22 @@ impl RunProjection {
         state_detail(&next),
       );
     }
+    self.completed_units = next
+      .completed_work_units
+      .iter()
+      .map(|item| item.work_unit.id.clone())
+      .collect();
+    self.blocked_units = next
+      .work_statuses
+      .iter()
+      .filter(|(_, status)| {
+        matches!(
+          status,
+          loops_domain::model::WorkStatus::Blocked | loops_domain::model::WorkStatus::Failed
+        )
+      })
+      .map(|(id, _)| id.clone())
+      .collect();
     self.state = next;
   }
 
@@ -193,13 +337,21 @@ impl RunProjection {
     for assessment in result.requirements {
       self.assessments.insert(assessment.id.clone(), assessment);
     }
-    let summary = result.next_work_unit.as_ref().map_or_else(
-      || result.summary.clone(),
-      |work| format!("Selected {} · {}", work.id, work.title),
-    );
-    let detail = result
-      .next_work_unit
-      .map_or(result.summary, |work| work_detail(&work));
+    let summary = match result.work_units.as_slice() {
+      [] => result.summary.clone(),
+      [work] => format!("Proposed {} · {}", work.id, work.title),
+      work => format!("Proposed {} work units", work.len()),
+    };
+    let detail = if result.work_units.is_empty() {
+      result.summary
+    } else {
+      result
+        .work_units
+        .iter()
+        .map(work_detail)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+    };
     self.push_activity(
       now(),
       ActivityCategory::Controller,
@@ -233,9 +385,18 @@ impl RunProjection {
 
   fn apply_worker(&mut self, event: WorkerEvent) {
     match event {
-      WorkerEvent::Start { role, at } => {
+      WorkerEvent::Start {
+        role,
+        worker_id,
+        lease_id,
+        work_unit_id,
+        at,
+      } => {
         self.workers.push_back(WorkerSession {
           role,
+          worker_id: worker_id.clone(),
+          lease_id,
+          work_unit_id,
           started_at: at.clone(),
           ended_at: None,
           ok: None,
@@ -246,13 +407,25 @@ impl RunProjection {
           at,
           ActivityCategory::Worker,
           format!("{} STARTED", role_label(role)),
-          "Worker session started".into(),
+          worker_id,
           String::new(),
         );
       }
-      WorkerEvent::Text { role, at, delta } => {
+      WorkerEvent::Text {
+        role,
+        worker_id,
+        lease_id,
+        work_unit_id,
+        at,
+        delta,
+      } => {
         let text = sanitize_terminal_text(&delta);
-        append_bounded(&mut self.worker_mut(role, &at).detail, &text);
+        append_bounded(
+          &mut self
+            .worker_mut(role, &worker_id, lease_id, work_unit_id, &at)
+            .detail,
+          &text,
+        );
         self.push_activity(
           at,
           ActivityCategory::Worker,
@@ -266,6 +439,7 @@ impl RunProjection {
         at,
         tool_name,
         args,
+        ..
       } => {
         let detail = format!(
           "Tool: {tool_name}\nArguments:\n{}",
@@ -285,6 +459,7 @@ impl RunProjection {
         tool_name,
         is_error,
         output,
+        ..
       } => {
         let output = output
           .map(|value| sanitize_terminal_text(&value))
@@ -308,11 +483,14 @@ impl RunProjection {
       }
       WorkerEvent::End {
         role,
+        worker_id,
+        lease_id,
+        work_unit_id,
         at,
         ok,
         message,
       } => {
-        let worker = self.worker_mut(role, &at);
+        let worker = self.worker_mut(role, &worker_id, lease_id, work_unit_id, &at);
         worker.ended_at = Some(at.clone());
         worker.ok = Some(ok);
         worker.summary = message.clone();
@@ -342,21 +520,32 @@ impl RunProjection {
     }
   }
 
-  fn worker_mut(&mut self, role: WorkerRole, at: &str) -> &mut WorkerSession {
-    let new = self
+  fn worker_mut(
+    &mut self,
+    role: WorkerRole,
+    worker_id: &str,
+    lease_id: Option<String>,
+    work_unit_id: Option<String>,
+    at: &str,
+  ) -> &mut WorkerSession {
+    if let Some(index) = self
       .workers
-      .back()
-      .is_none_or(|worker| worker.role != role || worker.ended_at.is_some());
-    if new {
-      self.workers.push_back(WorkerSession {
-        role,
-        started_at: at.into(),
-        ended_at: None,
-        ok: None,
-        summary: None,
-        detail: String::new(),
-      });
+      .iter()
+      .rposition(|worker| worker.worker_id == worker_id)
+    {
+      return &mut self.workers[index];
     }
+    self.workers.push_back(WorkerSession {
+      role,
+      worker_id: worker_id.into(),
+      lease_id,
+      work_unit_id,
+      started_at: at.into(),
+      ended_at: None,
+      ok: None,
+      summary: None,
+      detail: String::new(),
+    });
     self
       .workers
       .back_mut()
@@ -398,9 +587,11 @@ pub fn phase_label(phase: &Phase) -> &'static str {
     Phase::Initialized => "READY",
     Phase::Architecting => "ARCHITECT",
     Phase::Reconciling => "RECONCILE",
+    Phase::Scheduling => "SCHEDULE",
     Phase::Implementing => "IMPLEMENT",
     Phase::Verifying => "VERIFY",
     Phase::Repairing => "REPAIR",
+    Phase::Integrating => "INTEGRATE",
     Phase::Assessing => "ASSESS",
     Phase::Complete => "COMPLETE",
   }
@@ -540,28 +731,23 @@ fn now() -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use loops_domain::model::{CommandResult, RequirementCounts, WorkUnit};
+  use loops_domain::model::{CommandResult, RequirementCounts, WorkScope, WorkUnit};
 
   fn state(status: RunStatus, phase: Phase) -> State {
-    State {
-      version: 1,
-      status,
-      phase,
-      run_id: Some("run".into()),
-      cycle: 4,
-      current_work_unit: None,
-      requirement_counts: RequirementCounts {
-        total: 2,
-        satisfied: 1,
-        partial: 1,
-        missing: 0,
-      },
-      completed_work_units: Vec::new(),
-      last_summary: "Controller update".into(),
-      blocked_reason: None,
-      last_error: None,
-      updated_at: "10:00:00".into(),
-    }
+    let mut state = State::fresh();
+    state.status = status;
+    state.phase = phase;
+    state.run_id = Some("run".into());
+    state.cycle = 4;
+    state.requirement_counts = RequirementCounts {
+      total: 2,
+      satisfied: 1,
+      partial: 1,
+      missing: 0,
+    };
+    state.last_summary = "Controller update".into();
+    state.updated_at = "10:00:00".into();
+    state
   }
   fn report(passed: bool) -> VerificationReport {
     VerificationReport {
@@ -591,6 +777,10 @@ mod tests {
       requirement_ids: vec!["REQ-012".into()],
       acceptance_criteria: Vec::new(),
       suggested_checks: Vec::new(),
+      depends_on: Vec::new(),
+      scope: WorkScope {
+        paths: vec!["src/auth/**".into()],
+      },
     }
   }
 
@@ -606,10 +796,13 @@ mod tests {
         evidence: vec!["API exists".into()],
         gaps: vec!["No test".into()],
       }],
-      next_work_unit: Some(work()),
+      work_units: vec![work()],
     }));
     projection.apply(RunEvent::Worker(WorkerEvent::Start {
       role: WorkerRole::Implement,
+      worker_id: "worker-1".into(),
+      lease_id: Some("lease-1".into()),
+      work_unit_id: Some("W-014".into()),
       at: "10:00:00".into(),
     }));
     projection.apply(RunEvent::Verification(report(true)));
@@ -669,6 +862,28 @@ mod tests {
       .activities()
       .iter()
       .any(|item| item.title == "CHANGES"));
+  }
+
+  #[test]
+  fn concurrent_workers_with_same_role_remain_distinct() {
+    let mut projection = RunProjection::new(State::fresh(), Vec::new());
+    for (worker_id, lease_id, work_unit_id) in
+      [("worker-b", "lease-b", "B"), ("worker-c", "lease-c", "C")]
+    {
+      projection.apply(RunEvent::Worker(WorkerEvent::Start {
+        role: WorkerRole::Implement,
+        worker_id: worker_id.into(),
+        lease_id: Some(lease_id.into()),
+        work_unit_id: Some(work_unit_id.into()),
+        at: "10:00:00".into(),
+      }));
+    }
+
+    assert_eq!(projection.workers().len(), 2);
+    assert_ne!(
+      projection.workers()[0].worker_id,
+      projection.workers()[1].worker_id
+    );
   }
 
   #[test]

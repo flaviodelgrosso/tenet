@@ -113,8 +113,11 @@ impl App {
       "requirements: {}/{} satisfied",
       state.requirement_counts.satisfied, state.requirement_counts.total
     );
-    if let Some(work) = state.current_work_unit {
-      println!("work unit: {} · {}", work.id, work.title);
+    for lease in state.active_leases.values() {
+      println!(
+        "active work: {} · {} ({})",
+        lease.work_unit.id, lease.work_unit.title, lease.worker_id
+      );
     }
     println!("summary: {}", state.last_summary);
     if let Some(reason) = state.blocked_reason {

@@ -15,16 +15,22 @@ use loops_domain::{
   events::{EventSink, RunEvent, RunLogger},
   model::{
     CompletedWorkUnit, Phase, ReconcileResult, RequirementCatalog, RequirementCounts,
-    RequirementStatus, RunStatus, State, VerificationReport, WorkUnit,
+    RequirementStatus, RunStatus, State, VerificationReport, WorkExecution, WorkStatus,
   },
 };
 
 use crate::{
   backend::{AgentBackend, BackendContext},
+  git,
+  graph::WorkGraph,
+  integration::{deterministic_order, IntegrationOutcome, Integrator},
   protection,
+  scheduler::Scheduler,
   store::{self, RunLock},
   verifier,
+  workspace::WorkspaceManager,
 };
+
 pub struct Controller {
   cwd: PathBuf,
   backend: Arc<dyn AgentBackend>,
@@ -45,11 +51,12 @@ impl Controller {
     let config = ensure_config(&self.cwd).await?;
     store::ensure_spec(&self.cwd, &config).await?;
     store::ensure_gitignore(&self.cwd).await?;
-    store::maybe_init_git(&self.cwd, &config).await?;
+    if config.git.init {
+      git::initialize(&self.cwd).await?;
+    }
     let state_path = self.cwd.join(LOOPS_DIR).join(store::STATE_FILE);
     if !state_path.exists() {
-      let state = State::fresh();
-      store::write_state(&self.cwd, &state).await?;
+      store::write_state(&self.cwd, &State::fresh()).await?;
     }
     store::read_state(&self.cwd).await
   }
@@ -65,6 +72,11 @@ impl Controller {
     self.initialize().await?;
     let _lock = RunLock::acquire(&self.cwd)?;
     let config = Arc::new(ensure_config(&self.cwd).await?);
+    if config.execution.require_clean_base && !git::is_clean(&self.cwd).await? {
+      bail!("worktree execution requires a clean canonical working tree");
+    }
+    git::head(&self.cwd).await?;
+
     let run_id = format!(
       "{}-{}",
       Utc::now().format("%Y%m%dT%H%M%SZ"),
@@ -73,47 +85,58 @@ impl Controller {
     let logger =
       Arc::new(RunLogger::create(self.cwd.join(LOOPS_DIR).join("runs").join(&run_id)).await?);
     let events = self.events.clone().with_logger(logger);
-    let ctx = BackendContext {
+    let context = BackendContext {
       cwd: self.cwd.clone(),
       runtime_dir: self.cwd.join(LOOPS_DIR).join("runtime").join(&run_id),
       config: config.clone(),
       cancel: cancel.clone(),
       events: events.clone(),
       launch,
+      worker_id: format!("controller-{run_id}"),
+      lease_id: None,
+      work_unit_id: None,
     };
-    let mut state = store::read_state(&self.cwd)
-      .await
-      .unwrap_or_else(|_| State::fresh());
+    let mut state = store::read_state(&self.cwd).await?;
+    state.version = State::VERSION;
     state.status = RunStatus::Running;
     state.phase = Phase::Architecting;
-    state.run_id = Some(run_id);
+    state.run_id = Some(run_id.clone());
     state.cycle = 0;
-    state.current_work_unit = None;
+    state.active_leases.clear();
+    state.candidate_integrations.clear();
+    state.work_statuses.clear();
     state.blocked_reason = None;
     state.last_error = None;
-    state.last_summary = "Starting autonomous spec-driven run".into();
+    state.last_summary = "Starting deterministic coordinated run".into();
     self.publish(&events, &mut state).await?;
 
-    let result = self.run_inner(&ctx, &mut state).await;
-    match result {
-      Ok(final_state) => Ok(final_state),
-      Err(error) => {
+    let workspaces = WorkspaceManager::new(self.cwd.clone(), &run_id);
+    let result = self.run_inner(&context, &mut state).await;
+    let cleanup = workspaces.cleanup_run().await;
+    match (result, cleanup) {
+      (Ok(final_state), Ok(())) => Ok(final_state),
+      (Ok(_), Err(error)) => Err(error.context("run workspace cleanup")),
+      (Err(error), cleanup) => {
+        state.active_leases.clear();
+        state.candidate_integrations.clear();
         let cancelled = cancel.is_cancelled();
         state.status = if cancelled {
           RunStatus::Stopped
         } else {
           RunStatus::Failed
         };
-        state.last_error = if cancelled {
-          None
-        } else {
-          Some(error.to_string())
-        };
+        state.last_error = (!cancelled).then(|| error.to_string());
         state.last_summary = if cancelled {
           "Run stopped".into()
         } else {
           "Run failed".into()
         };
+        if let Err(cleanup_error) = cleanup {
+          state.last_error = Some(format!(
+            "{}; workspace cleanup failed: {cleanup_error:#}",
+            state.last_error.unwrap_or_else(|| error.to_string())
+          ));
+        }
         self.publish(&events, &mut state).await?;
         events.emit(RunEvent::Finished(state.clone())).await;
         if cancelled {
@@ -125,217 +148,331 @@ impl Controller {
     }
   }
 
-  async fn run_inner(&self, ctx: &BackendContext, state: &mut State) -> Result<State> {
-    let mut catalog = self.ensure_catalog(ctx, state).await?;
-    let mut previous_satisfied = usize::MAX;
-    let mut stagnant_fingerprint = String::new();
-    let mut stagnant_count = 0u32;
+  async fn run_inner(&self, context: &BackendContext, state: &mut State) -> Result<State> {
+    let mut catalog = self.ensure_catalog(context, state).await?;
 
-    for cycle in 1..=ctx.config.max_cycles {
-      self.check_cancel(ctx)?;
+    for cycle in 1..=context.config.max_cycles {
+      self.check_cancel(context)?;
       catalog = self
-        .refresh_catalog_if_spec_changed(ctx, state, catalog)
+        .refresh_catalog_if_spec_changed(context, state, catalog)
         .await?;
       state.cycle = cycle;
       state.phase = Phase::Reconciling;
-      state.current_work_unit = None;
-      state.last_summary = format!("Cycle {cycle}: reconciling implementation against spec");
-      self.publish(&ctx.events, state).await?;
+      state.active_leases.clear();
+      state.candidate_integrations.clear();
+      state.last_summary = format!("Cycle {cycle}: reconciling repository against requirements");
+      self.publish(&context.events, state).await?;
 
       let reconciliation = self
-        .read_only_worker(ctx, "reconciliation", || {
-          self
-            .backend
-            .reconcile(ctx, &catalog, &state.completed_work_units)
+        .read_only_worker(context, "reconciliation", || {
+          self.backend.reconcile(
+            context,
+            &catalog,
+            &state.completed_work_units,
+            &state.discoveries,
+          )
         })
         .await?;
       validate_reconcile(&catalog, &reconciliation)?;
+      let graph = WorkGraph::from_reconcile(&catalog, &reconciliation)?;
       store::write_roadmap(&self.cwd, &reconciliation).await?;
       state.requirement_counts = requirement_counts(&catalog, &reconciliation);
-      state.last_summary = reconciliation.summary.clone();
-      ctx
+      state.last_summary.clone_from(&reconciliation.summary);
+      context
         .events
         .emit(RunEvent::Reconcile(reconciliation.clone()))
         .await;
-      self.publish(&ctx.events, state).await?;
+      self.publish(&context.events, state).await?;
 
-      if reconciliation.complete
-        && all_satisfied(&catalog, &reconciliation)
-        && reconciliation.next_work_unit.is_none()
-      {
-        let final_unit = final_gate_work_unit(&catalog);
-        let report = self
-          .verify_with_repairs(ctx, state, &catalog, &final_unit, true)
-          .await?;
-        if !report.passed {
-          let reason = state
-            .blocked_reason
-            .clone()
-            .unwrap_or_else(|| "Final deterministic verification did not converge".into());
-          return self.block(ctx, state, &reason).await;
+      if reconciliation.complete && all_satisfied(&catalog, &reconciliation) {
+        if let Some(final_state) = self.finalize(context, state, &catalog).await? {
+          return Ok(final_state);
         }
-
-        state.phase = Phase::Assessing;
-        state.last_summary = "Independent fresh-context completion assessment".into();
-        self.publish(&ctx.events, state).await?;
-        let assessment = self
-          .read_only_worker(ctx, "assessment", || self.backend.assess(ctx, &catalog))
-          .await?;
-        validate_reconcile(&catalog, &assessment)?;
-        store::write_roadmap(&self.cwd, &assessment).await?;
-        state.requirement_counts = requirement_counts(&catalog, &assessment);
-        state.last_summary = assessment.summary.clone();
-        ctx
-          .events
-          .emit(RunEvent::Reconcile(assessment.clone()))
-          .await;
-        self.publish(&ctx.events, state).await?;
-
-        if assessment.complete
-          && all_satisfied(&catalog, &assessment)
-          && assessment.next_work_unit.is_none()
-        {
-          if ctx.config.git.require_clean_tree && !store::is_git_clean(&self.cwd).await {
-            return self
-              .block(ctx, state, "Completion requires a clean Git working tree")
-              .await;
-          }
-          state.status = RunStatus::Done;
-          state.phase = Phase::Complete;
-          state.current_work_unit = None;
-          state.last_summary = "All requirements have evidence and deterministic gates pass".into();
-          self.publish(&ctx.events, state).await?;
-          ctx.events.emit(RunEvent::Finished(state.clone())).await;
-          return Ok(state.clone());
-        }
-        previous_satisfied = state.requirement_counts.satisfied;
         continue;
       }
 
-      let work_unit = match reconciliation.next_work_unit {
-        Some(ref wu) => wu.clone(),
-        None => {
-          return self
-            .block(
-              ctx,
-              state,
-              "Reconciliation found gaps but produced no next work unit",
-            )
-            .await
+      let completed: BTreeSet<_> = state
+        .completed_work_units
+        .iter()
+        .map(|item| item.work_unit.id.clone())
+        .collect();
+      let active: BTreeSet<_> = state
+        .active_leases
+        .values()
+        .map(|lease| lease.work_unit.id.clone())
+        .collect();
+      let frontier = graph.ready_frontier(&completed, &active);
+      if frontier.is_empty() {
+        return self
+          .block(
+            context,
+            state,
+            "Reconciliation found gaps but the validated work graph has no ready work units",
+          )
+          .await;
+      }
+      context
+        .events
+        .emit(RunEvent::ReadyFrontier(frontier.clone()))
+        .await;
+      for unit in graph.units() {
+        state.work_statuses.insert(
+          unit.id.clone(),
+          if completed.contains(&unit.id) {
+            WorkStatus::Completed
+          } else {
+            WorkStatus::Pending
+          },
+        );
+      }
+      for unit in &frontier {
+        state
+          .work_statuses
+          .insert(unit.id.clone(), WorkStatus::Ready);
+      }
+
+      let base_revision = git::head(&self.cwd).await?;
+      if context.config.execution.require_clean_base && !git::is_clean(&self.cwd).await? {
+        return self
+          .block(
+            context,
+            state,
+            "Canonical working tree became dirty before scheduling",
+          )
+          .await;
+      }
+      let run_id = state.run_id.clone().context("run id missing")?;
+      let scheduler = Scheduler::new(
+        self.cwd.clone(),
+        run_id.clone(),
+        self.backend.clone(),
+        context.clone(),
+        Arc::new(catalog.clone()),
+      );
+      let leases = scheduler.issue_leases(frontier, &base_revision);
+      state.active_leases = leases
+        .iter()
+        .map(|lease| (lease.id.clone(), lease.clone()))
+        .collect();
+      for lease in &leases {
+        state
+          .work_statuses
+          .insert(lease.work_unit.id.clone(), WorkStatus::Running);
+      }
+      state.phase = Phase::Scheduling;
+      state.last_summary = format!("Executing {} ready work unit(s)", leases.len());
+      self.publish(&context.events, state).await?;
+
+      let execution_result = scheduler.execute_leases(leases).await;
+      let cleanup_result = scheduler.cleanup().await;
+      state.active_leases.clear();
+      let mut candidates = match (execution_result, cleanup_result) {
+        (Ok(candidates), Ok(())) => candidates,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(error)) => return Err(error.context("scheduler cleanup")),
+        (Err(error), Err(cleanup)) => {
+          return Err(error.context(format!("scheduler cleanup also failed: {cleanup:#}")))
         }
       };
-      validate_work_unit(&catalog, &work_unit)?;
-
-      let fingerprint = work_fingerprint(&work_unit);
-      if fingerprint == stagnant_fingerprint
-        && state.requirement_counts.satisfied <= previous_satisfied
-      {
-        stagnant_count += 1;
-      } else {
-        stagnant_fingerprint = fingerprint;
-        stagnant_count = 0;
+      deterministic_order(&mut candidates);
+      state.candidate_integrations = candidates.clone();
+      for candidate in &candidates {
+        state
+          .work_statuses
+          .insert(candidate.lease.work_unit.id.clone(), WorkStatus::Candidate);
+        state
+          .discoveries
+          .extend(candidate.worker_summary.discoveries.iter().cloned());
       }
-      previous_satisfied = state.requirement_counts.satisfied;
-      if stagnant_count >= ctx.config.stagnation_limit {
-        return self
-          .block(
-            ctx,
-            state,
-            &format!("Stagnation circuit breaker tripped on {}", work_unit.id),
-          )
-          .await;
-      }
+      self.publish(&context.events, state).await?;
 
-      state.phase = Phase::Implementing;
-      state.current_work_unit = Some(work_unit.clone());
-      state.last_summary = format!("Implementing {}: {}", work_unit.id, work_unit.title);
-      self.publish(&ctx.events, state).await?;
-
-      let protected = protection::snapshot(&self.cwd, &protected_paths(&ctx.config)).await?;
-      self
-        .backend
-        .implement(ctx, &catalog, &work_unit)
-        .await
-        .context("implementation worker")?;
-      ctx
-        .events
-        .emit(RunEvent::RepositoryChanges(
-          store::repository_changes(&self.cwd).await,
-        ))
-        .await;
-      store::ensure_gitignore(&self.cwd).await?;
-      let changed = protection::restore_changes(&self.cwd, &protected).await?;
-      if !changed.is_empty() {
-        return self
-          .block(
-            ctx,
-            state,
-            &format!(
-              "Worker modified controller-protected files; restored: {}",
-              changed.join(", ")
-            ),
-          )
-          .await;
-      }
-
-      let report = self
-        .verify_with_repairs(ctx, state, &catalog, &work_unit, false)
+      let integrated = self
+        .integrate_candidates(context, state, &run_id, base_revision, candidates)
         .await?;
-      if !report.passed {
-        let reason = state
-          .blocked_reason
-          .clone()
-          .unwrap_or_else(|| format!("Verification did not converge for {}", work_unit.id));
-        return self.block(ctx, state, &reason).await;
+      if !integrated {
+        return Ok(state.clone());
       }
-      let evidence_path = store::save_evidence(
-        &self.cwd,
-        &format!("{}-{}", state.cycle, work_unit.id),
-        &report,
-      )
-      .await?;
-      state.completed_work_units.push(CompletedWorkUnit {
-        work_unit: work_unit.clone(),
-        completed_at: Utc::now().to_rfc3339(),
-        verification_evidence: evidence_path
-          .strip_prefix(&self.cwd)
-          .unwrap_or(&evidence_path)
-          .display()
-          .to_string(),
-      });
-      state.current_work_unit = None;
-      if ctx.config.git.auto_commit {
-        store::auto_commit(&self.cwd, &format!("loops: complete {}", work_unit.id)).await?;
-      }
-      self.publish(&ctx.events, state).await?;
+      state.candidate_integrations.clear();
+      self.publish(&context.events, state).await?;
     }
 
     self
       .block(
-        ctx,
+        context,
         state,
-        &format!("Maximum cycle count ({}) reached", ctx.config.max_cycles),
+        &format!(
+          "Maximum cycle count ({}) reached",
+          context.config.max_cycles
+        ),
       )
       .await
   }
 
+  async fn integrate_candidates(
+    &self,
+    context: &BackendContext,
+    state: &mut State,
+    run_id: &str,
+    base_revision: String,
+    candidates: Vec<WorkExecution>,
+  ) -> Result<bool> {
+    let workspaces = WorkspaceManager::new(self.cwd.clone(), run_id);
+    let mut integrator = Integrator::create(
+      self.cwd.clone(),
+      &workspaces,
+      base_revision,
+      (*context.config).clone(),
+    )
+    .await?;
+
+    let mut accepted = true;
+    for candidate in candidates {
+      self.check_cancel(context)?;
+      let id = candidate.lease.work_unit.id.clone();
+      state.phase = Phase::Integrating;
+      state
+        .work_statuses
+        .insert(id.clone(), WorkStatus::Integrating);
+      state.last_summary = format!("Integrating {id}");
+      self.publish(&context.events, state).await?;
+      context
+        .events
+        .emit(RunEvent::IntegrationStarted {
+          work_unit_id: id.clone(),
+          candidate_revision: candidate.candidate_revision.clone(),
+        })
+        .await;
+
+      match integrator.integrate(&candidate).await? {
+        IntegrationOutcome::Accepted {
+          revision,
+          verification,
+        } => {
+          let evidence_path =
+            store::save_evidence(&self.cwd, &format!("{}-{id}", state.cycle), &verification)
+              .await?;
+          state.completed_work_units.push(CompletedWorkUnit {
+            work_unit: candidate.lease.work_unit.clone(),
+            completed_at: Utc::now().to_rfc3339(),
+            verification_evidence: relative_path(&self.cwd, &evidence_path),
+          });
+          state
+            .work_statuses
+            .insert(id.clone(), WorkStatus::Completed);
+          context
+            .events
+            .emit(RunEvent::IntegrationAccepted {
+              work_unit_id: id,
+              revision,
+            })
+            .await;
+        }
+        outcome => {
+          accepted = false;
+          let reason = integration_failure(&outcome);
+          state.work_statuses.insert(id.clone(), WorkStatus::Failed);
+          context
+            .events
+            .emit(RunEvent::IntegrationRejected {
+              work_unit_id: id,
+              reason: reason.clone(),
+            })
+            .await;
+          self.block(context, state, &reason).await?;
+          break;
+        }
+      }
+    }
+
+    integrator.cleanup(&workspaces).await?;
+    Ok(accepted)
+  }
+
+  async fn finalize(
+    &self,
+    context: &BackendContext,
+    state: &mut State,
+    catalog: &RequirementCatalog,
+  ) -> Result<Option<State>> {
+    state.phase = Phase::Verifying;
+    state.last_summary = "Running final deterministic verification".into();
+    self.publish(&context.events, state).await?;
+    let report = verifier::run_verification(&self.cwd, &context.config).await?;
+    context
+      .events
+      .emit(RunEvent::Verification(report.clone()))
+      .await;
+    if !report.passed {
+      return Ok(Some(
+        self
+          .block(context, state, "Final deterministic verification failed")
+          .await?,
+      ));
+    }
+
+    state.phase = Phase::Assessing;
+    state.last_summary = "Independent fresh-context completion assessment".into();
+    self.publish(&context.events, state).await?;
+    let assessment = self
+      .read_only_worker(context, "assessment", || {
+        self.backend.assess(context, catalog)
+      })
+      .await?;
+    validate_reconcile(catalog, &assessment)?;
+    WorkGraph::from_reconcile(catalog, &assessment)?;
+    store::write_roadmap(&self.cwd, &assessment).await?;
+    state.requirement_counts = requirement_counts(catalog, &assessment);
+    state.last_summary.clone_from(&assessment.summary);
+    context
+      .events
+      .emit(RunEvent::Reconcile(assessment.clone()))
+      .await;
+    if !(assessment.complete && all_satisfied(catalog, &assessment)) {
+      self.publish(&context.events, state).await?;
+      return Ok(None);
+    }
+    if context.config.git.require_clean_tree && !git::is_clean(&self.cwd).await? {
+      return Ok(Some(
+        self
+          .block(
+            context,
+            state,
+            "Completion requires a clean Git working tree",
+          )
+          .await?,
+      ));
+    }
+
+    state.status = RunStatus::Done;
+    state.phase = Phase::Complete;
+    state.last_summary = "All requirements have evidence and deterministic gates pass".into();
+    self.publish(&context.events, state).await?;
+    context.events.emit(RunEvent::Finished(state.clone())).await;
+    Ok(Some(state.clone()))
+  }
+
   async fn ensure_catalog(
     &self,
-    ctx: &BackendContext,
+    context: &BackendContext,
     state: &mut State,
   ) -> Result<RequirementCatalog> {
-    let (spec, spec_hash) = store::spec_text_and_hash(&self.cwd, &ctx.config).await?;
+    let (spec, spec_hash) = store::spec_text_and_hash(&self.cwd, &context.config).await?;
     if let Some(catalog) = store::read_catalog(&self.cwd).await? {
       if catalog.spec_hash == spec_hash {
-        ctx.events.emit(RunEvent::Catalog(catalog.clone())).await;
+        context
+          .events
+          .emit(RunEvent::Catalog(catalog.clone()))
+          .await;
         return Ok(catalog);
       }
     }
     state.phase = Phase::Architecting;
     state.last_summary = "Deriving requirement catalog from .loops/spec.md".into();
-    self.publish(&ctx.events, state).await?;
+    self.publish(&context.events, state).await?;
     let output = self
-      .read_only_worker(ctx, "architect", || self.backend.architect(ctx, &spec))
+      .read_only_worker(context, "architect", || {
+        self.backend.architect(context, &spec)
+      })
       .await?;
     validate_requirements(&output.requirements)?;
     let catalog = RequirementCatalog {
@@ -343,18 +480,21 @@ impl Controller {
       requirements: output.requirements,
     };
     store::write_catalog(&self.cwd, &catalog).await?;
-    ctx.events.emit(RunEvent::Catalog(catalog.clone())).await;
+    context
+      .events
+      .emit(RunEvent::Catalog(catalog.clone()))
+      .await;
     state.requirement_counts = RequirementCounts {
       total: catalog.requirements.len(),
       ..Default::default()
     };
-    self.publish(&ctx.events, state).await?;
+    self.publish(&context.events, state).await?;
     Ok(catalog)
   }
 
   async fn read_only_worker<T, F, Fut>(
     &self,
-    ctx: &BackendContext,
+    context: &BackendContext,
     name: &str,
     call: F,
   ) -> Result<T>
@@ -362,7 +502,7 @@ impl Controller {
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T>>,
   {
-    let protected = protection::snapshot(&self.cwd, &protected_paths(&ctx.config)).await?;
+    let protected = protection::snapshot(&self.cwd, &protected_paths(&context.config)).await?;
     let result = call().await;
     let restoration = protection::restore_changes(&self.cwd, &protected).await;
     match (result, restoration) {
@@ -383,110 +523,31 @@ impl Controller {
 
   async fn refresh_catalog_if_spec_changed(
     &self,
-    ctx: &BackendContext,
+    context: &BackendContext,
     state: &mut State,
     catalog: RequirementCatalog,
   ) -> Result<RequirementCatalog> {
-    let (_, hash) = store::spec_text_and_hash(&self.cwd, &ctx.config).await?;
+    let (_, hash) = store::spec_text_and_hash(&self.cwd, &context.config).await?;
     if hash == catalog.spec_hash {
       return Ok(catalog);
     }
     state.completed_work_units.clear();
-    self.ensure_catalog(ctx, state).await
+    state.work_statuses.clear();
+    state.discoveries.clear();
+    self.ensure_catalog(context, state).await
   }
 
-  async fn verify_with_repairs(
+  async fn block(
     &self,
-    ctx: &BackendContext,
+    context: &BackendContext,
     state: &mut State,
-    catalog: &RequirementCatalog,
-    work_unit: &WorkUnit,
-    final_gate: bool,
-  ) -> Result<VerificationReport> {
-    state.phase = Phase::Verifying;
-    state.last_summary = format!("Verifying {}", work_unit.id);
-    self.publish(&ctx.events, state).await?;
-
-    let mut report = verifier::run_verification(&self.cwd, &ctx.config).await?;
-    ctx
-      .events
-      .emit(RunEvent::Verification(report.clone()))
-      .await;
-    let label = if final_gate {
-      "final".to_owned()
-    } else {
-      work_unit.id.clone()
-    };
-    let _ = store::save_evidence(&self.cwd, &format!("verify-{label}-attempt-0"), &report).await?;
-    if report.passed {
-      state.last_summary = format!("Verification passed for {}", work_unit.id);
-      self.publish(&ctx.events, state).await?;
-      return Ok(report);
-    }
-
-    for attempt in 1..=ctx.config.max_repair_attempts {
-      self.check_cancel(ctx)?;
-      state.phase = Phase::Repairing;
-      state.last_summary = format!(
-        "Repairing {} (attempt {}/{})",
-        work_unit.id, attempt, ctx.config.max_repair_attempts
-      );
-      self.publish(&ctx.events, state).await?;
-
-      let protected = protection::snapshot(&self.cwd, &protected_paths(&ctx.config)).await?;
-      self
-        .backend
-        .repair(ctx, catalog, work_unit, &report)
-        .await
-        .context("repair worker")?;
-      ctx
-        .events
-        .emit(RunEvent::RepositoryChanges(
-          store::repository_changes(&self.cwd).await,
-        ))
-        .await;
-      store::ensure_gitignore(&self.cwd).await?;
-      let changed = protection::restore_changes(&self.cwd, &protected).await?;
-      if !changed.is_empty() {
-        let reason = format!(
-          "Repair worker modified controller-protected files; restored: {}",
-          changed.join(", ")
-        );
-        state.status = RunStatus::Blocked;
-        state.blocked_reason = Some(reason.clone());
-        state.last_summary = reason;
-        self.publish(&ctx.events, state).await?;
-        return Ok(report);
-      }
-
-      state.phase = Phase::Verifying;
-      self.publish(&ctx.events, state).await?;
-      report = verifier::run_verification(&self.cwd, &ctx.config).await?;
-      ctx
-        .events
-        .emit(RunEvent::Verification(report.clone()))
-        .await;
-      let _ = store::save_evidence(
-        &self.cwd,
-        &format!("verify-{label}-attempt-{attempt}"),
-        &report,
-      )
-      .await?;
-      if report.passed {
-        state.last_summary = format!("Verification passed for {}", work_unit.id);
-        self.publish(&ctx.events, state).await?;
-        return Ok(report);
-      }
-    }
-    Ok(report)
-  }
-
-  async fn block(&self, ctx: &BackendContext, state: &mut State, reason: &str) -> Result<State> {
+    reason: &str,
+  ) -> Result<State> {
     state.status = RunStatus::Blocked;
     state.blocked_reason = Some(reason.into());
     state.last_summary = reason.into();
-    self.publish(&ctx.events, state).await?;
-    ctx.events.emit(RunEvent::Finished(state.clone())).await;
+    self.publish(&context.events, state).await?;
+    context.events.emit(RunEvent::Finished(state.clone())).await;
     Ok(state.clone())
   }
 
@@ -497,8 +558,8 @@ impl Controller {
     Ok(())
   }
 
-  fn check_cancel(&self, ctx: &BackendContext) -> Result<()> {
-    if ctx.cancel.is_cancelled() {
+  fn check_cancel(&self, context: &BackendContext) -> Result<()> {
+    if context.cancel.is_cancelled() {
       bail!("run cancelled");
     }
     Ok(())
@@ -531,68 +592,48 @@ fn validate_requirements(requirements: &[loops_domain::model::Requirement]) -> R
 }
 
 fn validate_reconcile(catalog: &RequirementCatalog, result: &ReconcileResult) -> Result<()> {
-  let expected: BTreeSet<_> = catalog.requirements.iter().map(|r| r.id.as_str()).collect();
-  let actual: BTreeSet<_> = result.requirements.iter().map(|r| r.id.as_str()).collect();
-  if expected != actual {
+  let expected: BTreeSet<_> = catalog
+    .requirements
+    .iter()
+    .map(|item| item.id.as_str())
+    .collect();
+  let actual: BTreeSet<_> = result
+    .requirements
+    .iter()
+    .map(|item| item.id.as_str())
+    .collect();
+  if expected != actual || actual.len() != result.requirements.len() {
     bail!("reconciliation assessment IDs do not match the requirement catalog");
   }
-  if result.complete && (!all_satisfied(catalog, result) || result.next_work_unit.is_some()) {
-    bail!(
-      "reconciliation claimed complete without every requirement satisfied and nextWorkUnit=null"
-    );
+  if result.complete && (!all_satisfied(catalog, result) || !result.work_units.is_empty()) {
+    bail!("reconciliation claimed complete without every requirement satisfied and workUnits=[]");
   }
-  if let Some(work) = &result.next_work_unit {
-    validate_work_unit(catalog, work)?;
-  }
-  Ok(())
-}
-
-fn validate_work_unit(catalog: &RequirementCatalog, work: &WorkUnit) -> Result<()> {
-  if work.id.trim().is_empty() || work.title.trim().is_empty() || work.objective.trim().is_empty() {
-    bail!("work unit is missing id, title, or objective");
-  }
-  if !work
-    .id
-    .chars()
-    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-    || work.id == "."
-    || work.id == ".."
-  {
-    bail!("work unit id contains unsafe path characters: {}", work.id);
-  }
-  if work.requirement_ids.is_empty() {
-    bail!("{} targets no requirements", work.id);
-  }
-  let known: BTreeSet<_> = catalog.requirements.iter().map(|r| r.id.as_str()).collect();
-  for id in &work.requirement_ids {
-    if !known.contains(id.as_str()) {
-      bail!("{} targets unknown requirement {id}", work.id);
-    }
+  if !result.complete && result.work_units.is_empty() {
+    bail!("reconciliation found incomplete requirements but proposed no work units");
   }
   Ok(())
 }
 
 fn all_satisfied(catalog: &RequirementCatalog, result: &ReconcileResult) -> bool {
-  if result.requirements.len() != catalog.requirements.len() {
-    return false;
-  }
-  result
-    .requirements
-    .iter()
-    .all(|r| r.status == RequirementStatus::Satisfied)
+  result.requirements.len() == catalog.requirements.len()
+    && result
+      .requirements
+      .iter()
+      .all(|item| item.status == RequirementStatus::Satisfied)
 }
 
 fn requirement_counts(catalog: &RequirementCatalog, result: &ReconcileResult) -> RequirementCounts {
-  let mut by_id = BTreeMap::new();
-  for item in &result.requirements {
-    by_id.insert(item.id.as_str(), &item.status);
-  }
+  let by_id: BTreeMap<_, _> = result
+    .requirements
+    .iter()
+    .map(|item| (item.id.as_str(), &item.status))
+    .collect();
   let mut counts = RequirementCounts {
     total: catalog.requirements.len(),
     ..Default::default()
   };
-  for req in &catalog.requirements {
-    match by_id.get(req.id.as_str()).copied() {
+  for requirement in &catalog.requirements {
+    match by_id.get(requirement.id.as_str()).copied() {
       Some(RequirementStatus::Satisfied) => counts.satisfied += 1,
       Some(RequirementStatus::Partial) => counts.partial += 1,
       _ => counts.missing += 1,
@@ -601,32 +642,36 @@ fn requirement_counts(catalog: &RequirementCatalog, result: &ReconcileResult) ->
   counts
 }
 
-fn work_fingerprint(work: &WorkUnit) -> String {
-  format!(
-    "{}|{}|{}",
-    work.title,
-    work.objective,
-    work.requirement_ids.join(",")
-  )
-}
-
-fn final_gate_work_unit(catalog: &RequirementCatalog) -> WorkUnit {
-  WorkUnit {
-        id: "FINAL-GATE".into(),
-        title: "Final deterministic acceptance".into(),
-        objective: "Repair any remaining issue that prevents the project's deterministic acceptance gates from passing.".into(),
-        requirement_ids: catalog.requirements.iter().map(|r| r.id.clone()).collect(),
-        acceptance_criteria: vec!["All configured deterministic gates pass without weakening them.".into()],
-        suggested_checks: Vec::new(),
+fn integration_failure(outcome: &IntegrationOutcome) -> String {
+  match outcome {
+    IntegrationOutcome::StaleBase => "Candidate base is not an ancestor of integration HEAD".into(),
+    IntegrationOutcome::MergeConflict { paths } => {
+      format!("Candidate merge conflict: {}", paths.join(", "))
     }
+    IntegrationOutcome::VerificationFailed { .. } => {
+      "Candidate verification failed during integration".into()
+    }
+    IntegrationOutcome::RegressionDetected { .. } => {
+      "Candidate introduced a deterministic verification regression".into()
+    }
+    IntegrationOutcome::Accepted { .. } => "Candidate accepted".into(),
+  }
 }
 
 fn protected_paths(config: &Config) -> Vec<String> {
   let mut paths = config.protected_paths.clone();
-  if !paths.iter().any(|p| p == &config.spec_file) {
+  if !paths.iter().any(|path| path == &config.spec_file) {
     paths.push(config.spec_file.clone());
   }
   paths
+}
+
+fn relative_path(root: &Path, path: &Path) -> String {
+  path
+    .strip_prefix(root)
+    .unwrap_or(path)
+    .display()
+    .to_string()
 }
 
 pub async fn manual_verify(cwd: &Path) -> Result<VerificationReport> {

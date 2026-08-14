@@ -379,14 +379,18 @@ fn idle_screen(frame: &mut Frame<'_>, app: &Application, area: Rect) {
 fn context_pane(frame: &mut Frame<'_>, app: &Application, area: Rect) {
   let state = app.state();
   let mut lines = screen_heading("CONTEXT", "Live run state");
-  lines.extend([Line::raw(""), section_line("CURRENT WORK")]);
-  match state.current_work_unit.as_ref() {
-    Some(work) => lines.extend([
-      Line::styled(work.id.clone(), theme::accent()),
-      Line::styled(work.title.clone(), theme::heading()),
-      Line::styled(work.requirement_ids.join("  ·  "), theme::muted()),
-    ]),
-    None => lines.push(Line::styled("No work unit selected", theme::muted())),
+  let active_work = app.active_work_units().collect::<Vec<_>>();
+  lines.extend([Line::raw(""), section_line("ACTIVE WORK")]);
+  if active_work.is_empty() {
+    lines.push(Line::styled("No active work units", theme::muted()));
+  } else {
+    for work in active_work {
+      lines.extend([
+        Line::styled(work.id.clone(), theme::accent()),
+        Line::styled(work.title.clone(), theme::heading()),
+        Line::styled(work.requirement_ids.join("  ·  "), theme::muted()),
+      ]);
+    }
   }
   lines.extend([
     Line::raw(""),

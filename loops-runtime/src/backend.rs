@@ -8,8 +8,8 @@ use loops_domain::{
   config::Config,
   events::EventSink,
   model::{
-    ArchitectOutput, CompletedWorkUnit, ReconcileResult, RequirementCatalog, VerificationReport,
-    WorkUnit, WorkerSummary,
+    ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, RequirementCatalog,
+    VerificationReport, WorkUnit, WorkerSummary,
   },
 };
 
@@ -24,12 +24,18 @@ pub struct BackendContext {
   pub cancel: CancellationToken,
   pub events: EventSink,
   pub launch: Option<LaunchMetadata>,
+  pub worker_id: String,
+  pub lease_id: Option<String>,
+  pub work_unit_id: Option<String>,
 }
 
 /// A role-independent request executed by an agent runtime.
 #[derive(Clone)]
 pub struct WorkerRequest {
   pub role: loops_domain::model::WorkerRole,
+  pub worker_id: String,
+  pub lease_id: Option<String>,
+  pub work_unit_id: Option<String>,
   pub prompt: String,
   pub cwd: PathBuf,
   pub runtime_dir: PathBuf,
@@ -79,8 +85,8 @@ pub trait AgentBackend: Send + Sync {
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
     recent_completed: &[CompletedWorkUnit],
+    discoveries: &[Discovery],
   ) -> Result<ReconcileResult>;
-
   async fn implement(
     &self,
     ctx: &BackendContext,

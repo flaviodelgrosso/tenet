@@ -14,19 +14,59 @@ use loops_domain::{
 };
 
 pub async fn verification_commands(config: &Config) -> Result<Vec<String>> {
-  let mut out = Vec::new();
-  out.extend(config.verification.commands.iter().cloned());
-  let mut seen = BTreeSet::new();
-  out.retain(|cmd| !cmd.trim().is_empty() && seen.insert(cmd.trim().to_owned()));
-  Ok(out)
+  deduplicate_commands(config.verification.commands.iter().cloned())
 }
 
 pub async fn run_verification(cwd: &Path, config: &Config) -> Result<VerificationReport> {
+  run_commands(cwd, config, verification_commands(config).await?).await
+}
+
+pub async fn run_verification_with_checks(
+  cwd: &Path,
+  config: &Config,
+  suggested_checks: &[String],
+) -> Result<VerificationReport> {
+  let commands = deduplicate_commands(
+    suggested_checks
+      .iter()
+      .cloned()
+      .chain(config.verification.commands.iter().cloned()),
+  )?;
+  run_commands(cwd, config, commands).await
+}
+
+pub async fn run_suggested_checks(
+  cwd: &Path,
+  config: &Config,
+  suggested_checks: &[String],
+) -> Result<VerificationReport> {
+  run_commands(
+    cwd,
+    config,
+    deduplicate_commands(suggested_checks.iter().cloned())?,
+  )
+  .await
+}
+
+fn deduplicate_commands(commands: impl Iterator<Item = String>) -> Result<Vec<String>> {
+  let mut seen = BTreeSet::new();
+  Ok(
+    commands
+      .filter(|command| !command.trim().is_empty())
+      .filter(|command| seen.insert(command.trim().to_owned()))
+      .collect(),
+  )
+}
+
+async fn run_commands(
+  cwd: &Path,
+  config: &Config,
+  commands: Vec<String>,
+) -> Result<VerificationReport> {
   let started_at = Utc::now().to_rfc3339();
-  let commands = verification_commands(config).await?;
   let project_gate_count = commands
     .iter()
-    .filter(|cmd| cmd.as_str() != "git diff --check")
+    .filter(|command| command.as_str() != "git diff --check")
     .count();
   let mut warnings = Vec::new();
   if commands.is_empty() {
@@ -57,7 +97,7 @@ pub async fn run_verification(cwd: &Path, config: &Config) -> Result<Verificatio
 
   let passed = results
     .iter()
-    .all(|r| r.exit_code == Some(0) && !r.timed_out)
+    .all(|result| result.exit_code == Some(0) && !result.timed_out)
     && (!config.verification.require_project_gate || project_gate_count > 0);
 
   Ok(VerificationReport {
@@ -172,5 +212,13 @@ mod tests {
     assert_eq!(result.exit_code, Some(0));
     assert!(!result.timed_out);
     assert!(result.stdout.contains("loops-shell-test"));
+  }
+  #[tokio::test]
+  async fn run_shell_marks_timeout_and_terminates_child() {
+    let result = run_shell(Path::new("."), "sleep 1", Duration::from_millis(10), 1024)
+      .await
+      .expect("platform shell should start");
+
+    assert!(result.timed_out);
   }
 }

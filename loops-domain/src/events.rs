@@ -8,7 +8,8 @@ use tokio::{
 };
 
 use crate::model::{
-  ReconcileResult, RepositoryChange, RequirementCatalog, State, VerificationReport, WorkerEvent,
+  Discovery, ReconcileResult, RepositoryChange, RequirementCatalog, State, VerificationReport,
+  WorkExecution, WorkLease, WorkUnit, WorkerEvent,
 };
 
 #[derive(Debug, Clone)]
@@ -19,6 +20,38 @@ pub enum RunEvent {
   Message(String),
   Worker(WorkerEvent),
   Reconcile(ReconcileResult),
+  ReadyFrontier(Vec<WorkUnit>),
+  LeaseIssued(WorkLease),
+  WorkerStarted {
+    worker_id: String,
+    lease_id: String,
+    work_unit_id: String,
+  },
+  CandidateProduced(WorkExecution),
+  IntegrationStarted {
+    work_unit_id: String,
+    candidate_revision: String,
+  },
+  IntegrationAccepted {
+    work_unit_id: String,
+    revision: String,
+  },
+  IntegrationRejected {
+    work_unit_id: String,
+    reason: String,
+  },
+  DependencyDiscovered {
+    lease_id: String,
+    discovery: Discovery,
+  },
+  WorkspaceCreated {
+    lease_id: String,
+    path: PathBuf,
+  },
+  WorkspaceRemoved {
+    lease_id: String,
+    path: PathBuf,
+  },
   Verification(VerificationReport),
   RepositoryChanges(Vec<RepositoryChange>),
   Finished(State),
@@ -82,6 +115,44 @@ impl RunLogger {
       RunEvent::Message(v) => serde_json::json!({"type":"message","value":v}),
       RunEvent::Worker(v) => serde_json::json!({"type":"worker","value":v}),
       RunEvent::Reconcile(v) => serde_json::json!({"type":"reconcile","value":v}),
+      RunEvent::ReadyFrontier(v) => serde_json::json!({"type":"ready_frontier","value":v}),
+      RunEvent::LeaseIssued(v) => serde_json::json!({"type":"lease_issued","value":v}),
+      RunEvent::WorkerStarted {
+        worker_id,
+        lease_id,
+        work_unit_id,
+      } => {
+        serde_json::json!({"type":"worker_started","workerId":worker_id,"leaseId":lease_id,"workUnitId":work_unit_id})
+      }
+      RunEvent::CandidateProduced(v) => serde_json::json!({"type":"candidate_produced","value":v}),
+      RunEvent::IntegrationStarted {
+        work_unit_id,
+        candidate_revision,
+      } => {
+        serde_json::json!({"type":"integration_started","workUnitId":work_unit_id,"candidateRevision":candidate_revision})
+      }
+      RunEvent::IntegrationAccepted {
+        work_unit_id,
+        revision,
+      } => {
+        serde_json::json!({"type":"integration_accepted","workUnitId":work_unit_id,"revision":revision})
+      }
+      RunEvent::IntegrationRejected {
+        work_unit_id,
+        reason,
+      } => {
+        serde_json::json!({"type":"integration_rejected","workUnitId":work_unit_id,"reason":reason})
+      }
+      RunEvent::DependencyDiscovered {
+        lease_id,
+        discovery,
+      } => serde_json::json!({"type":"dependency_discovered","leaseId":lease_id,"value":discovery}),
+      RunEvent::WorkspaceCreated { lease_id, path } => {
+        serde_json::json!({"type":"workspace_created","leaseId":lease_id,"path":path})
+      }
+      RunEvent::WorkspaceRemoved { lease_id, path } => {
+        serde_json::json!({"type":"workspace_removed","leaseId":lease_id,"path":path})
+      }
       RunEvent::Verification(v) => serde_json::json!({"type":"verification","value":v}),
       RunEvent::RepositoryChanges(v) => {
         serde_json::json!({"type":"repository_changes","value":v})

@@ -21,6 +21,8 @@ pub struct Config {
   pub agent: AgentConfig,
   pub verification: VerificationConfig,
   pub git: GitConfig,
+  pub execution: ExecutionConfig,
+  pub integration: IntegrationConfig,
   pub protected_paths: Vec<String>,
 }
 
@@ -342,6 +344,33 @@ pub struct GitConfig {
   pub require_clean_tree: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKind {
+  Worktree,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionConfig {
+  pub max_parallel_workers: usize,
+  pub workspace: WorkspaceKind,
+  pub require_clean_base: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationStrategy {
+  CherryPick,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationConfig {
+  pub strategy: IntegrationStrategy,
+  pub verify_each_candidate: bool,
+}
+
 impl Default for Config {
   fn default() -> Self {
     Self {
@@ -373,6 +402,15 @@ impl Default for Config {
         init: true,
         auto_commit: false,
         require_clean_tree: false,
+      },
+      execution: ExecutionConfig {
+        max_parallel_workers: 1,
+        workspace: WorkspaceKind::Worktree,
+        require_clean_base: true,
+      },
+      integration: IntegrationConfig {
+        strategy: IntegrationStrategy::CherryPick,
+        verify_each_candidate: true,
       },
       protected_paths: vec![
         ".loops/spec.md",
@@ -416,6 +454,9 @@ pub async fn read_config(cwd: &Path) -> Result<Config> {
   let config: Config =
     toml::from_str(&text).map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))?;
   config.agent.validate_launch_source()?;
+  if config.execution.max_parallel_workers == 0 {
+    anyhow::bail!("execution.max_parallel_workers must be at least 1");
+  }
   Ok(config)
 }
 
@@ -479,6 +520,8 @@ mod tests {
       "agent",
       "verification",
       "git",
+      "execution",
+      "integration",
       "protected_paths",
     ];
     expected_root.sort_unstable();
@@ -575,6 +618,26 @@ mod tests {
     assert_eq!(
       schema["$defs"]["gitConfig"]["properties"]["require_clean_tree"]["default"],
       config.git.require_clean_tree
+    );
+    assert_eq!(
+      schema["$defs"]["executionConfig"]["properties"]["max_parallel_workers"]["default"],
+      config.execution.max_parallel_workers
+    );
+    assert_eq!(
+      schema["$defs"]["executionConfig"]["properties"]["workspace"]["default"],
+      serde_json::to_value(config.execution.workspace).unwrap()
+    );
+    assert_eq!(
+      schema["$defs"]["executionConfig"]["properties"]["require_clean_base"]["default"],
+      config.execution.require_clean_base
+    );
+    assert_eq!(
+      schema["$defs"]["integrationConfig"]["properties"]["strategy"]["default"],
+      serde_json::to_value(config.integration.strategy).unwrap()
+    );
+    assert_eq!(
+      schema["$defs"]["integrationConfig"]["properties"]["verify_each_candidate"]["default"],
+      config.integration.verify_each_candidate
     );
   }
 

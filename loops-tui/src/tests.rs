@@ -2,8 +2,8 @@ use loops_domain::{
   events::RunEvent,
   model::{
     CommandResult, Phase, ReconcileResult, RepositoryChange, Requirement, RequirementAssessment,
-    RequirementCatalog, RequirementStatus, RunStatus, State, VerificationReport, WorkUnit,
-    WorkerEvent, WorkerRole,
+    RequirementCatalog, RequirementStatus, RunStatus, State, VerificationReport, WorkScope,
+    WorkUnit, WorkerEvent, WorkerRole,
   },
 };
 use ratatui::{backend::TestBackend, Terminal};
@@ -62,10 +62,16 @@ fn projection_builds_causal_activity_feed() {
   app.apply(RunEvent::State(state));
   app.apply(RunEvent::Worker(WorkerEvent::Start {
     role: WorkerRole::Implement,
+    worker_id: "worker-1".into(),
+    lease_id: Some("lease-1".into()),
+    work_unit_id: Some("W1".into()),
     at: "10:00:00".into(),
   }));
   app.apply(RunEvent::Worker(WorkerEvent::ToolStart {
     role: WorkerRole::Implement,
+    worker_id: "worker-1".into(),
+    lease_id: Some("lease-1".into()),
+    work_unit_id: Some("W1".into()),
     at: "10:00:01".into(),
     tool_name: "cargo test".into(),
     args: serde_json::json!({"all": true}),
@@ -255,14 +261,18 @@ fn requirement_projection_preserves_evidence_and_gaps() {
       evidence: vec!["Implemented API".into()],
       gaps: vec!["No check".into()],
     }],
-    next_work_unit: Some(WorkUnit {
+    work_units: vec![WorkUnit {
       id: "W1".into(),
       title: "Finish R1".into(),
       objective: "Complete it".into(),
       requirement_ids: vec!["R1".into()],
       acceptance_criteria: vec![],
       suggested_checks: vec![],
-    }),
+      depends_on: Vec::new(),
+      scope: WorkScope {
+        paths: vec!["src/**".into()],
+      },
+    }],
   }));
   assert_eq!(
     app.assessments().get("R1").unwrap().status,
@@ -305,6 +315,9 @@ fn active_run_renders_phase_tool_and_focus_at_wide_and_narrow_sizes() {
   app.apply(RunEvent::State(state));
   app.apply(RunEvent::Worker(WorkerEvent::ToolStart {
     role: WorkerRole::Implement,
+    worker_id: "worker-2".into(),
+    lease_id: Some("lease-2".into()),
+    work_unit_id: Some("W2".into()),
     at: "10:01:00".into(),
     tool_name: "cargo test".into(),
     args: serde_json::json!({"package": "loops-tui"}),
@@ -349,7 +362,7 @@ fn requirements_changes_history_and_overlays_have_composed_surfaces() {
       evidence: vec!["Implementation exists".into()],
       gaps: vec!["No verification yet".into()],
     }],
-    next_work_unit: None,
+    work_units: Vec::new(),
   }));
   app.dispatch(Action::Go(Screen::Requirements));
   let requirements = rendered(&app, 140, 40);

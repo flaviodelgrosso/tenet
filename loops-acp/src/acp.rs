@@ -24,8 +24,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use loops_domain::events::EventSink;
 use loops_domain::model::{
-  ArchitectOutput, CompletedWorkUnit, ReconcileResult, RequirementCatalog, VerificationReport,
-  WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
+  ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, RequirementCatalog,
+  VerificationReport, WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -120,8 +120,9 @@ impl AgentBackend for AcpRuntime {
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
     recent: &[CompletedWorkUnit],
+    discoveries: &[Discovery],
   ) -> Result<ReconcileResult> {
-    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository against this catalog. Inspect it directly.\n\nCatalog:\n{}\n\nRecent completed work:\n{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(recent)?), reconcile_schema()).await
+    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository against this catalog. Inspect it directly. Propose a dependency graph of candidate work units; the controller alone decides concurrency.\n\nCatalog:\n{}\n\nRecent completed work:\n{}\n\nWorker discoveries requiring reconsideration:\n{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(recent)?, serde_json::to_string_pretty(discoveries)?), reconcile_schema()).await
   }
 
   async fn implement(
@@ -263,6 +264,9 @@ impl AcpRuntime {
 
     let request = WorkerRequest {
       role,
+      worker_id: ctx.worker_id.clone(),
+      lease_id: ctx.lease_id.clone(),
+      work_unit_id: ctx.work_unit_id.clone(),
       prompt: build_worker_prompt(role, &schema, &prompt)?,
       cwd: ctx.cwd.clone(),
       runtime_dir: ctx.runtime_dir.clone(),
@@ -278,10 +282,12 @@ impl AcpRuntime {
       .events
       .worker(WorkerEvent::Start {
         role,
+        worker_id: ctx.worker_id.clone(),
+        lease_id: ctx.lease_id.clone(),
+        work_unit_id: ctx.work_unit_id.clone(),
         at: chrono::Utc::now().to_rfc3339(),
       })
       .await;
-
     let timeout = request.timeout;
     let run = self.run_worker_with_events(request, Some(ctx.events.clone()));
     let outcome = tokio::time::timeout(timeout, async {
@@ -316,12 +322,14 @@ impl AcpRuntime {
       .events
       .worker(WorkerEvent::End {
         role,
+        worker_id: ctx.worker_id.clone(),
+        lease_id: ctx.lease_id.clone(),
+        work_unit_id: ctx.work_unit_id.clone(),
         at: chrono::Utc::now().to_rfc3339(),
         ok,
         message,
       })
       .await;
-
     match outcome {
       Ok(result) => serde_json::from_value::<T>(result.structured_output)
         .map_err(|error| anyhow!("worker response did not match the requested schema: {error}")),
@@ -576,6 +584,11 @@ impl AcpRuntime {
     request: WorkerRequest,
     events: Option<EventSink>,
   ) -> Result<WorkerResult> {
+    let identity = WorkerIdentity {
+      worker_id: request.worker_id.clone(),
+      lease_id: request.lease_id.clone(),
+      work_unit_id: request.work_unit_id.clone(),
+    };
     let (command, args, env) = if let Some(launch) = request.launch {
       (launch.command, launch.args, launch.env)
     } else if let Some(custom) = request.custom {
@@ -625,6 +638,7 @@ impl AcpRuntime {
         let schema = schema.clone();
         let validate_output = validate_output.clone();
         let events = events.clone();
+        let identity = identity.clone();
         async move {
           let initialize = connection
             .send_request(initialize_request())
@@ -647,6 +661,7 @@ impl AcpRuntime {
             let mcp_schema = schema.clone();
             let mcp_validate_output = validate_output.clone();
             let mcp_events = events.clone();
+            let mcp_identity = identity.clone();
             match connection.build_session(&cwd).with_mcp_server(server) {
               Ok(builder) => {
                 builder
@@ -662,6 +677,7 @@ impl AcpRuntime {
                         validate_output: mcp_validate_output,
                         retries,
                         events: mcp_events,
+                        identity: mcp_identity,
                         yielded: Some((yield_receiver, yield_completion_receiver)),
                       },
                     )
@@ -684,6 +700,7 @@ impl AcpRuntime {
                         validate_output,
                         retries,
                         events,
+                        identity,
                         yielded: None,
                       },
                     )
@@ -707,6 +724,7 @@ impl AcpRuntime {
                     validate_output,
                     retries,
                     events,
+                    identity,
                     yielded: None,
                   },
                 )
@@ -717,8 +735,15 @@ impl AcpRuntime {
         }
       })
       .await
-      .map_err(|e| anyhow!("ACP worker failed: {e}"))
+      .map_err(|error| anyhow!("ACP worker failed: {error}"))
   }
+}
+
+#[derive(Clone)]
+struct WorkerIdentity {
+  worker_id: String,
+  lease_id: Option<String>,
+  work_unit_id: Option<String>,
 }
 
 struct WorkerSessionInput {
@@ -729,6 +754,7 @@ struct WorkerSessionInput {
   validate_output: WorkerOutputValidator,
   retries: u32,
   events: Option<EventSink>,
+  identity: WorkerIdentity,
   yielded: Option<(oneshot::Receiver<Value>, oneshot::Receiver<()>)>,
 }
 
@@ -747,6 +773,7 @@ where
     validate_output,
     retries,
     events,
+    identity,
     mut yielded,
   } = input;
   let response = session.response();
@@ -758,16 +785,31 @@ where
   let mut tool_calls = HashMap::new();
   if has_selector_preference {
     if preferences.required && options.is_empty() {
-      options = read_config_options(session, role, events.clone(), &mut text, &mut tool_calls)
-        .await?
-        .unwrap_or_default();
+      options = read_config_options(
+        session,
+        role,
+        &identity,
+        events.clone(),
+        &mut text,
+        &mut tool_calls,
+      )
+      .await?
+      .unwrap_or_default();
     }
     if !options.is_empty() || preferences.required {
       apply_preferences(session, options, &preferences).await?;
     }
   }
   session.send_prompt(prompt)?;
-  read_response(session, role, events.clone(), &mut text, &mut tool_calls).await?;
+  read_response(
+    session,
+    role,
+    &identity,
+    events.clone(),
+    &mut text,
+    &mut tool_calls,
+  )
+  .await?;
 
   if let Some(structured_output) = take_yielded(&mut yielded).await {
     return Ok(WorkerResult { structured_output });
@@ -783,7 +825,15 @@ where
             attempts += 1;
             text.clear();
             session.send_prompt(format!("The previous response was valid schema JSON but could not be deserialized for the requested role type ({error}). Reply with only one schema-valid JSON value matching the requested role type; no markdown or prose."))?;
-            read_response(session, role, events.clone(), &mut text, &mut tool_calls).await?;
+            read_response(
+              session,
+              role,
+              &identity,
+              events.clone(),
+              &mut text,
+              &mut tool_calls,
+            )
+            .await?;
             if let Some(structured_output) = take_yielded(&mut yielded).await {
               return Ok(WorkerResult { structured_output });
             }
@@ -798,7 +848,15 @@ where
           attempts += 1;
           text.clear();
           session.send_prompt(format!("The previous response was not schema-valid JSON ({error}). Reply with only one schema-valid JSON value; no markdown or prose."))?;
-          read_response(session, role, events.clone(), &mut text, &mut tool_calls).await?;
+          read_response(
+            session,
+            role,
+            &identity,
+            events.clone(),
+            &mut text,
+            &mut tool_calls,
+          )
+          .await?;
           if let Some(structured_output) = take_yielded(&mut yielded).await {
             return Ok(WorkerResult { structured_output });
           }
@@ -813,7 +871,15 @@ where
         attempts += 1;
         text.clear();
         session.send_prompt(format!("The previous response was not valid whole-response JSON ({error}). Reply with only one schema-valid JSON value; no markdown or prose."))?;
-        read_response(session, role, events.clone(), &mut text, &mut tool_calls).await?;
+        read_response(
+          session,
+          role,
+          &identity,
+          events.clone(),
+          &mut text,
+          &mut tool_calls,
+        )
+        .await?;
         if let Some(structured_output) = take_yielded(&mut yielded).await {
           return Ok(WorkerResult { structured_output });
         }
@@ -848,6 +914,7 @@ async fn take_yielded(
 async fn read_response<Link>(
   session: &mut agent_client_protocol::ActiveSession<'_, Link>,
   role: WorkerRole,
+  identity: &WorkerIdentity,
   events: Option<EventSink>,
   text: &mut String,
   tool_calls: &mut HashMap<ToolCallId, ToolCall>,
@@ -862,7 +929,7 @@ where
         let sink = events.clone();
         MatchDispatch::new(dispatch)
           .if_notification(async |notification: SessionNotification| {
-            map_update(notification.update, role, sink, text, tool_calls).await;
+            map_update(notification.update, role, identity, sink, text, tool_calls).await;
             Ok(())
           })
           .await
@@ -876,6 +943,7 @@ where
 async fn map_update(
   update: SessionUpdate,
   role: WorkerRole,
+  identity: &WorkerIdentity,
   events: Option<EventSink>,
   text: &mut String,
   tool_calls: &mut HashMap<ToolCallId, ToolCall>,
@@ -888,6 +956,9 @@ async fn map_update(
           events
             .worker(WorkerEvent::Text {
               role,
+              worker_id: identity.worker_id.clone(),
+              lease_id: identity.lease_id.clone(),
+              work_unit_id: identity.work_unit_id.clone(),
               at: chrono::Utc::now().to_rfc3339(),
               delta: content.text,
             })
@@ -906,6 +977,9 @@ async fn map_update(
         events
           .worker(WorkerEvent::ToolStart {
             role,
+            worker_id: identity.worker_id.clone(),
+            lease_id: identity.lease_id.clone(),
+            work_unit_id: identity.work_unit_id.clone(),
             at: chrono::Utc::now().to_rfc3339(),
             tool_name: title.clone(),
             args,
@@ -915,6 +989,9 @@ async fn map_update(
           events
             .worker(WorkerEvent::ToolEnd {
               role,
+              worker_id: identity.worker_id.clone(),
+              lease_id: identity.lease_id.clone(),
+              work_unit_id: identity.work_unit_id.clone(),
               at: chrono::Utc::now().to_rfc3339(),
               tool_name: title,
               is_error: matches!(status, ToolCallStatus::Failed),
@@ -938,6 +1015,9 @@ async fn map_update(
           events
             .worker(WorkerEvent::ToolEnd {
               role,
+              worker_id: identity.worker_id.clone(),
+              lease_id: identity.lease_id.clone(),
+              work_unit_id: identity.work_unit_id.clone(),
               at: chrono::Utc::now().to_rfc3339(),
               tool_name,
               is_error: matches!(status, ToolCallStatus::Failed),
@@ -1021,6 +1101,7 @@ where
 async fn read_config_options<Link>(
   session: &mut agent_client_protocol::ActiveSession<'_, Link>,
   role: WorkerRole,
+  identity: &WorkerIdentity,
   events: Option<EventSink>,
   text: &mut String,
   tool_calls: &mut HashMap<ToolCallId, ToolCall>,
@@ -1053,7 +1134,7 @@ where
       .if_notification(async |notification: SessionNotification| {
         match notification.update {
           SessionUpdate::ConfigOptionUpdate(update) => options = Some(update.config_options),
-          update => map_update(update, role, sink, text, tool_calls).await,
+          update => map_update(update, role, identity, sink, text, tool_calls).await,
         }
         Ok(())
       })
@@ -1086,8 +1167,12 @@ fn requirement_assessment_schema() -> Value {
   json!({"type":"object","additionalProperties":false,"required":["id","status","evidence","gaps"],"properties":{"id":{"type":"string"},"status":{"type":"string","enum":["satisfied","partial","missing"]},"evidence":string_array_schema(),"gaps":string_array_schema()}})
 }
 
+fn work_scope_schema() -> Value {
+  json!({"type":"object","additionalProperties":false,"required":["paths"],"properties":{"paths":string_array_schema()}})
+}
+
 fn work_unit_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["id","title","objective","requirementIds","acceptanceCriteria","suggestedChecks"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"objective":{"type":"string"},"requirementIds":string_array_schema(),"acceptanceCriteria":string_array_schema(),"suggestedChecks":string_array_schema()}})
+  json!({"type":"object","additionalProperties":false,"required":["id","title","objective","requirementIds","acceptanceCriteria","suggestedChecks","dependsOn","scope"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"objective":{"type":"string"},"requirementIds":string_array_schema(),"acceptanceCriteria":string_array_schema(),"suggestedChecks":{"type":"array","description":"Executable, non-interactive shell commands only; no instructions, prose, or Markdown backticks. Each command must perform its own assertion.","items":{"type":"string","description":"A single executable shell command."}},"dependsOn":string_array_schema(),"scope":work_scope_schema()}})
 }
 
 fn architect_schema() -> Value {
@@ -1095,11 +1180,15 @@ fn architect_schema() -> Value {
 }
 
 fn reconcile_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["complete","summary","requirements","nextWorkUnit"],"properties":{"complete":{"type":"boolean"},"summary":{"type":"string"},"requirements":{"type":"array","items":requirement_assessment_schema()},"nextWorkUnit":{"anyOf":[{"type":"null"},work_unit_schema()]}}})
+  json!({"type":"object","additionalProperties":false,"required":["complete","summary","requirements","workUnits"],"properties":{"complete":{"type":"boolean"},"summary":{"type":"string"},"requirements":{"type":"array","items":requirement_assessment_schema()},"workUnits":{"type":"array","items":work_unit_schema()}}})
+}
+
+fn discovery_schema() -> Value {
+  json!({"oneOf":[{"type":"object","additionalProperties":false,"required":["type","workUnitId","dependsOn","reason"],"properties":{"type":{"const":"dependency"},"workUnitId":{"type":"string"},"dependsOn":{"type":"string"},"reason":{"type":"string"}}},{"type":"object","additionalProperties":false,"required":["type","description"],"properties":{"type":{"const":"blocker"},"description":{"type":"string"}}},{"type":"object","additionalProperties":false,"required":["type","paths","reason"],"properties":{"type":{"const":"scope_expansion"},"paths":string_array_schema(),"reason":{"type":"string"}}}]})
 }
 
 fn worker_summary_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["summary","changedFiles","testsRun","notes"],"properties":{"summary":{"type":"string"},"changedFiles":string_array_schema(),"testsRun":string_array_schema(),"notes":string_array_schema(),"decisions":string_array_schema(),"discoveries":string_array_schema(),"risks":string_array_schema(),"followUps":string_array_schema()}})
+  json!({"type":"object","additionalProperties":false,"required":["summary","changedFiles","testsRun","notes"],"properties":{"summary":{"type":"string"},"changedFiles":string_array_schema(),"testsRun":string_array_schema(),"notes":string_array_schema(),"decisions":string_array_schema(),"discoveries":{"type":"array","items":discovery_schema()},"risks":string_array_schema(),"followUps":string_array_schema()}})
 }
 
 #[cfg(test)]
@@ -1116,14 +1205,16 @@ mod tests {
         "evidence": [],
         "gaps": ["Current output is static"]
       }],
-      "nextWorkUnit": {
+      "workUnits": [{
         "id": "WU-001",
         "title": "Print current datetime",
         "objective": "Replace the static greeting",
         "requirementIds": ["REQ-001"],
         "acceptanceCriteria": ["Output contains the current datetime"],
-        "suggestedChecks": ["cargo run --quiet"]
-      }
+        "suggestedChecks": ["cargo run --quiet"],
+        "dependsOn": [],
+        "scope": {"paths": ["src/**"]}
+      }]
     })
   }
 
@@ -1138,8 +1229,7 @@ mod tests {
   #[test]
   fn reconcile_schema_rejects_unknown_nested_work_unit_fields() {
     let mut output = valid_reconcile_output();
-    output["nextWorkUnit"]["description"] = Value::String("not part of WorkUnit".into());
-
+    output["workUnits"][0]["description"] = Value::String("not part of WorkUnit".into());
     let error = validate_json_schema(&output, &reconcile_schema())
       .expect_err("unknown nested fields must fail schema validation");
 

@@ -45,3 +45,12 @@ max_output_bytes = 65536
 init = true
 auto_commit = false
 require_clean_tree = false
+
+[execution]
+max_parallel_workers = 1
+workspace = "worktree"
+require_clean_base = true
+
+[integration]
+strategy = "cherry_pick"
+verify_each_candidate = true

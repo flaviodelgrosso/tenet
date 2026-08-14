@@ -142,6 +142,9 @@ impl Application {
   pub fn changes(&self) -> &[RepositoryChange] {
     self.run.changes()
   }
+  pub fn active_work_units(&self) -> impl Iterator<Item = &loops_domain::model::WorkUnit> {
+    self.run.active_work_units()
+  }
 
   pub fn ui(&self) -> &UiState {
     &self.ui
@@ -600,7 +603,9 @@ impl Application {
           requirement_detail(
             item,
             self.assessments().get(&item.id),
-            self.state().current_work_unit.as_ref(),
+            self
+              .active_work_units()
+              .find(|work| work.requirement_ids.contains(&item.id)),
           ),
         )
       }),
@@ -696,10 +701,14 @@ fn work_detail(work: &loops_domain::model::WorkUnit) -> String {
 
 fn context_detail(app: &Application) -> String {
   let state = app.state();
-  let work = state
-    .current_work_unit
-    .as_ref()
-    .map_or_else(|| "No work unit selected".into(), work_detail);
+  let work = {
+    let active = app.active_work_units().map(work_detail).collect::<Vec<_>>();
+    if active.is_empty() {
+      "No active work units".into()
+    } else {
+      active.join("\n\n")
+    }
+  };
   let checks = app.checks().last().map_or_else(
     || "No deterministic check recorded".into(),
     |check| {
@@ -710,7 +719,7 @@ fn context_detail(app: &Application) -> String {
       }
     },
   );
-  format!("Current work\n{work}\n\nRequirement health\n{}/{} satisfied · {} partial · {} missing\n\nCycle\n{}\n\nLatest verification\n{checks}\n\nRepository changes\n{} changed paths", state.requirement_counts.satisfied, state.requirement_counts.total, state.requirement_counts.partial, state.requirement_counts.missing, state.cycle, app.changes().len())
+  format!("Active work\n{work}\n\nRequirement health\n{}/{} satisfied · {} partial · {} missing\n\nCycle\n{}\n\nLatest verification\n{checks}\n\nRepository changes\n{} changed paths", state.requirement_counts.satisfied, state.requirement_counts.total, state.requirement_counts.partial, state.requirement_counts.missing, state.cycle, app.changes().len())
 }
 
 fn bullets(items: &[String]) -> String {

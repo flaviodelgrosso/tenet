@@ -12,7 +12,7 @@ use tokio::fs;
 
 use loops_domain::{
   config::{Config, LOOPS_DIR},
-  model::{ReconcileResult, RepositoryChange, RequirementCatalog, State},
+  model::{ReconcileResult, RequirementCatalog, State},
 };
 
 pub const STATE_FILE: &str = "state.json";
@@ -55,7 +55,21 @@ pub async fn read_state(cwd: &Path) -> Result<State> {
   if !path.exists() {
     return Ok(State::fresh());
   }
-  read_json(path).await
+  let mut value: serde_json::Value = read_json(path).await?;
+  let version = value
+    .get("version")
+    .and_then(serde_json::Value::as_u64)
+    .ok_or_else(|| anyhow!("state file has no numeric version"))?;
+  match version {
+    1 => migrate_v1(&mut value),
+    current if current == u64::from(State::VERSION) => {
+      serde_json::from_value(value).context("deserialize current state")
+    }
+    _ => Err(anyhow!(
+      "unsupported state version {version}; expected {}",
+      State::VERSION
+    )),
+  }
 }
 
 pub async fn write_state(cwd: &Path, state: &State) -> Result<()> {
@@ -104,82 +118,6 @@ pub async fn spec_text_and_hash(cwd: &Path, config: &Config) -> Result<(String, 
     write!(hash, "{byte:02x}")?;
   }
   Ok((text, hash))
-}
-
-pub async fn maybe_init_git(cwd: &Path, config: &Config) -> Result<()> {
-  if !config.git.init || cwd.join(".git").exists() {
-    return Ok(());
-  }
-  let status = tokio::process::Command::new("git")
-    .arg("init")
-    .current_dir(cwd)
-    .status()
-    .await
-    .context("git init")?;
-  if !status.success() {
-    return Err(anyhow!("git init failed"));
-  }
-  Ok(())
-}
-
-pub async fn is_git_clean(cwd: &Path) -> bool {
-  let output = tokio::process::Command::new("git")
-    .args(["status", "--porcelain"])
-    .current_dir(cwd)
-    .output()
-    .await;
-  output
-    .map(|o| o.status.success() && o.stdout.is_empty())
-    .unwrap_or(false)
-}
-
-pub async fn repository_changes(cwd: &Path) -> Vec<RepositoryChange> {
-  let output = tokio::process::Command::new("git")
-    .args(["status", "--porcelain", "--untracked-files=all"])
-    .current_dir(cwd)
-    .output()
-    .await;
-  let Ok(output) = output else {
-    return Vec::new();
-  };
-  if !output.status.success() {
-    return Vec::new();
-  }
-  String::from_utf8_lossy(&output.stdout)
-    .lines()
-    .filter_map(|line| {
-      let status = line.chars().find(|ch| !ch.is_whitespace())?;
-      let path = line
-        .get(3..)?
-        .rsplit_once(" -> ")
-        .map_or_else(|| line.get(3..).unwrap_or_default(), |(_, path)| path)
-        .to_owned();
-      Some(RepositoryChange { path, status })
-    })
-    .collect()
-}
-
-pub async fn auto_commit(cwd: &Path, message: &str) -> Result<()> {
-  let add = tokio::process::Command::new("git")
-    .args(["add", "-A"])
-    .current_dir(cwd)
-    .status()
-    .await?;
-  if !add.success() {
-    return Err(anyhow!("git add failed"));
-  }
-  let status = tokio::process::Command::new("git")
-    .args(["commit", "-m", message])
-    .current_dir(cwd)
-    .status()
-    .await?;
-  if !status.success() {
-    let clean = is_git_clean(cwd).await;
-    if !clean {
-      return Err(anyhow!("git commit failed"));
-    }
-  }
-  Ok(())
 }
 
 pub struct RunLock {
@@ -248,6 +186,32 @@ fn process_alive(_pid: u32) -> bool {
   false
 }
 
+fn migrate_v1(value: &mut serde_json::Value) -> Result<State> {
+  let object = value
+    .as_object_mut()
+    .ok_or_else(|| anyhow!("state version 1 must be a JSON object"))?;
+  object.insert("version".into(), State::VERSION.into());
+  object.remove("currentWorkUnit");
+  object.insert("activeLeases".into(), serde_json::json!({}));
+  object.insert("candidateIntegrations".into(), serde_json::json!([]));
+  object.insert("workStatuses".into(), serde_json::json!({}));
+  object.insert("discoveries".into(), serde_json::json!([]));
+  if let Some(completed) = object
+    .get_mut("completedWorkUnits")
+    .and_then(serde_json::Value::as_array_mut)
+  {
+    for item in completed {
+      if let Some(unit) = item
+        .get_mut("workUnit")
+        .and_then(serde_json::Value::as_object_mut)
+      {
+        unit.insert("dependsOn".into(), serde_json::json!([]));
+        unit.insert("scope".into(), serde_json::json!({"paths":["**"]}));
+      }
+    }
+  }
+  serde_json::from_value(value.clone()).context("migrate state version 1 to version 2")
+}
 async fn read_json<T: serde::de::DeserializeOwned>(path: PathBuf) -> Result<T> {
   let bytes = fs::read(&path)
     .await
@@ -280,3 +244,32 @@ Describe the product and the outcome the autonomous coding loop must deliver.
 ## Acceptance
 Describe commands and observable behavior that prove the product is complete.
 "#;
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn state_v1_migration_adds_coordination_fields_explicitly() {
+    let mut value = serde_json::json!({
+      "version": 1,
+      "status": "idle",
+      "phase": "initialized",
+      "runId": null,
+      "cycle": 0,
+      "currentWorkUnit": null,
+      "requirementCounts": {"total":0,"satisfied":0,"partial":0,"missing":0},
+      "completedWorkUnits": [],
+      "lastSummary": "Initialized",
+      "blockedReason": null,
+      "lastError": null,
+      "updatedAt": "now"
+    });
+
+    let state = migrate_v1(&mut value).expect("version 1 migrates");
+
+    assert_eq!(state.version, State::VERSION);
+    assert!(state.active_leases.is_empty());
+    assert!(state.candidate_integrations.is_empty());
+  }
+}
