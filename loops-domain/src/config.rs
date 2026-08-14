@@ -26,63 +26,15 @@ pub struct Config {
   pub protected_paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RolePreference {
-  pub model: Option<String>,
-  pub thought_level: Option<String>,
-  pub mode: Option<String>,
-  pub required: bool,
-  required_is_set: bool,
-}
-
-#[derive(Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct RolePreferenceWire {
-  model: Option<String>,
-  thought_level: Option<String>,
-  mode: Option<String>,
-  required: Option<bool>,
-}
-
-impl<'de> Deserialize<'de> for RolePreference {
-  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-  where
-    D: de::Deserializer<'de>,
-  {
-    let wire = RolePreferenceWire::deserialize(deserializer)?;
-    Ok(Self {
-      model: wire.model,
-      thought_level: wire.thought_level,
-      mode: wire.mode,
-      required: wire.required.unwrap_or(false),
-      required_is_set: wire.required.is_some(),
-    })
-  }
-}
-impl Serialize for RolePreference {
-  fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-  where
-    S: serde::Serializer,
-  {
-    let field_count = usize::from(self.model.is_some())
-      + usize::from(self.thought_level.is_some())
-      + usize::from(self.mode.is_some())
-      + usize::from(self.required_is_set || self.required);
-    let mut state = serializer.serialize_struct("RolePreference", field_count)?;
-    if let Some(model) = &self.model {
-      state.serialize_field("model", model)?;
-    }
-    if let Some(thought_level) = &self.thought_level {
-      state.serialize_field("thought_level", thought_level)?;
-    }
-    if let Some(mode) = &self.mode {
-      state.serialize_field("mode", mode)?;
-    }
-    if self.required_is_set || self.required {
-      state.serialize_field("required", &self.required)?;
-    }
-    state.end()
-  }
+pub struct RolePreference {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub model: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub thought_level: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub mode: Option<String>,
 }
 
 fn default_completion_retries() -> u32 {
@@ -271,10 +223,6 @@ impl AgentPreferences {
       }
       if override_.mode.is_some() {
         preference.mode = override_.mode.clone();
-      }
-      if override_.required_is_set {
-        preference.required = override_.required;
-        preference.required_is_set = true;
       }
     }
     preference
@@ -545,9 +493,7 @@ mod tests {
         .keys()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>(),
-      ["model", "thought_level", "mode", "required"]
-        .into_iter()
-        .collect(),
+      ["model", "thought_level", "mode"].into_iter().collect(),
     );
   }
 
@@ -839,6 +785,24 @@ mod tests {
       serialized_config(|_| {}, "").replacen("thought_level = \"high\"", "thinking = \"high\"", 1);
     let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
     assert!(error.contains("thinking"), "unexpected error: {error}");
+  }
+
+  #[test]
+  fn required_role_preference_field_is_rejected() {
+    let default_preference = serialized_config(|_| {}, "").replacen(
+      "thought_level = \"high\"",
+      "thought_level = \"high\"\nrequired = true",
+      1,
+    );
+    let role_preference = serialized_config(
+      |_| {},
+      "\n[agent.preferences.roles.implement]\nrequired = true\n",
+    );
+
+    for text in [default_preference, role_preference] {
+      let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
+      assert!(error.contains("required"), "unexpected error: {error}");
+    }
   }
 
   #[test]

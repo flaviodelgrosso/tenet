@@ -10,8 +10,8 @@ use agent_client_protocol::schema::{
     Implementation, InitializeRequest, InitializeResponse, PermissionOptionKind,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOptions, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
-    ToolCall, ToolCallId, ToolCallStatus,
+    SessionConfigSelectOption, SessionConfigSelectOptions, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, ToolCall, ToolCallId, ToolCallStatus,
   },
   ProtocolVersion,
 };
@@ -784,7 +784,7 @@ where
   let mut text = String::new();
   let mut tool_calls = HashMap::new();
   if has_selector_preference {
-    if preferences.required && options.is_empty() {
+    if preferences.model.is_some() && options.is_empty() {
       options = read_config_options(
         session,
         role,
@@ -796,7 +796,7 @@ where
       .await?
       .unwrap_or_default();
     }
-    if !options.is_empty() || preferences.required {
+    if !options.is_empty() || preferences.model.is_some() {
       apply_preferences(session, options, &preferences).await?;
     }
   }
@@ -1055,30 +1055,12 @@ where
   ] {
     let Some(value) = configured else { continue };
 
-    let option = options
-      .iter()
-      .find(|option| option.category.as_ref() == Some(&category));
-    let selected = option.and_then(|option| match &option.kind {
-      SessionConfigKind::Select(select) => match &select.options {
-        SessionConfigSelectOptions::Ungrouped(values) => values
-          .iter()
-          .find(|candidate| candidate.value.to_string() == value),
-        SessionConfigSelectOptions::Grouped(groups) => groups
-          .iter()
-          .flat_map(|group| group.options.iter())
-          .find(|candidate| candidate.value.to_string() == value),
-        _ => None,
-      },
-      _ => None,
-    });
-
-    let Some((option, selected)) = option.zip(selected) else {
-      let message =
-        format!("requested {category:?} preference {value:?} is not exposed by this ACP session");
-      if preferences.required {
-        return Err(agent_client_protocol::Error::internal_error().data(message));
-      }
-      eprintln!("{message}; continuing with agent default");
+    let selected = resolve_preference_option(&options, &category, value)
+      .map_err(|message| agent_client_protocol::Error::internal_error().data(message))?;
+    let Some((option, selected)) = selected else {
+      eprintln!(
+        "requested {category:?} preference {value:?} is not exposed by this ACP session; continuing with agent default"
+      );
       continue;
     };
 
@@ -1096,6 +1078,37 @@ where
       .await?;
   }
   Ok(())
+}
+
+fn resolve_preference_option<'a>(
+  options: &'a [SessionConfigOption],
+  category: &SessionConfigOptionCategory,
+  value: &str,
+) -> std::result::Result<Option<(&'a SessionConfigOption, &'a SessionConfigSelectOption)>, String> {
+  let option = options
+    .iter()
+    .find(|option| option.category.as_ref() == Some(category));
+  let selected = option.and_then(|option| match &option.kind {
+    SessionConfigKind::Select(select) => match &select.options {
+      SessionConfigSelectOptions::Ungrouped(values) => values
+        .iter()
+        .find(|candidate| candidate.value.to_string() == value),
+      SessionConfigSelectOptions::Grouped(groups) => groups
+        .iter()
+        .flat_map(|group| group.options.iter())
+        .find(|candidate| candidate.value.to_string() == value),
+      _ => None,
+    },
+    _ => None,
+  });
+
+  match option.zip(selected) {
+    Some(selection) => Ok(Some(selection)),
+    None if matches!(category, SessionConfigOptionCategory::Model) => Err(format!(
+      "requested {category:?} preference {value:?} is not exposed by this ACP session"
+    )),
+    None => Ok(None),
+  }
 }
 
 async fn read_config_options<Link>(
@@ -1236,5 +1249,28 @@ mod tests {
     assert!(error
       .to_string()
       .contains(r#"unexpected property "description""#));
+  }
+
+  #[test]
+  fn configured_model_is_rejected_when_not_discovered() {
+    let options = vec![SessionConfigOption::select(
+      "model",
+      "Model",
+      "available-model",
+      vec![SessionConfigSelectOption::new(
+        "available-model",
+        "Available model",
+      )],
+    )
+    .category(SessionConfigOptionCategory::Model)];
+
+    let error = resolve_preference_option(
+      &options,
+      &SessionConfigOptionCategory::Model,
+      "missing-model",
+    )
+    .unwrap_err();
+
+    assert!(error.contains(r#"Model preference "missing-model" is not exposed"#));
   }
 }

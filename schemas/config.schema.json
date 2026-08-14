@@ -132,8 +132,7 @@
       "properties": {
         "model": { "type": "string" },
         "thought_level": { "type": "string" },
-        "mode": { "type": "string" },
-        "required": { "type": "boolean", "default": false }
+        "mode": { "type": "string" }
       }
     },
     "customAgentConfig": {

@@ -270,9 +270,6 @@ fn print_preferences(preferences: &loops_domain::config::AgentPreferences) {
     if preference.mode.is_some() {
       values.push("mode");
     }
-    if preference.required {
-      values.push("required");
-    }
     values.join(",")
   };
 

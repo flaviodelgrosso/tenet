@@ -643,6 +643,8 @@ thought_level = "medium"
 [agent.preferences.roles.architect]
 thought_level = "xhigh"
 
+Configured model IDs must be advertised by the ACP session. Loops fails the worker session instead of silently using the agent's default model when a configured model is unavailable.
+
 # Instead of `agent.id`, an unregistered ACP command is also valid:
 # [agent.custom]
 # command = "omp"
