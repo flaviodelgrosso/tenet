@@ -6,12 +6,12 @@
 
 [![CI](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml/badge.svg)](https://github.com/flaviodelgrosso/loops/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust\&logoColor=white)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Status: MVP](https://img.shields.io/badge/status-MVP-orange)](#mvp-read-this-first)
 
-### Give an agent a task and it can write code.
+### Give an agent a task and it can write code
 
-### Give **Loops** a spec and it keeps asking whether the software is actually done.
+### Give **Loops** a spec and it keeps asking whether the software is actually done
 
 **A deterministic control loop for autonomous, spec-driven software development.**
 
@@ -25,12 +25,12 @@ That is not the same thing as being good at **finishing software autonomously**.
 
 Long-running agent workflows have a different problem:
 
-* context accumulates;
-* assumptions become stale;
-* plans drift away from the repository;
-* failed tests become another paragraph in a conversation;
-* the agent that wrote the code is often the same agent deciding whether it worked;
-* and eventually something says *“done”*.
+- context accumulates;
+- assumptions become stale;
+- plans drift away from the repository;
+- failed tests become another paragraph in a conversation;
+- the agent that wrote the code is often the same agent deciding whether it worked;
+- and eventually something says _“done”_.
 
 **Loops is an experiment in moving that responsibility out of the conversation.**
 
@@ -88,15 +88,15 @@ A strong model can already solve surprisingly difficult bounded coding tasks.
 
 But an autonomous engineering system also needs to answer questions like:
 
-* What are we actually trying to satisfy?
-* What is already implemented?
-* What should happen next?
-* Which work can safely run?
-* Did the change really pass the project's checks?
-* Did the fix break something that was already working?
-* Are we repeating ourselves?
-* Should we retry, repair, stop, or reassess?
-* Who decides that the repository is finished?
+- What are we actually trying to satisfy?
+- What is already implemented?
+- What should happen next?
+- Which work can safely run?
+- Did the change really pass the project's checks?
+- Did the fix break something that was already working?
+- Are we repeating ourselves?
+- Should we retry, repair, stop, or reassess?
+- Who decides that the repository is finished?
 
 Those decisions should not live only inside model context.
 
@@ -148,11 +148,11 @@ It can also become baggage.
 
 An agent may carry forward:
 
-* an obsolete mental model of the codebase;
-* a plan that made sense three changes ago;
-* assumptions it never re-checked;
-* compressed summaries of previous failures;
-* confidence inherited from its own earlier reasoning.
+- an obsolete mental model of the codebase;
+- a plan that made sense three changes ago;
+- assumptions it never re-checked;
+- compressed summaries of previous failures;
+- confidence inherited from its own earlier reasoning.
 
 Loops deliberately uses fresh sessions for different roles.
 
@@ -218,7 +218,7 @@ make ci
 
 Whatever your project considers meaningful evidence.
 
-An agent saying *“tests pass”* is not evidence when Loops can run the tests itself.
+An agent saying _“tests pass”_ is not evidence when Loops can run the tests itself.
 
 ### 5. Repair
 
@@ -313,22 +313,22 @@ It is also young, experimental software that is changing quickly.
 
 Today, the project already contains the foundations for:
 
-* spec-driven requirement analysis;
-* repository reconciliation;
-* separate Architect, Reconcile, Implement, Repair, and Assess sessions;
-* ACP-based coding-agent execution;
-* isolated Git worktrees for coding workers;
-* deterministic project verification;
-* bounded repair attempts;
-* bounded project cycles;
-* persistent controller state;
-* evidence capture;
-* dependency-aware scheduling;
-* controlled integration;
-* protected controller-owned paths;
-* role-specific model configuration;
-* interactive terminal UI;
-* headless execution for automation and logs.
+- spec-driven requirement analysis;
+- repository reconciliation;
+- separate Architect, Reconcile, Implement, Repair, and Assess sessions;
+- ACP-based coding-agent execution;
+- isolated Git worktrees for coding workers;
+- deterministic project verification;
+- bounded repair attempts;
+- bounded project cycles;
+- persistent controller state;
+- evidence capture;
+- dependency-aware scheduling;
+- controlled integration;
+- protected controller-owned paths;
+- role-specific model configuration;
+- interactive terminal UI;
+- headless execution for automation and logs.
 
 That is the promising part.
 
@@ -338,12 +338,12 @@ Here is the equally important part.
 
 There is not yet enough comparative evaluation to claim that Loops is:
 
-* more reliable than a strong single-agent workflow;
-* better than a simple Ralph-style loop;
-* cheaper;
-* faster;
-* safer for unattended production development;
-* or less likely to produce false completion.
+- more reliable than a strong single-agent workflow;
+- better than a simple Ralph-style loop;
+- cheaper;
+- faster;
+- safer for unattended production development;
+- or less likely to produce false completion.
 
 Those are hypotheses.
 
@@ -365,15 +365,15 @@ If you try Loops today, expect bugs.
 
 Particularly around the places where real systems get messy:
 
-* different ACP agents and their capabilities;
-* model/configuration compatibility;
-* unusual Git repository states;
-* worktree lifecycle edge cases;
-* terminal rendering and streaming output;
-* cancellation and recovery;
-* incomplete or misleading verification suites;
-* agent output that violates the expected structure;
-* workflows nobody has tested yet.
+- different ACP agents and their capabilities;
+- model/configuration compatibility;
+- unusual Git repository states;
+- worktree lifecycle edge cases;
+- terminal rendering and streaming output;
+- cancellation and recovery;
+- incomplete or misleading verification suites;
+- agent output that violates the expected structure;
+- workflows nobody has tested yet.
 
 Do not point it at an important repository, walk away, and assume autonomous perfection.
 
@@ -409,17 +409,17 @@ It may also require better machinery around the model.
 
 Software engineering already has machinery:
 
-* version control;
-* CI;
-* tests;
-* dependency graphs;
-* transaction boundaries;
-* schedulers;
-* logs;
-* state machines;
-* review;
-* rollback;
-* observability.
+- version control;
+- CI;
+- tests;
+- dependency graphs;
+- transaction boundaries;
+- schedulers;
+- logs;
+- state machines;
+- review;
+- rollback;
+- observability.
 
 Loops asks:
 
@@ -603,12 +603,12 @@ By default Loops provides an interactive terminal interface for watching the con
 
 The important views are about **process**, not just tokens:
 
-* current worker activity;
-* requirement progress;
-* evidence;
-* verification;
-* state transitions;
-* timeline.
+- current worker activity;
+- requirement progress;
+- evidence;
+- verification;
+- state transitions;
+- timeline.
 
 Useful controls:
 
@@ -836,18 +836,18 @@ Loops is early enough that experiments are unusually valuable.
 
 Useful contributions include:
 
-* bug reports with reproducible runs;
-* weird repositories that break assumptions;
-* ACP compatibility fixes;
-* verification improvements;
-* failure cases;
-* benchmark tasks;
-* benchmark infrastructure;
-* run observability;
-* Git/worktree edge cases;
-* controller correctness;
-* documentation;
-* negative results.
+- bug reports with reproducible runs;
+- weird repositories that break assumptions;
+- ACP compatibility fixes;
+- verification improvements;
+- failure cases;
+- benchmark tasks;
+- benchmark infrastructure;
+- run observability;
+- Git/worktree edge cases;
+- controller correctness;
+- documentation;
+- negative results.
 
 Especially negative results.
 
@@ -873,7 +873,7 @@ That is enough.
 
 <div align="center">
 
-## Agents write the code.
+## Agents write the code
 
 ## **Loops makes them prove the work.**
 
