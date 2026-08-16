@@ -18,10 +18,6 @@ pub async fn verification_commands(config: &Config) -> Result<Vec<String>> {
   deduplicate_commands(config.verification.commands.iter().cloned())
 }
 
-pub async fn run_verification(cwd: &Path, config: &Config) -> Result<VerificationReport> {
-  run_verification_cancelled(cwd, config, &CancellationToken::new()).await
-}
-
 pub async fn run_verification_cancelled(
   cwd: &Path,
   config: &Config,
@@ -30,31 +26,31 @@ pub async fn run_verification_cancelled(
   run_commands(cwd, config, verification_commands(config).await?, cancel).await
 }
 
-pub async fn run_verification_with_checks_cancelled(
+pub async fn run_verification_with_checks_cancelled<'a>(
   cwd: &Path,
   config: &Config,
-  suggested_checks: &[String],
+  suggested_checks: impl IntoIterator<Item = &'a str>,
   cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
   let commands = deduplicate_commands(
     suggested_checks
-      .iter()
-      .cloned()
+      .into_iter()
+      .map(str::to_owned)
       .chain(config.verification.commands.iter().cloned()),
   )?;
   run_commands(cwd, config, commands, cancel).await
 }
 
-pub async fn run_suggested_checks_cancelled(
+pub async fn run_suggested_checks_cancelled<'a>(
   cwd: &Path,
   config: &Config,
-  suggested_checks: &[String],
+  suggested_checks: impl IntoIterator<Item = &'a str>,
   cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
   run_commands(
     cwd,
     config,
-    deduplicate_commands(suggested_checks.iter().cloned())?,
+    deduplicate_commands(suggested_checks.into_iter().map(str::to_owned))?,
     cancel,
   )
   .await

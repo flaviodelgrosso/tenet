@@ -1,10 +1,12 @@
 use ratatui::{backend::TestBackend, Terminal};
 use tenet_domain::{
   events::RunEvent,
+  evidence::{AcceptanceCriterion, ImplementationState},
+  ids::{CriterionId, ObligationId, RequirementId},
   model::{
     CommandResult, Phase, ReconcileResult, RepositoryChange, Requirement, RequirementAssessment,
-    RequirementCatalog, RequirementStatus, RunStatus, State, VerificationReport, WorkScope,
-    WorkUnit, WorkerEvent, WorkerRole,
+    RequirementCatalog, RunStatus, State, VerificationReport, WorkScope, WorkUnit, WorkerEvent,
+    WorkerRole,
   },
 };
 
@@ -17,10 +19,10 @@ use crate::tui::{
 
 fn requirement(id: &str) -> Requirement {
   Requirement {
-    id: id.into(),
+    id: RequirementId::from(id),
     title: format!("Requirement {id}"),
     description: "Make the observable contract work".into(),
-    acceptance_criteria: vec!["It works".into()],
+    required: true,
   }
 }
 fn app() -> Application {
@@ -296,22 +298,30 @@ fn requirement_projection_preserves_evidence_and_gaps() {
   app.apply(RunEvent::Catalog(RequirementCatalog {
     spec_hash: "hash".into(),
     requirements: vec![requirement("R1")],
+    acceptance_criteria: vec![AcceptanceCriterion {
+      id: CriterionId::from("R1/AC-01"),
+      requirement_id: RequirementId::from("R1"),
+      description: "It works".into(),
+      mandatory: true,
+    }],
+    verification_obligations: Vec::new(),
   }));
   app.apply(RunEvent::Reconcile(ReconcileResult {
-    complete: false,
     summary: "Missing R1".into(),
     requirements: vec![RequirementAssessment {
-      id: "R1".into(),
-      status: RequirementStatus::Partial,
-      evidence: vec!["Implemented API".into()],
-      gaps: vec!["No check".into()],
+      requirement_id: RequirementId::from("R1"),
+      implementation_state: ImplementationState::Partial,
+      observations: vec!["Implemented API".into()],
+      missing_implementation: vec!["No check".into()],
+      missing_evidence: vec![ObligationId::from("R1/AC-01/VO-01")],
     }],
     work_units: vec![WorkUnit {
       id: "W1".into(),
       title: "Finish R1".into(),
       objective: "Complete it".into(),
-      requirement_ids: vec!["R1".into()],
-      acceptance_criteria: vec![],
+      requirement_ids: vec![RequirementId::from("R1")],
+      criterion_ids: vec![CriterionId::from("R1/AC-01")],
+      verification_obligation_ids: vec![ObligationId::from("R1/AC-01/VO-01")],
       suggested_checks: vec![],
       depends_on: Vec::new(),
       scope: WorkScope {
@@ -320,8 +330,8 @@ fn requirement_projection_preserves_evidence_and_gaps() {
     }],
   }));
   assert_eq!(
-    app.assessments().get("R1").unwrap().status,
-    RequirementStatus::Partial
+    app.assessments().get("R1").unwrap().implementation_state,
+    ImplementationState::Partial
   );
 }
 
@@ -413,13 +423,13 @@ fn failure_repair_and_checks_render_structured_evidence() {
 fn requirements_changes_history_and_overlays_have_composed_surfaces() {
   let mut app = app();
   app.apply(RunEvent::Reconcile(ReconcileResult {
-    complete: false,
     summary: "R1 is partial".into(),
     requirements: vec![RequirementAssessment {
-      id: "R1".into(),
-      status: RequirementStatus::Partial,
-      evidence: vec!["Implementation exists".into()],
-      gaps: vec!["No verification yet".into()],
+      requirement_id: RequirementId::from("R1"),
+      implementation_state: ImplementationState::Partial,
+      observations: vec!["Implementation exists".into()],
+      missing_implementation: vec!["No verification yet".into()],
+      missing_evidence: vec![ObligationId::from("R1/AC-01/VO-01")],
     }],
     work_units: Vec::new(),
   }));

@@ -246,13 +246,8 @@ async fn execute_and_commit(
   let mut changed_paths =
     git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
   validate_changed_paths(&lease.work_unit, &changed_paths)?;
-  let mut verification = verify_candidate(
-    repository,
-    context,
-    &candidate_revision,
-    &lease.work_unit.suggested_checks,
-  )
-  .await?;
+  let mut verification =
+    verify_candidate(repository, context, &candidate_revision, &lease.work_unit).await?;
 
   for attempt in 1..=context.config.max_repair_attempts {
     if verification.passed {
@@ -284,13 +279,8 @@ async fn execute_and_commit(
     changed_paths =
       git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
     validate_changed_paths(&lease.work_unit, &changed_paths)?;
-    verification = verify_candidate(
-      repository,
-      context,
-      &candidate_revision,
-      &lease.work_unit.suggested_checks,
-    )
-    .await?;
+    verification =
+      verify_candidate(repository, context, &candidate_revision, &lease.work_unit).await?;
   }
   context
     .events
@@ -355,7 +345,7 @@ async fn verify_candidate(
   repository: &Path,
   context: &BackendContext,
   revision: &str,
-  suggested_checks: &[String],
+  work_unit: &WorkUnit,
 ) -> Result<tenet_domain::model::VerificationReport> {
   let canonical_before = git::repository_state(repository).await?;
   let run_id = context
@@ -371,7 +361,7 @@ async fn verify_candidate(
   let result = verifier::run_verification_with_checks_cancelled(
     &workspace,
     &context.config,
-    suggested_checks,
+    work_unit.suggested_commands(),
     &context.cancel,
   )
   .await;
@@ -485,15 +475,19 @@ fn scope_samples(patterns: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use tenet_domain::model::WorkScope;
+  use tenet_domain::{
+    ids::{CriterionId, ObligationId, RequirementId},
+    model::WorkScope,
+  };
 
   fn unit(id: &str, paths: &[&str]) -> WorkUnit {
     WorkUnit {
       id: id.into(),
       title: id.into(),
       objective: id.into(),
-      requirement_ids: vec!["REQ-001".into()],
-      acceptance_criteria: vec!["done".into()],
+      requirement_ids: vec![RequirementId::from("REQ-001")],
+      criterion_ids: vec![CriterionId::from("REQ-001/AC-01")],
+      verification_obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
       suggested_checks: Vec::new(),
       depends_on: Vec::new(),
       scope: WorkScope {

@@ -2,51 +2,107 @@ use std::{fmt, ops::Deref};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
-/// Stable work-unit identity used in serialized domain relationships.
-#[derive(
-  Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
-)]
-#[serde(transparent)]
-pub struct WorkUnitId(String);
+macro_rules! semantic_id {
+  ($name:ident, $doc:literal) => {
+    #[doc = $doc]
+    #[derive(
+      Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+    )]
+    #[serde(transparent)]
+    pub struct $name(String);
 
-impl WorkUnitId {
-  pub fn as_str(&self) -> &str {
-    &self.0
-  }
+    impl $name {
+      pub fn as_str(&self) -> &str {
+        &self.0
+      }
+    }
+
+    impl Deref for $name {
+      type Target = str;
+
+      fn deref(&self) -> &Self::Target {
+        self.as_str()
+      }
+    }
+
+    impl AsRef<str> for $name {
+      fn as_ref(&self) -> &str {
+        self.as_str()
+      }
+    }
+
+    impl fmt::Display for $name {
+      fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+      }
+    }
+
+    impl From<String> for $name {
+      fn from(value: String) -> Self {
+        Self(value)
+      }
+    }
+
+    impl From<&str> for $name {
+      fn from(value: &str) -> Self {
+        Self(value.to_owned())
+      }
+    }
+  };
 }
 
-impl Deref for WorkUnitId {
-  type Target = str;
+semantic_id!(RequirementId, "Stable semantic requirement identity.");
+semantic_id!(
+  CriterionId,
+  "Stable semantic acceptance-criterion identity."
+);
+semantic_id!(
+  ObligationId,
+  "Stable semantic verification-obligation identity."
+);
+semantic_id!(
+  WorkUnitId,
+  "Stable work-unit identity used in serialized domain relationships."
+);
 
-  fn deref(&self) -> &Self::Target {
-    self.as_str()
-  }
+macro_rules! uuid_id {
+  ($name:ident, $doc:literal) => {
+    #[doc = $doc]
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[serde(transparent)]
+    pub struct $name(Uuid);
+
+    impl $name {
+      pub fn new() -> Self {
+        Self(Uuid::new_v4())
+      }
+
+      pub fn as_uuid(self) -> Uuid {
+        self.0
+      }
+    }
+
+    impl Default for $name {
+      fn default() -> Self {
+        Self::new()
+      }
+    }
+
+    impl fmt::Display for $name {
+      fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+      }
+    }
+  };
 }
 
-impl AsRef<str> for WorkUnitId {
-  fn as_ref(&self) -> &str {
-    self.as_str()
-  }
-}
-
-impl fmt::Display for WorkUnitId {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter.write_str(self.as_str())
-  }
-}
-
-impl From<String> for WorkUnitId {
-  fn from(value: String) -> Self {
-    Self(value)
-  }
-}
-
-impl From<&str> for WorkUnitId {
-  fn from(value: &str) -> Self {
-    Self(value.to_owned())
-  }
-}
+uuid_id!(EvidenceId, "UUID-backed identity for one evidence fact.");
+uuid_id!(
+  VerificationRunId,
+  "UUID-backed identity for one controller verification run."
+);
 
 #[cfg(test)]
 mod tests {
@@ -63,5 +119,14 @@ mod tests {
 
       prop_assert_eq!(decoded.as_str(), value);
     }
+  }
+
+  #[test]
+  fn evidence_ids_round_trip_as_uuid_values() {
+    let id = EvidenceId::new();
+    let json = serde_json::to_string(&id).expect("serialize evidence id");
+    let decoded: EvidenceId = serde_json::from_str(&json).expect("deserialize evidence id");
+
+    assert_eq!(decoded, id);
   }
 }

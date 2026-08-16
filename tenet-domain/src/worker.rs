@@ -3,24 +3,20 @@ use std::collections::BTreeSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::DomainValidationError, ids::WorkUnitId};
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RequirementStatus {
-  Satisfied,
-  Partial,
-  Missing,
-}
+use crate::{
+  error::DomainValidationError,
+  evidence::{AcceptanceCriterion, ImplementationState, VerificationObligation},
+  ids::{CriterionId, ObligationId, RequirementId, WorkUnitId},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Requirement {
-  pub id: String,
+  pub id: RequirementId,
   pub title: String,
   pub description: String,
-  #[serde(rename = "acceptanceCriteria")]
-  pub acceptance_criteria: Vec<String>,
+  #[serde(default = "default_true")]
+  pub required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,21 +24,34 @@ pub struct RequirementCatalog {
   #[serde(rename = "specHash")]
   pub spec_hash: String,
   pub requirements: Vec<Requirement>,
+  #[serde(rename = "acceptanceCriteria")]
+  pub acceptance_criteria: Vec<AcceptanceCriterion>,
+  #[serde(rename = "verificationObligations")]
+  pub verification_obligations: Vec<VerificationObligation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ArchitectOutput {
   pub requirements: Vec<Requirement>,
+  #[serde(rename = "acceptanceCriteria")]
+  pub acceptance_criteria: Vec<AcceptanceCriterion>,
+  #[serde(rename = "verificationObligations")]
+  pub verification_obligations: Vec<VerificationObligation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RequirementAssessment {
-  pub id: String,
-  pub status: RequirementStatus,
-  pub evidence: Vec<String>,
-  pub gaps: Vec<String>,
+  #[serde(rename = "requirementId")]
+  pub requirement_id: RequirementId,
+  #[serde(rename = "implementationState")]
+  pub implementation_state: ImplementationState,
+  pub observations: Vec<String>,
+  #[serde(rename = "missingImplementation")]
+  pub missing_implementation: Vec<String>,
+  #[serde(rename = "missingEvidence")]
+  pub missing_evidence: Vec<ObligationId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -53,25 +62,38 @@ pub struct WorkScope {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct CandidateCheck {
+  #[serde(rename = "obligationId")]
+  pub obligation_id: ObligationId,
+  pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkUnit {
   pub id: String,
   pub title: String,
   pub objective: String,
   #[serde(rename = "requirementIds")]
-  pub requirement_ids: Vec<String>,
-  #[serde(rename = "acceptanceCriteria")]
-  pub acceptance_criteria: Vec<String>,
-  /// Executable, non-interactive, deterministic, self-contained shell commands. Each command must
-  /// perform its own assertion without relying on external network access or a previous check.
+  pub requirement_ids: Vec<RequirementId>,
+  #[serde(rename = "criterionIds")]
+  pub criterion_ids: Vec<CriterionId>,
+  #[serde(rename = "verificationObligationIds")]
+  pub verification_obligation_ids: Vec<ObligationId>,
   #[serde(rename = "suggestedChecks")]
-  pub suggested_checks: Vec<String>,
+  pub suggested_checks: Vec<CandidateCheck>,
   #[serde(rename = "dependsOn")]
   pub depends_on: Vec<String>,
   pub scope: WorkScope,
 }
 
 impl WorkUnit {
-  pub fn validate(&self, known_requirements: &BTreeSet<&str>) -> Result<(), DomainValidationError> {
+  pub fn validate(
+    &self,
+    known_requirements: &BTreeSet<RequirementId>,
+    known_criteria: &BTreeSet<CriterionId>,
+    known_obligations: &BTreeSet<ObligationId>,
+  ) -> Result<(), DomainValidationError> {
     if self.id.trim().is_empty() || self.title.trim().is_empty() || self.objective.trim().is_empty()
     {
       return Err(DomainValidationError::MissingWorkUnitFields);
@@ -89,31 +111,63 @@ impl WorkUnit {
         self.id.clone(),
       ));
     }
-    if self.acceptance_criteria.is_empty() {
+    if self.criterion_ids.is_empty() {
       return Err(DomainValidationError::WorkUnitWithoutAcceptanceCriteria(
         self.id.clone(),
       ));
+    }
+    if self.verification_obligation_ids.is_empty() {
+      return Err(DomainValidationError::WorkUnitWithoutVerificationObligations(self.id.clone()));
     }
     if self.scope.paths.is_empty() || self.scope.paths.iter().any(|path| path.trim().is_empty()) {
       return Err(DomainValidationError::EmptyWorkScope(self.id.clone()));
     }
     for check in &self.suggested_checks {
-      if check.trim().is_empty() || check.contains(['\r', '\n', '`']) {
+      if check.command.trim().is_empty() || check.command.contains(['\r', '\n', '`']) {
         return Err(DomainValidationError::InvalidSuggestedCheck {
           work_unit_id: self.id.clone(),
-          check: check.clone(),
+          check: check.command.clone(),
+        });
+      }
+      if !known_obligations.contains(&check.obligation_id) {
+        return Err(DomainValidationError::UnknownObligation {
+          work_unit_id: self.id.clone(),
+          obligation_id: check.obligation_id.to_string(),
         });
       }
     }
     for requirement_id in &self.requirement_ids {
-      if !known_requirements.contains(requirement_id.as_str()) {
+      if !known_requirements.contains(requirement_id) {
         return Err(DomainValidationError::UnknownRequirement {
           work_unit_id: self.id.clone(),
-          requirement_id: requirement_id.clone(),
+          requirement_id: requirement_id.to_string(),
+        });
+      }
+    }
+    for criterion_id in &self.criterion_ids {
+      if !known_criteria.contains(criterion_id) {
+        return Err(DomainValidationError::UnknownCriterion {
+          work_unit_id: self.id.clone(),
+          criterion_id: criterion_id.to_string(),
+        });
+      }
+    }
+    for obligation_id in &self.verification_obligation_ids {
+      if !known_obligations.contains(obligation_id) {
+        return Err(DomainValidationError::UnknownObligation {
+          work_unit_id: self.id.clone(),
+          obligation_id: obligation_id.to_string(),
         });
       }
     }
     Ok(())
+  }
+
+  pub fn suggested_commands(&self) -> impl Iterator<Item = &str> {
+    self
+      .suggested_checks
+      .iter()
+      .map(|check| check.command.as_str())
   }
 }
 
@@ -127,18 +181,21 @@ mod tests {
       id: "WU-001".into(),
       title: "Implement requirement".into(),
       objective: "Make behavior observable".into(),
-      requirement_ids: vec!["REQ-002".into()],
-      acceptance_criteria: vec!["Behavior passes".into()],
-      suggested_checks: vec!["cargo test".into()],
+      requirement_ids: vec![RequirementId::from("REQ-002")],
+      criterion_ids: vec![CriterionId::from("REQ-002/AC-01")],
+      verification_obligation_ids: vec![ObligationId::from("REQ-002/AC-01/VO-01")],
+      suggested_checks: Vec::new(),
       depends_on: Vec::new(),
       scope: WorkScope {
         paths: vec!["src/**".into()],
       },
     };
-    let known = BTreeSet::from(["REQ-001"]);
+    let known_requirements = BTreeSet::from([RequirementId::from("REQ-001")]);
+    let known_criteria = BTreeSet::from([CriterionId::from("REQ-002/AC-01")]);
+    let known_obligations = BTreeSet::from([ObligationId::from("REQ-002/AC-01/VO-01")]);
 
     assert_eq!(
-      unit.validate(&known),
+      unit.validate(&known_requirements, &known_criteria, &known_obligations),
       Err(DomainValidationError::UnknownRequirement {
         work_unit_id: "WU-001".into(),
         requirement_id: "REQ-002".into(),
@@ -150,11 +207,14 @@ mod tests {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReconcileResult {
-  pub complete: bool,
   pub summary: String,
   pub requirements: Vec<RequirementAssessment>,
   #[serde(rename = "workUnits")]
   pub work_units: Vec<WorkUnit>,
+}
+
+fn default_true() -> bool {
+  true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

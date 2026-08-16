@@ -8,8 +8,10 @@ pub enum DomainValidationError {
   UnsafeWorkUnitId(String),
   #[error("{0} targets no requirements")]
   WorkUnitWithoutRequirements(String),
-  #[error("{0} has no acceptance criteria")]
+  #[error("{0} targets no acceptance criteria")]
   WorkUnitWithoutAcceptanceCriteria(String),
+  #[error("{0} targets no verification obligations")]
+  WorkUnitWithoutVerificationObligations(String),
   #[error("{0} has an empty declared scope")]
   EmptyWorkScope(String),
   #[error("{work_unit_id} has an invalid suggested check; expected one executable shell command without prose or Markdown backticks: {check}")]
@@ -18,5 +20,15 @@ pub enum DomainValidationError {
   UnknownRequirement {
     work_unit_id: String,
     requirement_id: String,
+  },
+  #[error("{work_unit_id} targets unknown acceptance criterion {criterion_id}")]
+  UnknownCriterion {
+    work_unit_id: String,
+    criterion_id: String,
+  },
+  #[error("{work_unit_id} targets unknown verification obligation {obligation_id}")]
+  UnknownObligation {
+    work_unit_id: String,
+    obligation_id: String,
   },
 }

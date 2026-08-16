@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tenet_domain::{
   config::Config,
   events::EventSink,
+  evidence::EvidenceProjection,
   model::{
     ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, RequirementCatalog,
     VerificationReport, WorkUnit, WorkerSummary,
@@ -86,6 +87,7 @@ pub trait AgentBackend: Send + Sync {
     catalog: &RequirementCatalog,
     recent_completed: &[CompletedWorkUnit],
     discoveries: &[Discovery],
+    evidence: &[EvidenceProjection],
   ) -> Result<ReconcileResult>;
   async fn implement(
     &self,
@@ -106,5 +108,6 @@ pub trait AgentBackend: Send + Sync {
     &self,
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
+    evidence: &[EvidenceProjection],
   ) -> Result<ReconcileResult>;
 }

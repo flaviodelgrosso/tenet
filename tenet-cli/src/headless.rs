@@ -171,8 +171,11 @@ impl ConsoleRenderer {
 
     writeln!(
       self.stdout,
-      "  Requirements   {}/{} satisfied",
-      state.requirement_counts.satisfied, state.requirement_counts.total
+      "  Requirements   {}/{} verified ({} stale, {} contradicted)",
+      state.requirement_counts.verified,
+      state.requirement_counts.total,
+      state.requirement_counts.stale,
+      state.requirement_counts.contradicted
     )?;
 
     writeln!(

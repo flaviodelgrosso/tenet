@@ -12,16 +12,20 @@ use tokio::fs;
 
 use tenet_domain::{
   config::{Config, TENET_DIR},
+  evidence::EvidenceGraphState,
   model::{
     CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
     RequirementCatalog, State, VerificationReport,
   },
 };
 
+use crate::evidence::graph_from_catalog;
+
 pub const STATE_FILE: &str = "state.json";
 pub const REQUIREMENTS_FILE: &str = "requirements.json";
 pub const ROADMAP_FILE: &str = "roadmap.json";
 pub const INTEGRATION_JOURNAL_FILE: &str = "integration-journal.json";
+pub const EVIDENCE_GRAPH_FILE: &str = "evidence/graph.json";
 
 pub async fn ensure_layout(cwd: &Path) -> Result<()> {
   fs::create_dir_all(cwd.join(TENET_DIR).join("evidence")).await?;
@@ -118,6 +122,55 @@ pub async fn write_catalog(cwd: &Path, catalog: &RequirementCatalog) -> Result<(
 
 pub async fn write_roadmap(cwd: &Path, value: &ReconcileResult) -> Result<()> {
   write_json_atomic(cwd.join(TENET_DIR).join(ROADMAP_FILE), value).await
+}
+pub async fn read_evidence_graph(
+  cwd: &Path,
+  catalog: &RequirementCatalog,
+) -> Result<EvidenceGraphState> {
+  let path = cwd.join(TENET_DIR).join(EVIDENCE_GRAPH_FILE);
+  if !path.exists() {
+    return graph_from_catalog(catalog);
+  }
+  let mut value: serde_json::Value = read_json(path).await?;
+  let version = value
+    .get("version")
+    .and_then(serde_json::Value::as_u64)
+    .ok_or_else(|| anyhow!("evidence graph has no numeric version"))?;
+  if version == 0 {
+    value["version"] = serde_json::Value::from(EvidenceGraphState::VERSION);
+  } else if version != u64::from(EvidenceGraphState::VERSION) {
+    return Err(anyhow!(
+      "unsupported evidence graph version {version}; expected {}",
+      EvidenceGraphState::VERSION
+    ));
+  }
+  let mut graph: EvidenceGraphState =
+    serde_json::from_value(value).context("deserialize evidence graph")?;
+  if graph.requirements.is_empty() {
+    graph.requirements = catalog
+      .requirements
+      .iter()
+      .map(|requirement| requirement.id.clone())
+      .collect();
+  }
+  if graph.specification_hash != catalog.spec_hash {
+    return graph_from_catalog(catalog);
+  }
+  let expected = graph_from_catalog(catalog)?;
+  if graph.requirements != expected.requirements
+    || graph.required_requirements != expected.required_requirements
+    || graph.criteria != expected.criteria
+    || graph.obligations != expected.obligations
+  {
+    return Err(anyhow!(
+      "persisted evidence graph structure does not match the requirement catalog"
+    ));
+  }
+  Ok(graph)
+}
+
+pub async fn write_evidence_graph(cwd: &Path, graph: &EvidenceGraphState) -> Result<()> {
+  write_json_atomic(cwd.join(TENET_DIR).join(EVIDENCE_GRAPH_FILE), graph).await
 }
 
 pub async fn save_evidence<T: serde::Serialize>(
@@ -388,5 +441,132 @@ mod tests {
 
     assert_eq!(state.run_id.as_deref(), Some("run-existing"));
     assert_eq!(state.cycle, 3);
+  }
+
+  fn evidence_catalog() -> RequirementCatalog {
+    use tenet_domain::{
+      evidence::{AcceptanceCriterion, VerificationKind, VerificationObligation},
+      ids::{CriterionId, ObligationId, RequirementId},
+      model::Requirement,
+    };
+
+    RequirementCatalog {
+      spec_hash: "spec".into(),
+      requirements: vec![Requirement {
+        id: RequirementId::from("REQ-001"),
+        title: "Requirement".into(),
+        description: "Description".into(),
+        required: true,
+      }],
+      acceptance_criteria: vec![AcceptanceCriterion {
+        id: CriterionId::from("REQ-001/AC-01"),
+        requirement_id: RequirementId::from("REQ-001"),
+        description: "Observable".into(),
+        mandatory: true,
+      }],
+      verification_obligations: vec![VerificationObligation {
+        id: ObligationId::from("REQ-001/AC-01/VO-01"),
+        criterion_id: CriterionId::from("REQ-001/AC-01"),
+        description: "Run check".into(),
+        kind: VerificationKind::Command,
+        required: true,
+        command: "true".into(),
+        dependency_scope: vec!["src/**".into()],
+      }],
+    }
+  }
+
+  #[tokio::test]
+  async fn evidence_graph_persists_and_reloads_semantics() {
+    use chrono::Utc;
+    use tenet_domain::{
+      evidence::{EvidencePolicy, VerificationState},
+      ids::{ObligationId, RequirementId, VerificationRunId},
+      model::CommandResult,
+    };
+
+    let project = tempfile::tempdir().expect("temporary project");
+    ensure_layout(project.path()).await.expect("layout");
+    let catalog = evidence_catalog();
+    let mut graph = graph_from_catalog(&catalog).expect("graph");
+    graph
+      .record_command_result(
+        &ObligationId::from("REQ-001/AC-01/VO-01"),
+        "abc123",
+        VerificationRunId::new(),
+        Utc::now(),
+        &CommandResult {
+          command: "true".into(),
+          exit_code: Some(0),
+          timed_out: false,
+          duration_ms: 1,
+          stdout: String::new(),
+          stderr: String::new(),
+        },
+      )
+      .expect("evidence");
+    write_evidence_graph(project.path(), &graph)
+      .await
+      .expect("write graph");
+
+    let reloaded = read_evidence_graph(project.path(), &catalog)
+      .await
+      .expect("reload graph");
+
+    assert_eq!(
+      reloaded.requirement_verification_state(&RequirementId::from("REQ-001"), &EvidencePolicy),
+      Ok(VerificationState::Verified)
+    );
+  }
+
+  #[tokio::test]
+  async fn evidence_graph_version_zero_migrates_to_current_version() {
+    let project = tempfile::tempdir().expect("temporary project");
+    ensure_layout(project.path()).await.expect("layout");
+    let catalog = evidence_catalog();
+    let graph = graph_from_catalog(&catalog).expect("graph");
+    let mut value = serde_json::to_value(graph).expect("serialize graph");
+    value["version"] = serde_json::json!(0);
+    value
+      .as_object_mut()
+      .expect("graph object")
+      .remove("requirements");
+    fs::write(
+      project.path().join(TENET_DIR).join(EVIDENCE_GRAPH_FILE),
+      serde_json::to_vec_pretty(&value).expect("serialize fixture"),
+    )
+    .await
+    .expect("write fixture");
+
+    let migrated = read_evidence_graph(project.path(), &catalog)
+      .await
+      .expect("migrate graph");
+
+    assert_eq!(migrated.version, EvidenceGraphState::VERSION);
+    assert_eq!(migrated.requirements, migrated.required_requirements);
+  }
+
+  #[tokio::test]
+  async fn evidence_graph_rejects_unknown_future_version() {
+    let project = tempfile::tempdir().expect("temporary project");
+    ensure_layout(project.path()).await.expect("layout");
+    let catalog = evidence_catalog();
+    let mut value =
+      serde_json::to_value(graph_from_catalog(&catalog).expect("graph")).expect("serialize graph");
+    value["version"] = serde_json::json!(99);
+    fs::write(
+      project.path().join(TENET_DIR).join(EVIDENCE_GRAPH_FILE),
+      serde_json::to_vec_pretty(&value).expect("serialize fixture"),
+    )
+    .await
+    .expect("write fixture");
+
+    let error = read_evidence_graph(project.path(), &catalog)
+      .await
+      .expect_err("future version rejected");
+
+    assert!(error
+      .to_string()
+      .contains("unsupported evidence graph version"));
   }
 }

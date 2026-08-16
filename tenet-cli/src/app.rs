@@ -110,8 +110,11 @@ impl App {
     println!("phase: {:?}", state.phase);
     println!("cycle: {}", state.cycle);
     println!(
-      "requirements: {}/{} satisfied",
-      state.requirement_counts.satisfied, state.requirement_counts.total
+      "requirements: {}/{} verified ({} stale, {} contradicted)",
+      state.requirement_counts.verified,
+      state.requirement_counts.total,
+      state.requirement_counts.stale,
+      state.requirement_counts.contradicted
     );
     for lease in state.active_leases.values() {
       println!(

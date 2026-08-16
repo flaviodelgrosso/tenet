@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod events;
+pub mod evidence;
 pub mod ids;
 pub mod model;
 pub mod verification;

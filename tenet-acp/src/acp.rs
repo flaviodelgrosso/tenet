@@ -26,6 +26,7 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tenet_domain::events::EventSink;
+use tenet_domain::evidence::EvidenceProjection;
 use tenet_domain::model::{
   ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, RequirementCatalog,
   VerificationReport, WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
@@ -122,8 +123,9 @@ impl AgentBackend for AcpRuntime {
     catalog: &RequirementCatalog,
     recent: &[CompletedWorkUnit],
     discoveries: &[Discovery],
+    evidence: &[EvidenceProjection],
   ) -> Result<ReconcileResult> {
-    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository against this catalog. Inspect it directly. Propose a dependency graph of candidate work units; the controller alone decides concurrency.\n\nCatalog:\n{}\n\nRecent completed work:\n{}\n\nWorker discoveries requiring reconsideration:\n{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(recent)?, serde_json::to_string_pretty(discoveries)?)).await
+    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository implementation against this catalog. Inspect it directly. Identify implementation gaps and missing evidence; propose a dependency graph of candidate work units when implementation work remains. The controller alone decides verification and concurrency.\n\nCatalog:\n{}\n\nController-derived evidence projections:\n{}\n\nRecent completed work:\n{}\n\nWorker discoveries requiring reconsideration:\n{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(evidence)?, serde_json::to_string_pretty(recent)?, serde_json::to_string_pretty(discoveries)?)).await
   }
 
   async fn implement(
@@ -159,14 +161,16 @@ impl AgentBackend for AcpRuntime {
     &self,
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
+    evidence: &[EvidenceProjection],
   ) -> Result<ReconcileResult> {
     self
       .run_typed(
         ctx,
         WorkerRole::Assess,
         format!(
-          "Perform an independent final assessment against every requirement.\n\nCatalog:\n{}",
-          serde_json::to_string_pretty(catalog)?
+          "Perform an independent skeptical gap assessment against every requirement. The controller-derived evidence projection is authoritative for verification state; identify gaps but do not declare completion.\n\nCatalog:\n{}\n\nController-derived evidence projections:\n{}",
+          serde_json::to_string_pretty(catalog)?,
+          serde_json::to_string_pretty(evidence)?
         ),
       )
       .await
@@ -1166,21 +1170,25 @@ mod tests {
 
   fn valid_reconcile_output() -> Value {
     json!({
-      "complete": false,
       "summary": "One requirement remains",
       "requirements": [{
-        "id": "REQ-001",
-        "status": "missing",
-        "evidence": [],
-        "gaps": ["Current output is static"]
+        "requirementId": "REQ-001",
+        "implementationState": "absent",
+        "observations": [],
+        "missingImplementation": ["Current output is static"],
+        "missingEvidence": ["REQ-001/AC-01/VO-01"]
       }],
       "workUnits": [{
         "id": "WU-001",
         "title": "Print current datetime",
         "objective": "Replace the static greeting",
         "requirementIds": ["REQ-001"],
-        "acceptanceCriteria": ["Output contains the current datetime"],
-        "suggestedChecks": ["cargo run --quiet"],
+        "criterionIds": ["REQ-001/AC-01"],
+        "verificationObligationIds": ["REQ-001/AC-01/VO-01"],
+        "suggestedChecks": [{
+          "obligationId": "REQ-001/AC-01/VO-01",
+          "command": "cargo run --quiet"
+        }],
         "dependsOn": [],
         "scope": {"paths": ["src/**"]}
       }]
@@ -1233,7 +1241,11 @@ mod tests {
 
   #[test]
   fn generated_contracts_deserialize_valid_architect_reconcile_and_worker_output() {
-    let architect = json!({"requirements":[{"id":"REQ-001","title":"Title","description":"Description","acceptanceCriteria":["Observable"]}]});
+    let architect = json!({
+      "requirements":[{"id":"REQ-001","title":"Title","description":"Description","required":true}],
+      "acceptanceCriteria":[{"id":"REQ-001/AC-01","requirementId":"REQ-001","description":"Observable","mandatory":true}],
+      "verificationObligations":[{"id":"REQ-001/AC-01/VO-01","criterionId":"REQ-001/AC-01","description":"Run check","kind":"automated_test","required":true,"command":"cargo test","dependencyScope":["src/**"]}]
+    });
     let worker = json!({"summary":"done","changedFiles":["src/lib.rs"],"testsRun":["cargo test"],"notes":[],"discoveries":[{"type":"blocker","description":"blocked"}]});
 
     validate_structured_output::<ArchitectOutput>(
@@ -1280,7 +1292,7 @@ mod tests {
   #[test]
   fn generated_schema_rejects_invalid_enum_variants() {
     let mut output = valid_reconcile_output();
-    output["requirements"][0]["status"] = Value::String("unknown".into());
+    output["requirements"][0]["implementationState"] = Value::String("unknown_variant".into());
 
     assert!(validate_structured_output::<ReconcileResult>(
       &output,

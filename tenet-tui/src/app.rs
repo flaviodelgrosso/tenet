@@ -1,12 +1,13 @@
-use tenet_domain::model::{
-  RepositoryChange, Requirement, RequirementAssessment, RequirementStatus, VerificationReport,
+use tenet_domain::{
+  evidence::{AcceptanceCriterion, ImplementationState, VerificationState},
+  model::{RepositoryChange, Requirement, RequirementAssessment, VerificationReport},
 };
 
 use crate::tui::action::{Action, Effect, HistoryFilter, Overlay, Screen};
 
 pub use tenet_projection::{
-  check_detail, failure_preview, phase_label, requirement_status, status_label, Activity,
-  ActivityCategory, RunProjection, WorkerSession,
+  check_detail, failure_preview, phase_label, requirement_implementation_state, status_label,
+  Activity, ActivityCategory, RunProjection, WorkerSession,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -125,6 +126,13 @@ impl Application {
 
   pub fn assessments(&self) -> &std::collections::BTreeMap<String, RequirementAssessment> {
     self.run.assessments()
+  }
+  pub fn criteria_for(&self, requirement_id: &str) -> &[AcceptanceCriterion] {
+    self.run.criteria_for(requirement_id)
+  }
+
+  pub fn verification_state(&self, requirement_id: &str) -> VerificationState {
+    self.run.verification_state(requirement_id)
   }
 
   pub fn activities(&self) -> &std::collections::VecDeque<Activity> {
@@ -609,7 +617,9 @@ impl Application {
           format!("Requirement {}", item.id),
           requirement_detail(
             item,
-            self.assessments().get(&item.id),
+            self.criteria_for(item.id.as_str()),
+            self.assessments().get(item.id.as_str()),
+            self.verification_state(item.id.as_str()),
             self
               .active_work_units()
               .find(|work| work.requirement_ids.contains(&item.id)),
@@ -679,11 +689,32 @@ fn history_match(item: &Activity, filter: HistoryFilter, query: &str) -> bool {
 
 fn requirement_detail(
   requirement: &Requirement,
+  criteria: &[AcceptanceCriterion],
   assessment: Option<&RequirementAssessment>,
+  verification: VerificationState,
   current: Option<&tenet_domain::model::WorkUnit>,
 ) -> String {
-  let status = requirement_status(assessment);
-  format!("{} · {}\nStatus: {}\n\n{}\n\nAcceptance criteria\n{}\n\nEvidence\n{}\n\nGaps\n{}\n\nCurrent work relationship\n{}", requirement.id, requirement.title, match status { RequirementStatus::Satisfied => "SATISFIED", RequirementStatus::Partial => "PARTIAL", RequirementStatus::Missing => "MISSING / UNASSESSED" }, requirement.description, bullets(&requirement.acceptance_criteria), assessment.map_or_else(|| "- No evidence assessed yet".into(), |item| bullets(&item.evidence)), assessment.map_or_else(|| "- Not assessed".into(), |item| bullets(&item.gaps)), current.filter(|work| work.requirement_ids.contains(&requirement.id)).map_or_else(|| "Not linked to the current work unit".into(), |work| format!("Linked to {} · {}", work.id, work.title)))
+  let implementation = requirement_implementation_state(assessment);
+  let criteria = criteria
+    .iter()
+    .map(|criterion| format!("{}: {}", criterion.id, criterion.description))
+    .collect::<Vec<_>>();
+  let observations = assessment
+    .map(|item| item.observations.clone())
+    .unwrap_or_default();
+  let gaps = assessment
+    .map(|item| item.missing_implementation.clone())
+    .unwrap_or_default();
+  let missing_evidence = assessment
+    .map(|item| {
+      item
+        .missing_evidence
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+  format!("{} · {}\nImplementation: {}\nVerification: {}\n\n{}\n\nAcceptance criteria\n{}\n\nImplementation observations\n{}\n\nImplementation gaps\n{}\n\nMissing evidence\n{}\n\nCurrent work relationship\n{}", requirement.id, requirement.title, implementation_label(implementation), verification_label(verification), requirement.description, bullets(&criteria), bullets(&observations), bullets(&gaps), bullets(&missing_evidence), current.filter(|work| work.requirement_ids.contains(&requirement.id)).map_or_else(|| "Not linked to the current work unit".into(), |work| format!("Linked to {} · {}", work.id, work.title)))
 }
 
 fn activity_detail(item: &Activity) -> String {
@@ -697,12 +728,17 @@ fn activity_detail(item: &Activity) -> String {
 }
 
 fn work_detail(work: &tenet_domain::model::WorkUnit) -> String {
+  let requirements = work
+    .requirement_ids
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
   format!(
     "{} · {}\n\nObjective\n{}\n\nRequirements\n{}",
     work.id,
     work.title,
     work.objective,
-    bullets(&work.requirement_ids)
+    bullets(&requirements)
   )
 }
 
@@ -726,7 +762,26 @@ fn context_detail(app: &Application) -> String {
       }
     },
   );
-  format!("Active work\n{work}\n\nRequirement health\n{}/{} satisfied · {} partial · {} missing\n\nCycle\n{}\n\nLatest verification\n{checks}\n\nRepository changes\n{} changed paths", state.requirement_counts.satisfied, state.requirement_counts.total, state.requirement_counts.partial, state.requirement_counts.missing, state.cycle, app.changes().len())
+  format!("Active work\n{work}\n\nRequirement evidence\n{}/{} verified · {} partial · {} unverified · {} stale · {} contradicted\nMissing implementation: {}\n\nCycle\n{}\n\nLatest verification\n{checks}\n\nRepository changes\n{} changed paths", state.requirement_counts.verified, state.requirement_counts.total, state.requirement_counts.partially_verified, state.requirement_counts.unverified, state.requirement_counts.stale, state.requirement_counts.contradicted, state.requirement_counts.missing_implementation, state.cycle, app.changes().len())
+}
+
+fn implementation_label(state: ImplementationState) -> &'static str {
+  match state {
+    ImplementationState::Present => "PRESENT",
+    ImplementationState::Partial => "PARTIAL",
+    ImplementationState::Absent => "ABSENT",
+    ImplementationState::Unknown => "UNKNOWN",
+  }
+}
+
+fn verification_label(state: VerificationState) -> &'static str {
+  match state {
+    VerificationState::Verified => "VERIFIED",
+    VerificationState::PartiallyVerified => "PARTIALLY VERIFIED",
+    VerificationState::Unverified => "UNVERIFIED",
+    VerificationState::Stale => "STALE",
+    VerificationState::Contradicted => "CONTRADICTED",
+  }
 }
 
 fn bullets(items: &[String]) -> String {

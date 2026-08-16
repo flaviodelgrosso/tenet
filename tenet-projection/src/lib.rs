@@ -5,10 +5,11 @@ use std::{
 
 use tenet_domain::{
   events::RunEvent,
+  evidence::{AcceptanceCriterion, ImplementationState, VerificationState},
   model::{
     Phase, ReconcileResult, RepositoryChange, Requirement, RequirementAssessment,
-    RequirementCatalog, RequirementStatus, RunStatus, State, VerificationReport, WorkExecution,
-    WorkUnit, WorkerEvent, WorkerRole,
+    RequirementCatalog, RunStatus, State, VerificationReport, WorkExecution, WorkUnit, WorkerEvent,
+    WorkerRole,
   },
 };
 
@@ -61,7 +62,9 @@ pub struct WorkerSession {
 pub struct RunProjection {
   state: State,
   catalog: Vec<Requirement>,
+  criteria: BTreeMap<String, Vec<AcceptanceCriterion>>,
   assessments: BTreeMap<String, RequirementAssessment>,
+  verification_states: BTreeMap<String, VerificationState>,
   activities: VecDeque<Activity>,
   workers: VecDeque<WorkerSession>,
   checks: Vec<VerificationReport>,
@@ -88,6 +91,8 @@ impl RunProjection {
       state,
       catalog,
       assessments: BTreeMap::new(),
+      criteria: BTreeMap::new(),
+      verification_states: BTreeMap::new(),
       activities: VecDeque::new(),
       workers: VecDeque::new(),
       checks: Vec::new(),
@@ -108,8 +113,22 @@ impl RunProjection {
   pub fn catalog(&self) -> &[Requirement] {
     &self.catalog
   }
+  pub fn criteria_for(&self, requirement_id: &str) -> &[AcceptanceCriterion] {
+    self
+      .criteria
+      .get(requirement_id)
+      .map(Vec::as_slice)
+      .unwrap_or(&[])
+  }
   pub fn assessments(&self) -> &BTreeMap<String, RequirementAssessment> {
     &self.assessments
+  }
+  pub fn verification_state(&self, requirement_id: &str) -> VerificationState {
+    self
+      .verification_states
+      .get(requirement_id)
+      .copied()
+      .unwrap_or(VerificationState::Unverified)
   }
   pub fn activities(&self) -> &VecDeque<Activity> {
     &self.activities
@@ -179,7 +198,21 @@ impl RunProjection {
     }
     match event {
       RunEvent::State(state) => self.apply_state(state),
-      RunEvent::Catalog(RequirementCatalog { requirements, .. }) => self.catalog = requirements,
+      RunEvent::Catalog(RequirementCatalog {
+        requirements,
+        acceptance_criteria,
+        ..
+      }) => {
+        self.catalog = requirements;
+        self.criteria.clear();
+        for criterion in acceptance_criteria {
+          self
+            .criteria
+            .entry(criterion.requirement_id.to_string())
+            .or_default()
+            .push(criterion);
+        }
+      }
       RunEvent::Message(message) => {
         let category = if message.to_ascii_lowercase().contains("error") {
           ActivityCategory::Error
@@ -295,6 +328,71 @@ impl RunProjection {
           detail,
         );
       }
+      RunEvent::EvidenceEstablished(evidence) => self.push_activity(
+        evidence.observed_at.to_rfc3339(),
+        ActivityCategory::Check,
+        "EVIDENCE ESTABLISHED",
+        format!("{} · {}", evidence.obligation_id, evidence.check_identity),
+        format!("revision {}\n{}", evidence.revision, evidence.output),
+      ),
+      RunEvent::EvidenceFailed(evidence) => self.push_activity(
+        evidence.observed_at.to_rfc3339(),
+        ActivityCategory::Error,
+        "EVIDENCE FAILED",
+        format!("{} · {}", evidence.obligation_id, evidence.check_identity),
+        format!("revision {}\n{}", evidence.revision, evidence.output),
+      ),
+      RunEvent::EvidenceInvalidated {
+        evidence_id,
+        revision,
+      } => self.push_activity(
+        now(),
+        ActivityCategory::Check,
+        "EVIDENCE STALE",
+        evidence_id.to_string(),
+        format!("repository advanced to {revision}"),
+      ),
+      RunEvent::EvidenceContradiction {
+        obligation_id,
+        evidence_ids,
+      } => self.push_activity(
+        now(),
+        ActivityCategory::Error,
+        "EVIDENCE CONTRADICTION",
+        obligation_id.to_string(),
+        evidence_ids
+          .iter()
+          .map(ToString::to_string)
+          .collect::<Vec<_>>()
+          .join("\n"),
+      ),
+      RunEvent::CriterionVerificationChanged {
+        criterion_id,
+        previous,
+        current,
+      } => self.push_activity(
+        now(),
+        ActivityCategory::Check,
+        "CRITERION VERIFICATION",
+        format!("{criterion_id} · {previous:?} → {current:?}"),
+        String::new(),
+      ),
+      RunEvent::RequirementVerificationChanged {
+        requirement_id,
+        previous,
+        current,
+      } => {
+        self
+          .verification_states
+          .insert(requirement_id.to_string(), current);
+        self.push_activity(
+          now(),
+          ActivityCategory::Check,
+          "REQUIREMENT VERIFICATION",
+          format!("{requirement_id} · {previous:?} → {current:?}"),
+          String::new(),
+        );
+      }
       RunEvent::Finished(state) => {
         self.apply_state(state);
         self.running = false;
@@ -341,7 +439,9 @@ impl RunProjection {
 
   fn apply_reconcile(&mut self, result: ReconcileResult) {
     for assessment in result.requirements {
-      self.assessments.insert(assessment.id.clone(), assessment);
+      self
+        .assessments
+        .insert(assessment.requirement_id.to_string(), assessment);
     }
     let summary = match result.work_units.as_slice() {
       [] => result.summary.clone(),
@@ -621,8 +721,12 @@ pub fn status_label(status: &RunStatus) -> &'static str {
     RunStatus::Stopped => "STOPPED",
   }
 }
-pub fn requirement_status(assessment: Option<&RequirementAssessment>) -> RequirementStatus {
-  assessment.map_or(RequirementStatus::Missing, |item| item.status.clone())
+pub fn requirement_implementation_state(
+  assessment: Option<&RequirementAssessment>,
+) -> ImplementationState {
+  assessment.map_or(ImplementationState::Unknown, |item| {
+    item.implementation_state
+  })
 }
 pub fn failure_preview(report: &VerificationReport) -> String {
   report
@@ -683,17 +787,32 @@ fn append_bounded(target: &mut String, text: &str) {
 }
 fn state_detail(state: &State) -> String {
   format!(
-    "Status: {}\nPhase: {}\nCycle: {}\nRequirements: {}/{} satisfied\n\n{}",
+    "Status: {}\nPhase: {}\nCycle: {}\nRequirements: {}/{} verified\n\n{}",
     status_label(&state.status),
     phase_label(&state.phase),
     state.cycle,
-    state.requirement_counts.satisfied,
+    state.requirement_counts.verified,
     state.requirement_counts.total,
     state.last_summary
   )
 }
 fn work_detail(work: &tenet_domain::model::WorkUnit) -> String {
-  format!("{} · {}\n\nObjective\n{}\n\nRequirements\n{}\n\nAcceptance criteria\n{}\n\nSuggested checks\n{}", work.id, work.title, work.objective, bullets(&work.requirement_ids), bullets(&work.acceptance_criteria), bullets(&work.suggested_checks))
+  let requirements = work
+    .requirement_ids
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+  let criteria = work
+    .criterion_ids
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>();
+  let checks = work
+    .suggested_checks
+    .iter()
+    .map(|check| format!("{}: {}", check.obligation_id, check.command))
+    .collect::<Vec<_>>();
+  format!("{} · {}\n\nObjective\n{}\n\nRequirements\n{}\n\nAcceptance criteria\n{}\n\nSuggested checks\n{}", work.id, work.title, work.objective, bullets(&requirements), bullets(&criteria), bullets(&checks))
 }
 pub fn check_detail(report: &VerificationReport) -> String {
   let commands = report
@@ -743,7 +862,11 @@ fn now() -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use tenet_domain::model::{CommandResult, RequirementCounts, WorkScope, WorkUnit};
+  use tenet_domain::{
+    evidence::ImplementationState,
+    ids::{CriterionId, ObligationId, RequirementId},
+    model::{CommandResult, RequirementCounts, WorkScope, WorkUnit},
+  };
 
   fn state(status: RunStatus, phase: Phase) -> State {
     let mut state = State::fresh();
@@ -753,9 +876,9 @@ mod tests {
     state.cycle = 4;
     state.requirement_counts = RequirementCounts {
       total: 2,
-      satisfied: 1,
-      partial: 1,
-      missing: 0,
+      verified: 1,
+      partially_verified: 1,
+      ..Default::default()
     };
     state.last_summary = "Controller update".into();
     state.updated_at = "10:00:00".into();
@@ -786,8 +909,9 @@ mod tests {
       id: "W-014".into(),
       title: "Authentication error handling".into(),
       objective: "Handle errors".into(),
-      requirement_ids: vec!["REQ-012".into()],
-      acceptance_criteria: Vec::new(),
+      requirement_ids: vec![RequirementId::from("REQ-012")],
+      criterion_ids: vec![CriterionId::from("REQ-012/AC-01")],
+      verification_obligation_ids: vec![ObligationId::from("REQ-012/AC-01/VO-01")],
       suggested_checks: Vec::new(),
       depends_on: Vec::new(),
       scope: WorkScope {
@@ -800,13 +924,13 @@ mod tests {
   fn projects_reconcile_implementation_and_verification() {
     let mut projection = RunProjection::new(State::fresh(), Vec::new());
     projection.apply(RunEvent::Reconcile(ReconcileResult {
-      complete: false,
       summary: "select work".into(),
       requirements: vec![RequirementAssessment {
-        id: "REQ-012".into(),
-        status: RequirementStatus::Partial,
-        evidence: vec!["API exists".into()],
-        gaps: vec!["No test".into()],
+        requirement_id: RequirementId::from("REQ-012"),
+        implementation_state: ImplementationState::Partial,
+        observations: vec!["API exists".into()],
+        missing_implementation: vec!["No test".into()],
+        missing_evidence: vec![ObligationId::from("REQ-012/AC-01/VO-01")],
       }],
       work_units: vec![work()],
     }));
@@ -819,8 +943,8 @@ mod tests {
     }));
     projection.apply(RunEvent::Verification(report(true)));
     assert_eq!(
-      projection.assessments()["REQ-012"].status,
-      RequirementStatus::Partial
+      projection.assessments()["REQ-012"].implementation_state,
+      ImplementationState::Partial
     );
     assert!(projection
       .activities()

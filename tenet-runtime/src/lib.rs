@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod controller;
+pub mod evidence;
 pub mod git;
 pub mod graph;
 pub mod integration;

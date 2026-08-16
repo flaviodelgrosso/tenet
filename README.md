@@ -184,21 +184,17 @@ A run is a sequence of bounded engineering cycles.
 
 ### 1. Architect
 
-The specification is turned into explicit requirements.
+The specification is turned into explicit requirements, acceptance criteria, and verification obligations with stable semantic IDs.
 
-Not a vague todo list.
-
-A concrete catalog of what the repository is supposed to satisfy.
+An acceptance criterion states what must be true. A verification obligation separately states how the controller must demonstrate it.
 
 ### 2. Reconcile
 
-A fresh worker compares those requirements with the repository **as it exists now**.
+A fresh worker compares the repository implementation with the catalog **as it exists now**.
 
-It proposes the work that remains.
+It proposes implementation observations, missing implementation, missing evidence obligations, candidate checks, and bounded work units. These are proposals: Reconcile cannot declare a requirement verified or complete.
 
-Tenet validates that work before execution.
-
-The plan is therefore allowed to change as the code changes.
+Tenet validates the relationships and work graph before execution. The plan may change as the code changes.
 
 ### 3. Implement
 
@@ -216,9 +212,7 @@ make ci
 ./scripts/acceptance.sh
 ```
 
-Whatever your project considers meaningful evidence.
-
-An agent saying _“tests pass”_ is not evidence when Tenet can run the tests itself.
+Each matching command result becomes a first-class evidence fact tied to its requirement, criterion, obligation, verification run, command output, timestamp, provenance, and exact Git revision. An agent saying _“tests pass”_ is advisory; it cannot authorize verification.
 
 ### 5. Repair
 
@@ -251,9 +245,9 @@ Because after code changes, yesterday's plan is only a hypothesis.
 
 ### 7. Assess
 
-When reconciliation believes the work is complete and deterministic gates pass, another fresh worker performs an independent assessment.
+After deterministic gates establish the required evidence, another fresh worker skeptically searches for implementation and evidence gaps.
 
-The worker that wrote the implementation does not get the final vote by default.
+Assess may veto completion by proposing a concrete gap and work, but it cannot authorize completion. The controller derives completion from the persisted evidence graph and deterministic policies.
 
 ### Controller-enforced repository invariants
 
@@ -263,13 +257,15 @@ Implement and Repair run in leased detached worktrees. Before Tenet accepts a ca
 
 Candidates are committed before verification. Suggested checks and configured project gates run in disposable worktrees at that immutable commit, so relative command effects cannot alter the commit that is integrated. Protected paths are compared as repository objects, including recursive directories, file contents, executable mode, symlink targets, additions, and deletions. Configured protected paths must be normalized repository-relative paths.
 
-Current Reconcile output is authoritative for scheduling. Historical completed-work records are evidence/context only and never suppress a work unit emitted by the current reconciliation. A specification hash change replaces the catalog context and invalidates completion and discovery history from the previous catalog.
+Current Reconcile output is authoritative for scheduling, not verification. Historical completed-work records are context only. Verification authority comes from controller-executed evidence persisted in `.tenet/evidence/graph.json`.
+
+Evidence retains stable typed relationships rather than graph-container indices. Passing and failing facts are both preserved. A valid controller-observed failure blocks a conflicting pass. When changed paths intersect an evidence dependency scope, that evidence becomes stale and the requirement requires re-verification; unrelated changes preserve the graph.
 
 Implement and Repair discoveries are persisted with catalog hash, repository revision, work-unit ID, role, cycle, deterministic fingerprint, and lifecycle status. Active discoveries are supplied to the next reconciliation once, then marked consumed; deterministic duplicates are not accumulated indefinitely.
 
 Canonical advancement uses a durable integration journal. Verification evidence and a `prepared` transaction are persisted before fast-forward. Cancellation is checked during verification and immediately before canonical advancement. After Git advances, the journal moves through `git_committed` and `state_committed`; startup reconciles an incomplete journal against actual `HEAD`, recovers when `HEAD` is the intended revision, abandons a prepared transaction when `HEAD` is still old, and fails closed for any third revision.
 
-Persisted `State` is the observable projection used by the CLI/TUI. The integration journal is the recovery-critical transaction record. Serialized leases and candidates describe the active attempt; they are not treated as sufficient recovery proof. State loading rejects impossible terminal/phase combinations and idle states with active work.
+`EvidenceGraphState` stores authoritative evidence facts. `EvidencePolicy` derives verification, and read projections feed the CLI/TUI. Persisted `State` remains an observable run projection, not completion authority.
 
 The cancellation boundary is the canonical fast-forward: cancellation observed before that operation prevents advancement. If the atomic Git operation completed before cancellation became observable, journal recovery records the completed advancement deterministically.
 
@@ -291,25 +287,25 @@ Tenet does not treat that sentence as completion.
 Conceptually, `DONE(R)` requires all of the following for one exact canonical revision `R`:
 
 ```text
-valid authoritative specification and catalog
+valid authoritative specification and typed catalog
         +
-current reconciliation: every requirement satisfied, with nonblank evidence
+every required requirement has mandatory acceptance criteria
         +
-current reconciliation: no remaining work
+every mandatory criterion has all required verification obligations
         +
-clean canonical revision R and no stale history suppressing work
+every required obligation has valid controller-executed passing evidence at R
         +
-deterministic verification of an immutable checkout of R passes
+no valid blocking contradictory evidence
         +
-fresh Assess inspects a disposable checkout of R
+current reconciliation and skeptical assessment propose no implementation work
         +
-Assess: every requirement satisfied with evidence, no gaps, no work
+repository-wide deterministic gates pass on an immutable checkout of R
         +
-canonical HEAD is still R
+canonical HEAD is still R and the working tree is clean
         +
 no active lease, candidate, or integration transaction
         +
-required workspace cleanup, evidence logging, and state persistence succeed
+required workspace cleanup, evidence logging, and atomic state persistence succeed
         =
 DONE(R)
 ```
@@ -351,7 +347,7 @@ Today, the project already contains the foundations for:
 - bounded repair attempts;
 - bounded project cycles;
 - persistent controller state;
-- evidence capture;
+- versioned requirement evidence graph persistence with revision-scoped invalidation;
 - dependency-aware scheduling;
 - controlled integration;
 - protected controller-owned paths;

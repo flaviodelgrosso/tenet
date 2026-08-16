@@ -16,16 +16,20 @@ use uuid::Uuid;
 use tenet_domain::{
   config::{config_path, ensure_config, read_config, TENET_DIR},
   events::{EventSink, RunEvent, RunLogger},
+  evidence::{
+    EvidenceGraphState, EvidencePolicy, EvidenceResult, ImplementationState, VerificationState,
+  },
+  ids::{CriterionId, RequirementId},
   model::{
-    CompletedWorkUnit, DiscoveryRecord, DiscoveryStatus, IntegrationPhase, Phase, ReconcileResult,
-    RepairProgress, RequirementCatalog, RequirementCounts, RequirementStatus, RunStatus, State,
+    CandidateCheck, CompletedWorkUnit, DiscoveryRecord, DiscoveryStatus, IntegrationPhase, Phase,
+    ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus, State,
     VerificationReport, WorkExecution, WorkStatus,
   },
 };
 
 use crate::{
   backend::{AgentBackend, BackendContext},
-  git,
+  evidence as evidence_graph, git,
   graph::WorkGraph,
   integration::{deterministic_order, IntegrationOutcome, Integrator},
   scheduler::{ExecutionUpdate, Scheduler},
@@ -205,11 +209,19 @@ impl Controller {
 
   async fn run_inner(&self, context: &BackendContext, state: &mut State) -> Result<State> {
     let mut catalog = self.ensure_catalog(context, state).await?;
+    let mut evidence_graph = store::read_evidence_graph(&self.cwd, &catalog).await?;
+    store::write_evidence_graph(&self.cwd, &evidence_graph).await?;
 
     for cycle in 1..=context.config.max_cycles {
       self.check_cancel(context)?;
       catalog = self
         .refresh_catalog_if_spec_changed(context, state, catalog)
+        .await?;
+      evidence_graph = store::read_evidence_graph(&self.cwd, &catalog).await?;
+      store::write_evidence_graph(&self.cwd, &evidence_graph).await?;
+      let current_revision = git::head(&self.cwd).await?;
+      self
+        .invalidate_evidence(context, &mut evidence_graph, &current_revision)
         .await?;
       state.cycle = cycle;
       state.phase = Phase::Reconciling;
@@ -229,6 +241,7 @@ impl Controller {
         .iter()
         .map(|record| record.discovery.clone())
         .collect();
+      let evidence_for_worker = evidence_graph::projections(&evidence_graph)?;
       let backend = self.backend.clone();
       let reconciliation = self
         .read_only_worker(
@@ -241,6 +254,7 @@ impl Controller {
                 &catalog_for_worker,
                 &completed_for_worker,
                 &discoveries_for_worker,
+                &evidence_for_worker,
               )
               .await
           },
@@ -265,7 +279,7 @@ impl Controller {
         record.status = DiscoveryStatus::Consumed;
       }
       store::write_roadmap(&self.cwd, &reconciliation).await?;
-      state.requirement_counts = requirement_counts(&catalog, &reconciliation);
+      state.requirement_counts = requirement_counts(&catalog, &reconciliation, &evidence_graph)?;
       state.last_summary.clone_from(&reconciliation.summary);
       context
         .events
@@ -273,8 +287,11 @@ impl Controller {
         .await?;
       self.publish(&context.events, state).await?;
 
-      if reconciliation.complete && all_satisfied(&catalog, &reconciliation) {
-        if let Some(final_state) = self.finalize(context, state, &catalog).await? {
+      if reconciliation.work_units.is_empty() {
+        if let Some(final_state) = self
+          .finalize(context, state, &catalog, &mut evidence_graph)
+          .await?
+        {
           return Ok(final_state);
         }
         continue;
@@ -403,7 +420,14 @@ impl Controller {
       self.publish(&context.events, state).await?;
 
       let integrated = self
-        .integrate_candidates(context, state, &run_id, base_revision, candidates)
+        .integrate_candidates(
+          context,
+          state,
+          &run_id,
+          base_revision,
+          candidates,
+          &mut evidence_graph,
+        )
         .await?;
       if !integrated {
         return Ok(state.clone());
@@ -432,6 +456,7 @@ impl Controller {
     run_id: &str,
     base_revision: String,
     candidates: Vec<WorkExecution>,
+    evidence_graph: &mut EvidenceGraphState,
   ) -> Result<bool> {
     let workspaces = WorkspaceManager::new(self.cwd.clone(), run_id);
     let mut integrator = Integrator::create_with_cancel(
@@ -464,9 +489,24 @@ impl Controller {
       match integrator.integrate(&candidate).await? {
         IntegrationOutcome::Accepted {
           revision,
-          verification: _,
+          verification,
           mut transaction,
         } => {
+          self
+            .invalidate_evidence(context, evidence_graph, &revision)
+            .await?;
+          self
+            .record_verification_evidence(
+              context,
+              evidence_graph,
+              &revision,
+              &candidate.verification,
+              &candidate.lease.work_unit.suggested_checks,
+            )
+            .await?;
+          self
+            .record_verification_evidence(context, evidence_graph, &revision, &verification, &[])
+            .await?;
           state.completed_work_units.push(CompletedWorkUnit {
             work_unit: transaction.work_unit.clone(),
             completed_at: Utc::now().to_rfc3339(),
@@ -514,15 +554,21 @@ impl Controller {
     context: &BackendContext,
     state: &mut State,
     catalog: &RequirementCatalog,
+    evidence_graph: &mut EvidenceGraphState,
   ) -> Result<Option<State>> {
     let verified_revision = git::head(&self.cwd).await?;
     state.phase = Phase::Verifying;
     state.last_summary = "Running final deterministic verification".into();
     self.publish(&context.events, state).await?;
-    let report = self.verify_revision(context, &verified_revision).await?;
+    let report = self
+      .verify_revision(context, &verified_revision, catalog)
+      .await?;
     context
       .events
       .emit(RunEvent::Verification(report.clone()))
+      .await?;
+    self
+      .record_verification_evidence(context, evidence_graph, &verified_revision, &report, &[])
       .await?;
     if !report.passed {
       return Ok(Some(
@@ -531,11 +577,23 @@ impl Controller {
           .await?,
       ));
     }
+    if !evidence_graph.all_required_verified(&EvidencePolicy) {
+      return Ok(Some(
+        self
+          .block(
+            context,
+            state,
+            "Final verification did not establish every mandatory verification obligation",
+          )
+          .await?,
+      ));
+    }
 
     state.phase = Phase::Assessing;
-    state.last_summary = "Independent fresh-context completion assessment".into();
+    state.last_summary = "Independent skeptical evidence-gap assessment".into();
     self.publish(&context.events, state).await?;
     let catalog_for_worker = catalog.clone();
+    let evidence_for_worker = evidence_graph::projections(evidence_graph)?;
     let backend = self.backend.clone();
     let assessment = self
       .read_only_worker(
@@ -543,7 +601,11 @@ impl Controller {
         "assessment",
         move |inspection_context| async move {
           backend
-            .assess(&inspection_context, &catalog_for_worker)
+            .assess(
+              &inspection_context,
+              &catalog_for_worker,
+              &evidence_for_worker,
+            )
             .await
         },
       )
@@ -551,13 +613,13 @@ impl Controller {
     validate_reconcile(catalog, &assessment)?;
     WorkGraph::from_reconcile(catalog, &assessment)?;
     store::write_roadmap(&self.cwd, &assessment).await?;
-    state.requirement_counts = requirement_counts(catalog, &assessment);
+    state.requirement_counts = requirement_counts(catalog, &assessment, evidence_graph)?;
     state.last_summary.clone_from(&assessment.summary);
     context
       .events
       .emit(RunEvent::Reconcile(assessment.clone()))
       .await?;
-    if !(assessment.complete && all_satisfied(catalog, &assessment)) {
+    if !assessment.work_units.is_empty() {
       self.publish(&context.events, state).await?;
       return Ok(None);
     }
@@ -575,7 +637,9 @@ impl Controller {
           .await?,
       ));
     }
-
+    if !evidence_graph.all_required_verified(&EvidencePolicy) {
+      bail!("completion requires every mandatory evidence obligation to remain verified");
+    }
     if !state.active_leases.is_empty() || !state.candidate_integrations.is_empty() {
       bail!("completion requires no active lease or unresolved candidate integration");
     }
@@ -584,7 +648,8 @@ impl Controller {
     }
     state.status = RunStatus::Done;
     state.phase = Phase::Complete;
-    state.last_summary = "All requirements have evidence and deterministic gates pass".into();
+    state.last_summary =
+      "All requirements have valid revision-bound evidence and deterministic gates pass".into();
     Ok(Some(state.clone()))
   }
 
@@ -596,8 +661,7 @@ impl Controller {
     let (spec, spec_hash) = store::spec_text_and_hash(&self.cwd, &context.config).await?;
     let cached = store::read_catalog(&self.cwd).await?;
     if let Some(catalog) = &cached {
-      validate_requirements(&catalog.requirements)
-        .context("cached requirement catalog is invalid")?;
+      validate_catalog(catalog).context("cached requirement catalog is invalid")?;
       if catalog.spec_hash == spec_hash {
         context
           .events
@@ -620,11 +684,13 @@ impl Controller {
         backend.architect(&inspection_context, &spec).await
       })
       .await?;
-    validate_requirements(&output.requirements)?;
     let catalog = RequirementCatalog {
       spec_hash,
       requirements: output.requirements,
+      acceptance_criteria: output.acceptance_criteria,
+      verification_obligations: output.verification_obligations,
     };
+    validate_catalog(&catalog)?;
     store::write_catalog(&self.cwd, &catalog).await?;
     context
       .events
@@ -641,6 +707,7 @@ impl Controller {
     &self,
     context: &BackendContext,
     revision: &str,
+    catalog: &RequirementCatalog,
   ) -> Result<VerificationReport> {
     let canonical_before = git::repository_state(&self.cwd).await?;
     let run_id = context
@@ -652,8 +719,17 @@ impl Controller {
     let workspace = workspaces
       .create_disposable("final-verification", revision)
       .await?;
-    let result =
-      verifier::run_verification_cancelled(&workspace, &context.config, &context.cancel).await;
+    let result = verifier::run_verification_with_checks_cancelled(
+      &workspace,
+      &context.config,
+      catalog
+        .verification_obligations
+        .iter()
+        .filter(|obligation| obligation.required)
+        .map(|obligation| obligation.command.as_str()),
+      &context.cancel,
+    )
+    .await;
     let cleanup = workspaces.remove(&workspace).await;
     if let Err(cleanup) = cleanup {
       return match result {
@@ -667,6 +743,126 @@ impl Controller {
       bail!("final verification command modified canonical repository state");
     }
     result
+  }
+  async fn record_verification_evidence(
+    &self,
+    context: &BackendContext,
+    graph: &mut EvidenceGraphState,
+    revision: &str,
+    report: &VerificationReport,
+    bindings: &[CandidateCheck],
+  ) -> Result<()> {
+    let requirement_before = evidence_graph::verification_states(graph)?;
+    let criterion_before = evidence_graph::criterion_states(graph)?;
+    let ids = evidence_graph::record_report_with_bindings(
+      graph,
+      revision,
+      report,
+      bindings
+        .iter()
+        .map(|binding| (&binding.obligation_id, binding.command.as_str())),
+    )?;
+    if ids.is_empty() {
+      return Ok(());
+    }
+    store::write_evidence_graph(&self.cwd, graph).await?;
+    for id in ids {
+      let evidence = graph.evidence[&id].clone();
+      let event = if evidence.result == EvidenceResult::Failed {
+        RunEvent::EvidenceFailed(evidence.clone())
+      } else {
+        RunEvent::EvidenceEstablished(evidence.clone())
+      };
+      context.events.emit(event).await?;
+      let related: Vec<_> = graph
+        .evidence
+        .values()
+        .filter(|item| item.obligation_id == evidence.obligation_id)
+        .collect();
+      if related.iter().any(|item| EvidencePolicy.authorizes(item))
+        && related.iter().any(|item| EvidencePolicy.blocks(item))
+      {
+        context
+          .events
+          .emit(RunEvent::EvidenceContradiction {
+            obligation_id: evidence.obligation_id,
+            evidence_ids: related.iter().map(|item| item.id).collect(),
+          })
+          .await?;
+      }
+    }
+    self
+      .emit_verification_transitions(context, graph, requirement_before, criterion_before)
+      .await
+  }
+
+  async fn invalidate_evidence(
+    &self,
+    context: &BackendContext,
+    graph: &mut EvidenceGraphState,
+    revision: &str,
+  ) -> Result<()> {
+    let requirement_before = evidence_graph::verification_states(graph)?;
+    let criterion_before = evidence_graph::criterion_states(graph)?;
+    let invalidated = evidence_graph::invalidate_for_revision(&self.cwd, graph, revision).await?;
+    if invalidated.is_empty() {
+      return Ok(());
+    }
+    store::write_evidence_graph(&self.cwd, graph).await?;
+    for evidence_id in invalidated {
+      context
+        .events
+        .emit(RunEvent::EvidenceInvalidated {
+          evidence_id,
+          revision: revision.to_owned(),
+        })
+        .await?;
+    }
+    self
+      .emit_verification_transitions(context, graph, requirement_before, criterion_before)
+      .await
+  }
+
+  async fn emit_verification_transitions(
+    &self,
+    context: &BackendContext,
+    graph: &EvidenceGraphState,
+    requirement_before: BTreeMap<RequirementId, VerificationState>,
+    criterion_before: BTreeMap<CriterionId, VerificationState>,
+  ) -> Result<()> {
+    for (criterion_id, current) in evidence_graph::criterion_states(graph)? {
+      let previous = criterion_before
+        .get(&criterion_id)
+        .copied()
+        .unwrap_or(VerificationState::Unverified);
+      if previous != current {
+        context
+          .events
+          .emit(RunEvent::CriterionVerificationChanged {
+            criterion_id,
+            previous,
+            current,
+          })
+          .await?;
+      }
+    }
+    for (requirement_id, current) in evidence_graph::verification_states(graph)? {
+      let previous = requirement_before
+        .get(&requirement_id)
+        .copied()
+        .unwrap_or(VerificationState::Unverified);
+      if previous != current {
+        context
+          .events
+          .emit(RunEvent::RequirementVerificationChanged {
+            requirement_id,
+            previous,
+            current,
+          })
+          .await?;
+      }
+    }
+    Ok(())
   }
 
   async fn read_only_worker<T, F, Fut>(
@@ -772,32 +968,89 @@ impl Controller {
   }
 }
 
-fn validate_requirements(requirements: &[tenet_domain::model::Requirement]) -> Result<()> {
-  if requirements.is_empty() {
+fn validate_catalog(catalog: &RequirementCatalog) -> Result<()> {
+  if catalog.requirements.is_empty() {
     bail!("architect produced no requirements");
   }
-  for (index, requirement) in requirements.iter().enumerate() {
+  let mut requirement_ids = BTreeSet::new();
+  for (index, requirement) in catalog.requirements.iter().enumerate() {
     let expected = format!("REQ-{:03}", index + 1);
-    if requirement.id != expected {
+    if requirement.id.as_str() != expected {
       bail!(
         "requirement id {} is unstable; expected {expected}",
         requirement.id
       );
     }
-    if requirement.title.trim().is_empty()
-      || requirement.description.trim().is_empty()
-      || requirement.acceptance_criteria.is_empty()
-      || requirement
-        .acceptance_criteria
-        .iter()
-        .any(|criterion| criterion.trim().is_empty())
-    {
-      bail!(
-        "{} is missing title, description, or acceptance criteria",
-        requirement.id
-      );
+    if !requirement_ids.insert(requirement.id.clone()) {
+      bail!("duplicate requirement id {}", requirement.id);
+    }
+    if requirement.title.trim().is_empty() || requirement.description.trim().is_empty() {
+      bail!("{} is missing title or description", requirement.id);
     }
   }
+
+  let mut criterion_ids = BTreeSet::new();
+  for requirement in &catalog.requirements {
+    let criteria: Vec<_> = catalog
+      .acceptance_criteria
+      .iter()
+      .filter(|criterion| criterion.requirement_id == requirement.id)
+      .collect();
+    if requirement.required && !criteria.iter().any(|criterion| criterion.mandatory) {
+      bail!("{} has no mandatory acceptance criterion", requirement.id);
+    }
+    for (index, criterion) in criteria.iter().enumerate() {
+      let expected = format!("{}/AC-{:02}", requirement.id, index + 1);
+      if criterion.id.as_str() != expected {
+        bail!(
+          "criterion id {} is unstable; expected {expected}",
+          criterion.id
+        );
+      }
+      if !criterion_ids.insert(criterion.id.clone()) {
+        bail!("duplicate criterion id {}", criterion.id);
+      }
+    }
+  }
+  if catalog
+    .acceptance_criteria
+    .iter()
+    .any(|criterion| !requirement_ids.contains(&criterion.requirement_id))
+  {
+    bail!("acceptance criterion targets an unknown requirement");
+  }
+
+  let mut obligation_ids = BTreeSet::new();
+  for criterion in &catalog.acceptance_criteria {
+    let obligations: Vec<_> = catalog
+      .verification_obligations
+      .iter()
+      .filter(|obligation| obligation.criterion_id == criterion.id)
+      .collect();
+    if criterion.mandatory && !obligations.iter().any(|obligation| obligation.required) {
+      bail!("{} has no required verification obligation", criterion.id);
+    }
+    for (index, obligation) in obligations.iter().enumerate() {
+      let expected = format!("{}/VO-{:02}", criterion.id, index + 1);
+      if obligation.id.as_str() != expected {
+        bail!(
+          "verification obligation id {} is unstable; expected {expected}",
+          obligation.id
+        );
+      }
+      if !obligation_ids.insert(obligation.id.clone()) {
+        bail!("duplicate verification obligation id {}", obligation.id);
+      }
+    }
+  }
+  if catalog
+    .verification_obligations
+    .iter()
+    .any(|obligation| !criterion_ids.contains(&obligation.criterion_id))
+  {
+    bail!("verification obligation targets an unknown acceptance criterion");
+  }
+  evidence_graph::graph_from_catalog(catalog)?;
   Ok(())
 }
 
@@ -805,49 +1058,109 @@ fn validate_reconcile(catalog: &RequirementCatalog, result: &ReconcileResult) ->
   let expected: BTreeSet<_> = catalog
     .requirements
     .iter()
-    .map(|item| item.id.as_str())
+    .map(|item| item.id.clone())
     .collect();
   let actual: BTreeSet<_> = result
     .requirements
     .iter()
-    .map(|item| item.id.as_str())
+    .map(|item| item.requirement_id.clone())
     .collect();
   if expected != actual || actual.len() != result.requirements.len() {
     bail!("reconciliation assessment IDs do not match the requirement catalog");
   }
+  let criterion_requirements: BTreeMap<_, _> = catalog
+    .acceptance_criteria
+    .iter()
+    .map(|criterion| (criterion.id.clone(), criterion.requirement_id.clone()))
+    .collect();
+  let obligation_criteria: BTreeMap<_, _> = catalog
+    .verification_obligations
+    .iter()
+    .map(|obligation| (obligation.id.clone(), obligation.criterion_id.clone()))
+    .collect();
+  let mut implementation_gap = false;
   for assessment in &result.requirements {
-    match assessment.status {
-      RequirementStatus::Satisfied => {
-        if assessment.evidence.is_empty()
-          || assessment
-            .evidence
-            .iter()
-            .any(|evidence| evidence.trim().is_empty())
-          || !assessment.gaps.is_empty()
-        {
+    if assessment
+      .observations
+      .iter()
+      .chain(&assessment.missing_implementation)
+      .any(|value| value.trim().is_empty())
+    {
+      bail!(
+        "{} contains a blank implementation observation",
+        assessment.requirement_id
+      );
+    }
+    match assessment.implementation_state {
+      ImplementationState::Present if !assessment.missing_implementation.is_empty() => {
+        bail!(
+          "present implementation {} cannot report implementation gaps",
+          assessment.requirement_id
+        )
+      }
+      ImplementationState::Partial | ImplementationState::Absent | ImplementationState::Unknown => {
+        implementation_gap = true;
+        if assessment.missing_implementation.is_empty() {
           bail!(
-            "satisfied requirement {} requires nonblank evidence and no gaps",
-            assessment.id
+            "incomplete implementation {} requires a concrete gap",
+            assessment.requirement_id
           );
         }
       }
-      RequirementStatus::Partial | RequirementStatus::Missing => {
-        if assessment.gaps.is_empty() || assessment.gaps.iter().any(|gap| gap.trim().is_empty()) {
-          bail!(
-            "incomplete requirement {} requires at least one nonblank gap",
-            assessment.id
-          );
-        }
+      ImplementationState::Present => {}
+    }
+    for obligation_id in &assessment.missing_evidence {
+      let Some(criterion_id) = obligation_criteria.get(obligation_id) else {
+        bail!(
+          "{} reports an unknown missing evidence obligation",
+          assessment.requirement_id
+        );
+      };
+      if criterion_requirements.get(criterion_id) != Some(&assessment.requirement_id) {
+        bail!(
+          "{} reports missing evidence owned by another requirement",
+          assessment.requirement_id
+        );
       }
     }
   }
-  if result.complete && (!all_satisfied(catalog, result) || !result.work_units.is_empty()) {
-    bail!("reconciliation claimed complete without every requirement satisfied and workUnits=[]");
+  for work in &result.work_units {
+    for criterion_id in &work.criterion_ids {
+      let requirement_id = criterion_requirements
+        .get(criterion_id)
+        .context("work unit targets an unknown acceptance criterion")?;
+      if !work.requirement_ids.contains(requirement_id) {
+        bail!(
+          "{} criterion relationships do not match its requirements",
+          work.id
+        );
+      }
+    }
+    for obligation_id in &work.verification_obligation_ids {
+      let criterion_id = obligation_criteria
+        .get(obligation_id)
+        .context("work unit targets an unknown verification obligation")?;
+      if !work.criterion_ids.contains(criterion_id) {
+        bail!(
+          "{} obligation relationships do not match its criteria",
+          work.id
+        );
+      }
+    }
+    if work.suggested_checks.iter().any(|check| {
+      !work
+        .verification_obligation_ids
+        .contains(&check.obligation_id)
+    }) {
+      bail!(
+        "{} binds a check outside its verification obligations",
+        work.id
+      );
+    }
   }
-  if !result.complete && result.work_units.is_empty() {
-    bail!("reconciliation found incomplete requirements but proposed no work units");
+  if implementation_gap && result.work_units.is_empty() {
+    bail!("implementation gaps require at least one proposed work unit");
   }
-
   Ok(())
 }
 async fn progress_fingerprint(
@@ -882,32 +1195,38 @@ fn advance_stagnation(state: &mut State, fingerprint: String, limit: u32) -> boo
   state.stagnation_count >= limit
 }
 
-fn all_satisfied(catalog: &RequirementCatalog, result: &ReconcileResult) -> bool {
-  result.requirements.len() == catalog.requirements.len()
-    && result
-      .requirements
-      .iter()
-      .all(|item| item.status == RequirementStatus::Satisfied)
-}
-
-fn requirement_counts(catalog: &RequirementCatalog, result: &ReconcileResult) -> RequirementCounts {
-  let by_id: BTreeMap<_, _> = result
+fn requirement_counts(
+  catalog: &RequirementCatalog,
+  result: &ReconcileResult,
+  graph: &EvidenceGraphState,
+) -> Result<RequirementCounts> {
+  let implementations: BTreeMap<_, _> = result
     .requirements
     .iter()
-    .map(|item| (item.id.as_str(), &item.status))
+    .map(|item| (item.requirement_id.clone(), item.implementation_state))
     .collect();
   let mut counts = RequirementCounts {
     total: catalog.requirements.len(),
     ..Default::default()
   };
   for requirement in &catalog.requirements {
-    match by_id.get(requirement.id.as_str()).copied() {
-      Some(RequirementStatus::Satisfied) => counts.satisfied += 1,
-      Some(RequirementStatus::Partial) => counts.partial += 1,
-      _ => counts.missing += 1,
+    match graph.requirement_verification_state(&requirement.id, &EvidencePolicy)? {
+      VerificationState::Verified => counts.verified += 1,
+      VerificationState::PartiallyVerified => counts.partially_verified += 1,
+      VerificationState::Unverified => counts.unverified += 1,
+      VerificationState::Stale => counts.stale += 1,
+      VerificationState::Contradicted => counts.contradicted += 1,
+    }
+    if implementations.get(&requirement.id).is_some_and(|state| {
+      matches!(
+        state,
+        ImplementationState::Partial | ImplementationState::Absent | ImplementationState::Unknown
+      )
+    }) {
+      counts.missing_implementation += 1;
     }
   }
-  counts
+  Ok(counts)
 }
 fn record_candidate_discoveries(
   state: &mut State,
@@ -966,99 +1285,138 @@ fn integration_failure(outcome: &IntegrationOutcome) -> String {
 
 pub async fn manual_verify(cwd: &Path) -> Result<VerificationReport> {
   let config = ensure_config(cwd).await?;
-  let report = verifier::run_verification(cwd, &config).await?;
-  let _ = store::save_evidence(cwd, &format!("manual-{}", Utc::now().timestamp()), &report).await?;
+  let catalog = store::read_catalog(cwd)
+    .await?
+    .context("manual verification requires an initialized requirement catalog")?;
+  validate_catalog(&catalog)?;
+  let revision = git::head(cwd).await?;
+  let report = verifier::run_verification_with_checks_cancelled(
+    cwd,
+    &config,
+    catalog
+      .verification_obligations
+      .iter()
+      .filter(|obligation| obligation.required)
+      .map(|obligation| obligation.command.as_str()),
+    &CancellationToken::new(),
+  )
+  .await?;
+  let mut graph = store::read_evidence_graph(cwd, &catalog).await?;
+  evidence_graph::invalidate_for_revision(cwd, &mut graph, &revision).await?;
+  evidence_graph::record_report(&mut graph, &revision, &report)?;
+  store::write_evidence_graph(cwd, &graph).await?;
   Ok(report)
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use tenet_domain::model::{Requirement, RequirementAssessment};
+  use tenet_domain::{
+    evidence::{AcceptanceCriterion, VerificationKind, VerificationObligation},
+    ids::{ObligationId, RequirementId},
+    model::{Requirement, RequirementAssessment},
+  };
 
   fn catalog() -> RequirementCatalog {
     RequirementCatalog {
       spec_hash: "spec".into(),
       requirements: vec![Requirement {
-        id: "REQ-001".into(),
+        id: RequirementId::from("REQ-001"),
         title: "Requirement".into(),
         description: "Description".into(),
-        acceptance_criteria: vec!["Observable result".into()],
+        required: true,
+      }],
+      acceptance_criteria: vec![AcceptanceCriterion {
+        id: CriterionId::from("REQ-001/AC-01"),
+        requirement_id: RequirementId::from("REQ-001"),
+        description: "Observable result".into(),
+        mandatory: true,
+      }],
+      verification_obligations: vec![VerificationObligation {
+        id: ObligationId::from("REQ-001/AC-01/VO-01"),
+        criterion_id: CriterionId::from("REQ-001/AC-01"),
+        description: "Run test".into(),
+        kind: VerificationKind::AutomatedTest,
+        required: true,
+        command: "cargo test".into(),
+        dependency_scope: vec!["src/**".into()],
       }],
     }
   }
 
-  fn result(status: RequirementStatus, evidence: Vec<&str>, gaps: Vec<&str>) -> ReconcileResult {
-    let complete = status == RequirementStatus::Satisfied;
+  fn result(state: ImplementationState, gaps: Vec<&str>, with_work: bool) -> ReconcileResult {
     ReconcileResult {
-      complete,
       summary: "assessment".into(),
       requirements: vec![RequirementAssessment {
-        id: "REQ-001".into(),
-        status,
-        evidence: evidence.into_iter().map(str::to_owned).collect(),
-        gaps: gaps.into_iter().map(str::to_owned).collect(),
+        requirement_id: RequirementId::from("REQ-001"),
+        implementation_state: state,
+        observations: vec!["src/lib.rs contains the implementation".into()],
+        missing_implementation: gaps.into_iter().map(str::to_owned).collect(),
+        missing_evidence: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
       }],
-      work_units: if complete {
-        Vec::new()
-      } else {
+      work_units: if with_work {
         vec![tenet_domain::model::WorkUnit {
           id: "A".into(),
           title: "Work".into(),
           objective: "Implement".into(),
-          requirement_ids: vec!["REQ-001".into()],
-          acceptance_criteria: vec!["Done".into()],
+          requirement_ids: vec![RequirementId::from("REQ-001")],
+          criterion_ids: vec![CriterionId::from("REQ-001/AC-01")],
+          verification_obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
           suggested_checks: Vec::new(),
           depends_on: Vec::new(),
           scope: tenet_domain::model::WorkScope {
             paths: vec!["src/**".into()],
           },
         }]
+      } else {
+        Vec::new()
       },
     }
   }
 
   #[test]
-  fn satisfied_requirement_without_evidence_is_rejected() {
-    let error = validate_reconcile(
+  fn present_implementation_with_missing_evidence_is_a_valid_proposal() {
+    assert!(validate_reconcile(
       &catalog(),
-      &result(RequirementStatus::Satisfied, Vec::new(), Vec::new()),
+      &result(ImplementationState::Present, Vec::new(), false)
     )
-    .expect_err("empty evidence rejected");
-
-    assert!(error.to_string().contains("requires nonblank evidence"));
+    .is_ok());
   }
 
   #[test]
-  fn satisfied_requirement_with_gap_is_rejected() {
+  fn incomplete_implementation_requires_a_concrete_gap() {
     let error = validate_reconcile(
       &catalog(),
-      &result(RequirementStatus::Satisfied, vec!["proof"], vec!["gap"]),
-    )
-    .expect_err("satisfied gap rejected");
-
-    assert!(error.to_string().contains("and no gaps"));
-  }
-
-  #[test]
-  fn missing_requirement_without_gap_is_rejected() {
-    let error = validate_reconcile(
-      &catalog(),
-      &result(RequirementStatus::Missing, Vec::new(), Vec::new()),
+      &result(ImplementationState::Absent, Vec::new(), true),
     )
     .expect_err("missing gap rejected");
 
+    assert!(error.to_string().contains("requires a concrete gap"));
+  }
+
+  #[test]
+  fn implementation_gap_requires_proposed_work() {
+    let error = validate_reconcile(
+      &catalog(),
+      &result(
+        ImplementationState::Partial,
+        vec!["missing behavior"],
+        false,
+      ),
+    )
+    .expect_err("missing work rejected");
+
     assert!(error
       .to_string()
-      .contains("requires at least one nonblank gap"));
+      .contains("require at least one proposed work unit"));
   }
 
   #[test]
   fn blank_catalog_acceptance_criterion_is_rejected() {
     let mut invalid = catalog();
-    invalid.requirements[0].acceptance_criteria = vec![" ".into()];
+    invalid.acceptance_criteria[0].description = " ".into();
 
-    assert!(validate_requirements(&invalid.requirements).is_err());
+    assert!(validate_catalog(&invalid).is_err());
   }
 }
 

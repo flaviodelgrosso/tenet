@@ -17,16 +17,26 @@ pub struct WorkGraph {
 
 impl WorkGraph {
   pub fn from_reconcile(catalog: &RequirementCatalog, result: &ReconcileResult) -> Result<Self> {
-    let known_requirements: BTreeSet<_> = catalog
+    let known_requirements = catalog
       .requirements
       .iter()
-      .map(|item| item.id.as_str())
+      .map(|item| item.id.clone())
+      .collect();
+    let known_criteria = catalog
+      .acceptance_criteria
+      .iter()
+      .map(|item| item.id.clone())
+      .collect();
+    let known_obligations = catalog
+      .verification_obligations
+      .iter()
+      .map(|item| item.id.clone())
       .collect();
     let mut graph = StableDiGraph::new();
     let mut by_id = BTreeMap::new();
 
     for unit in &result.work_units {
-      unit.validate(&known_requirements)?;
+      unit.validate(&known_requirements, &known_criteria, &known_obligations)?;
       if by_id.contains_key(&unit.id) {
         bail!("duplicate work unit id {}", unit.id);
       }
@@ -88,16 +98,37 @@ impl WorkGraph {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use tenet_domain::model::{Requirement, RequirementAssessment, RequirementStatus, WorkScope};
+  use tenet_domain::{
+    evidence::{
+      AcceptanceCriterion, ImplementationState, VerificationKind, VerificationObligation,
+    },
+    ids::{CriterionId, ObligationId, RequirementId},
+    model::{CandidateCheck, Requirement, RequirementAssessment, WorkScope},
+  };
 
   fn catalog() -> RequirementCatalog {
     RequirementCatalog {
       spec_hash: "hash".into(),
       requirements: vec![Requirement {
-        id: "REQ-001".into(),
+        id: RequirementId::from("REQ-001"),
         title: "Requirement".into(),
         description: "Description".into(),
-        acceptance_criteria: vec!["Observable".into()],
+        required: true,
+      }],
+      acceptance_criteria: vec![AcceptanceCriterion {
+        id: CriterionId::from("REQ-001/AC-01"),
+        requirement_id: RequirementId::from("REQ-001"),
+        description: "Observable".into(),
+        mandatory: true,
+      }],
+      verification_obligations: vec![VerificationObligation {
+        id: ObligationId::from("REQ-001/AC-01/VO-01"),
+        criterion_id: CriterionId::from("REQ-001/AC-01"),
+        description: "Run check".into(),
+        kind: VerificationKind::Command,
+        required: true,
+        command: "cargo test".into(),
+        dependency_scope: vec!["src/**".into()],
       }],
     }
   }
@@ -107,8 +138,9 @@ mod tests {
       id: id.into(),
       title: id.into(),
       objective: format!("Implement {id}"),
-      requirement_ids: vec!["REQ-001".into()],
-      acceptance_criteria: vec!["Passes".into()],
+      requirement_ids: vec![RequirementId::from("REQ-001")],
+      criterion_ids: vec![CriterionId::from("REQ-001/AC-01")],
+      verification_obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
       suggested_checks: Vec::new(),
       depends_on: dependencies.iter().map(|value| (*value).into()).collect(),
       scope: WorkScope {
@@ -119,13 +151,13 @@ mod tests {
 
   fn reconcile(units: Vec<WorkUnit>) -> ReconcileResult {
     ReconcileResult {
-      complete: false,
       summary: "work remains".into(),
       requirements: vec![RequirementAssessment {
-        id: "REQ-001".into(),
-        status: RequirementStatus::Missing,
-        evidence: Vec::new(),
-        gaps: vec!["missing".into()],
+        requirement_id: RequirementId::from("REQ-001"),
+        implementation_state: ImplementationState::Absent,
+        observations: Vec::new(),
+        missing_implementation: vec!["missing".into()],
+        missing_evidence: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
       }],
       work_units: units,
     }
@@ -189,7 +221,7 @@ mod tests {
   #[test]
   fn graph_rejects_unknown_requirement() {
     let mut invalid = unit("A", &[]);
-    invalid.requirement_ids = vec!["REQ-404".into()];
+    invalid.requirement_ids = vec![RequirementId::from("REQ-404")];
 
     let error = WorkGraph::from_reconcile(&catalog(), &reconcile(vec![invalid]))
       .err()
@@ -221,8 +253,10 @@ mod tests {
   #[test]
   fn graph_rejects_markdown_check_descriptions() {
     let mut invalid = unit("A", &[]);
-    invalid.suggested_checks =
-      vec!["Run `cargo run --quiet` and verify stdout is a datetime value.".into()];
+    invalid.suggested_checks = vec![CandidateCheck {
+      obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+      command: "Run `cargo run --quiet` and verify stdout is a datetime value.".into(),
+    }];
 
     let error = WorkGraph::from_reconcile(&catalog(), &reconcile(vec![invalid]))
       .err()

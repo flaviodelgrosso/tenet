@@ -6,11 +6,14 @@ use ratatui::{
   Frame,
 };
 
-use tenet_domain::model::{RequirementStatus, RunStatus, VerificationReport};
+use tenet_domain::{
+  evidence::VerificationState,
+  model::{RunStatus, VerificationReport},
+};
 
 use crate::tui::{
   action::{ActivityCategory, Overlay, Screen},
-  app::{failure_preview, requirement_status, status_label, Activity, Application},
+  app::{failure_preview, status_label, Activity, Application},
   layout::{self, Density},
   theme,
 };
@@ -208,12 +211,12 @@ fn terminal_summary(app: &Application, density: Density) -> Option<Line<'static>
       let detail = if density == Density::Narrow {
         format!(
           "{}/{} requirements",
-          state.requirement_counts.satisfied, state.requirement_counts.total
+          state.requirement_counts.verified, state.requirement_counts.total
         )
       } else {
         format!(
           "{}/{} requirements · {} cycles · {} work units",
-          state.requirement_counts.satisfied,
+          state.requirement_counts.verified,
           state.requirement_counts.total,
           state.cycle,
           state.completed_work_units.len()
@@ -339,22 +342,22 @@ fn idle_screen(frame: &mut Frame<'_>, app: &Application, area: Rect) {
     section_line("REQUIREMENT HEALTH"),
     Line::from(vec![
       Span::styled(
-        format!("{} ✓", state.requirement_counts.satisfied),
+        format!("{} ✓", state.requirement_counts.verified),
         theme::success(),
       ),
       Span::styled(
-        format!("   {} ◐", state.requirement_counts.partial),
+        format!("   {} ◐", state.requirement_counts.partially_verified),
         theme::warning(),
       ),
       Span::styled(
-        format!("   {} ○", state.requirement_counts.missing),
+        format!("   {} ○", state.requirement_counts.unverified),
         theme::muted(),
       ),
       Span::styled(
         format!(
           "   {}",
           progress_meter(
-            state.requirement_counts.satisfied,
+            state.requirement_counts.verified,
             state.requirement_counts.total,
             14
           )
@@ -388,7 +391,15 @@ fn context_pane(frame: &mut Frame<'_>, app: &Application, area: Rect) {
       lines.extend([
         Line::styled(work.id.clone(), theme::accent()),
         Line::styled(work.title.clone(), theme::heading()),
-        Line::styled(work.requirement_ids.join("  ·  "), theme::muted()),
+        Line::styled(
+          work
+            .requirement_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("  ·  "),
+          theme::muted(),
+        ),
       ]);
     }
   }
@@ -397,21 +408,21 @@ fn context_pane(frame: &mut Frame<'_>, app: &Application, area: Rect) {
     section_line("REQUIREMENTS"),
     Line::from(vec![
       Span::styled(
-        format!("{} ✓", state.requirement_counts.satisfied),
+        format!("{} ✓", state.requirement_counts.verified),
         theme::success(),
       ),
       Span::styled(
-        format!("   {} ◐", state.requirement_counts.partial),
+        format!("   {} ◐", state.requirement_counts.partially_verified),
         theme::warning(),
       ),
       Span::styled(
-        format!("   {} ○", state.requirement_counts.missing),
+        format!("   {} ○", state.requirement_counts.unverified),
         theme::muted(),
       ),
     ]),
     Line::styled(
       progress_meter(
-        state.requirement_counts.satisfied,
+        state.requirement_counts.verified,
         state.requirement_counts.total,
         18,
       ),
@@ -469,7 +480,7 @@ fn requirements_screen(frame: &mut Frame<'_>, app: &Application, area: Rect, den
   }
   for (selected, index) in visible.iter().enumerate() {
     if let Some(requirement) = app.catalog().get(*index) {
-      let status = requirement_status(app.assessments().get(&requirement.id));
+      let status = app.verification_state(requirement.id.as_str());
       let label = if density == Density::Narrow {
         String::new()
       } else {
@@ -522,11 +533,11 @@ fn requirement_detail_pane(frame: &mut Frame<'_>, app: &Application, area: Rect)
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
     return;
   };
-  let assessment = app.assessments().get(&item.id);
-  let status = requirement_status(assessment);
+  let assessment = app.assessments().get(item.id.as_str());
+  let status = app.verification_state(item.id.as_str());
   lines.extend([
     Line::raw(""),
-    Line::styled(item.id.clone(), theme::accent()),
+    Line::styled(item.id.to_string(), theme::accent()),
     Line::styled(item.title.clone(), theme::heading()),
     Line::from(vec![Span::styled(
       status_text(&status),
@@ -536,25 +547,47 @@ fn requirement_detail_pane(frame: &mut Frame<'_>, app: &Application, area: Rect)
     section_line("DESCRIPTION"),
     Line::styled(item.description.clone(), theme::secondary()),
     Line::raw(""),
-    section_line("GAPS"),
+    section_line("IMPLEMENTATION GAPS"),
   ]);
   lines.extend(detail_bullets(
-    assessment.map(|value| value.gaps.as_slice()).unwrap_or(&[]),
-    "No gaps assessed yet",
+    assessment
+      .map(|value| value.missing_implementation.as_slice())
+      .unwrap_or(&[]),
+    "No implementation gaps assessed",
     theme::failure(),
   ));
-  lines.extend([Line::raw(""), section_line("EVIDENCE")]);
+  lines.extend([Line::raw(""), section_line("OBSERVATIONS (ADVISORY)")]);
   lines.extend(detail_bullets(
     assessment
-      .map(|value| value.evidence.as_slice())
+      .map(|value| value.observations.as_slice())
       .unwrap_or(&[]),
-    "No evidence assessed yet",
+    "No model observations",
     theme::muted(),
   ));
+  let missing_evidence = assessment
+    .map(|value| {
+      value
+        .missing_evidence
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+    })
+    .unwrap_or_default();
+  lines.extend([Line::raw(""), section_line("MISSING EVIDENCE")]);
+  lines.extend(detail_bullets(
+    &missing_evidence,
+    "No missing obligations reported",
+    theme::muted(),
+  ));
+  let criteria = app
+    .criteria_for(item.id.as_str())
+    .iter()
+    .map(|criterion| format!("{}: {}", criterion.id, criterion.description))
+    .collect::<Vec<_>>();
   lines.push(Line::raw(""));
   lines.push(section_line("ACCEPTANCE"));
   lines.extend(detail_bullets(
-    &item.acceptance_criteria,
+    &criteria,
     "No acceptance criteria recorded",
     theme::secondary(),
   ));
@@ -1048,27 +1081,32 @@ fn status_style(status: &RunStatus) -> Style {
   }
 }
 
-fn status_style_requirement(status: &RequirementStatus) -> Style {
+fn status_style_requirement(status: &VerificationState) -> Style {
   match status {
-    RequirementStatus::Satisfied => theme::success(),
-    RequirementStatus::Partial => theme::warning(),
-    RequirementStatus::Missing => theme::failure(),
+    VerificationState::Verified => theme::success(),
+    VerificationState::PartiallyVerified | VerificationState::Stale => theme::warning(),
+    VerificationState::Unverified => theme::muted(),
+    VerificationState::Contradicted => theme::failure(),
   }
 }
 
-fn requirement_mark(status: &RequirementStatus) -> &'static str {
+fn requirement_mark(status: &VerificationState) -> &'static str {
   match status {
-    RequirementStatus::Satisfied => "✓",
-    RequirementStatus::Partial => "◐",
-    RequirementStatus::Missing => "○",
+    VerificationState::Verified => "✓",
+    VerificationState::PartiallyVerified => "◐",
+    VerificationState::Unverified => "○",
+    VerificationState::Stale => "↻",
+    VerificationState::Contradicted => "✕",
   }
 }
 
-fn status_text(status: &RequirementStatus) -> &'static str {
+fn status_text(status: &VerificationState) -> &'static str {
   match status {
-    RequirementStatus::Satisfied => "SATISFIED",
-    RequirementStatus::Partial => "PARTIAL",
-    RequirementStatus::Missing => "MISSING",
+    VerificationState::Verified => "VERIFIED",
+    VerificationState::PartiallyVerified => "PARTIAL",
+    VerificationState::Unverified => "UNVERIFIED",
+    VerificationState::Stale => "STALE",
+    VerificationState::Contradicted => "CONTRADICTED",
   }
 }
 

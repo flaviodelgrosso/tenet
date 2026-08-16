@@ -1,8 +1,8 @@
 pub use crate::verification::{CommandResult, RepositoryChange, VerificationReport};
 pub use crate::worker::{
-  ArchitectOutput, Discovery, DiscoveryRecord, DiscoveryStatus, ReconcileResult, Requirement,
-  RequirementAssessment, RequirementCatalog, RequirementStatus, WorkScope, WorkUnit,
-  WorkerDiscovery, WorkerEvent, WorkerRole, WorkerSummary,
+  ArchitectOutput, CandidateCheck, Discovery, DiscoveryRecord, DiscoveryStatus, ReconcileResult,
+  Requirement, RequirementAssessment, RequirementCatalog, WorkScope, WorkUnit, WorkerDiscovery,
+  WorkerEvent, WorkerRole, WorkerSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -33,11 +33,19 @@ pub enum Phase {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
 pub struct RequirementCounts {
   pub total: usize,
-  pub satisfied: usize,
-  pub partial: usize,
-  pub missing: usize,
+  #[serde(alias = "satisfied")]
+  pub verified: usize,
+  #[serde(rename = "partiallyVerified", alias = "partial")]
+  pub partially_verified: usize,
+  #[serde(alias = "missing")]
+  pub unverified: usize,
+  pub stale: usize,
+  pub contradicted: usize,
+  #[serde(rename = "missingImplementation")]
+  pub missing_implementation: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

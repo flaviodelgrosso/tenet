@@ -7,7 +7,9 @@ use uuid::Uuid;
 
 use tenet_domain::{
   config::Config,
-  model::{IntegrationPhase, IntegrationTransaction, VerificationReport, WorkExecution},
+  model::{
+    CandidateCheck, IntegrationPhase, IntegrationTransaction, VerificationReport, WorkExecution,
+  },
 };
 
 use crate::{git, store, verifier, workspace::WorkspaceManager};
@@ -172,7 +174,7 @@ impl Integrator {
   async fn verify_revision(
     &self,
     revision: &str,
-    suggested_checks: &[String],
+    suggested_checks: &[CandidateCheck],
     project_verification: bool,
   ) -> Result<VerificationReport> {
     let canonical_before = git::repository_state(&self.repository).await?;
@@ -186,7 +188,7 @@ impl Integrator {
       verifier::run_suggested_checks_cancelled(
         &workspace,
         &self.config,
-        suggested_checks,
+        suggested_checks.iter().map(|check| check.command.as_str()),
         &self.cancel,
       )
       .await

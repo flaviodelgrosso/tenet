@@ -21,10 +21,15 @@ use uuid::Uuid;
 use tenet_domain::{
   config::{Config, CustomAgentConfig},
   events::{EventSink, RunEvent},
+  evidence::{
+    AcceptanceCriterion, EvidencePolicy, ImplementationState, VerificationKind,
+    VerificationObligation, VerificationState,
+  },
+  ids::{CriterionId, ObligationId, RequirementId},
   model::{
-    ArchitectOutput, CompletedWorkUnit, Discovery, DiscoveryRecord, DiscoveryStatus,
-    IntegrationPhase, IntegrationTransaction, ReconcileResult, Requirement, RequirementAssessment,
-    RequirementCatalog, RequirementStatus, State, VerificationReport, WorkExecution, WorkLease,
+    ArchitectOutput, CandidateCheck, CompletedWorkUnit, Discovery, DiscoveryRecord,
+    DiscoveryStatus, IntegrationPhase, IntegrationTransaction, ReconcileResult, Requirement,
+    RequirementAssessment, RequirementCatalog, State, VerificationReport, WorkExecution, WorkLease,
     WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
 };
@@ -81,10 +86,31 @@ fn run_git(cwd: &Path, args: &[&str]) -> String {
 
 fn requirement() -> Requirement {
   Requirement {
-    id: "REQ-001".into(),
+    id: RequirementId::from("REQ-001"),
     title: "Diamond".into(),
     description: "Complete the diamond graph".into(),
-    acceptance_criteria: vec!["A, B, C, and D exist".into()],
+    required: true,
+  }
+}
+
+fn criterion() -> AcceptanceCriterion {
+  AcceptanceCriterion {
+    id: CriterionId::from("REQ-001/AC-01"),
+    requirement_id: RequirementId::from("REQ-001"),
+    description: "A, B, C, and D exist".into(),
+    mandatory: true,
+  }
+}
+
+fn obligation() -> VerificationObligation {
+  VerificationObligation {
+    id: ObligationId::from("REQ-001/AC-01/VO-01"),
+    criterion_id: CriterionId::from("REQ-001/AC-01"),
+    description: "Verify every diamond output".into(),
+    kind: VerificationKind::Command,
+    required: true,
+    command: "test -f A.txt && test -f B.txt && test -f C.txt && test -f D.txt".into(),
+    dependency_scope: vec!["*.txt".into()],
   }
 }
 
@@ -93,9 +119,13 @@ fn unit(id: &str, dependencies: &[&str]) -> WorkUnit {
     id: id.into(),
     title: format!("Implement {id}"),
     objective: format!("Create {id}"),
-    requirement_ids: vec!["REQ-001".into()],
-    acceptance_criteria: vec![format!("{id}.txt exists")],
-    suggested_checks: vec![format!("test -f {id}.txt")],
+    requirement_ids: vec![RequirementId::from("REQ-001")],
+    criterion_ids: vec![CriterionId::from("REQ-001/AC-01")],
+    verification_obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
+    suggested_checks: vec![CandidateCheck {
+      obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+      command: format!("test -f {id}.txt"),
+    }],
     depends_on: dependencies.iter().map(|value| (*value).into()).collect(),
     scope: WorkScope {
       paths: vec![format!("{id}.txt")],
@@ -114,20 +144,21 @@ fn graph_units() -> Vec<WorkUnit> {
 
 fn assessment(satisfied: bool) -> RequirementAssessment {
   RequirementAssessment {
-    id: "REQ-001".into(),
-    status: if satisfied {
-      RequirementStatus::Satisfied
+    requirement_id: RequirementId::from("REQ-001"),
+    implementation_state: if satisfied {
+      ImplementationState::Present
     } else {
-      RequirementStatus::Missing
+      ImplementationState::Absent
     },
-    evidence: satisfied
+    observations: satisfied
       .then(|| "all files exist".into())
       .into_iter()
       .collect(),
-    gaps: (!satisfied)
+    missing_implementation: (!satisfied)
       .then(|| "diamond incomplete".into())
       .into_iter()
       .collect(),
+    missing_evidence: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
   }
 }
 
@@ -242,6 +273,8 @@ impl AgentBackend for FakeBackend {
       .await?;
     Ok(ArchitectOutput {
       requirements: vec![requirement()],
+      acceptance_criteria: vec![criterion()],
+      verification_obligations: vec![obligation()],
     })
   }
 
@@ -255,6 +288,7 @@ impl AgentBackend for FakeBackend {
     _catalog: &RequirementCatalog,
     _recent: &[CompletedWorkUnit],
     discoveries: &[Discovery],
+    _evidence: &[tenet_domain::evidence::EvidenceProjection],
   ) -> Result<ReconcileResult> {
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Reconcile)
@@ -278,18 +312,23 @@ impl AgentBackend for FakeBackend {
     }
     if matches!(self.mode, BackendMode::RepairDiscovery) {
       if let Some(unit) = work_units.iter_mut().find(|unit| unit.id == "A") {
-        unit.suggested_checks = vec!["grep -q repaired A.txt".into()];
+        unit.suggested_checks = vec![CandidateCheck {
+          obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+          command: "grep -q repaired A.txt".into(),
+        }];
       }
     }
     if matches!(self.mode, BackendMode::NeverPassingVerification) {
       if let Some(unit) = work_units.iter_mut().find(|unit| unit.id == "A") {
-        unit.suggested_checks = vec!["false".into()];
+        unit.suggested_checks = vec![CandidateCheck {
+          obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+          command: "false".into(),
+        }];
       }
     }
     Ok(ReconcileResult {
-      complete: satisfied,
       summary: if satisfied {
-        "complete".into()
+        "implementation present; evidence pending".into()
       } else {
         "work remains".into()
       },
@@ -384,6 +423,7 @@ impl AgentBackend for FakeBackend {
     &self,
     ctx: &BackendContext,
     _catalog: &RequirementCatalog,
+    _evidence: &[tenet_domain::evidence::EvidenceProjection],
   ) -> Result<ReconcileResult> {
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Assess)
@@ -410,15 +450,13 @@ impl AgentBackend for FakeBackend {
     }
     if matches!(self.mode, BackendMode::IncompleteAssessment) && satisfied {
       return Ok(ReconcileResult {
-        complete: false,
         summary: "assessment still finds a gap".into(),
         requirements: vec![assessment(false)],
         work_units: vec![unit("assessment-gap", &[])],
       });
     }
     Ok(ReconcileResult {
-      complete: satisfied,
-      summary: "assessment".into(),
+      summary: "skeptical assessment".into(),
       requirements: vec![assessment(satisfied)],
       work_units: Vec::new(),
     })
@@ -461,6 +499,8 @@ async fn configured_controller(
     &RequirementCatalog {
       spec_hash,
       requirements: vec![requirement()],
+      acceptance_criteria: vec![criterion()],
+      verification_obligations: vec![obligation()],
     },
   )
   .await
@@ -548,23 +588,27 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
     .expect("diamond run succeeds");
 
   assert_eq!(state.completed_work_units.len(), 4);
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
   assert!(backend.max_active.load(Ordering::SeqCst) >= 2);
-  let workspaces = backend.workspaces.lock().expect("workspace lock");
-  let b = workspaces
-    .iter()
-    .find(|(id, _)| id == "B")
-    .expect("B workspace");
-  let c = workspaces
-    .iter()
-    .find(|(id, _)| id == "C")
-    .expect("C workspace");
-  assert_ne!(b.1, c.1);
-  drop(workspaces);
+  {
+    let workspaces = backend.workspaces.lock().expect("workspace lock");
+    let b = workspaces
+      .iter()
+      .find(|(id, _)| id == "B")
+      .expect("B workspace");
+    let c = workspaces
+      .iter()
+      .find(|(id, _)| id == "C")
+      .expect("C workspace");
+    assert_ne!(b.1, c.1);
+  }
   assert!(backend.discoveries_seen.load(Ordering::SeqCst) > 0);
 
   let mut integrations = Vec::new();
   let mut worker_ids = std::collections::BTreeSet::new();
   let mut candidates = Vec::new();
+  let mut evidence_events = 0;
+  let mut verified_transition = false;
   while let Ok(event) = events.try_recv() {
     match event {
       RunEvent::IntegrationAccepted { work_unit_id, .. } => integrations.push(work_unit_id),
@@ -572,12 +616,36 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
         worker_ids.insert(worker_id);
       }
       RunEvent::CandidateProduced(candidate) => candidates.push(candidate),
+      RunEvent::EvidenceEstablished(_) => evidence_events += 1,
+      RunEvent::RequirementVerificationChanged {
+        current: VerificationState::Verified,
+        ..
+      } => verified_transition = true,
       _ => {}
     }
   }
   assert_eq!(integrations, ["A", "B", "C", "D"]);
   assert_eq!(worker_ids.len(), 4);
   assert_eq!(candidates.len(), 4);
+  assert!(evidence_events > 0);
+  assert!(verified_transition);
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("read catalog")
+    .expect("catalog");
+  let graph = store::read_evidence_graph(repository.path(), &catalog)
+    .await
+    .expect("read evidence graph");
+  assert!(graph.all_required_verified(&EvidencePolicy));
+  let explanation = graph
+    .projection(&RequirementId::from("REQ-001"), &EvidencePolicy)
+    .expect("requirement explanation");
+  assert_eq!(explanation.verification_state, VerificationState::Verified);
+  let head = git::head(repository.path()).await.expect("head");
+  assert!(explanation.criteria[0].obligations[0]
+    .evidence
+    .iter()
+    .any(|evidence| evidence.revision == head));
 
   let b_candidate = candidates
     .iter()
@@ -943,7 +1011,13 @@ async fn candidate(
       id: lease_id,
       worker_id: format!("worker-{id}"),
       work_unit: WorkUnit {
-        suggested_checks,
+        suggested_checks: suggested_checks
+          .into_iter()
+          .map(|command| CandidateCheck {
+            obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+            command,
+          })
+          .collect(),
         ..unit(id, &[])
       },
       base_revision: base.into(),
