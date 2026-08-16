@@ -7,12 +7,15 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::{
+  sync::{mpsc, Semaphore},
+  task::JoinSet,
+};
 use uuid::Uuid;
 
 use tenet_domain::{
   events::RunEvent,
-  model::{RequirementCatalog, WorkExecution, WorkLease, WorkUnit},
+  model::{RequirementCatalog, WorkExecution, WorkLease, WorkUnit, WorkerDiscovery, WorkerRole},
 };
 
 use crate::{
@@ -21,12 +24,19 @@ use crate::{
   workspace::WorkspaceManager,
 };
 
+#[derive(Debug, Clone)]
+pub enum ExecutionUpdate {
+  Implementing { work_unit_id: String },
+  Repairing { work_unit_id: String, attempt: u32 },
+}
+
 pub struct Scheduler {
   repository: PathBuf,
   backend: Arc<dyn AgentBackend>,
   context: BackendContext,
   catalog: Arc<RequirementCatalog>,
   workspaces: WorkspaceManager,
+  updates: mpsc::UnboundedSender<ExecutionUpdate>,
 }
 
 impl Scheduler {
@@ -36,6 +46,7 @@ impl Scheduler {
     backend: Arc<dyn AgentBackend>,
     context: BackendContext,
     catalog: Arc<RequirementCatalog>,
+    updates: mpsc::UnboundedSender<ExecutionUpdate>,
   ) -> Self {
     let workspaces = WorkspaceManager::new(repository.clone(), &run_id);
     Self {
@@ -44,6 +55,7 @@ impl Scheduler {
       context,
       catalog,
       workspaces,
+      updates,
     }
   }
 
@@ -91,7 +103,7 @@ impl Scheduler {
         .context
         .events
         .emit(RunEvent::LeaseIssued(lease.clone()))
-        .await;
+        .await?;
       let permit_pool = semaphore.clone();
       let backend = self.backend.clone();
       let mut context = self.context.clone();
@@ -99,12 +111,16 @@ impl Scheduler {
       let catalog = self.catalog.clone();
       let repository = self.repository.clone();
       let workspaces = self.workspaces.clone();
+      let updates = self.updates.clone();
       tasks.spawn(async move {
         let _permit = permit_pool
           .acquire_owned()
           .await
           .map_err(|_| anyhow!("worker semaphore closed"))?;
-        execute_lease(repository, workspaces, backend, context, catalog, lease).await
+        execute_lease(
+          repository, workspaces, backend, context, catalog, lease, updates,
+        )
+        .await
       });
     }
 
@@ -151,6 +167,7 @@ async fn execute_lease(
   mut context: BackendContext,
   catalog: Arc<RequirementCatalog>,
   mut lease: WorkLease,
+  updates: mpsc::UnboundedSender<ExecutionUpdate>,
 ) -> Result<WorkExecution> {
   let workspace = workspaces
     .create_worker(&lease.id, &lease.base_revision)
@@ -167,7 +184,7 @@ async fn execute_lease(
       lease_id: lease.id.clone(),
       path: workspace.clone(),
     })
-    .await;
+    .await?;
   context
     .events
     .emit(RunEvent::WorkerStarted {
@@ -175,9 +192,10 @@ async fn execute_lease(
       lease_id: lease.id.clone(),
       work_unit_id: lease.work_unit.id.clone(),
     })
-    .await;
+    .await?;
 
-  let result = execute_and_commit(&repository, &backend, &context, &catalog, &lease).await;
+  let result =
+    execute_and_commit(&repository, &backend, &context, &catalog, &lease, &updates).await;
   let cleanup = workspaces.remove(&workspace).await;
   context
     .events
@@ -185,7 +203,7 @@ async fn execute_lease(
       lease_id: lease.id.clone(),
       path: workspace,
     })
-    .await;
+    .await?;
   match (result, cleanup) {
     (Ok(execution), Ok(())) => Ok(execution),
     (Err(error), Ok(())) => Err(error),
@@ -202,48 +220,74 @@ async fn execute_and_commit(
   context: &BackendContext,
   catalog: &RequirementCatalog,
   lease: &WorkLease,
+  updates: &mpsc::UnboundedSender<ExecutionUpdate>,
 ) -> Result<WorkExecution> {
   let protected_paths = protected_paths(context);
   let protected = protection::snapshot(&lease.workspace, &protected_paths).await?;
+  let _ = updates.send(ExecutionUpdate::Implementing {
+    work_unit_id: lease.work_unit.id.clone(),
+  });
   let worker_summary = backend
     .implement(context, catalog, &lease.work_unit)
     .await
     .context("implementation worker")?;
-  let violated = protection::restore_changes(&lease.workspace, &protected).await?;
-  if !violated.is_empty() {
-    bail!(
-      "worker modified controller-protected files: {}",
-      violated.join(", ")
-    );
-  }
+  let mut discoveries: Vec<_> = worker_summary
+    .discoveries
+    .iter()
+    .cloned()
+    .map(|discovery| WorkerDiscovery {
+      discovery,
+      role: WorkerRole::Implement,
+    })
+    .collect();
+  reject_protected_changes(&lease.workspace, &protected, "worker").await?;
 
-  let mut verification = verifier::run_verification_with_checks(
-    &lease.workspace,
-    &context.config,
+  let mut candidate_revision = commit_candidate(&lease.workspace, lease).await?;
+  let mut changed_paths =
+    git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
+  validate_changed_paths(&lease.work_unit, &changed_paths)?;
+  let mut verification = verify_candidate(
+    repository,
+    context,
+    &candidate_revision,
     &lease.work_unit.suggested_checks,
   )
   .await?;
-  for _ in 0..context.config.max_repair_attempts {
+
+  for attempt in 1..=context.config.max_repair_attempts {
     if verification.passed {
       break;
     }
     if context.cancel.is_cancelled() {
       bail!("run cancelled");
     }
-    backend
+    git::reset_soft(&lease.workspace, &lease.base_revision).await?;
+    let _ = updates.send(ExecutionUpdate::Repairing {
+      work_unit_id: lease.work_unit.id.clone(),
+      attempt,
+    });
+    let repair_summary = backend
       .repair(context, catalog, &lease.work_unit, &verification)
       .await
       .context("repair worker")?;
-    let violated = protection::restore_changes(&lease.workspace, &protected).await?;
-    if !violated.is_empty() {
-      bail!(
-        "repair worker modified controller-protected files: {}",
-        violated.join(", ")
-      );
-    }
-    verification = verifier::run_verification_with_checks(
-      &lease.workspace,
-      &context.config,
+    discoveries.extend(
+      repair_summary
+        .discoveries
+        .into_iter()
+        .map(|discovery| WorkerDiscovery {
+          discovery,
+          role: WorkerRole::Repair,
+        }),
+    );
+    reject_protected_changes(&lease.workspace, &protected, "repair worker").await?;
+    candidate_revision = commit_candidate(&lease.workspace, lease).await?;
+    changed_paths =
+      git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
+    validate_changed_paths(&lease.work_unit, &changed_paths)?;
+    verification = verify_candidate(
+      repository,
+      context,
+      &candidate_revision,
       &lease.work_unit.suggested_checks,
     )
     .await?;
@@ -251,21 +295,11 @@ async fn execute_and_commit(
   context
     .events
     .emit(RunEvent::Verification(verification.clone()))
-    .await;
+    .await?;
   if !verification.passed {
     bail!("verification failed for {}", lease.work_unit.id);
   }
 
-  let candidate_revision = git::commit_all(
-    &lease.workspace,
-    &format!(
-      "tenet: candidate {} (lease {})",
-      lease.work_unit.id, lease.id
-    ),
-  )
-  .await?;
-  let changed_paths =
-    git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
   let execution = WorkExecution {
     lease: lease.clone(),
     worker_summary,
@@ -273,21 +307,105 @@ async fn execute_and_commit(
     base_revision: lease.base_revision.clone(),
     candidate_revision,
     changed_paths,
+    discoveries,
   };
-  for discovery in &execution.worker_summary.discoveries {
+  for discovered in &execution.discoveries {
     context
       .events
       .emit(RunEvent::DependencyDiscovered {
         lease_id: lease.id.clone(),
-        discovery: discovery.clone(),
+        discovery: discovered.discovery.clone(),
       })
-      .await;
+      .await?;
   }
   context
     .events
     .emit(RunEvent::CandidateProduced(execution.clone()))
-    .await;
+    .await?;
   Ok(execution)
+}
+
+async fn reject_protected_changes(
+  workspace: &Path,
+  protected: &protection::Snapshot,
+  role: &str,
+) -> Result<()> {
+  let violated = protection::restore_changes(workspace, protected).await?;
+  if !violated.is_empty() {
+    bail!(
+      "{role} modified controller-protected files: {}",
+      violated.join(", ")
+    );
+  }
+  Ok(())
+}
+
+async fn commit_candidate(workspace: &Path, lease: &WorkLease) -> Result<String> {
+  git::commit_all(
+    workspace,
+    &format!(
+      "tenet: candidate {} (lease {})",
+      lease.work_unit.id, lease.id
+    ),
+  )
+  .await
+}
+
+async fn verify_candidate(
+  repository: &Path,
+  context: &BackendContext,
+  revision: &str,
+  suggested_checks: &[String],
+) -> Result<tenet_domain::model::VerificationReport> {
+  let canonical_before = git::repository_state(repository).await?;
+  let run_id = context
+    .runtime_dir
+    .parent()
+    .and_then(Path::file_name)
+    .and_then(|value| value.to_str())
+    .context("worker run id is unavailable")?;
+  let workspaces = WorkspaceManager::new(repository.to_path_buf(), run_id);
+  let workspace = workspaces
+    .create_disposable("verification", revision)
+    .await?;
+  let result = verifier::run_verification_with_checks_cancelled(
+    &workspace,
+    &context.config,
+    suggested_checks,
+    &context.cancel,
+  )
+  .await;
+  let cleanup = workspaces.remove(&workspace).await;
+  if let Err(cleanup) = cleanup {
+    return match result {
+      Ok(_) => Err(cleanup).context("discard candidate verification worktree"),
+      Err(error) => Err(error).context(format!(
+        "candidate verification failed; cleanup also failed: {cleanup:#}"
+      )),
+    };
+  }
+  let canonical_after = git::repository_state(repository).await?;
+  if canonical_after != canonical_before {
+    bail!("verification command modified canonical repository state");
+  }
+  result
+}
+
+fn validate_changed_paths(unit: &WorkUnit, changed_paths: &[String]) -> Result<()> {
+  let allowed = compile_scope(&unit.scope.paths)?;
+  let unauthorized: Vec<_> = changed_paths
+    .iter()
+    .filter(|path| !allowed.is_match(path))
+    .cloned()
+    .collect();
+  if !unauthorized.is_empty() {
+    bail!(
+      "candidate {} changed paths outside its declared scope: {}",
+      unit.id,
+      unauthorized.join(", ")
+    );
+  }
+  Ok(())
 }
 
 fn protected_paths(context: &BackendContext) -> Vec<String> {

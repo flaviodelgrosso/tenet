@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 use anyhow::{Context, Result};
 use tokio::fs;
@@ -17,6 +18,10 @@ impl WorkspaceManager {
       repository,
       run_id: run_id.into(),
     }
+  }
+
+  pub fn run_id(&self) -> &str {
+    &self.run_id
   }
 
   pub fn worker_path(&self, lease_id: &str) -> PathBuf {
@@ -38,6 +43,14 @@ impl WorkspaceManager {
 
   pub async fn create_worker(&self, lease_id: &str, revision: &str) -> Result<PathBuf> {
     let path = self.worker_path(lease_id);
+    self.create(&path, revision).await?;
+    Ok(path)
+  }
+
+  pub async fn create_disposable(&self, purpose: &str, revision: &str) -> Result<PathBuf> {
+    let safe_purpose = purpose.replace(['/', '\\'], "-");
+    let id = format!("{safe_purpose}-{}", &Uuid::new_v4().to_string()[..8]);
+    let path = self.worker_path(&id);
     self.create(&path, revision).await?;
     Ok(path)
   }

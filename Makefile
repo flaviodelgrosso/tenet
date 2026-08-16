@@ -17,16 +17,16 @@ fmt-check: ## Check Rust formatting without modifying files
 	$(CARGO) fmt --all -- --check
 
 check: ## Type-check all targets with every feature enabled
-	$(CARGO) check --all-targets --all-features --locked
+	$(CARGO) check --workspace --all-targets --all-features --locked
 
 test: ## Run all tests with every feature enabled
-	$(CARGO) test --all-targets --all-features --locked
+	$(CARGO) test --workspace --all-targets --all-features --locked
 
 clippy: ## Run Clippy with warnings treated as errors
-	$(CARGO) clippy --all-targets --all-features --locked -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 build: ## Build the release binary
-	$(CARGO) build --release --locked
+	$(CARGO) build --workspace --all-targets --all-features --release --locked
 
 ci: fmt-check check clippy test ## Run the complete CI quality gate
 

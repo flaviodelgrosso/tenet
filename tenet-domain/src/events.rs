@@ -73,22 +73,24 @@ impl EventSink {
     self
   }
 
-  pub async fn emit(&self, event: RunEvent) {
+  pub async fn emit(&self, event: RunEvent) -> Result<()> {
     if let Some(logger) = &self.logger {
-      let _ = logger.write_event(&event).await;
+      logger.write_event(&event).await?;
     }
     if let Some(tx) = &self.tx {
       let _ = tx.send(event);
     }
+    Ok(())
   }
 
-  pub async fn worker(&self, event: WorkerEvent) {
+  pub async fn worker(&self, event: WorkerEvent) -> Result<()> {
     if let Some(logger) = &self.logger {
-      let _ = logger.write_worker(&event).await;
+      logger.write_worker(&event).await?;
     }
     if let Some(tx) = &self.tx {
       let _ = tx.send(RunEvent::Worker(event));
     }
+    Ok(())
   }
 }
 
@@ -249,4 +251,38 @@ fn utf8_floor(text: &str, max_bytes: usize) -> usize {
     end -= 1;
   }
   end
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn event_log_write_failure_is_returned_to_controller() {
+    let directory = tempfile::tempdir().expect("temporary log directory");
+    let read_only_path = directory.path().join("read-only-events.jsonl");
+    std::fs::write(&read_only_path, "seed").expect("seed read-only log");
+    let read_only = tokio::fs::File::open(read_only_path)
+      .await
+      .expect("open read-only event log");
+    let worker_events = open_append(directory.path().join("worker.jsonl"))
+      .await
+      .expect("worker log");
+    let transcript = open_append(directory.path().join("transcript.log"))
+      .await
+      .expect("transcript log");
+    let logger = Arc::new(RunLogger {
+      events: Mutex::new(read_only),
+      worker_events: Mutex::new(worker_events),
+      transcript: Mutex::new(transcript),
+    });
+    let sink = EventSink::new(None).with_logger(logger);
+
+    let error = sink
+      .emit(RunEvent::Message("required evidence".into()))
+      .await
+      .expect_err("log failure must propagate");
+
+    assert!(!error.to_string().is_empty());
+  }
 }

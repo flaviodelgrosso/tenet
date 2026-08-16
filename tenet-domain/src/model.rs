@@ -50,6 +50,7 @@ pub struct RequirementCatalog {
   pub spec_hash: String,
   pub requirements: Vec<Requirement>,
 }
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ArchitectOutput {
@@ -115,6 +116,37 @@ pub enum Discovery {
     paths: Vec<String>,
     reason: String,
   },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerDiscovery {
+  pub discovery: Discovery,
+  pub role: WorkerRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryStatus {
+  Active,
+  Consumed,
+  Invalidated,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryRecord {
+  pub fingerprint: String,
+  pub discovery: Discovery,
+  #[serde(rename = "catalogHash")]
+  pub catalog_hash: String,
+  #[serde(rename = "repositoryRevision")]
+  pub repository_revision: String,
+  #[serde(rename = "workUnitId")]
+  pub work_unit_id: String,
+  pub role: WorkerRole,
+  pub cycle: u32,
+  pub status: DiscoveryStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -225,6 +257,54 @@ pub struct WorkExecution {
   pub candidate_revision: String,
   #[serde(rename = "changedPaths")]
   pub changed_paths: Vec<String>,
+  #[serde(default)]
+  pub discoveries: Vec<WorkerDiscovery>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationPhase {
+  Prepared,
+  GitCommitted,
+  StateCommitted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationTransaction {
+  pub version: u32,
+  pub id: String,
+  #[serde(rename = "runId")]
+  pub run_id: String,
+  #[serde(rename = "workUnit")]
+  pub work_unit: WorkUnit,
+  #[serde(rename = "candidateRevision")]
+  pub candidate_revision: String,
+  #[serde(rename = "oldHead")]
+  pub old_head: String,
+  #[serde(rename = "newHead")]
+  pub new_head: String,
+  pub phase: IntegrationPhase,
+  #[serde(rename = "verificationEvidence")]
+  pub verification_evidence: String,
+  #[serde(rename = "verificationHash")]
+  pub verification_hash: String,
+  #[serde(rename = "createdAt")]
+  pub created_at: String,
+  #[serde(rename = "updatedAt")]
+  pub updated_at: String,
+}
+
+impl IntegrationTransaction {
+  pub const VERSION: u32 = 1;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RepairProgress {
+  #[serde(rename = "workUnitId")]
+  pub work_unit_id: String,
+  pub attempt: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -246,9 +326,15 @@ pub struct State {
   pub requirement_counts: RequirementCounts,
   #[serde(rename = "completedWorkUnits")]
   pub completed_work_units: Vec<CompletedWorkUnit>,
-  pub discoveries: Vec<Discovery>,
+  pub discoveries: Vec<DiscoveryRecord>,
+  #[serde(default, rename = "stagnationCount")]
+  pub stagnation_count: u32,
+  #[serde(default, rename = "progressFingerprint")]
+  pub progress_fingerprint: Option<String>,
   #[serde(rename = "lastSummary")]
   pub last_summary: String,
+  #[serde(default, rename = "currentRepair")]
+  pub current_repair: Option<RepairProgress>,
   #[serde(rename = "blockedReason")]
   pub blocked_reason: Option<String>,
   #[serde(rename = "lastError")]
@@ -258,7 +344,7 @@ pub struct State {
 }
 
 impl State {
-  pub const VERSION: u32 = 2;
+  pub const VERSION: u32 = 1;
 
   pub fn fresh() -> Self {
     Self {
@@ -272,9 +358,12 @@ impl State {
       work_statuses: std::collections::BTreeMap::new(),
       requirement_counts: RequirementCounts::default(),
       completed_work_units: Vec::new(),
+      stagnation_count: 0,
+      progress_fingerprint: None,
       discoveries: Vec::new(),
       last_summary: "Initialized".into(),
       blocked_reason: None,
+      current_repair: None,
       last_error: None,
       updated_at: chrono::Utc::now().to_rfc3339(),
     }
@@ -300,6 +389,10 @@ impl WorkerRole {
       Self::Repair => "repair",
       Self::Assess => "assess",
     }
+  }
+
+  pub fn is_read_only(self) -> bool {
+    matches!(self, Self::Architect | Self::Reconcile | Self::Assess)
   }
 }
 

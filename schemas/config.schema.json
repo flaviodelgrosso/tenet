@@ -20,7 +20,7 @@
   "properties": {
     "version": {
       "type": "integer",
-      "minimum": 0,
+      "const": 1,
       "default": 1,
       "description": "Configuration format version read by tenet."
     },
@@ -44,7 +44,7 @@
     },
     "stagnation_limit": {
       "type": "integer",
-      "minimum": 0,
+      "minimum": 1,
       "default": 3,
       "description": "Number of consecutive cycles without requirement progress before the run is blocked."
     },

@@ -12,12 +12,16 @@ use tokio::fs;
 
 use tenet_domain::{
   config::{Config, TENET_DIR},
-  model::{ReconcileResult, RequirementCatalog, State},
+  model::{
+    CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
+    RequirementCatalog, State, VerificationReport,
+  },
 };
 
 pub const STATE_FILE: &str = "state.json";
 pub const REQUIREMENTS_FILE: &str = "requirements.json";
 pub const ROADMAP_FILE: &str = "roadmap.json";
+pub const INTEGRATION_JOURNAL_FILE: &str = "integration-journal.json";
 
 pub async fn ensure_layout(cwd: &Path) -> Result<()> {
   fs::create_dir_all(cwd.join(TENET_DIR).join("evidence")).await?;
@@ -55,21 +59,45 @@ pub async fn read_state(cwd: &Path) -> Result<State> {
   if !path.exists() {
     return Ok(State::fresh());
   }
-  let mut value: serde_json::Value = read_json(path).await?;
+  let value: serde_json::Value = read_json(path).await?;
   let version = value
     .get("version")
     .and_then(serde_json::Value::as_u64)
     .ok_or_else(|| anyhow!("state file has no numeric version"))?;
-  match version {
-    1 => migrate_v1(&mut value),
-    current if current == u64::from(State::VERSION) => {
-      serde_json::from_value(value).context("deserialize current state")
-    }
-    _ => Err(anyhow!(
+  if version != u64::from(State::VERSION) {
+    return Err(anyhow!(
       "unsupported state version {version}; expected {}",
       State::VERSION
-    )),
+    ));
   }
+  let state = serde_json::from_value(value).context("deserialize current state")?;
+  validate_state(&state)?;
+  Ok(state)
+}
+
+fn validate_state(state: &State) -> Result<()> {
+  use tenet_domain::model::{Phase, RunStatus};
+
+  if state.status == RunStatus::Done && state.phase != Phase::Complete {
+    return Err(anyhow!(
+      "invalid persisted state: done status requires complete phase"
+    ));
+  }
+  if state.status == RunStatus::Idle
+    && (!state.active_leases.is_empty() || !state.candidate_integrations.is_empty())
+  {
+    return Err(anyhow!(
+      "invalid persisted state: idle state cannot contain active leases or candidate integrations"
+    ));
+  }
+  if state.current_repair.is_some()
+    && (state.status != RunStatus::Running || state.phase != Phase::Repairing)
+  {
+    return Err(anyhow!(
+      "invalid persisted state: current repair requires running/repairing state"
+    ));
+  }
+  Ok(())
 }
 
 pub async fn write_state(cwd: &Path, state: &State) -> Result<()> {
@@ -104,20 +132,111 @@ pub async fn save_evidence<T: serde::Serialize>(
   write_json_atomic(path.clone(), value).await?;
   Ok(path)
 }
+pub async fn read_integration_journal(cwd: &Path) -> Result<Option<IntegrationTransaction>> {
+  let path = cwd.join(TENET_DIR).join(INTEGRATION_JOURNAL_FILE);
+  if !path.exists() {
+    return Ok(None);
+  }
+  let transaction: IntegrationTransaction = read_json(path).await?;
+  if transaction.version != IntegrationTransaction::VERSION {
+    return Err(anyhow!(
+      "unsupported integration journal version {}; expected {}",
+      transaction.version,
+      IntegrationTransaction::VERSION
+    ));
+  }
+  Ok(Some(transaction))
+}
+
+pub async fn write_integration_journal(
+  cwd: &Path,
+  transaction: &IntegrationTransaction,
+) -> Result<()> {
+  write_json_atomic(
+    cwd.join(TENET_DIR).join(INTEGRATION_JOURNAL_FILE),
+    transaction,
+  )
+  .await
+}
+
+pub async fn remove_integration_journal(cwd: &Path) -> Result<()> {
+  let path = cwd.join(TENET_DIR).join(INTEGRATION_JOURNAL_FILE);
+  match fs::remove_file(path).await {
+    Ok(()) => Ok(()),
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    Err(error) => Err(error.into()),
+  }
+}
+
+pub async fn recover_integration(cwd: &Path, state: &mut State) -> Result<()> {
+  let Some(transaction) = read_integration_journal(cwd).await? else {
+    return Ok(());
+  };
+  let head = crate::git::head(cwd).await?;
+  if head == transaction.old_head && transaction.phase == IntegrationPhase::Prepared {
+    remove_integration_journal(cwd).await?;
+    return Ok(());
+  }
+  if head != transaction.new_head {
+    return Err(anyhow!(
+      "integration recovery failed closed: canonical HEAD {head} matches neither expected old {} nor intended new {} for transaction {}",
+      transaction.old_head,
+      transaction.new_head,
+      transaction.id
+    ));
+  }
+  verify_transaction_evidence(cwd, &transaction).await?;
+  if !state.completed_work_units.iter().any(|completed| {
+    completed.work_unit == transaction.work_unit
+      && completed.verification_evidence == transaction.verification_evidence
+  }) {
+    state.completed_work_units.push(CompletedWorkUnit {
+      work_unit: transaction.work_unit.clone(),
+      completed_at: transaction.updated_at.clone(),
+      verification_evidence: transaction.verification_evidence.clone(),
+    });
+  }
+  state.candidate_integrations.clear();
+  write_state(cwd, state).await?;
+  remove_integration_journal(cwd).await
+}
+
+pub fn verification_hash(report: &VerificationReport) -> Result<String> {
+  let bytes = serde_json::to_vec(report)?;
+  Ok(sha256_hex(&bytes))
+}
+
+async fn verify_transaction_evidence(
+  cwd: &Path,
+  transaction: &IntegrationTransaction,
+) -> Result<()> {
+  let report: VerificationReport = read_json(cwd.join(&transaction.verification_evidence)).await?;
+  let actual = verification_hash(&report)?;
+  if actual != transaction.verification_hash {
+    return Err(anyhow!(
+      "integration evidence hash mismatch for transaction {}",
+      transaction.id
+    ));
+  }
+  Ok(())
+}
 
 pub async fn spec_text_and_hash(cwd: &Path, config: &Config) -> Result<(String, String)> {
   let path = cwd.join(&config.spec_file);
   let text = fs::read_to_string(&path)
     .await
     .with_context(|| format!("read authoritative spec {}", path.display()))?;
-  let mut hasher = Sha256::new();
-  hasher.update(text.as_bytes());
-  let digest = hasher.finalize();
+  let hash = sha256_hex(text.as_bytes());
+  Ok((text, hash))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+  let digest = Sha256::digest(bytes);
   let mut hash = String::with_capacity(digest.len() * 2);
   for byte in digest {
-    write!(hash, "{byte:02x}")?;
+    write!(hash, "{byte:02x}").expect("writing to String cannot fail");
   }
-  Ok((text, hash))
+  hash
 }
 
 pub struct RunLock {
@@ -186,32 +305,6 @@ fn process_alive(_pid: u32) -> bool {
   false
 }
 
-fn migrate_v1(value: &mut serde_json::Value) -> Result<State> {
-  let object = value
-    .as_object_mut()
-    .ok_or_else(|| anyhow!("state version 1 must be a JSON object"))?;
-  object.insert("version".into(), State::VERSION.into());
-  object.remove("currentWorkUnit");
-  object.insert("activeLeases".into(), serde_json::json!({}));
-  object.insert("candidateIntegrations".into(), serde_json::json!([]));
-  object.insert("workStatuses".into(), serde_json::json!({}));
-  object.insert("discoveries".into(), serde_json::json!([]));
-  if let Some(completed) = object
-    .get_mut("completedWorkUnits")
-    .and_then(serde_json::Value::as_array_mut)
-  {
-    for item in completed {
-      if let Some(unit) = item
-        .get_mut("workUnit")
-        .and_then(serde_json::Value::as_object_mut)
-      {
-        unit.insert("dependsOn".into(), serde_json::json!([]));
-        unit.insert("scope".into(), serde_json::json!({"paths":["**"]}));
-      }
-    }
-  }
-  serde_json::from_value(value.clone()).context("migrate state version 1 to version 2")
-}
 async fn read_json<T: serde::de::DeserializeOwned>(path: PathBuf) -> Result<T> {
   let bytes = fs::read(&path)
     .await
@@ -250,26 +343,11 @@ mod tests {
   use super::*;
 
   #[test]
-  fn state_v1_migration_adds_coordination_fields_explicitly() {
-    let mut value = serde_json::json!({
-      "version": 1,
-      "status": "idle",
-      "phase": "initialized",
-      "runId": null,
-      "cycle": 0,
-      "currentWorkUnit": null,
-      "requirementCounts": {"total":0,"satisfied":0,"partial":0,"missing":0},
-      "completedWorkUnits": [],
-      "lastSummary": "Initialized",
-      "blockedReason": null,
-      "lastError": null,
-      "updatedAt": "now"
-    });
+  fn state_validation_rejects_done_outside_complete_phase() {
+    let mut state = State::fresh();
+    state.status = tenet_domain::model::RunStatus::Done;
+    state.phase = tenet_domain::model::Phase::Reconciling;
 
-    let state = migrate_v1(&mut value).expect("version 1 migrates");
-
-    assert_eq!(state.version, State::VERSION);
-    assert!(state.active_leases.is_empty());
-    assert!(state.candidate_integrations.is_empty());
+    assert!(validate_state(&state).is_err());
   }
 }

@@ -255,6 +255,25 @@ When reconciliation believes the work is complete and deterministic gates pass, 
 
 The worker that wrote the implementation does not get the final vote by default.
 
+### Controller-enforced repository invariants
+
+Architect, Reconcile, and Assess run in disposable detached worktrees at the exact canonical revision they inspect. Their worktrees are always discarded. Tenet also compares canonical `HEAD` and canonical status before and after each read-only worker; any unexpected change fails the run. ACP permission requests from these roles are rejected rather than automatically granted.
+
+Implement and Repair run in leased detached worktrees. Before Tenet accepts a candidate, every added, modified, deleted, renamed, generated, mode-changed, or symlink path must match the current work unit's declared scope. A worker can request wider authority only by returning a `scope_expansion` discovery for a later reconciliation; the current out-of-scope candidate is rejected.
+
+Candidates are committed before verification. Suggested checks and configured project gates run in disposable worktrees at that immutable commit, so relative command effects cannot alter the commit that is integrated. Protected paths are compared as repository objects, including recursive directories, file contents, executable mode, symlink targets, additions, and deletions. Configured protected paths must be normalized repository-relative paths.
+
+Current Reconcile output is authoritative for scheduling. Historical completed-work records are evidence/context only and never suppress a work unit emitted by the current reconciliation. A specification hash change replaces the catalog context and invalidates completion and discovery history from the previous catalog.
+
+Implement and Repair discoveries are persisted with catalog hash, repository revision, work-unit ID, role, cycle, deterministic fingerprint, and lifecycle status. Active discoveries are supplied to the next reconciliation once, then marked consumed; deterministic duplicates are not accumulated indefinitely.
+
+Canonical advancement uses a durable integration journal. Verification evidence and a `prepared` transaction are persisted before fast-forward. Cancellation is checked during verification and immediately before canonical advancement. After Git advances, the journal moves through `git_committed` and `state_committed`; startup reconciles an incomplete journal against actual `HEAD`, recovers when `HEAD` is the intended revision, abandons a prepared transaction when `HEAD` is still old, and fails closed for any third revision.
+
+Persisted `State` is the observable projection used by the CLI/TUI. The integration journal is the recovery-critical transaction record. Serialized leases and candidates describe the active attempt; they are not treated as sufficient recovery proof. State loading rejects impossible terminal/phase combinations and idle states with active work.
+
+The cancellation boundary is the canonical fast-forward: cancellation observed before that operation prevents advancement. If the atomic Git operation completed before cancellation became observable, journal recovery records the completed advancement deterministically.
+
+
 ---
 
 ## `DONE` is a state, not a sentence
@@ -269,20 +288,30 @@ Everything is implemented successfully.
 
 Tenet does not treat that sentence as completion.
 
-Conceptually, completion looks more like:
+Conceptually, `DONE(R)` requires all of the following for one exact canonical revision `R`:
 
 ```text
-requirements accounted for
+valid authoritative specification and catalog
         +
-no remaining reconciled work
+current reconciliation: every requirement satisfied, with nonblank evidence
         +
-deterministic verification passes
+current reconciliation: no remaining work
         +
-independent assessment finds no remaining gap
+clean canonical revision R and no stale history suppressing work
         +
-controller policies pass
+deterministic verification of an immutable checkout of R passes
+        +
+fresh Assess inspects a disposable checkout of R
+        +
+Assess: every requirement satisfied with evidence, no gaps, no work
+        +
+canonical HEAD is still R
+        +
+no active lease, candidate, or integration transaction
+        +
+required workspace cleanup, evidence logging, and state persistence succeed
         =
-DONE
+DONE(R)
 ```
 
 Even then, `DONE` does **not** mean mathematically proven correct.
@@ -591,11 +620,13 @@ For more worker diagnostics:
 tenet run --headless --verbose
 ```
 
-State is persisted, so execution can be resumed:
+State is persisted, so a later invocation can reconcile the current repository again:
 
 ```bash
 tenet resume
 ```
+
+Resume does not trust serialized in-flight leases or candidates as recovery proof. Recovery-critical canonical advancement is handled separately by the integration journal described above.
 
 ---
 

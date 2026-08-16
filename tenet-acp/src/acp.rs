@@ -287,7 +287,7 @@ impl AcpRuntime {
         work_unit_id: ctx.work_unit_id.clone(),
         at: chrono::Utc::now().to_rfc3339(),
       })
-      .await;
+      .await?;
     let timeout = request.timeout;
     let run = self.run_worker_with_events(request, Some(ctx.events.clone()));
     let outcome = tokio::time::timeout(timeout, async {
@@ -329,7 +329,7 @@ impl AcpRuntime {
         ok,
         message,
       })
-      .await;
+      .await?;
     match outcome {
       Ok(result) => serde_json::from_value::<T>(result.structured_output)
         .map_err(|error| anyhow!("worker response did not match the requested schema: {error}")),
@@ -618,10 +618,15 @@ impl AcpRuntime {
       .name("tenet")
       .on_receive_request(
         async move |request: RequestPermissionRequest, responder, _connection| {
+          let preferred = if role.is_read_only() {
+            PermissionOptionKind::RejectOnce
+          } else {
+            PermissionOptionKind::AllowOnce
+          };
           let outcome = request
             .options
             .iter()
-            .find(|option| option.kind == PermissionOptionKind::AllowOnce)
+            .find(|option| option.kind == preferred)
             .map(|option| {
               RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
                 option.option_id.clone(),
@@ -934,7 +939,7 @@ where
         let sink = events.clone();
         MatchDispatch::new(dispatch)
           .if_notification(async |notification: SessionNotification| {
-            map_update(notification.update, role, identity, sink, text, tool_calls).await;
+            map_update(notification.update, role, identity, sink, text, tool_calls).await?;
             Ok(())
           })
           .await
@@ -952,7 +957,7 @@ async fn map_update(
   events: Option<EventSink>,
   text: &mut String,
   tool_calls: &mut HashMap<ToolCallId, ToolCall>,
-) {
+) -> std::result::Result<(), agent_client_protocol::Error> {
   match update {
     SessionUpdate::AgentMessageChunk(chunk) => {
       if let ContentBlock::Text(content) = chunk.content {
@@ -967,7 +972,11 @@ async fn map_update(
               at: chrono::Utc::now().to_rfc3339(),
               delta: content.text,
             })
-            .await;
+            .await
+            .map_err(|error| {
+              agent_client_protocol::Error::internal_error()
+                .data(format!("persist worker event: {error:#}"))
+            })?;
         }
       }
     }
@@ -989,7 +998,11 @@ async fn map_update(
             tool_name: title.clone(),
             args,
           })
-          .await;
+          .await
+          .map_err(|error| {
+            agent_client_protocol::Error::internal_error()
+              .data(format!("persist worker event: {error:#}"))
+          })?;
         if matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed) {
           events
             .worker(WorkerEvent::ToolEnd {
@@ -1002,7 +1015,11 @@ async fn map_update(
               is_error: matches!(status, ToolCallStatus::Failed),
               output: output.map(|value| value.to_string()),
             })
-            .await;
+            .await
+            .map_err(|error| {
+              agent_client_protocol::Error::internal_error()
+                .data(format!("persist worker event: {error:#}"))
+            })?;
         }
       }
     }
@@ -1028,12 +1045,17 @@ async fn map_update(
               is_error: matches!(status, ToolCallStatus::Failed),
               output: output.map(|value| value.to_string()),
             })
-            .await;
+            .await
+            .map_err(|error| {
+              agent_client_protocol::Error::internal_error()
+                .data(format!("persist worker event: {error:#}"))
+            })?;
         }
       }
     }
     _ => {}
   }
+  Ok(())
 }
 
 fn has_option_category(
@@ -1197,7 +1219,7 @@ where
       .if_notification(async |notification: SessionNotification| {
         match notification.update {
           SessionUpdate::ConfigOptionUpdate(update) => options = Some(update.config_options),
-          update => map_update(update, role, identity, sink, text, tool_calls).await,
+          update => map_update(update, role, identity, sink, text, tool_calls).await?,
         }
         Ok(())
       })
@@ -1238,7 +1260,7 @@ fn work_scope_schema() -> Value {
 }
 
 fn work_unit_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["id","title","objective","requirementIds","acceptanceCriteria","suggestedChecks","dependsOn","scope"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"objective":{"type":"string"},"requirementIds":string_array_schema(),"acceptanceCriteria":string_array_schema(),"suggestedChecks":{"type":"array","description":"Executable, non-interactive shell commands only; no instructions, prose, or Markdown backticks. Each command must perform its own assertion.","items":{"type":"string","description":"A single executable shell command."}},"dependsOn":string_array_schema(),"scope":work_scope_schema()}})
+  json!({"type":"object","additionalProperties":false,"required":["id","title","objective","requirementIds","acceptanceCriteria","suggestedChecks","dependsOn","scope"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"objective":{"type":"string"},"requirementIds":string_array_schema(),"acceptanceCriteria":string_array_schema(),"suggestedChecks":{"type":"array","description":"Executable, non-interactive, deterministic, self-contained shell commands only; no instructions, prose, or Markdown backticks. Each command must perform its own assertion without depending on external network access, mutable user state, a previous check, or externally produced executables. Isolation must target application state without hiding verification tooling: prefer application-specific state overrides, or resolve tools before isolation and preserve unrelated runner environment.","items":{"type":"string","description":"A single executable shell command."}},"dependsOn":string_array_schema(),"scope":work_scope_schema()}})
 }
 
 fn architect_schema() -> Value {

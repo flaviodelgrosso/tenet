@@ -40,7 +40,9 @@ Rules:
 - If work remains, propose the smallest coherent dependency graph of candidate work units.
 - Declare dependencies and conservative path scopes; never decide which units run concurrently.
 - Incorporate structured worker discoveries into a revised proposal. Never treat discoveries as direct graph mutations.
-- Every suggestedChecks entry must be only an executable, non-interactive shell command. Never put instructions, prose, or Markdown backticks in suggestedChecks; encode the complete assertion in the command itself.
+- Every suggestedChecks entry must be one executable, non-interactive shell command that performs its own assertion; never emit instructions, prose, or Markdown backticks.
+- Checks must be deterministic and self-contained: do not depend on external network access, mutable user state, a previous check, or an executable produced outside the command.
+- Isolate application state without hiding verification tooling. Prefer application-specific state overrides; otherwise resolve tools and dependencies before isolation, invoke produced artifacts by explicit path, and preserve unrelated environment needed by the command runner.
 - Do not implement anything. You are read-only.
 - `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence. Verify claims from source/tests/configuration instead.
 - complete may be true only when every requirement is satisfied and workUnits is empty.
@@ -64,6 +66,7 @@ Repair the assigned work unit using the deterministic verification evidence.
 Constraints:
 - Do not edit .tenet/spec.md, tenet.toml, .tenet/, or AGENTS.md.
 - Do not weaken verification or tests to obtain a green result.
+- If the evidence shows that a suggested check is invalid or its environment prevents the command from running, do not modify product code to compensate; report a blocker discovery naming the command and cause.
 - Report newly found dependencies, blockers, and scope expansions only through structured discoveries.
 - Never modify the work graph or coordinate with other workers.
 "#;
@@ -77,7 +80,9 @@ Rules:
 - For partial or missing requirements, state specific gaps.
 - If anything remains, propose the smallest coherent dependency graph of candidate work units.
 - Declare dependencies and conservative path scopes; never decide concurrency.
-- Every suggestedChecks entry must be only an executable, non-interactive shell command. Never put instructions, prose, or Markdown backticks in suggestedChecks; encode the complete assertion in the command itself.
+- Every suggestedChecks entry must be one executable, non-interactive shell command that performs its own assertion; never emit instructions, prose, or Markdown backticks.
+- Checks must be deterministic and self-contained: do not depend on external network access, mutable user state, a previous check, or an executable produced outside the command.
+- Isolate application state without hiding verification tooling. Prefer application-specific state overrides; otherwise resolve tools and dependencies before isolation, invoke produced artifacts by explicit path, and preserve unrelated environment needed by the command runner.
 - Do not modify the repository. You are read-only.
 - `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence. Independently verify source/tests/configuration.
 - complete may be true only when all requirements are satisfied and workUnits is empty.
@@ -85,4 +90,24 @@ Rules:
 
 pub fn full_role_prompt(role: WorkerRole) -> String {
   format!("{}{}", role_prompt(role), COMMON_END)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn planning_roles_isolate_application_state_without_hiding_tools() {
+    for role in [WorkerRole::Reconcile, WorkerRole::Assess] {
+      let prompt = full_role_prompt(role);
+      assert!(prompt.contains("Isolate application state without hiding verification tooling"));
+    }
+  }
+
+  #[test]
+  fn repair_role_reports_invalid_checks_without_product_changes() {
+    let prompt = full_role_prompt(WorkerRole::Repair);
+
+    assert!(prompt.contains("report a blocker discovery naming the command and cause"));
+  }
 }

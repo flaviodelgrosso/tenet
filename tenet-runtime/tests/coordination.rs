@@ -22,9 +22,10 @@ use tenet_domain::{
   config::{Config, CustomAgentConfig},
   events::{EventSink, RunEvent},
   model::{
-    ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, Requirement,
-    RequirementAssessment, RequirementCatalog, RequirementStatus, VerificationReport,
-    WorkExecution, WorkLease, WorkScope, WorkUnit, WorkerSummary,
+    ArchitectOutput, CompletedWorkUnit, Discovery, DiscoveryRecord, DiscoveryStatus,
+    IntegrationPhase, IntegrationTransaction, ReconcileResult, Requirement, RequirementAssessment,
+    RequirementCatalog, RequirementStatus, State, VerificationReport, WorkExecution, WorkLease,
+    WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
 };
 use tenet_runtime::{
@@ -144,21 +145,41 @@ fn summary(discoveries: Vec<Discovery>) -> WorkerSummary {
 }
 
 #[derive(Clone, Copy)]
+enum ScopeMutation {
+  Modification,
+  Addition,
+  Deletion,
+  Rename,
+}
+
+#[derive(Clone, Copy)]
 enum BackendMode {
   Normal,
   FailB,
   WorkerTimeout,
   ProtectedMutation,
   WaitForCancellation,
+  RepairDiscovery,
+  NeverPassingVerification,
+  IncompleteAssessment,
+  CleanupFailure,
+  ScopeMutation(ScopeMutation),
+  ReadOnlyMutation {
+    role: tenet_domain::model::WorkerRole,
+    commit: bool,
+  },
 }
 
 struct FakeBackend {
   mode: BackendMode,
   workspaces: Mutex<Vec<(String, PathBuf)>>,
+  canonical: Mutex<Option<PathBuf>>,
   waiting: Notify,
   active: AtomicUsize,
   max_active: AtomicUsize,
   discoveries_seen: AtomicUsize,
+  repair_calls: AtomicUsize,
+  assessment_calls: AtomicUsize,
 }
 
 impl FakeBackend {
@@ -166,10 +187,13 @@ impl FakeBackend {
     Self {
       mode,
       workspaces: Mutex::new(Vec::new()),
+      canonical: Mutex::new(None),
       active: AtomicUsize::new(0),
       max_active: AtomicUsize::new(0),
       waiting: Notify::new(),
       discoveries_seen: AtomicUsize::new(0),
+      repair_calls: AtomicUsize::new(0),
+      assessment_calls: AtomicUsize::new(0),
     }
   }
 
@@ -177,6 +201,28 @@ impl FakeBackend {
     let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
     self.max_active.fetch_max(active, Ordering::SeqCst);
     ActiveGuard(&self.active)
+  }
+  async fn mutate_read_only_workspace(
+    &self,
+    ctx: &BackendContext,
+    role: tenet_domain::model::WorkerRole,
+  ) -> Result<()> {
+    let BackendMode::ReadOnlyMutation {
+      role: target,
+      commit,
+    } = self.mode
+    else {
+      return Ok(());
+    };
+    if target != role {
+      return Ok(());
+    }
+    fs::write(ctx.cwd.join("read-only-mutation.txt"), role.as_str()).await?;
+    if commit {
+      run_git(&ctx.cwd, &["add", "read-only-mutation.txt"]);
+      run_git(&ctx.cwd, &["commit", "-m", "malicious read-only mutation"]);
+    }
+    Ok(())
   }
 }
 
@@ -190,7 +236,10 @@ impl Drop for ActiveGuard<'_> {
 
 #[async_trait]
 impl AgentBackend for FakeBackend {
-  async fn architect(&self, _ctx: &BackendContext, _spec: &str) -> Result<ArchitectOutput> {
+  async fn architect(&self, ctx: &BackendContext, _spec: &str) -> Result<ArchitectOutput> {
+    self
+      .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Architect)
+      .await?;
     Ok(ArchitectOutput {
       requirements: vec![requirement()],
     })
@@ -208,11 +257,35 @@ impl AgentBackend for FakeBackend {
     discoveries: &[Discovery],
   ) -> Result<ReconcileResult> {
     self
+      .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Reconcile)
+      .await?;
+    self
       .discoveries_seen
       .fetch_add(discoveries.len(), Ordering::SeqCst);
-    let satisfied = ["A", "B", "C", "D"]
-      .iter()
-      .all(|id| ctx.cwd.join(format!("{id}.txt")).exists());
+    let missing: std::collections::BTreeSet<_> = ["A", "B", "C", "D"]
+      .into_iter()
+      .filter(|id| !ctx.cwd.join(format!("{id}.txt")).exists())
+      .collect();
+    let satisfied = missing.is_empty();
+    let mut work_units: Vec<_> = graph_units()
+      .into_iter()
+      .filter(|unit| missing.contains(unit.id.as_str()))
+      .collect();
+    for unit in &mut work_units {
+      unit
+        .depends_on
+        .retain(|dependency| missing.contains(dependency.as_str()));
+    }
+    if matches!(self.mode, BackendMode::RepairDiscovery) {
+      if let Some(unit) = work_units.iter_mut().find(|unit| unit.id == "A") {
+        unit.suggested_checks = vec!["grep -q repaired A.txt".into()];
+      }
+    }
+    if matches!(self.mode, BackendMode::NeverPassingVerification) {
+      if let Some(unit) = work_units.iter_mut().find(|unit| unit.id == "A") {
+        unit.suggested_checks = vec!["false".into()];
+      }
+    }
     Ok(ReconcileResult {
       complete: satisfied,
       summary: if satisfied {
@@ -221,7 +294,7 @@ impl AgentBackend for FakeBackend {
         "work remains".into()
       },
       requirements: vec![assessment(satisfied)],
-      work_units: if satisfied { Vec::new() } else { graph_units() },
+      work_units,
     })
   }
 
@@ -248,6 +321,23 @@ impl AgentBackend for FakeBackend {
       ctx.cancel.cancelled().await;
       bail!("run cancelled");
     }
+    if work_unit.id == "A" {
+      match self.mode {
+        BackendMode::ScopeMutation(ScopeMutation::Modification) => {
+          fs::write(ctx.cwd.join("README.txt"), "unauthorized modification").await?;
+        }
+        BackendMode::ScopeMutation(ScopeMutation::Addition) => {
+          fs::write(ctx.cwd.join("outside.txt"), "unauthorized addition").await?;
+        }
+        BackendMode::ScopeMutation(ScopeMutation::Deletion) => {
+          fs::remove_file(ctx.cwd.join("README.txt")).await?;
+        }
+        BackendMode::ScopeMutation(ScopeMutation::Rename) => {
+          fs::rename(ctx.cwd.join("README.txt"), ctx.cwd.join("renamed.txt")).await?;
+        }
+        _ => {}
+      }
+    }
     if matches!(self.mode, BackendMode::ProtectedMutation) {
       fs::write(ctx.cwd.join("tenet.toml"), "modified").await?;
     }
@@ -271,11 +361,22 @@ impl AgentBackend for FakeBackend {
 
   async fn repair(
     &self,
-    _ctx: &BackendContext,
+    ctx: &BackendContext,
     _catalog: &RequirementCatalog,
-    _work_unit: &WorkUnit,
+    work_unit: &WorkUnit,
     _report: &VerificationReport,
   ) -> Result<WorkerSummary> {
+    let repair_number = self.repair_calls.fetch_add(1, Ordering::SeqCst) + 1;
+    if matches!(self.mode, BackendMode::NeverPassingVerification) && work_unit.id == "A" {
+      fs::write(ctx.cwd.join("A.txt"), format!("repair-{repair_number}")).await?;
+      return Ok(summary(Vec::new()));
+    }
+    if matches!(self.mode, BackendMode::RepairDiscovery) && work_unit.id == "A" {
+      fs::write(ctx.cwd.join("A.txt"), "repaired").await?;
+      return Ok(summary(vec![Discovery::Blocker {
+        description: "repair found a dependent concern".into(),
+      }]));
+    }
     bail!("repair not expected")
   }
 
@@ -284,9 +385,37 @@ impl AgentBackend for FakeBackend {
     ctx: &BackendContext,
     _catalog: &RequirementCatalog,
   ) -> Result<ReconcileResult> {
+    self
+      .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Assess)
+      .await?;
+    self.assessment_calls.fetch_add(1, Ordering::SeqCst);
     let satisfied = ["A", "B", "C", "D"]
       .iter()
       .all(|id| ctx.cwd.join(format!("{id}.txt")).exists());
+    if matches!(self.mode, BackendMode::CleanupFailure) && satisfied {
+      let canonical = self
+        .canonical
+        .lock()
+        .expect("canonical path lock")
+        .clone()
+        .expect("canonical path configured");
+      let run_id = ctx
+        .runtime_dir
+        .parent()
+        .and_then(Path::file_name)
+        .expect("assessment run id");
+      let obstacle = canonical.join(".tenet/integration").join(run_id);
+      fs::create_dir_all(obstacle.parent().expect("integration parent")).await?;
+      fs::write(obstacle, "cleanup obstacle").await?;
+    }
+    if matches!(self.mode, BackendMode::IncompleteAssessment) && satisfied {
+      return Ok(ReconcileResult {
+        complete: false,
+        summary: "assessment still finds a gap".into(),
+        requirements: vec![assessment(false)],
+        work_units: vec![unit("assessment-gap", &[])],
+      });
+    }
     Ok(ReconcileResult {
       complete: satisfied,
       summary: "assessment".into(),
@@ -301,6 +430,7 @@ async fn configured_controller(
   backend: Arc<FakeBackend>,
   max_parallel_workers: usize,
 ) -> (Controller, mpsc::UnboundedReceiver<RunEvent>) {
+  *backend.canonical.lock().expect("canonical path lock") = Some(repository.path().to_path_buf());
   let mut config = Config::default();
   config.agent.custom = Some(CustomAgentConfig {
     command: "unused".into(),
@@ -346,6 +476,66 @@ async fn configured_controller(
   )
 }
 
+async fn assert_read_only_role_is_isolated(role: tenet_domain::model::WorkerRole, commit: bool) {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::ReadOnlyMutation {
+    role,
+    commit,
+  }));
+  let (controller, _) = configured_controller(&repository, backend, 2).await;
+  if role == tenet_domain::model::WorkerRole::Architect {
+    fs::remove_file(repository.path().join(".tenet/requirements.json"))
+      .await
+      .expect("remove cached catalog");
+  }
+  let head_before = git::head(repository.path()).await.expect("head before run");
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("isolated read-only mutation cannot affect the run");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert!(!repository.path().join("read-only-mutation.txt").exists());
+  assert_ne!(
+    git::head(repository.path()).await.expect("head after run"),
+    head_before,
+    "normal candidate integrations should still advance HEAD"
+  );
+  let history = run_git(repository.path(), &["log", "--format=%s"]);
+  assert!(!history.contains("malicious read-only mutation"));
+}
+
+#[tokio::test]
+async fn architect_uncommitted_mutation_is_discarded() {
+  assert_read_only_role_is_isolated(tenet_domain::model::WorkerRole::Architect, false).await;
+}
+
+#[tokio::test]
+async fn architect_committed_mutation_is_discarded() {
+  assert_read_only_role_is_isolated(tenet_domain::model::WorkerRole::Architect, true).await;
+}
+
+#[tokio::test]
+async fn reconcile_uncommitted_mutation_is_discarded() {
+  assert_read_only_role_is_isolated(tenet_domain::model::WorkerRole::Reconcile, false).await;
+}
+
+#[tokio::test]
+async fn reconcile_committed_mutation_is_discarded() {
+  assert_read_only_role_is_isolated(tenet_domain::model::WorkerRole::Reconcile, true).await;
+}
+
+#[tokio::test]
+async fn assess_uncommitted_mutation_is_discarded_after_final_verification() {
+  assert_read_only_role_is_isolated(tenet_domain::model::WorkerRole::Assess, false).await;
+}
+
+#[tokio::test]
+async fn assess_committed_mutation_is_discarded_after_final_verification() {
+  assert_read_only_role_is_isolated(tenet_domain::model::WorkerRole::Assess, true).await;
+}
+
 #[tokio::test]
 async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
   let repository = TempRepo::new();
@@ -388,6 +578,7 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
   assert_eq!(integrations, ["A", "B", "C", "D"]);
   assert_eq!(worker_ids.len(), 4);
   assert_eq!(candidates.len(), 4);
+
   let b_candidate = candidates
     .iter()
     .find(|item| item.lease.work_unit.id == "B")
@@ -409,6 +600,179 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
     .iter()
     .all(|id| repository.path().join(format!("{id}.txt")).exists()));
 }
+async fn assert_out_of_scope_change_is_rejected(mutation: ScopeMutation) {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::ScopeMutation(mutation)));
+  let (controller, _) = configured_controller(&repository, backend, 1).await;
+  let head_before = git::head(repository.path()).await.expect("head before run");
+
+  let error = controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("out-of-scope candidate must fail closed");
+
+  assert!(error.to_string().contains("outside its declared scope"));
+  assert_eq!(
+    git::head(repository.path()).await.expect("canonical head"),
+    head_before
+  );
+}
+
+#[tokio::test]
+async fn candidate_modification_outside_scope_is_rejected() {
+  assert_out_of_scope_change_is_rejected(ScopeMutation::Modification).await;
+}
+
+#[tokio::test]
+async fn candidate_addition_outside_scope_is_rejected() {
+  assert_out_of_scope_change_is_rejected(ScopeMutation::Addition).await;
+}
+
+#[tokio::test]
+async fn candidate_deletion_outside_scope_is_rejected() {
+  assert_out_of_scope_change_is_rejected(ScopeMutation::Deletion).await;
+}
+
+#[tokio::test]
+async fn candidate_rename_outside_scope_is_rejected() {
+  assert_out_of_scope_change_is_rejected(ScopeMutation::Rename).await;
+}
+
+async fn run_with_historical_a(mut historical: WorkUnit) {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend, 2).await;
+  historical.id = "A".into();
+  let mut state = State::fresh();
+  state.completed_work_units.push(CompletedWorkUnit {
+    work_unit: historical,
+    completed_at: "historical".into(),
+    verification_evidence: ".tenet/evidence/historical.json".into(),
+  });
+  store::write_state(repository.path(), &state)
+    .await
+    .expect("persist historical completion");
+
+  let result = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("current reconciliation must outrank historical completion");
+
+  assert_eq!(result.status, tenet_domain::model::RunStatus::Done);
+  assert!(repository.path().join("A.txt").exists());
+}
+
+#[tokio::test]
+async fn reused_work_id_with_changed_objective_is_not_suppressed() {
+  let mut historical = unit("A", &[]);
+  historical.objective = "obsolete objective".into();
+  run_with_historical_a(historical).await;
+}
+
+#[tokio::test]
+async fn reused_work_id_with_changed_requirement_set_is_not_suppressed() {
+  let mut historical = unit("A", &[]);
+  historical.requirement_ids = vec!["REQ-OLD".into()];
+  run_with_historical_a(historical).await;
+}
+
+#[tokio::test]
+async fn reused_work_id_with_changed_scope_is_not_suppressed() {
+  let mut historical = unit("A", &[]);
+  historical.scope.paths = vec!["obsolete/**".into()];
+  run_with_historical_a(historical).await;
+}
+
+#[tokio::test]
+async fn manual_repository_regression_is_not_hidden_by_completion_history() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend, 2).await;
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect("first run completes");
+  std::fs::remove_file(repository.path().join("A.txt")).expect("regress repository");
+  run_git(repository.path(), &["add", "-A"]);
+  run_git(repository.path(), &["commit", "-m", "manual regression"]);
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("second run repairs current repository reality");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert!(repository.path().join("A.txt").exists());
+}
+
+#[tokio::test]
+async fn repository_rewind_is_not_hidden_by_completion_history() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend, 2).await;
+  let before_work = git::head(repository.path())
+    .await
+    .expect("pre-work revision");
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect("first run completes");
+  run_git(repository.path(), &["reset", "--hard", &before_work]);
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("rewound repository is reconciled again");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert!(repository.path().join("A.txt").exists());
+}
+
+#[tokio::test]
+async fn specification_change_invalidates_completion_and_discovery_history() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend, 2).await;
+  let mut first = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("first run completes");
+  assert!(!first.completed_work_units.is_empty());
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("read catalog")
+    .expect("catalog exists");
+  first.discoveries.push(DiscoveryRecord {
+    fingerprint: "stale".into(),
+    discovery: Discovery::Blocker {
+      description: "old catalog blocker".into(),
+    },
+    catalog_hash: catalog.spec_hash,
+    repository_revision: git::head(repository.path()).await.expect("current head"),
+    work_unit_id: "A".into(),
+    role: WorkerRole::Implement,
+    cycle: first.cycle,
+    status: DiscoveryStatus::Active,
+  });
+  store::write_state(repository.path(), &first)
+    .await
+    .expect("persist stale discovery");
+  fs::write(
+    repository.path().join(".tenet/spec.md"),
+    "changed specification",
+  )
+  .await
+  .expect("change specification");
+
+  let second = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("changed specification starts a new catalog context");
+
+  assert_eq!(second.status, tenet_domain::model::RunStatus::Done);
+  assert!(second.completed_work_units.is_empty());
+  assert!(second.discoveries.is_empty());
+}
 #[tokio::test]
 async fn concurrency_one_preserves_sequential_execution() {
   let repository = TempRepo::new();
@@ -421,6 +785,38 @@ async fn concurrency_one_preserves_sequential_execution() {
     .expect("sequential run succeeds");
 
   assert_eq!(backend.max_active.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn repair_discovery_reaches_next_reconciliation_once() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::RepairDiscovery));
+  let (controller, mut events) = configured_controller(&repository, backend.clone(), 2).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("repair discovery run completes");
+
+  assert_eq!(
+    state.status,
+    tenet_domain::model::RunStatus::Done,
+    "blocked={:?} error={:?}",
+    state.blocked_reason,
+    state.last_error
+  );
+  assert_eq!(backend.discoveries_seen.load(Ordering::SeqCst), 2);
+  let repair_state = std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| {
+    let RunEvent::State(state) = event else {
+      return None;
+    };
+    (state.phase == tenet_domain::model::Phase::Repairing).then_some(state)
+  });
+  let repair = repair_state
+    .and_then(|state| state.current_repair)
+    .expect("repair phase includes current repair details");
+  assert_eq!(repair.work_unit_id, "A");
+  assert_eq!(repair.attempt, 1);
 }
 
 #[tokio::test]
@@ -559,6 +955,7 @@ async fn candidate(
     base_revision: base.into(),
     candidate_revision: revision,
     changed_paths: vec![path.into()],
+    discoveries: Vec::new(),
   };
   manager
     .remove(&workspace)
@@ -734,4 +1131,595 @@ async fn integration_rejects_candidate_check_and_global_regression() {
     .cleanup(&regression_manager)
     .await
     .expect("cleanup regression integration");
+}
+
+#[cfg(unix)]
+async fn repository_after_disposable_check(command: &str) -> (TempRepo, String, String) {
+  use std::os::unix::fs::{symlink, PermissionsExt};
+
+  let repository = TempRepo::new();
+  std::fs::write(repository.path().join("tenet.toml"), "protected\n").expect("protected file");
+  std::fs::write(repository.path().join("victim.txt"), "present\n").expect("victim file");
+  std::fs::write(repository.path().join("script.sh"), "#!/bin/sh\n").expect("script file");
+  let mut permissions = std::fs::metadata(repository.path().join("script.sh"))
+    .expect("script metadata")
+    .permissions();
+  permissions.set_mode(0o755);
+  std::fs::set_permissions(repository.path().join("script.sh"), permissions)
+    .expect("script permissions");
+  std::fs::write(repository.path().join("target.txt"), "target\n").expect("target file");
+  symlink("target.txt", repository.path().join("link.txt")).expect("test symlink");
+  run_git(repository.path(), &["add", "-A"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "verification fixtures"],
+  );
+  let base = git::head(repository.path()).await.expect("base revision");
+  let manager = WorkspaceManager::new(repository.path().to_path_buf(), "immutable-check");
+  let candidate = candidate(
+    &repository,
+    &manager,
+    "check",
+    &base,
+    "check.txt",
+    "candidate\n",
+    vec![command.into()],
+  )
+  .await;
+  let candidate_revision = candidate.candidate_revision.clone();
+  let mut integrator = Integrator::create(
+    repository.path().to_path_buf(),
+    &manager,
+    base,
+    Config::default(),
+  )
+  .await
+  .expect("create integrator");
+
+  let outcome = integrator
+    .integrate(&candidate)
+    .await
+    .expect("integrate immutable candidate");
+  let IntegrationOutcome::Accepted { revision, .. } = outcome else {
+    panic!("mutation in disposable check must not reject the immutable candidate")
+  };
+  assert_eq!(
+    git::head(repository.path()).await.expect("canonical head"),
+    revision
+  );
+  integrator
+    .cleanup(&manager)
+    .await
+    .expect("cleanup integration");
+  (repository, revision, candidate_revision)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn suggested_check_cannot_modify_candidate_source() {
+  let (repository, accepted_revision, candidate_revision) = repository_after_disposable_check(
+    "printf hacked > check.txt && git add -A && git commit -m malicious-check",
+  )
+  .await;
+  assert_eq!(
+    std::fs::read_to_string(repository.path().join("check.txt")).expect("candidate source"),
+    "candidate\n"
+  );
+  assert_eq!(
+    git::head(repository.path()).await.expect("canonical head"),
+    accepted_revision
+  );
+  assert_eq!(
+    run_git(
+      repository.path(),
+      &["show", &format!("{candidate_revision}:check.txt")]
+    ),
+    "candidate"
+  );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn suggested_check_cannot_modify_protected_file() {
+  let (repository, _, _) = repository_after_disposable_check("printf hacked > tenet.toml").await;
+  assert_eq!(
+    std::fs::read_to_string(repository.path().join("tenet.toml")).expect("protected file"),
+    "protected\n"
+  );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn suggested_check_cannot_delete_tracked_file() {
+  let (repository, _, _) = repository_after_disposable_check("rm victim.txt").await;
+  assert!(repository.path().join("victim.txt").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn suggested_check_cannot_change_executable_mode() {
+  use std::os::unix::fs::PermissionsExt;
+
+  let (repository, _, _) = repository_after_disposable_check("chmod -x script.sh").await;
+  let mode = std::fs::metadata(repository.path().join("script.sh"))
+    .expect("script metadata")
+    .permissions()
+    .mode();
+
+  assert_ne!(mode & 0o111, 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn suggested_check_cannot_change_symlink_target() {
+  let (repository, _, _) = repository_after_disposable_check("ln -sf victim.txt link.txt").await;
+  assert_eq!(
+    std::fs::read_link(repository.path().join("link.txt")).expect("symlink target"),
+    PathBuf::from("target.txt")
+  );
+}
+
+#[tokio::test]
+async fn cancellation_before_integration_leaves_canonical_head_unchanged() {
+  let repository = TempRepo::new();
+  let base = git::head(repository.path()).await.expect("base revision");
+  let manager = WorkspaceManager::new(repository.path().to_path_buf(), "cancel-before");
+  let candidate = candidate(
+    &repository,
+    &manager,
+    "cancel",
+    &base,
+    "cancel.txt",
+    "candidate",
+    Vec::new(),
+  )
+  .await;
+  let cancel = CancellationToken::new();
+  cancel.cancel();
+  let mut integrator = Integrator::create_with_cancel(
+    repository.path().to_path_buf(),
+    &manager,
+    base.clone(),
+    Config::default(),
+    cancel,
+  )
+  .await
+  .expect("create integrator");
+
+  let error = integrator
+    .integrate(&candidate)
+    .await
+    .expect_err("cancellation fences integration");
+
+  assert!(error.to_string().contains("cancelled"));
+  assert_eq!(
+    git::head(repository.path()).await.expect("canonical head"),
+    base
+  );
+  integrator
+    .cleanup(&manager)
+    .await
+    .expect("cleanup integrator");
+}
+
+async fn assert_cancellation_during_integration_verification(global: bool) {
+  let repository = TempRepo::new();
+  let base = git::head(repository.path()).await.expect("base revision");
+  let manager = WorkspaceManager::new(repository.path().to_path_buf(), "cancel-verification");
+  let marker = repository
+    .path()
+    .parent()
+    .expect("temporary parent")
+    .join(format!("tenet-cancel-marker-{}", Uuid::new_v4()));
+  let command = format!("touch '{}' && sleep 30", marker.display());
+  let candidate = candidate(
+    &repository,
+    &manager,
+    "cancel",
+    &base,
+    "cancel.txt",
+    "candidate",
+    (!global).then_some(command.clone()).into_iter().collect(),
+  )
+  .await;
+  let mut config = Config::default();
+  if global {
+    config.verification.commands = vec![command];
+  }
+  let cancel = CancellationToken::new();
+  let trigger = cancel.clone();
+  let marker_for_trigger = marker.clone();
+  let cancellation = tokio::spawn(async move {
+    while !marker_for_trigger.exists() {
+      tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    trigger.cancel();
+  });
+  let mut integrator = Integrator::create_with_cancel(
+    repository.path().to_path_buf(),
+    &manager,
+    base.clone(),
+    config,
+    cancel,
+  )
+  .await
+  .expect("create integrator");
+
+  let error = integrator
+    .integrate(&candidate)
+    .await
+    .expect_err("verification cancellation propagates");
+  cancellation.await.expect("cancellation trigger");
+
+  assert!(error.to_string().contains("cancelled"));
+  assert_eq!(
+    git::head(repository.path()).await.expect("canonical head"),
+    base
+  );
+  integrator
+    .cleanup(&manager)
+    .await
+    .expect("cleanup integrator");
+  let _ = std::fs::remove_file(marker);
+}
+
+#[tokio::test]
+async fn cancellation_during_suggested_check_leaves_canonical_head_unchanged() {
+  assert_cancellation_during_integration_verification(false).await;
+}
+
+#[tokio::test]
+async fn cancellation_during_global_verification_leaves_canonical_head_unchanged() {
+  assert_cancellation_during_integration_verification(true).await;
+}
+
+async fn write_recovery_transaction(
+  repository: &TempRepo,
+  old_head: &str,
+  new_head: &str,
+  phase: IntegrationPhase,
+) -> IntegrationTransaction {
+  let report = passing_report();
+  let evidence_path = store::save_evidence(repository.path(), "recovery", &report)
+    .await
+    .expect("save recovery evidence");
+  let evidence = evidence_path
+    .strip_prefix(repository.path())
+    .expect("relative evidence")
+    .display()
+    .to_string();
+  let transaction = IntegrationTransaction {
+    version: IntegrationTransaction::VERSION,
+    id: Uuid::new_v4().to_string(),
+    run_id: "recovery-run".into(),
+    work_unit: unit("A", &[]),
+    candidate_revision: new_head.into(),
+    old_head: old_head.into(),
+    new_head: new_head.into(),
+    phase,
+    verification_evidence: evidence,
+    verification_hash: store::verification_hash(&report).expect("hash evidence"),
+    created_at: "created".into(),
+    updated_at: "updated".into(),
+  };
+  store::write_integration_journal(repository.path(), &transaction)
+    .await
+    .expect("write recovery journal");
+  transaction
+}
+
+#[tokio::test]
+async fn prepared_journal_with_old_head_is_abandoned_without_advancement() {
+  let repository = TempRepo::new();
+  store::ensure_layout(repository.path())
+    .await
+    .expect("ensure layout");
+  let old_head = git::head(repository.path()).await.expect("old head");
+  write_recovery_transaction(
+    &repository,
+    &old_head,
+    "1111111111111111111111111111111111111111",
+    IntegrationPhase::Prepared,
+  )
+  .await;
+  let mut state = State::fresh();
+
+  store::recover_integration(repository.path(), &mut state)
+    .await
+    .expect("abandon uncommitted transaction");
+
+  assert!(state.completed_work_units.is_empty());
+  assert!(store::read_integration_journal(repository.path())
+    .await
+    .expect("read journal")
+    .is_none());
+}
+
+async fn assert_new_head_transaction_recovers(phase: IntegrationPhase) {
+  let repository = TempRepo::new();
+  store::ensure_layout(repository.path())
+    .await
+    .expect("ensure layout");
+  let old_head = git::head(repository.path()).await.expect("old head");
+  std::fs::write(repository.path().join("recovered.txt"), "committed").expect("recovery file");
+  run_git(repository.path(), &["add", "recovered.txt"]);
+  run_git(repository.path(), &["commit", "-m", "already advanced"]);
+  let new_head = git::head(repository.path()).await.expect("new head");
+  write_recovery_transaction(&repository, &old_head, &new_head, phase).await;
+  let mut state = State::fresh();
+
+  store::recover_integration(repository.path(), &mut state)
+    .await
+    .expect("recover committed transaction");
+
+  assert_eq!(state.completed_work_units.len(), 1);
+  assert!(store::read_integration_journal(repository.path())
+    .await
+    .expect("read journal")
+    .is_none());
+}
+
+#[tokio::test]
+async fn prepared_journal_with_new_head_recovers_state() {
+  assert_new_head_transaction_recovers(IntegrationPhase::Prepared).await;
+}
+
+#[tokio::test]
+async fn git_committed_journal_with_new_head_recovers_state() {
+  assert_new_head_transaction_recovers(IntegrationPhase::GitCommitted).await;
+}
+
+#[tokio::test]
+async fn integration_recovery_rejects_unexpected_head() {
+  let repository = TempRepo::new();
+  store::ensure_layout(repository.path())
+    .await
+    .expect("ensure layout");
+  write_recovery_transaction(
+    &repository,
+    "1111111111111111111111111111111111111111",
+    "2222222222222222222222222222222222222222",
+    IntegrationPhase::GitCommitted,
+  )
+  .await;
+  let mut state = State::fresh();
+
+  let error = store::recover_integration(repository.path(), &mut state)
+    .await
+    .expect_err("unexpected HEAD must fail closed");
+
+  assert!(error.to_string().contains("matches neither expected old"));
+}
+
+#[tokio::test]
+async fn prior_done_then_dirty_run_records_latest_failed_attempt() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend, 2).await;
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect("first run completes");
+  std::fs::write(repository.path().join("dirty.txt"), "dirty").expect("dirty repository");
+
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("dirty second run fails preflight");
+  let state = store::read_state(repository.path())
+    .await
+    .expect("read latest attempt state");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Failed);
+  assert_eq!(state.phase, tenet_domain::model::Phase::Initialized);
+  assert!(state
+    .last_error
+    .as_deref()
+    .is_some_and(|error| error.contains("clean canonical")));
+}
+
+#[tokio::test]
+async fn prior_done_then_invalid_config_records_latest_failed_attempt() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend, 2).await;
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect("first run completes");
+  std::fs::write(repository.path().join("tenet.toml"), "not valid toml =").expect("invalid config");
+
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("invalid configuration fails preflight");
+  let state = store::read_state(repository.path())
+    .await
+    .expect("read latest attempt state");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Failed);
+  assert!(state
+    .run_id
+    .as_deref()
+    .is_some_and(|id| id.starts_with("preflight-")));
+}
+
+async fn rewrite_config(repository: &TempRepo, configure: impl FnOnce(&mut Config)) {
+  let mut config = tenet_domain::config::read_config(repository.path())
+    .await
+    .expect("read test config");
+  configure(&mut config);
+  fs::write(
+    repository.path().join("tenet.toml"),
+    toml::to_string_pretty(&config).expect("serialize test config"),
+  )
+  .await
+  .expect("write test config");
+  run_git(repository.path(), &["add", "tenet.toml"]);
+  run_git(repository.path(), &["commit", "-m", "adjust test bounds"]);
+}
+
+#[tokio::test]
+async fn repair_attempt_count_matches_configured_bound_exactly() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::NeverPassingVerification));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  rewrite_config(&repository, |config| config.max_repair_attempts = 2).await;
+
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("permanently failing verification exhausts repairs");
+
+  assert_eq!(backend.repair_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn maximum_cycle_count_blocks_on_exact_configured_cycle() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::IncompleteAssessment));
+  let (controller, _) = configured_controller(&repository, backend, 2).await;
+  rewrite_config(&repository, |config| {
+    config.max_cycles = 5;
+    config.stagnation_limit = 10;
+  })
+  .await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("max cycles produces blocked state");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Blocked);
+  assert_eq!(state.cycle, 5);
+  assert_eq!(
+    state.blocked_reason.as_deref(),
+    Some("Maximum cycle count (5) reached")
+  );
+}
+
+#[tokio::test]
+async fn stagnation_limit_blocks_on_exact_unchanged_transition() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::IncompleteAssessment));
+  let (controller, _) = configured_controller(&repository, backend, 2).await;
+  rewrite_config(&repository, |config| {
+    config.max_cycles = 10;
+    config.stagnation_limit = 1;
+  })
+  .await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("stagnation produces blocked state");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Blocked);
+  assert_eq!(state.cycle, 5);
+  assert!(state
+    .blocked_reason
+    .as_deref()
+    .is_some_and(|reason| reason.contains("Stagnation limit (1)")));
+}
+
+#[tokio::test]
+async fn cancellation_after_prepared_journal_prevents_fast_forward() {
+  let repository = TempRepo::new();
+  store::ensure_layout(repository.path())
+    .await
+    .expect("ensure layout");
+  let base = git::head(repository.path()).await.expect("base revision");
+  let manager = WorkspaceManager::new(repository.path().to_path_buf(), "cancel-prepared");
+  let candidate = candidate(
+    &repository,
+    &manager,
+    "cancel",
+    &base,
+    "cancel.txt",
+    "candidate",
+    Vec::new(),
+  )
+  .await;
+  let cancel = CancellationToken::new();
+  let trigger = cancel.clone();
+  let journal = repository
+    .path()
+    .join(".tenet")
+    .join(store::INTEGRATION_JOURNAL_FILE);
+  let monitor = tokio::spawn(async move {
+    while !journal.exists() {
+      tokio::task::yield_now().await;
+    }
+    trigger.cancel();
+  });
+  let mut integrator = Integrator::create_with_cancel(
+    repository.path().to_path_buf(),
+    &manager,
+    base.clone(),
+    Config::default(),
+    cancel,
+  )
+  .await
+  .expect("create integrator");
+
+  let error = integrator
+    .integrate(&candidate)
+    .await
+    .expect_err("prepared cancellation must fence fast-forward");
+  monitor.await.expect("journal monitor");
+
+  assert!(error.to_string().contains("cancelled"));
+  assert_eq!(
+    git::head(repository.path()).await.expect("canonical head"),
+    base
+  );
+  integrator
+    .cleanup(&manager)
+    .await
+    .expect("cleanup integrator");
+}
+
+#[tokio::test]
+async fn state_committed_journal_with_new_head_recovers_idempotently() {
+  assert_new_head_transaction_recovers(IntegrationPhase::StateCommitted).await;
+}
+
+#[tokio::test]
+async fn orphan_evidence_before_journal_does_not_claim_completion() {
+  let repository = TempRepo::new();
+  store::ensure_layout(repository.path())
+    .await
+    .expect("ensure layout");
+  store::save_evidence(repository.path(), "orphan", &passing_report())
+    .await
+    .expect("save orphan evidence");
+  let mut state = State::fresh();
+
+  store::recover_integration(repository.path(), &mut state)
+    .await
+    .expect("no journal means no recovery action");
+
+  assert!(state.completed_work_units.is_empty());
+}
+
+#[tokio::test]
+async fn cleanup_failure_prevents_persisted_done_state() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::CleanupFailure));
+  let (controller, _) = configured_controller(&repository, backend, 2).await;
+
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("required cleanup failure must fail the run");
+  let state = store::read_state(repository.path())
+    .await
+    .expect("read cleanup failure state");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Failed);
+  assert_ne!(state.status, tenet_domain::model::RunStatus::Done);
+  assert!(state
+    .last_error
+    .as_deref()
+    .is_some_and(|error| error.contains("workspace cleanup failed")));
 }

@@ -9,6 +9,7 @@ pub const TENET_DIR: &str = ".tenet";
 pub const CONFIG_FILE: &str = "tenet.toml";
 pub const CONFIG_SCHEMA_URL: &str =
   "https://raw.githubusercontent.com/flaviodelgrosso/tenet/main/schemas/config.schema.json";
+pub const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -378,6 +379,16 @@ pub async fn read_config(cwd: &Path) -> Result<Config> {
   let config: Config =
     toml::from_str(&text).map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))?;
   config.agent.validate_launch_source()?;
+  if config.version != SUPPORTED_CONFIG_VERSION {
+    anyhow::bail!(
+      "unsupported configuration version {}; supported version is {}; migrate tenet.toml before running",
+      config.version,
+      SUPPORTED_CONFIG_VERSION
+    );
+  }
+  if config.stagnation_limit == 0 {
+    anyhow::bail!("stagnation_limit must be at least 1");
+  }
   if config.execution.max_parallel_workers == 0 {
     anyhow::bail!("execution.max_parallel_workers must be at least 1");
   }
@@ -826,7 +837,34 @@ mod tests {
     assert_eq!(loaded.agent.turn_timeout_secs, 900);
     assert_eq!(
       loaded.agent.model_for(WorkerRole::Architect),
-      Some("openai-codex/gpt-5.6-sol"),
+      Some("github-copilot/gpt-5.6-sol"),
     );
+  }
+
+  #[tokio::test]
+  async fn unsupported_configuration_version_is_rejected() {
+    let project = tempdir().unwrap();
+    let text = serialized_config(|config| config.version = 99, "");
+    tokio::fs::write(config_path(project.path()), text)
+      .await
+      .unwrap();
+
+    let error = read_config(project.path()).await.unwrap_err().to_string();
+
+    assert!(error.contains("unsupported configuration version 99"));
+    assert!(error.contains("supported version is 1"));
+  }
+
+  #[tokio::test]
+  async fn zero_stagnation_limit_is_rejected() {
+    let project = tempdir().unwrap();
+    let text = serialized_config(|config| config.stagnation_limit = 0, "");
+    tokio::fs::write(config_path(project.path()), text)
+      .await
+      .unwrap();
+
+    let error = read_config(project.path()).await.unwrap_err().to_string();
+
+    assert!(error.contains("stagnation_limit must be at least 1"));
   }
 }

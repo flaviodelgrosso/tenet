@@ -7,6 +7,7 @@ use tokio::{
   process::Command,
   time::{timeout, Duration},
 };
+use tokio_util::sync::CancellationToken;
 
 use tenet_domain::{
   config::Config,
@@ -18,13 +19,22 @@ pub async fn verification_commands(config: &Config) -> Result<Vec<String>> {
 }
 
 pub async fn run_verification(cwd: &Path, config: &Config) -> Result<VerificationReport> {
-  run_commands(cwd, config, verification_commands(config).await?).await
+  run_verification_cancelled(cwd, config, &CancellationToken::new()).await
 }
 
-pub async fn run_verification_with_checks(
+pub async fn run_verification_cancelled(
+  cwd: &Path,
+  config: &Config,
+  cancel: &CancellationToken,
+) -> Result<VerificationReport> {
+  run_commands(cwd, config, verification_commands(config).await?, cancel).await
+}
+
+pub async fn run_verification_with_checks_cancelled(
   cwd: &Path,
   config: &Config,
   suggested_checks: &[String],
+  cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
   let commands = deduplicate_commands(
     suggested_checks
@@ -32,18 +42,20 @@ pub async fn run_verification_with_checks(
       .cloned()
       .chain(config.verification.commands.iter().cloned()),
   )?;
-  run_commands(cwd, config, commands).await
+  run_commands(cwd, config, commands, cancel).await
 }
 
-pub async fn run_suggested_checks(
+pub async fn run_suggested_checks_cancelled(
   cwd: &Path,
   config: &Config,
   suggested_checks: &[String],
+  cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
   run_commands(
     cwd,
     config,
     deduplicate_commands(suggested_checks.iter().cloned())?,
+    cancel,
   )
   .await
 }
@@ -62,6 +74,7 @@ async fn run_commands(
   cwd: &Path,
   config: &Config,
   commands: Vec<String>,
+  cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
   let started_at = Utc::now().to_rfc3339();
   let project_gate_count = commands
@@ -86,6 +99,7 @@ async fn run_commands(
       &command,
       Duration::from_secs(config.verification.timeout_secs),
       config.verification.max_output_bytes,
+      cancel,
     )
     .await?;
     let failed = result.exit_code != Some(0) || result.timed_out;
@@ -133,6 +147,7 @@ async fn run_shell(
   command: &str,
   limit: Duration,
   max_output: usize,
+  cancel: &CancellationToken,
 ) -> Result<CommandResult> {
   let start = Instant::now();
   let mut child = shell_command(command)
@@ -160,12 +175,17 @@ async fn run_shell(
     stderr.read_to_end(&mut buf).await.map(|_| buf)
   });
 
-  let (status, timed_out) = match timeout(limit, child.wait()).await {
-    Ok(status) => (Some(status?), false),
-    Err(_) => {
-      let _ = child.kill().await;
-      let _ = child.wait().await;
-      (None, true)
+  let (status, timed_out) = tokio::select! {
+    _ = cancel.cancelled() => {
+      terminate(&mut child).await;
+      anyhow::bail!("run cancelled during verification command: {command}");
+    }
+    result = timeout(limit, child.wait()) => match result {
+      Ok(status) => (Some(status?), false),
+      Err(_) => {
+        terminate(&mut child).await;
+        (None, true)
+      }
     }
   };
 
@@ -179,6 +199,11 @@ async fn run_shell(
     stdout: truncate_utf8(&stdout, max_output),
     stderr: truncate_utf8(&stderr, max_output),
   })
+}
+
+async fn terminate(child: &mut tokio::process::Child) {
+  let _ = child.kill().await;
+  let _ = child.wait().await;
 }
 
 fn truncate_utf8(bytes: &[u8], max: usize) -> String {
@@ -205,6 +230,7 @@ mod tests {
       "echo tenet-shell-test",
       Duration::from_secs(5),
       1024,
+      &CancellationToken::new(),
     )
     .await
     .expect("platform shell should start");
@@ -215,9 +241,15 @@ mod tests {
   }
   #[tokio::test]
   async fn run_shell_marks_timeout_and_terminates_child() {
-    let result = run_shell(Path::new("."), "sleep 1", Duration::from_millis(10), 1024)
-      .await
-      .expect("platform shell should start");
+    let result = run_shell(
+      Path::new("."),
+      "sleep 1",
+      Duration::from_millis(10),
+      1024,
+      &CancellationToken::new(),
+    )
+    .await
+    .expect("platform shell should start");
 
     assert!(result.timed_out);
   }

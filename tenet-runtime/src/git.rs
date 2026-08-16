@@ -18,6 +18,18 @@ pub async fn is_clean(cwd: &Path) -> Result<bool> {
       .is_empty(),
   )
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryState {
+  pub head: String,
+  pub status: String,
+}
+
+pub async fn repository_state(cwd: &Path) -> Result<RepositoryState> {
+  Ok(RepositoryState {
+    head: head(cwd).await?,
+    status: run(cwd, &["status", "--porcelain=v1", "--untracked-files=all"]).await?,
+  })
+}
 
 pub async fn repository_changes(cwd: &Path) -> Result<Vec<RepositoryChange>> {
   let output = run(cwd, &["status", "--porcelain", "--untracked-files=all"]).await?;
@@ -101,6 +113,10 @@ pub async fn conflict_paths(cwd: &Path) -> Result<Vec<String>> {
 
 pub async fn abort_cherry_pick(cwd: &Path) -> Result<()> {
   run(cwd, &["cherry-pick", "--abort"]).await.map(|_| ())
+}
+
+pub async fn reset_soft(cwd: &Path, revision: &str) -> Result<()> {
+  run(cwd, &["reset", "--soft", revision]).await.map(|_| ())
 }
 
 pub async fn reset_hard(cwd: &Path, revision: &str) -> Result<()> {

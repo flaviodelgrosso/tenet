@@ -1,76 +1,167 @@
 use std::{
-  collections::BTreeMap,
-  path::{Path, PathBuf},
+  collections::{BTreeMap, BTreeSet},
+  path::{Component, Path, PathBuf},
 };
 
-use anyhow::Result;
-use tokio::fs;
+use anyhow::{bail, Context, Result};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryState {
+  Missing,
+  Directory,
+  File { bytes: Vec<u8>, executable: bool },
+  Symlink(PathBuf),
+}
+
 #[derive(Debug, Clone)]
 pub struct Snapshot {
-  files: BTreeMap<PathBuf, Option<Vec<u8>>>,
+  entries: BTreeMap<PathBuf, EntryState>,
+  roots: Vec<PathBuf>,
 }
 
 pub async fn snapshot(cwd: &Path, paths: &[String]) -> Result<Snapshot> {
-  let mut files = BTreeMap::new();
-  for rel in paths {
-    let path = cwd.join(rel);
-    let value = match fs::read(&path).await {
-      Ok(bytes) => Some(bytes),
-      Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-      Err(err) => return Err(err.into()),
-    };
-    files.insert(PathBuf::from(rel), value);
+  let mut entries = BTreeMap::new();
+  let mut roots = Vec::with_capacity(paths.len());
+  for configured in paths {
+    let rel = normalize_relative(configured)?;
+    roots.push(rel.clone());
+    collect_entry(cwd, &rel, &mut entries)?;
   }
-  Ok(Snapshot { files })
+  Ok(Snapshot { entries, roots })
 }
 
 pub async fn restore_changes(cwd: &Path, snapshot: &Snapshot) -> Result<Vec<String>> {
-  let mut changed = Vec::new();
-  let mut first_error = None;
-  for (rel, before) in &snapshot.files {
-    let path = cwd.join(rel);
-    let after = match fs::read(&path).await {
-      Ok(bytes) => Some(bytes),
-      Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-      Err(err) => {
-        if first_error.is_none() {
-          first_error = Some(
-            anyhow::Error::from(err).context(format!("reading protected path {}", rel.display())),
-          );
-        }
-        continue;
-      }
-    };
-    if &after == before {
-      continue;
+  let mut current = BTreeMap::new();
+  for root in &snapshot.roots {
+    collect_entry(cwd, root, &mut current)?;
+  }
+  let paths: BTreeSet<_> = snapshot
+    .entries
+    .keys()
+    .chain(current.keys())
+    .cloned()
+    .collect();
+  Ok(
+    paths
+      .into_iter()
+      .filter(|path| snapshot.entries.get(path) != current.get(path))
+      .map(|path| path.to_string_lossy().into_owned())
+      .collect(),
+  )
+}
+
+fn collect_entry(
+  cwd: &Path,
+  rel: &Path,
+  entries: &mut BTreeMap<PathBuf, EntryState>,
+) -> Result<()> {
+  let path = cwd.join(rel);
+  let metadata = match std::fs::symlink_metadata(&path) {
+    Ok(metadata) => metadata,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+      entries.insert(rel.to_path_buf(), EntryState::Missing);
+      return Ok(());
     }
-    changed.push(rel.to_string_lossy().to_string());
-    let restore_result = match before {
-      Some(bytes) => {
-        async {
-          if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-          }
-          fs::write(&path, bytes).await
-        }
-        .await
-      }
-      None => match fs::remove_file(&path).await {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+    Err(error) => {
+      return Err(error).with_context(|| format!("inspect protected path {}", rel.display()))
+    }
+  };
+  let file_type = metadata.file_type();
+  if file_type.is_symlink() {
+    entries.insert(
+      rel.to_path_buf(),
+      EntryState::Symlink(std::fs::read_link(&path)?),
+    );
+  } else if file_type.is_dir() {
+    entries.insert(rel.to_path_buf(), EntryState::Directory);
+    for child in std::fs::read_dir(&path)? {
+      let child = child?;
+      collect_entry(cwd, &rel.join(child.file_name()), entries)?;
+    }
+  } else if file_type.is_file() {
+    entries.insert(
+      rel.to_path_buf(),
+      EntryState::File {
+        bytes: std::fs::read(&path)?,
+        executable: is_executable(&metadata),
       },
-    };
-    if let Err(err) = restore_result {
-      if first_error.is_none() {
-        first_error = Some(
-          anyhow::Error::from(err).context(format!("restoring protected path {}", rel.display())),
-        );
+    );
+  } else {
+    bail!("unsupported protected repository object {}", rel.display());
+  }
+  Ok(())
+}
+
+fn normalize_relative(value: &str) -> Result<PathBuf> {
+  let path = Path::new(value);
+  if value.trim().is_empty() || path.is_absolute() {
+    bail!("protected path must be a nonblank repository-relative path: {value:?}");
+  }
+  let mut normalized = PathBuf::new();
+  for component in path.components() {
+    match component {
+      Component::Normal(value) => normalized.push(value),
+      Component::CurDir => {}
+      Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+        bail!("protected path escapes the repository: {value:?}")
       }
     }
   }
-  if let Some(error) = first_error {
-    return Err(error);
+  if normalized.as_os_str().is_empty() {
+    bail!("protected path resolves to the repository root: {value:?}");
   }
-  Ok(changed)
+  Ok(normalized)
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &std::fs::Metadata) -> bool {
+  use std::os::unix::fs::PermissionsExt;
+  metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &std::fs::Metadata) -> bool {
+  false
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn unsafe_protected_paths_are_rejected() {
+    assert!(normalize_relative("../outside").is_err());
+    assert!(normalize_relative("/absolute").is_err());
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn recursive_snapshot_detects_mode_and_symlink_changes() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let root = std::env::temp_dir().join(format!("tenet-protection-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("protected")).expect("protected directory");
+    std::fs::write(root.join("protected/script"), "script").expect("protected script");
+    symlink("script", root.join("protected/link")).expect("protected symlink");
+    let snapshot = snapshot(&root, &["protected".into()])
+      .await
+      .expect("snapshot protected tree");
+    let mut permissions = std::fs::metadata(root.join("protected/script"))
+      .expect("script metadata")
+      .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(root.join("protected/script"), permissions).expect("change mode");
+    std::fs::remove_file(root.join("protected/link")).expect("remove old symlink");
+    symlink("other", root.join("protected/link")).expect("change symlink");
+
+    let changed = restore_changes(&root, &snapshot)
+      .await
+      .expect("detect protected changes");
+    std::fs::remove_dir_all(root).expect("cleanup protected fixture");
+
+    assert_eq!(
+      changed,
+      vec!["protected/link".to_owned(), "protected/script".to_owned()]
+    );
+  }
 }
