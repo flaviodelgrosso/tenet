@@ -3,3 +3,4 @@
 pub mod acp;
 mod prompts;
 pub mod registry;
+mod schemas;

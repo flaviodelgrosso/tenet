@@ -33,8 +33,8 @@ fn app() -> Application {
 fn report(passed: bool) -> VerificationReport {
   VerificationReport {
     passed,
-    started_at: "10:00:00".into(),
-    finished_at: "10:00:01".into(),
+    started_at: "2026-08-16T10:00:00Z".parse().expect("valid timestamp"),
+    finished_at: "2026-08-16T10:00:01Z".parse().expect("valid timestamp"),
     commands: vec![CommandResult {
       command: "cargo test".into(),
       exit_code: if passed { Some(0) } else { Some(101) },

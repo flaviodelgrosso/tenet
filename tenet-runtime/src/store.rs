@@ -350,4 +350,43 @@ mod tests {
 
     assert!(validate_state(&state).is_err());
   }
+
+  #[tokio::test]
+  async fn read_state_accepts_existing_version_one_json() {
+    let project = tempfile::tempdir().expect("temporary project");
+    let directory = project.path().join(TENET_DIR);
+    fs::create_dir_all(&directory)
+      .await
+      .expect("create state directory");
+    let fixture = serde_json::json!({
+      "version": 1,
+      "status": "running",
+      "phase": "reconciling",
+      "runId": "run-existing",
+      "cycle": 3,
+      "activeLeases": {},
+      "candidateIntegrations": [],
+      "workStatuses": {},
+      "requirementCounts": {"total": 1, "satisfied": 0, "partial": 0, "missing": 1},
+      "completedWorkUnits": [],
+      "discoveries": [],
+      "lastSummary": "Reconcile",
+      "blockedReason": null,
+      "lastError": null,
+      "updatedAt": "2026-08-16T10:00:00+00:00"
+    });
+    fs::write(
+      directory.join(STATE_FILE),
+      serde_json::to_vec_pretty(&fixture).expect("serialize fixture"),
+    )
+    .await
+    .expect("write fixture");
+
+    let state = read_state(project.path())
+      .await
+      .expect("read existing state");
+
+    assert_eq!(state.run_id.as_deref(), Some("run-existing"));
+    assert_eq!(state.cycle, 3);
+  }
 }

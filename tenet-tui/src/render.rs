@@ -625,7 +625,7 @@ fn check_attempt_lines(
           if density == Density::Narrow {
             String::new()
           } else {
-            format!("   {}", display_time(&report.finished_at))
+            format!("   {}", report.finished_at.format("%H:%M:%S"))
           },
           theme::muted(),
         ),
@@ -640,8 +640,8 @@ fn check_attempt_lines(
         Span::styled(
           format!(
             "{} → {}",
-            display_time(&report.started_at),
-            display_time(&report.finished_at)
+            report.started_at.format("%H:%M:%S"),
+            report.finished_at.format("%H:%M:%S")
           ),
           theme::muted(),
         ),

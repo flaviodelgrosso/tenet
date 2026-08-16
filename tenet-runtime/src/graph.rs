@@ -26,7 +26,7 @@ impl WorkGraph {
     let mut by_id = BTreeMap::new();
 
     for unit in &result.work_units {
-      validate_unit(unit, &known_requirements)?;
+      unit.validate(&known_requirements)?;
       if by_id.contains_key(&unit.id) {
         bail!("duplicate work unit id {}", unit.id);
       }
@@ -83,43 +83,6 @@ impl WorkGraph {
   pub fn units(&self) -> impl Iterator<Item = &WorkUnit> {
     self.by_id.values().map(|index| &self.graph[*index])
   }
-}
-
-fn validate_unit(unit: &WorkUnit, known_requirements: &BTreeSet<&str>) -> Result<()> {
-  if unit.id.trim().is_empty() || unit.title.trim().is_empty() || unit.objective.trim().is_empty() {
-    bail!("work unit is missing id, title, or objective");
-  }
-  if !unit
-    .id
-    .chars()
-    .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
-    || matches!(unit.id.as_str(), "." | "..")
-  {
-    bail!("work unit id contains unsafe path characters: {}", unit.id);
-  }
-  if unit.requirement_ids.is_empty() {
-    bail!("{} targets no requirements", unit.id);
-  }
-  if unit.acceptance_criteria.is_empty() {
-    bail!("{} has no acceptance criteria", unit.id);
-  }
-  if unit.scope.paths.is_empty() || unit.scope.paths.iter().any(|path| path.trim().is_empty()) {
-    bail!("{} has an empty declared scope", unit.id);
-  }
-  for check in &unit.suggested_checks {
-    if check.trim().is_empty() || check.contains(['\r', '\n', '`']) {
-      bail!(
-        "{} has an invalid suggested check; expected one executable shell command without prose or Markdown backticks: {check}",
-        unit.id
-      );
-    }
-  }
-  for requirement in &unit.requirement_ids {
-    if !known_requirements.contains(requirement.as_str()) {
-      bail!("{} targets unknown requirement {requirement}", unit.id);
-    }
-  }
-  Ok(())
 }
 
 #[cfg(test)]

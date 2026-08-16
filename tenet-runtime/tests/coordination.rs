@@ -911,8 +911,8 @@ async fn cancellation_after_partial_completion_cleans_all_worktrees() {
 fn passing_report() -> VerificationReport {
   VerificationReport {
     passed: true,
-    started_at: "start".into(),
-    finished_at: "finish".into(),
+    started_at: "2026-08-16T10:00:00Z".parse().expect("valid timestamp"),
+    finished_at: "2026-08-16T10:00:01Z".parse().expect("valid timestamp"),
     commands: Vec::new(),
     warnings: Vec::new(),
   }

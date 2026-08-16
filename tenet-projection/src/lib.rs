@@ -376,7 +376,7 @@ impl RunProjection {
     };
     let detail = check_detail(&report);
     self.push_activity(
-      report.finished_at.clone(),
+      report.finished_at.to_rfc3339(),
       if passed {
         ActivityCategory::Check
       } else {
@@ -764,8 +764,8 @@ mod tests {
   fn report(passed: bool) -> VerificationReport {
     VerificationReport {
       passed,
-      started_at: "10:00:00".into(),
-      finished_at: "10:00:01".into(),
+      started_at: "2026-08-16T10:00:00Z".parse().expect("valid timestamp"),
+      finished_at: "2026-08-16T10:00:01Z".parse().expect("valid timestamp"),
       warnings: Vec::new(),
       commands: vec![CommandResult {
         command: "cargo test".into(),

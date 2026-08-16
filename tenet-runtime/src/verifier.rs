@@ -76,7 +76,7 @@ async fn run_commands(
   commands: Vec<String>,
   cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
-  let started_at = Utc::now().to_rfc3339();
+  let started_at = Utc::now();
   let project_gate_count = commands
     .iter()
     .filter(|command| command.as_str() != "git diff --check")
@@ -117,7 +117,7 @@ async fn run_commands(
   Ok(VerificationReport {
     passed,
     started_at,
-    finished_at: Utc::now().to_rfc3339(),
+    finished_at: Utc::now(),
     commands: results,
     warnings,
   })

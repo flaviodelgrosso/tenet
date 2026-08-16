@@ -13,7 +13,7 @@ use tenet_domain::{
   },
 };
 
-/// Validates a schema-valid worker result against its role-specific output type.
+/// Validates worker output against its generated JSON Schema and role-specific Rust type.
 pub type WorkerOutputValidator = Arc<dyn Fn(&serde_json::Value) -> Result<()> + Send + Sync>;
 
 #[derive(Clone)]
@@ -40,7 +40,7 @@ pub struct WorkerRequest {
   pub cwd: PathBuf,
   pub runtime_dir: PathBuf,
   pub schema: serde_json::Value,
-  /// Validates that schema-valid output can be deserialized by the role adapter.
+  /// Runs JSON Schema validation before the role adapter's typed deserialization boundary.
   pub validate_output: WorkerOutputValidator,
   pub timeout: std::time::Duration,
   pub launch: Option<LaunchMetadata>,

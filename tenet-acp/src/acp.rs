@@ -22,6 +22,7 @@ use agent_client_protocol::{
 };
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tenet_domain::events::EventSink;
@@ -32,6 +33,7 @@ use tenet_domain::model::{
 use tokio::sync::oneshot;
 
 use crate::registry::RegistryClient;
+use crate::schemas::{schema_for, validate_structured_output};
 use tenet_runtime::backend::{
   AgentBackend, AgentRuntime, BackendContext, LaunchMetadata, WorkerOutputValidator, WorkerRequest,
   WorkerResult,
@@ -110,7 +112,6 @@ impl AgentBackend for AcpRuntime {
         format!(
           "Create the authoritative requirement catalog for the product spec below.\n\n{spec}"
         ),
-        architect_schema(),
       )
       .await
   }
@@ -122,7 +123,7 @@ impl AgentBackend for AcpRuntime {
     recent: &[CompletedWorkUnit],
     discoveries: &[Discovery],
   ) -> Result<ReconcileResult> {
-    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository against this catalog. Inspect it directly. Propose a dependency graph of candidate work units; the controller alone decides concurrency.\n\nCatalog:\n{}\n\nRecent completed work:\n{}\n\nWorker discoveries requiring reconsideration:\n{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(recent)?, serde_json::to_string_pretty(discoveries)?), reconcile_schema()).await
+    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository against this catalog. Inspect it directly. Propose a dependency graph of candidate work units; the controller alone decides concurrency.\n\nCatalog:\n{}\n\nRecent completed work:\n{}\n\nWorker discoveries requiring reconsideration:\n{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(recent)?, serde_json::to_string_pretty(discoveries)?)).await
   }
 
   async fn implement(
@@ -140,7 +141,6 @@ impl AgentBackend for AcpRuntime {
           serde_json::to_string_pretty(unit)?,
           serde_json::to_string_pretty(catalog)?
         ),
-        worker_summary_schema(),
       )
       .await
   }
@@ -152,7 +152,7 @@ impl AgentBackend for AcpRuntime {
     unit: &WorkUnit,
     report: &VerificationReport,
   ) -> Result<WorkerSummary> {
-    self.run_typed(ctx, WorkerRole::Repair, format!("Repair the assigned work unit from this deterministic verification report.\n\nWork unit:\n{}\n\nReport:\n{}\n\nCatalog:\n{}", serde_json::to_string_pretty(unit)?, serde_json::to_string_pretty(report)?, serde_json::to_string_pretty(catalog)?), worker_summary_schema()).await
+    self.run_typed(ctx, WorkerRole::Repair, format!("Repair the assigned work unit from this deterministic verification report.\n\nWork unit:\n{}\n\nReport:\n{}\n\nCatalog:\n{}", serde_json::to_string_pretty(unit)?, serde_json::to_string_pretty(report)?, serde_json::to_string_pretty(catalog)?)).await
   }
 
   async fn assess(
@@ -168,7 +168,6 @@ impl AgentBackend for AcpRuntime {
           "Perform an independent final assessment against every requirement.\n\nCatalog:\n{}",
           serde_json::to_string_pretty(catalog)?
         ),
-        reconcile_schema(),
       )
       .await
   }
@@ -249,17 +248,18 @@ impl AcpRuntime {
       .map_err(|error| anyhow!("ACP authentication failed: {error}"))
   }
 
-  async fn run_typed<T: DeserializeOwned + Send + 'static>(
+  async fn run_typed<T: DeserializeOwned + JsonSchema + Send + 'static>(
     &self,
     ctx: &BackendContext,
     role: WorkerRole,
     prompt: String,
-    schema: Value,
   ) -> Result<T> {
-    let validator = Arc::new(|value: &Value| {
-      serde_json::from_value::<T>(value.clone())
+    let schema = schema_for::<T>()?;
+    let validation_schema = schema.clone();
+    let validator = Arc::new(move |value: &Value| {
+      validate_structured_output::<T>(value, &validation_schema)
         .map(|_| ())
-        .map_err(|error| anyhow!("{error}"))
+        .map_err(anyhow::Error::new)
     });
 
     let request = WorkerRequest {
@@ -399,77 +399,20 @@ fn readiness_from_initialize(initialize: &InitializeResponse) -> AcpReadiness {
   }
 }
 
-fn validate_json_schema(value: &Value, schema: &Value) -> Result<()> {
-  if let Some(variants) = schema.get("anyOf").and_then(Value::as_array) {
-    let mut errors = Vec::with_capacity(variants.len());
-    for variant in variants {
-      match validate_json_schema(value, variant) {
-        Ok(()) => return Ok(()),
-        Err(error) => errors.push(error.to_string()),
-      }
-    }
-    return Err(anyhow!(
-      "did not match any allowed schema: {}",
-      errors.join("; ")
-    ));
-  }
-
-  if let Some(allowed) = schema.get("enum").and_then(Value::as_array) {
-    if !allowed.contains(value) {
-      return Err(anyhow!("value is not one of the allowed values"));
-    }
-  }
-
-  match schema.get("type").and_then(Value::as_str) {
-    Some("object") => {
-      let object = value
-        .as_object()
-        .ok_or_else(|| anyhow!("expected object"))?;
-      if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        for name in required.iter().filter_map(Value::as_str) {
-          if !object.contains_key(name) {
-            return Err(anyhow!("missing required property {name:?}"));
-          }
-        }
-      }
-      if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
-        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-          if let Some(name) = object.keys().find(|name| !properties.contains_key(*name)) {
-            return Err(anyhow!("unexpected property {name:?}"));
-          }
-        }
-      }
-      if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-        for (name, property_schema) in properties {
-          if let Some(property) = object.get(name) {
-            validate_json_schema(property, property_schema)
-              .map_err(|error| anyhow!("property {name:?}: {error}"))?;
-          }
-        }
-      }
-    }
-    Some("array") => {
-      let array = value.as_array().ok_or_else(|| anyhow!("expected array"))?;
-      if let Some(item_schema) = schema.get("items") {
-        for item in array {
-          validate_json_schema(item, item_schema)?;
-        }
-      }
-    }
-    Some("string") if !value.is_string() => return Err(anyhow!("expected string")),
-    Some("boolean") if !value.is_boolean() => return Err(anyhow!("expected boolean")),
-    Some("number") if !value.is_number() => return Err(anyhow!("expected number")),
-    Some("null") if !value.is_null() => return Err(anyhow!("expected null")),
-    _ => {}
-  }
-  Ok(())
-}
-
 struct TenetYieldServer {
   schema: Value,
   validate_output: WorkerOutputValidator,
   yield_sender: Arc<Mutex<Option<oneshot::Sender<Value>>>>,
   yield_completion_sender: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+fn validate_yield_arguments(
+  arguments: &Value,
+  validate_output: &WorkerOutputValidator,
+) -> Result<()> {
+  if !arguments.is_object() {
+    return Err(anyhow!("tenet_yield arguments must be an object"));
+  }
+  validate_output(arguments)
 }
 
 impl McpServerConnect<Agent> for TenetYieldServer {
@@ -514,12 +457,9 @@ impl McpServerConnect<Agent> for TenetYieldServer {
                   let name = request.params.get("name").and_then(Value::as_str);
                   if name != Some("tenet_yield") {
                     Err(agent_client_protocol::Error::invalid_params().data("unknown MCP tool"))
-                  } else if !arguments.is_object() {
-                    Err(agent_client_protocol::Error::invalid_params()
-                      .data("tenet_yield arguments must be an object"))
-                  } else if let Err(error) = validate_json_schema(&arguments, &schema) {
-                    Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
-                  } else if let Err(error) = validate_output(&arguments) {
+                  } else if let Err(error) =
+                    validate_yield_arguments(&arguments, &validate_output)
+                  {
                     Err(agent_client_protocol::Error::invalid_params().data(error.to_string()))
                   } else {
                     let sender = yield_sender.lock().map_err(|_| {
@@ -663,7 +603,6 @@ impl AcpRuntime {
             );
             let mcp_prompt = prompt.clone();
             let mcp_preferences = preferences.clone();
-            let mcp_schema = schema.clone();
             let mcp_validate_output = validate_output.clone();
             let mcp_events = events.clone();
             let mcp_identity = identity.clone();
@@ -678,7 +617,6 @@ impl AcpRuntime {
                         prompt: mcp_prompt,
                         role,
                         preferences: mcp_preferences,
-                        schema: mcp_schema,
                         validate_output: mcp_validate_output,
                         retries,
                         events: mcp_events,
@@ -701,7 +639,6 @@ impl AcpRuntime {
                         prompt,
                         role,
                         preferences,
-                        schema,
                         validate_output,
                         retries,
                         events,
@@ -725,7 +662,6 @@ impl AcpRuntime {
                     prompt,
                     role,
                     preferences,
-                    schema,
                     validate_output,
                     retries,
                     events,
@@ -755,7 +691,6 @@ struct WorkerSessionInput {
   prompt: String,
   role: WorkerRole,
   preferences: tenet_domain::config::RolePreference,
-  schema: Value,
   validate_output: WorkerOutputValidator,
   retries: u32,
   events: Option<EventSink>,
@@ -774,7 +709,6 @@ where
     prompt,
     role,
     preferences,
-    schema,
     validate_output,
     retries,
     events,
@@ -827,60 +761,12 @@ where
 
   let mut attempts = 0u32;
   loop {
-    match serde_json::from_str::<Value>(&text) {
-      Ok(structured_output) => match validate_json_schema(&structured_output, &schema) {
-        Ok(()) => match validate_output(&structured_output) {
-          Ok(()) => return Ok(WorkerResult { structured_output }),
-          Err(error) if attempts < retries => {
-            attempts += 1;
-            text.clear();
-            session.send_prompt(format!("The previous response was valid schema JSON but could not be deserialized for the requested role type ({error}). Reply with only one schema-valid JSON value matching the requested role type; no markdown or prose."))?;
-            read_response(
-              session,
-              role,
-              &identity,
-              events.clone(),
-              &mut text,
-              &mut tool_calls,
-            )
-            .await?;
-            if let Some(structured_output) = take_yielded(&mut yielded).await {
-              return Ok(WorkerResult { structured_output });
-            }
-          }
-          Err(error) => {
-            return Err(agent_client_protocol::Error::internal_error().data(format!(
-              "typed structured completion failed after {attempts} retries: {error}"
-            )))
-          }
-        },
-        Err(error) if attempts < retries => {
-          attempts += 1;
-          text.clear();
-          session.send_prompt(format!("The previous response was not schema-valid JSON ({error}). Reply with only one schema-valid JSON value; no markdown or prose."))?;
-          read_response(
-            session,
-            role,
-            &identity,
-            events.clone(),
-            &mut text,
-            &mut tool_calls,
-          )
-          .await?;
-          if let Some(structured_output) = take_yielded(&mut yielded).await {
-            return Ok(WorkerResult { structured_output });
-          }
-        }
-        Err(error) => {
-          return Err(agent_client_protocol::Error::internal_error().data(format!(
-            "invalid structured completion after {attempts} retries: {error}"
-          )))
-        }
-      },
-      Err(error) if attempts < retries => {
-        attempts += 1;
+    let structured_output = match serde_json::from_str::<Value>(&text) {
+      Ok(structured_output) => structured_output,
+      Err(error) => {
+        let retry = structured_completion_retry_prompt(&error, &mut attempts, retries)?;
         text.clear();
-        session.send_prompt(format!("The previous response was not valid whole-response JSON ({error}). Reply with only one schema-valid JSON value; no markdown or prose."))?;
+        session.send_prompt(retry)?;
         read_response(
           session,
           role,
@@ -893,14 +779,45 @@ where
         if let Some(structured_output) = take_yielded(&mut yielded).await {
           return Ok(WorkerResult { structured_output });
         }
+        continue;
       }
-      Err(error) => {
-        return Err(agent_client_protocol::Error::internal_error().data(format!(
-          "invalid structured completion after {attempts} retries: {error}"
-        )))
+    };
+
+    if let Err(error) = validate_output(&structured_output) {
+      let retry = structured_completion_retry_prompt(&error, &mut attempts, retries)?;
+      text.clear();
+      session.send_prompt(retry)?;
+      read_response(
+        session,
+        role,
+        &identity,
+        events.clone(),
+        &mut text,
+        &mut tool_calls,
+      )
+      .await?;
+      if let Some(structured_output) = take_yielded(&mut yielded).await {
+        return Ok(WorkerResult { structured_output });
       }
+      continue;
     }
+
+    return Ok(WorkerResult { structured_output });
   }
+}
+
+fn structured_completion_retry_prompt(
+  error: &dyn std::fmt::Display,
+  attempts: &mut u32,
+  retries: u32,
+) -> std::result::Result<String, agent_client_protocol::Error> {
+  if *attempts >= retries {
+    return Err(agent_client_protocol::Error::internal_error().data(format!(
+      "invalid structured completion after {attempts} retries: {error}"
+    )));
+  }
+  *attempts += 1;
+  Ok(format!("The previous response did not match the requested structured contract ({error}). Reply with only one schema-valid JSON value matching the requested role type; no markdown or prose."))
 }
 
 async fn take_yielded(
@@ -1243,42 +1160,6 @@ fn build_worker_prompt(role: WorkerRole, schema: &Value, work_context: &str) -> 
   ))
 }
 
-fn string_array_schema() -> Value {
-  json!({"type":"array","items":{"type":"string"}})
-}
-
-fn requirement_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["id","title","description","acceptanceCriteria"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"acceptanceCriteria":string_array_schema()}})
-}
-
-fn requirement_assessment_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["id","status","evidence","gaps"],"properties":{"id":{"type":"string"},"status":{"type":"string","enum":["satisfied","partial","missing"]},"evidence":string_array_schema(),"gaps":string_array_schema()}})
-}
-
-fn work_scope_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["paths"],"properties":{"paths":string_array_schema()}})
-}
-
-fn work_unit_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["id","title","objective","requirementIds","acceptanceCriteria","suggestedChecks","dependsOn","scope"],"properties":{"id":{"type":"string"},"title":{"type":"string"},"objective":{"type":"string"},"requirementIds":string_array_schema(),"acceptanceCriteria":string_array_schema(),"suggestedChecks":{"type":"array","description":"Executable, non-interactive, deterministic, self-contained shell commands only; no instructions, prose, or Markdown backticks. Each command must perform its own assertion without depending on external network access, mutable user state, a previous check, or externally produced executables. Isolation must target application state without hiding verification tooling: prefer application-specific state overrides, or resolve tools before isolation and preserve unrelated runner environment.","items":{"type":"string","description":"A single executable shell command."}},"dependsOn":string_array_schema(),"scope":work_scope_schema()}})
-}
-
-fn architect_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["requirements"],"properties":{"requirements":{"type":"array","items":requirement_schema()}}})
-}
-
-fn reconcile_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["complete","summary","requirements","workUnits"],"properties":{"complete":{"type":"boolean"},"summary":{"type":"string"},"requirements":{"type":"array","items":requirement_assessment_schema()},"workUnits":{"type":"array","items":work_unit_schema()}}})
-}
-
-fn discovery_schema() -> Value {
-  json!({"oneOf":[{"type":"object","additionalProperties":false,"required":["type","workUnitId","dependsOn","reason"],"properties":{"type":{"const":"dependency"},"workUnitId":{"type":"string"},"dependsOn":{"type":"string"},"reason":{"type":"string"}}},{"type":"object","additionalProperties":false,"required":["type","description"],"properties":{"type":{"const":"blocker"},"description":{"type":"string"}}},{"type":"object","additionalProperties":false,"required":["type","paths","reason"],"properties":{"type":{"const":"scope_expansion"},"paths":string_array_schema(),"reason":{"type":"string"}}}]})
-}
-
-fn worker_summary_schema() -> Value {
-  json!({"type":"object","additionalProperties":false,"required":["summary","changedFiles","testsRun","notes"],"properties":{"summary":{"type":"string"},"changedFiles":string_array_schema(),"testsRun":string_array_schema(),"notes":string_array_schema(),"decisions":string_array_schema(),"discoveries":{"type":"array","items":discovery_schema()},"risks":string_array_schema(),"followUps":string_array_schema()}})
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1342,23 +1223,104 @@ mod tests {
   }
 
   #[test]
-  fn reconcile_schema_accepts_the_typed_shape() {
-    let output = valid_reconcile_output();
+  fn generated_reconcile_schema_preserves_wire_field_names() {
+    let schema = schema_for::<ReconcileResult>().expect("generate reconcile schema");
+    let properties = schema["properties"].as_object().expect("root properties");
 
-    validate_json_schema(&output, &reconcile_schema()).expect("typed reconcile shape is valid");
-    serde_json::from_value::<ReconcileResult>(output).expect("schema matches the domain type");
+    assert!(properties.contains_key("workUnits"));
+    assert!(!properties.contains_key("work_units"));
   }
 
   #[test]
-  fn reconcile_schema_rejects_unknown_nested_work_unit_fields() {
+  fn generated_contracts_deserialize_valid_architect_reconcile_and_worker_output() {
+    let architect = json!({"requirements":[{"id":"REQ-001","title":"Title","description":"Description","acceptanceCriteria":["Observable"]}]});
+    let worker = json!({"summary":"done","changedFiles":["src/lib.rs"],"testsRun":["cargo test"],"notes":[],"discoveries":[{"type":"blocker","description":"blocked"}]});
+
+    validate_structured_output::<ArchitectOutput>(
+      &architect,
+      &schema_for::<ArchitectOutput>().expect("architect schema"),
+    )
+    .expect("valid architect output");
+    validate_structured_output::<ReconcileResult>(
+      &valid_reconcile_output(),
+      &schema_for::<ReconcileResult>().expect("reconcile schema"),
+    )
+    .expect("valid reconcile output");
+    validate_structured_output::<WorkerSummary>(
+      &worker,
+      &schema_for::<WorkerSummary>().expect("worker schema"),
+    )
+    .expect("valid worker output");
+  }
+
+  #[test]
+  fn generated_schema_rejects_missing_required_fields() {
+    let mut output = valid_reconcile_output();
+    output.as_object_mut().expect("object").remove("summary");
+
+    assert!(validate_structured_output::<ReconcileResult>(
+      &output,
+      &schema_for::<ReconcileResult>().expect("schema")
+    )
+    .is_err());
+  }
+
+  #[test]
+  fn generated_schema_rejects_unknown_nested_fields() {
     let mut output = valid_reconcile_output();
     output["workUnits"][0]["description"] = Value::String("not part of WorkUnit".into());
-    let error = validate_json_schema(&output, &reconcile_schema())
-      .expect_err("unknown nested fields must fail schema validation");
 
-    assert!(error
-      .to_string()
-      .contains(r#"unexpected property "description""#));
+    assert!(validate_structured_output::<ReconcileResult>(
+      &output,
+      &schema_for::<ReconcileResult>().expect("schema")
+    )
+    .is_err());
+  }
+
+  #[test]
+  fn generated_schema_rejects_invalid_enum_variants() {
+    let mut output = valid_reconcile_output();
+    output["requirements"][0]["status"] = Value::String("unknown".into());
+
+    assert!(validate_structured_output::<ReconcileResult>(
+      &output,
+      &schema_for::<ReconcileResult>().expect("schema")
+    )
+    .is_err());
+  }
+
+  #[test]
+  fn generated_union_schema_accepts_discovery_variant_and_rejects_malformed_variant() {
+    let schema = schema_for::<WorkerSummary>().expect("worker schema");
+    let valid = json!({"summary":"done","changedFiles":[],"testsRun":[],"notes":[],"discoveries":[{"type":"dependency","workUnitId":"WU-002","dependsOn":"WU-001","reason":"ordering"}]});
+    let invalid = json!({"summary":"done","changedFiles":[],"testsRun":[],"notes":[],"discoveries":[{"type":"dependency","description":"wrong fields"}]});
+
+    assert!(validate_structured_output::<WorkerSummary>(&valid, &schema).is_ok());
+    assert!(validate_structured_output::<WorkerSummary>(&invalid, &schema).is_err());
+  }
+
+  #[test]
+  fn tenet_yield_rejects_invalid_structured_output() {
+    let schema = schema_for::<ReconcileResult>().expect("schema");
+    let validator: WorkerOutputValidator = Arc::new(move |value| {
+      validate_structured_output::<ReconcileResult>(value, &schema)
+        .map(|_| ())
+        .map_err(anyhow::Error::new)
+    });
+    let invalid = json!({"complete": false});
+
+    assert!(validate_yield_arguments(&invalid, &validator).is_err());
+  }
+
+  #[test]
+  fn structured_completion_retries_until_configured_limit() {
+    let error = anyhow!("invalid output");
+    let mut attempts = 0;
+
+    assert!(structured_completion_retry_prompt(&error, &mut attempts, 2).is_ok());
+    assert!(structured_completion_retry_prompt(&error, &mut attempts, 2).is_ok());
+    assert!(structured_completion_retry_prompt(&error, &mut attempts, 2).is_err());
+    assert_eq!(attempts, 2);
   }
 
   #[test]
