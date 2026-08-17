@@ -14,6 +14,7 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 tenet-acp = { path = "../tenet-acp" }
+tenet-controller = { path = "../tenet-controller" }
 tenet-runtime = { path = "../tenet-runtime" }
 tenet-domain = { path = "../tenet-domain" }
 tenet-projection = { path = "../tenet-projection" }

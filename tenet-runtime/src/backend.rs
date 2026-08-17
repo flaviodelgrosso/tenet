@@ -4,15 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use tenet_domain::{
-  config::Config,
-  events::EventSink,
-  evidence::EvidenceProjection,
-  model::{
-    ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, RequirementCatalog,
-    VerificationReport, WorkUnit, WorkerSummary,
-  },
-};
+use tenet_domain::{config::Config, events::EventSink};
 
 /// Validates worker output against its generated JSON Schema and role-specific Rust type.
 pub type WorkerOutputValidator = Arc<dyn Fn(&serde_json::Value) -> Result<()> + Send + Sync>;
@@ -68,46 +60,4 @@ pub struct LaunchMetadata {
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
   async fn run_worker(&self, request: WorkerRequest) -> Result<WorkerResult>;
-}
-
-#[async_trait]
-pub trait AgentBackend: Send + Sync {
-  async fn architect(&self, ctx: &BackendContext, spec: &str) -> Result<ArchitectOutput>;
-
-  /// Resolves the configured agent launch once before the runtime publishes run state.
-  async fn resolve_launch(
-    &self,
-    cwd: &std::path::Path,
-    config: &Config,
-  ) -> Result<Option<LaunchMetadata>>;
-
-  async fn reconcile(
-    &self,
-    ctx: &BackendContext,
-    catalog: &RequirementCatalog,
-    recent_completed: &[CompletedWorkUnit],
-    discoveries: &[Discovery],
-    evidence: &[EvidenceProjection],
-  ) -> Result<ReconcileResult>;
-  async fn implement(
-    &self,
-    ctx: &BackendContext,
-    catalog: &RequirementCatalog,
-    work_unit: &WorkUnit,
-  ) -> Result<WorkerSummary>;
-
-  async fn repair(
-    &self,
-    ctx: &BackendContext,
-    catalog: &RequirementCatalog,
-    work_unit: &WorkUnit,
-    report: &VerificationReport,
-  ) -> Result<WorkerSummary>;
-
-  async fn assess(
-    &self,
-    ctx: &BackendContext,
-    catalog: &RequirementCatalog,
-    evidence: &[EvidenceProjection],
-  ) -> Result<ReconcileResult>;
 }

@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use async_trait::async_trait;
 use chrono::Utc;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use tokio::{
@@ -15,14 +16,13 @@ use uuid::Uuid;
 
 use tenet_domain::{
   events::RunEvent,
-  model::{RequirementCatalog, WorkExecution, WorkLease, WorkUnit, WorkerDiscovery, WorkerRole},
+  model::{
+    RequirementCatalog, VerificationReport, WorkExecution, WorkLease, WorkUnit, WorkerDiscovery,
+    WorkerRole, WorkerSummary,
+  },
 };
 
-use crate::{
-  backend::{AgentBackend, BackendContext},
-  git, protection, verifier,
-  workspace::WorkspaceManager,
-};
+use crate::{backend::BackendContext, git, protection, verifier, workspace::WorkspaceManager};
 
 #[derive(Debug, Clone)]
 pub enum ExecutionUpdate {
@@ -30,9 +30,21 @@ pub enum ExecutionUpdate {
   Repairing { work_unit_id: String, attempt: u32 },
 }
 
+/// Supplies candidate mutations while the scheduler owns execution mechanics.
+#[async_trait]
+pub trait CandidateExecutor: Send + Sync {
+  async fn execute(
+    &self,
+    context: &BackendContext,
+    catalog: &RequirementCatalog,
+    work_unit: &WorkUnit,
+    previous_verification: Option<&VerificationReport>,
+  ) -> Result<WorkerSummary>;
+}
+
 pub struct Scheduler {
   repository: PathBuf,
-  backend: Arc<dyn AgentBackend>,
+  executor: Arc<dyn CandidateExecutor>,
   context: BackendContext,
   catalog: Arc<RequirementCatalog>,
   workspaces: WorkspaceManager,
@@ -43,7 +55,7 @@ impl Scheduler {
   pub fn new(
     repository: PathBuf,
     run_id: String,
-    backend: Arc<dyn AgentBackend>,
+    executor: Arc<dyn CandidateExecutor>,
     context: BackendContext,
     catalog: Arc<RequirementCatalog>,
     updates: mpsc::UnboundedSender<ExecutionUpdate>,
@@ -51,7 +63,7 @@ impl Scheduler {
     let workspaces = WorkspaceManager::new(repository.clone(), &run_id);
     Self {
       repository,
-      backend,
+      executor,
       context,
       catalog,
       workspaces,
@@ -105,7 +117,7 @@ impl Scheduler {
         .emit(RunEvent::LeaseIssued(lease.clone()))
         .await?;
       let permit_pool = semaphore.clone();
-      let backend = self.backend.clone();
+      let executor = self.executor.clone();
       let mut context = self.context.clone();
       context.cancel = batch_cancel.clone();
       let catalog = self.catalog.clone();
@@ -118,7 +130,7 @@ impl Scheduler {
           .await
           .map_err(|_| anyhow!("worker semaphore closed"))?;
         execute_lease(
-          repository, workspaces, backend, context, catalog, lease, updates,
+          repository, workspaces, executor, context, catalog, lease, updates,
         )
         .await
       });
@@ -163,7 +175,7 @@ impl Scheduler {
 async fn execute_lease(
   repository: PathBuf,
   workspaces: WorkspaceManager,
-  backend: Arc<dyn AgentBackend>,
+  executor: Arc<dyn CandidateExecutor>,
   mut context: BackendContext,
   catalog: Arc<RequirementCatalog>,
   mut lease: WorkLease,
@@ -195,7 +207,7 @@ async fn execute_lease(
     .await?;
 
   let result =
-    execute_and_commit(&repository, &backend, &context, &catalog, &lease, &updates).await;
+    execute_and_commit(&repository, &executor, &context, &catalog, &lease, &updates).await;
   let cleanup = workspaces.remove(&workspace).await;
   context
     .events
@@ -216,7 +228,7 @@ async fn execute_lease(
 
 async fn execute_and_commit(
   repository: &Path,
-  backend: &Arc<dyn AgentBackend>,
+  executor: &Arc<dyn CandidateExecutor>,
   context: &BackendContext,
   catalog: &RequirementCatalog,
   lease: &WorkLease,
@@ -227,8 +239,8 @@ async fn execute_and_commit(
   let _ = updates.send(ExecutionUpdate::Implementing {
     work_unit_id: lease.work_unit.id.clone(),
   });
-  let worker_summary = backend
-    .implement(context, catalog, &lease.work_unit)
+  let worker_summary = executor
+    .execute(context, catalog, &lease.work_unit, None)
     .await
     .context("implementation worker")?;
   let mut discoveries: Vec<_> = worker_summary
@@ -261,8 +273,8 @@ async fn execute_and_commit(
       work_unit_id: lease.work_unit.id.clone(),
       attempt,
     });
-    let repair_summary = backend
-      .repair(context, catalog, &lease.work_unit, &verification)
+    let repair_summary = executor
+      .execute(context, catalog, &lease.work_unit, Some(&verification))
       .await
       .context("repair worker")?;
     discoveries.extend(

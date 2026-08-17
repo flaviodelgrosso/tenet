@@ -5,14 +5,16 @@ use chrono::Utc;
 use globset::{Glob, GlobSetBuilder};
 
 use tenet_domain::{
+  events::{EventSink, RunEvent},
   evidence::{
-    EvidenceGraphState, EvidencePolicy, EvidenceProjection, EvidenceValidity, VerificationState,
+    EvidenceGraphState, EvidencePolicy, EvidenceProjection, EvidenceResult, EvidenceValidity,
+    VerificationState,
   },
-  ids::{EvidenceId, RequirementId},
+  ids::{CriterionId, EvidenceId, RequirementId},
   model::{RequirementCatalog, VerificationReport},
 };
 
-use crate::git;
+use tenet_runtime::{git, store};
 
 pub fn graph_from_catalog(catalog: &RequirementCatalog) -> Result<EvidenceGraphState> {
   let mut graph = EvidenceGraphState::new(&catalog.spec_hash);
@@ -32,6 +34,14 @@ pub fn graph_from_catalog(catalog: &RequirementCatalog) -> Result<EvidenceGraphS
       .context("register verification obligation")?;
   }
   Ok(graph)
+}
+
+pub async fn load(
+  cwd: &std::path::Path,
+  catalog: &RequirementCatalog,
+) -> Result<EvidenceGraphState> {
+  let expected = graph_from_catalog(catalog)?;
+  store::read_evidence_graph(cwd, &expected).await
 }
 
 pub fn verification_states(
@@ -92,6 +102,109 @@ pub fn record_report(
     .collect()
 }
 
+pub async fn establish(
+  cwd: &std::path::Path,
+  events: &EventSink,
+  graph: &mut EvidenceGraphState,
+  revision: &str,
+  report: &VerificationReport,
+) -> Result<()> {
+  let requirement_before = verification_states(graph)?;
+  let criterion_before = criterion_states(graph)?;
+  let ids = record_report(graph, revision, report)?;
+  if ids.is_empty() {
+    return Ok(());
+  }
+  store::write_evidence_graph(cwd, graph).await?;
+  for id in ids {
+    let evidence = graph.evidence[&id].clone();
+    let event = if evidence.result == EvidenceResult::Failed {
+      RunEvent::EvidenceFailed(evidence.clone())
+    } else {
+      RunEvent::EvidenceEstablished(evidence.clone())
+    };
+    events.emit(event).await?;
+    let related: Vec<_> = graph
+      .evidence
+      .values()
+      .filter(|item| item.obligation_id == evidence.obligation_id)
+      .collect();
+    if related.iter().any(|item| EvidencePolicy.authorizes(item))
+      && related.iter().any(|item| EvidencePolicy.blocks(item))
+    {
+      events
+        .emit(RunEvent::EvidenceContradiction {
+          obligation_id: evidence.obligation_id,
+          evidence_ids: related.iter().map(|item| item.id).collect(),
+        })
+        .await?;
+    }
+  }
+  emit_transitions(events, graph, requirement_before, criterion_before).await
+}
+
+pub async fn invalidate(
+  cwd: &std::path::Path,
+  events: &EventSink,
+  graph: &mut EvidenceGraphState,
+  revision: &str,
+) -> Result<()> {
+  let requirement_before = verification_states(graph)?;
+  let criterion_before = criterion_states(graph)?;
+  let invalidated = invalidate_for_revision(cwd, graph, revision).await?;
+  if invalidated.is_empty() {
+    return Ok(());
+  }
+  store::write_evidence_graph(cwd, graph).await?;
+  for evidence_id in invalidated {
+    events
+      .emit(RunEvent::EvidenceInvalidated {
+        evidence_id,
+        revision: revision.to_owned(),
+      })
+      .await?;
+  }
+  emit_transitions(events, graph, requirement_before, criterion_before).await
+}
+
+async fn emit_transitions(
+  events: &EventSink,
+  graph: &EvidenceGraphState,
+  requirement_before: BTreeMap<RequirementId, VerificationState>,
+  criterion_before: BTreeMap<CriterionId, VerificationState>,
+) -> Result<()> {
+  for (criterion_id, current) in criterion_states(graph)? {
+    let previous = criterion_before
+      .get(&criterion_id)
+      .copied()
+      .unwrap_or(VerificationState::Unverified);
+    if previous != current {
+      events
+        .emit(RunEvent::CriterionVerificationChanged {
+          criterion_id,
+          previous,
+          current,
+        })
+        .await?;
+    }
+  }
+  for (requirement_id, current) in verification_states(graph)? {
+    let previous = requirement_before
+      .get(&requirement_id)
+      .copied()
+      .unwrap_or(VerificationState::Unverified);
+    if previous != current {
+      events
+        .emit(RunEvent::RequirementVerificationChanged {
+          requirement_id,
+          previous,
+          current,
+        })
+        .await?;
+    }
+  }
+  Ok(())
+}
 pub async fn invalidate_for_revision(
   cwd: &std::path::Path,
   graph: &mut EvidenceGraphState,

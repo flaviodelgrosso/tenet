@@ -3,8 +3,9 @@ use std::{io::IsTerminal, path::PathBuf, process::ExitCode, sync::Arc};
 use anyhow::{Context, Result};
 use clap::Parser;
 use tenet_acp::acp::AcpRuntime;
+use tenet_controller::{controller::manual_verify, AgentBackend};
 use tenet_domain::model::RunStatus;
-use tenet_runtime::{backend::AgentBackend, controller::manual_verify, store};
+use tenet_runtime::store;
 use tenet_tui::tui;
 
 use crate::{

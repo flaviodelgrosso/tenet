@@ -19,8 +19,6 @@ use tenet_domain::{
   },
 };
 
-use crate::evidence::graph_from_catalog;
-
 pub const STATE_FILE: &str = "state.json";
 pub const REQUIREMENTS_FILE: &str = "requirements.json";
 pub const ROADMAP_FILE: &str = "roadmap.json";
@@ -125,11 +123,11 @@ pub async fn write_roadmap(cwd: &Path, value: &ReconcileResult) -> Result<()> {
 }
 pub async fn read_evidence_graph(
   cwd: &Path,
-  catalog: &RequirementCatalog,
+  expected: &EvidenceGraphState,
 ) -> Result<EvidenceGraphState> {
   let path = cwd.join(TENET_DIR).join(EVIDENCE_GRAPH_FILE);
   if !path.exists() {
-    return graph_from_catalog(catalog);
+    return Ok(expected.clone());
   }
   let mut value: serde_json::Value = read_json(path).await?;
   let version = value
@@ -147,16 +145,11 @@ pub async fn read_evidence_graph(
   let mut graph: EvidenceGraphState =
     serde_json::from_value(value).context("deserialize evidence graph")?;
   if graph.requirements.is_empty() {
-    graph.requirements = catalog
-      .requirements
-      .iter()
-      .map(|requirement| requirement.id.clone())
-      .collect();
+    graph.requirements.clone_from(&expected.requirements);
   }
-  if graph.specification_hash != catalog.spec_hash {
-    return graph_from_catalog(catalog);
+  if graph.specification_hash != expected.specification_hash {
+    return Ok(expected.clone());
   }
-  let expected = graph_from_catalog(catalog)?;
   if graph.requirements != expected.requirements
     || graph.required_requirements != expected.required_requirements
     || graph.criteria != expected.criteria
@@ -490,6 +483,20 @@ mod tests {
     }
   }
 
+  fn graph_from_catalog(catalog: &RequirementCatalog) -> Result<EvidenceGraphState> {
+    let mut graph = EvidenceGraphState::new(&catalog.spec_hash);
+    for requirement in &catalog.requirements {
+      graph.register_requirement(requirement.id.clone(), requirement.required);
+    }
+    for criterion in &catalog.acceptance_criteria {
+      graph.add_criterion(criterion.clone())?;
+    }
+    for obligation in &catalog.verification_obligations {
+      graph.add_obligation(obligation.clone())?;
+    }
+    Ok(graph)
+  }
+
   #[tokio::test]
   async fn evidence_graph_persists_and_reloads_semantics() {
     use chrono::Utc;
@@ -539,7 +546,7 @@ mod tests {
       .await
       .expect("write graph");
 
-    let reloaded = read_evidence_graph(project.path(), &catalog)
+    let reloaded = read_evidence_graph(project.path(), &graph)
       .await
       .expect("reload graph");
 
@@ -555,7 +562,7 @@ mod tests {
     ensure_layout(project.path()).await.expect("layout");
     let catalog = evidence_catalog();
     let graph = graph_from_catalog(&catalog).expect("graph");
-    let mut value = serde_json::to_value(graph).expect("serialize graph");
+    let mut value = serde_json::to_value(&graph).expect("serialize graph");
     value["version"] = serde_json::json!(0);
     value
       .as_object_mut()
@@ -568,7 +575,7 @@ mod tests {
     .await
     .expect("write fixture");
 
-    let migrated = read_evidence_graph(project.path(), &catalog)
+    let migrated = read_evidence_graph(project.path(), &graph)
       .await
       .expect("migrate graph");
 
@@ -591,9 +598,12 @@ mod tests {
     .await
     .expect("write fixture");
 
-    let error = read_evidence_graph(project.path(), &catalog)
-      .await
-      .expect_err("future version rejected");
+    let error = read_evidence_graph(
+      project.path(),
+      &graph_from_catalog(&catalog).expect("graph"),
+    )
+    .await
+    .expect_err("future version rejected");
 
     assert!(error
       .to_string()

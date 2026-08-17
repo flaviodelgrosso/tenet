@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "tenet-acp",
   "tenet-cli",
+  "tenet-controller",
   "tenet-domain",
   "tenet-projection",
   "tenet-runtime",

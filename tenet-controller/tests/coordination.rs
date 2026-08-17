@@ -18,6 +18,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use tenet_controller::{evidence as controller_evidence, AgentBackend, Controller};
 use tenet_domain::{
   config::{Config, CustomAgentConfig, ProjectVerificationGate},
   events::{EventSink, RunEvent},
@@ -37,8 +38,7 @@ use tenet_domain::{
   worker::{derive_normative_fragments, CatalogCoverage, SpecReference},
 };
 use tenet_runtime::{
-  backend::{AgentBackend, BackendContext, LaunchMetadata},
-  controller::Controller,
+  backend::{BackendContext, LaunchMetadata},
   git,
   integration::{IntegrationOutcome, Integrator},
   store,
@@ -672,7 +672,7 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
     .await
     .expect("read catalog")
     .expect("catalog");
-  let graph = store::read_evidence_graph(repository.path(), &catalog)
+  let graph = controller_evidence::load(repository.path(), &catalog)
     .await
     .expect("read evidence graph");
   assert!(graph.all_required_verified(&EvidencePolicy));

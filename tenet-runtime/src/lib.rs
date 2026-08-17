@@ -1,14 +1,11 @@
-//! Runtime orchestration, persistence, and deterministic verification for Tenet.
+//! Execution, repository, workspace, integration, verification, and persistence mechanisms for Tenet.
 
 pub mod backend;
-pub mod completion;
-pub mod controller;
-pub mod evidence;
 pub mod git;
 pub mod graph;
 pub mod integration;
 mod protection;
 pub mod scheduler;
 pub mod store;
-mod verifier;
+pub mod verifier;
 pub mod workspace;

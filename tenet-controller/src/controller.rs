@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
@@ -14,37 +15,65 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use tenet_domain::{
-  config::{config_path, ensure_config, read_config, Config, TENET_DIR},
+  config::{config_path, ensure_config, read_config, TENET_DIR},
   events::{EventSink, RunEvent, RunLogger},
-  evidence::{
-    EvidenceGraphState, EvidencePolicy, EvidenceResult, ImplementationState, VerificationState,
-  },
-  ids::{CriterionId, RequirementId, VerificationRunId},
+  evidence::{EvidenceGraphState, EvidencePolicy, ImplementationState, VerificationState},
+  ids::VerificationRunId,
   model::{
-    ArchitectOutput, CandidateCheck, CompletedWorkUnit, DiscoveryRecord, DiscoveryStatus,
-    IntegrationPhase, Phase, ReconcileResult, RepairProgress, RequirementCatalog,
-    RequirementCounts, RunStatus, State, VerificationReport, WorkExecution, WorkStatus,
+    CompletedWorkUnit, DiscoveryRecord, DiscoveryStatus, IntegrationPhase, Phase, ReconcileResult,
+    RepairProgress, RequirementCatalog, RequirementCounts, RunStatus, State, VerificationReport,
+    WorkExecution, WorkStatus,
   },
-  verification::{DependencyScopeAuthority, VerificationAuthority, VerificationExecutionRequest},
-  worker::CatalogCoverage,
 };
 
-use crate::{
-  backend::{AgentBackend, BackendContext},
-  completion::{CompletionContext, CompletionDecision, CompletionPolicy},
-  evidence as evidence_graph, git,
+use tenet_runtime::{
+  backend::BackendContext,
+  git,
   graph::WorkGraph,
   integration::{deterministic_order, IntegrationOutcome, Integrator},
-  scheduler::{ExecutionUpdate, Scheduler},
+  scheduler::{CandidateExecutor, ExecutionUpdate, Scheduler},
   store::{self, RunLock},
   verifier,
   workspace::WorkspaceManager,
+};
+
+use crate::{
+  catalog,
+  completion::{CompletionContext, CompletionDecision, CompletionPolicy},
+  evidence as evidence_graph,
+  ports::agent::AgentBackend,
+  verification,
 };
 
 pub struct Controller {
   cwd: PathBuf,
   backend: Arc<dyn AgentBackend>,
   events: EventSink,
+}
+
+struct ScheduledAgent {
+  backend: Arc<dyn AgentBackend>,
+}
+
+#[async_trait]
+impl CandidateExecutor for ScheduledAgent {
+  async fn execute(
+    &self,
+    context: &BackendContext,
+    catalog: &RequirementCatalog,
+    work_unit: &tenet_domain::model::WorkUnit,
+    previous_verification: Option<&VerificationReport>,
+  ) -> Result<tenet_domain::model::WorkerSummary> {
+    match previous_verification {
+      Some(report) => {
+        self
+          .backend
+          .repair(context, catalog, work_unit, report)
+          .await
+      }
+      None => self.backend.implement(context, catalog, work_unit).await,
+    }
+  }
 }
 
 impl Controller {
@@ -212,7 +241,7 @@ impl Controller {
 
   async fn run_inner(&self, context: &BackendContext, state: &mut State) -> Result<State> {
     let mut catalog = self.ensure_catalog(context, state).await?;
-    let mut evidence_graph = store::read_evidence_graph(&self.cwd, &catalog).await?;
+    let mut evidence_graph = evidence_graph::load(&self.cwd, &catalog).await?;
     store::write_evidence_graph(&self.cwd, &evidence_graph).await?;
 
     for cycle in 1..=context.config.max_cycles {
@@ -220,12 +249,16 @@ impl Controller {
       catalog = self
         .refresh_catalog_if_spec_changed(context, state, catalog)
         .await?;
-      evidence_graph = store::read_evidence_graph(&self.cwd, &catalog).await?;
+      evidence_graph = evidence_graph::load(&self.cwd, &catalog).await?;
       store::write_evidence_graph(&self.cwd, &evidence_graph).await?;
       let current_revision = git::head(&self.cwd).await?;
-      self
-        .invalidate_evidence(context, &mut evidence_graph, &current_revision)
-        .await?;
+      evidence_graph::invalidate(
+        &self.cwd,
+        &context.events,
+        &mut evidence_graph,
+        &current_revision,
+      )
+      .await?;
       state.cycle = cycle;
       state.phase = Phase::Reconciling;
       state.active_leases.clear();
@@ -353,7 +386,9 @@ impl Controller {
       let scheduler = Scheduler::new(
         self.cwd.clone(),
         run_id.clone(),
-        self.backend.clone(),
+        Arc::new(ScheduledAgent {
+          backend: self.backend.clone(),
+        }),
         context.clone(),
         Arc::new(catalog.clone()),
         updates,
@@ -495,21 +530,23 @@ impl Controller {
           verification,
           mut transaction,
         } => {
-          self
-            .invalidate_evidence(context, evidence_graph, &revision)
-            .await?;
-          self
-            .record_verification_evidence(
-              context,
-              evidence_graph,
-              &revision,
-              &candidate.verification,
-              &candidate.lease.work_unit.suggested_checks,
-            )
-            .await?;
-          self
-            .record_verification_evidence(context, evidence_graph, &revision, &verification, &[])
-            .await?;
+          evidence_graph::invalidate(&self.cwd, &context.events, evidence_graph, &revision).await?;
+          evidence_graph::establish(
+            &self.cwd,
+            &context.events,
+            evidence_graph,
+            &revision,
+            &candidate.verification,
+          )
+          .await?;
+          evidence_graph::establish(
+            &self.cwd,
+            &context.events,
+            evidence_graph,
+            &revision,
+            &verification,
+          )
+          .await?;
           state.completed_work_units.push(CompletedWorkUnit {
             work_unit: transaction.work_unit.clone(),
             completed_at: Utc::now().to_rfc3339(),
@@ -570,9 +607,14 @@ impl Controller {
       .events
       .emit(RunEvent::Verification(report.clone()))
       .await?;
-    self
-      .record_verification_evidence(context, evidence_graph, &verified_revision, &report, &[])
-      .await?;
+    evidence_graph::establish(
+      &self.cwd,
+      &context.events,
+      evidence_graph,
+      &verified_revision,
+      &report,
+    )
+    .await?;
     if !report.passed {
       return Ok(Some(
         self
@@ -664,26 +706,26 @@ impl Controller {
     context: &BackendContext,
     state: &mut State,
   ) -> Result<RequirementCatalog> {
-    let (spec, spec_hash) = store::spec_text_and_hash(&self.cwd, &context.config).await?;
-    let cached = store::read_catalog(&self.cwd).await?;
-    if let Some(catalog) = &cached {
-      validate_catalog(catalog).context("cached requirement catalog is structurally invalid")?;
-      if catalog.spec_hash == spec_hash {
-        validate_catalog_coverage(catalog, &spec)
-          .context("cached requirement catalog coverage is invalid")?;
-        context
-          .events
-          .emit(RunEvent::Catalog(catalog.clone()))
-          .await?;
-        return Ok(catalog.clone());
-      }
+    let catalog::Inspection {
+      specification: spec,
+      specification_hash: spec_hash,
+      authoritative,
+      had_cached_catalog,
+    } = catalog::inspect(&self.cwd, &context.config).await?;
+    if let Some(catalog) = authoritative {
+      context
+        .events
+        .emit(RunEvent::Catalog(catalog.clone()))
+        .await?;
+      return Ok(catalog);
     }
-    if cached.is_some() || !state.completed_work_units.is_empty() || !state.discoveries.is_empty() {
+    if had_cached_catalog || !state.completed_work_units.is_empty() || !state.discoveries.is_empty()
+    {
       state.completed_work_units.clear();
       state.work_statuses.clear();
       state.discoveries.clear();
     }
-    let architect_spec = annotated_specification(&spec);
+    let architect_spec = catalog::annotated_specification(&spec);
     state.last_summary = "Deriving requirement catalog from .tenet/spec.md".into();
     self.publish(&context.events, state).await?;
     let backend = self.backend.clone();
@@ -694,9 +736,9 @@ impl Controller {
           .await
       })
       .await?;
-    let catalog = build_catalog(&spec, spec_hash, output, &context.config)?;
-    validate_catalog(&catalog)?;
-    validate_catalog_coverage(&catalog, &spec)?;
+    let catalog = catalog::build(&spec, spec_hash, output, &context.config)?;
+    catalog::validate(&catalog)?;
+    catalog::validate_coverage(&catalog, &spec)?;
     store::write_catalog(&self.cwd, &catalog).await?;
     context
       .events
@@ -725,18 +767,7 @@ impl Controller {
     let workspace = workspaces
       .create_disposable("final-verification", revision)
       .await?;
-    let verification_run_id = VerificationRunId::new();
-    let requests: Vec<_> = catalog
-      .verification_obligations
-      .iter()
-      .filter(|obligation| obligation.required)
-      .map(|obligation| VerificationExecutionRequest {
-        run_id: verification_run_id,
-        obligation_id: obligation.id.clone(),
-        spec: obligation.spec.clone(),
-        authority: obligation.authority,
-      })
-      .collect();
+    let requests = verification::required_requests(catalog, VerificationRunId::new());
     let result = verifier::run_execution_requests_cancelled(
       &workspace,
       &context.config,
@@ -757,119 +788,6 @@ impl Controller {
       bail!("final verification command modified canonical repository state");
     }
     result
-  }
-  async fn record_verification_evidence(
-    &self,
-    context: &BackendContext,
-    graph: &mut EvidenceGraphState,
-    revision: &str,
-    report: &VerificationReport,
-    _bindings: &[CandidateCheck],
-  ) -> Result<()> {
-    let requirement_before = evidence_graph::verification_states(graph)?;
-    let criterion_before = evidence_graph::criterion_states(graph)?;
-    let ids = evidence_graph::record_report(graph, revision, report)?;
-    if ids.is_empty() {
-      return Ok(());
-    }
-    store::write_evidence_graph(&self.cwd, graph).await?;
-    for id in ids {
-      let evidence = graph.evidence[&id].clone();
-      let event = if evidence.result == EvidenceResult::Failed {
-        RunEvent::EvidenceFailed(evidence.clone())
-      } else {
-        RunEvent::EvidenceEstablished(evidence.clone())
-      };
-      context.events.emit(event).await?;
-      let related: Vec<_> = graph
-        .evidence
-        .values()
-        .filter(|item| item.obligation_id == evidence.obligation_id)
-        .collect();
-      if related.iter().any(|item| EvidencePolicy.authorizes(item))
-        && related.iter().any(|item| EvidencePolicy.blocks(item))
-      {
-        context
-          .events
-          .emit(RunEvent::EvidenceContradiction {
-            obligation_id: evidence.obligation_id,
-            evidence_ids: related.iter().map(|item| item.id).collect(),
-          })
-          .await?;
-      }
-    }
-    self
-      .emit_verification_transitions(context, graph, requirement_before, criterion_before)
-      .await
-  }
-
-  async fn invalidate_evidence(
-    &self,
-    context: &BackendContext,
-    graph: &mut EvidenceGraphState,
-    revision: &str,
-  ) -> Result<()> {
-    let requirement_before = evidence_graph::verification_states(graph)?;
-    let criterion_before = evidence_graph::criterion_states(graph)?;
-    let invalidated = evidence_graph::invalidate_for_revision(&self.cwd, graph, revision).await?;
-    if invalidated.is_empty() {
-      return Ok(());
-    }
-    store::write_evidence_graph(&self.cwd, graph).await?;
-    for evidence_id in invalidated {
-      context
-        .events
-        .emit(RunEvent::EvidenceInvalidated {
-          evidence_id,
-          revision: revision.to_owned(),
-        })
-        .await?;
-    }
-    self
-      .emit_verification_transitions(context, graph, requirement_before, criterion_before)
-      .await
-  }
-
-  async fn emit_verification_transitions(
-    &self,
-    context: &BackendContext,
-    graph: &EvidenceGraphState,
-    requirement_before: BTreeMap<RequirementId, VerificationState>,
-    criterion_before: BTreeMap<CriterionId, VerificationState>,
-  ) -> Result<()> {
-    for (criterion_id, current) in evidence_graph::criterion_states(graph)? {
-      let previous = criterion_before
-        .get(&criterion_id)
-        .copied()
-        .unwrap_or(VerificationState::Unverified);
-      if previous != current {
-        context
-          .events
-          .emit(RunEvent::CriterionVerificationChanged {
-            criterion_id,
-            previous,
-            current,
-          })
-          .await?;
-      }
-    }
-    for (requirement_id, current) in evidence_graph::verification_states(graph)? {
-      let previous = requirement_before
-        .get(&requirement_id)
-        .copied()
-        .unwrap_or(VerificationState::Unverified);
-      if previous != current {
-        context
-          .events
-          .emit(RunEvent::RequirementVerificationChanged {
-            requirement_id,
-            previous,
-            current,
-          })
-          .await?;
-      }
-    }
-    Ok(())
   }
 
   async fn read_only_worker<T, F, Fut>(
@@ -926,8 +844,7 @@ impl Controller {
     state: &mut State,
     catalog: RequirementCatalog,
   ) -> Result<RequirementCatalog> {
-    let (_, hash) = store::spec_text_and_hash(&self.cwd, &context.config).await?;
-    if hash == catalog.spec_hash {
+    if !catalog::specification_changed(&self.cwd, &context.config, &catalog).await? {
       return Ok(catalog);
     }
     state.completed_work_units.clear();
@@ -973,181 +890,6 @@ impl Controller {
     }
     Ok(())
   }
-}
-fn annotated_specification(specification: &str) -> String {
-  let mut annotated = String::from(
-    "Normative fragments below are controller-derived. Every fragmentId must appear in at least one requirement sourceRefs entry with the exact section and textHash.\n\n",
-  );
-  for fragment in tenet_domain::worker::derive_normative_fragments(specification) {
-    let section = fragment.section.as_deref().unwrap_or("<none>");
-    let _ = writeln!(
-      annotated,
-      "[fragmentId={} textHash={} section={section}]\n{}\n",
-      fragment.id, fragment.text_hash, fragment.text
-    );
-  }
-  annotated
-}
-fn build_catalog(
-  specification: &str,
-  spec_hash: String,
-  output: ArchitectOutput,
-  config: &Config,
-) -> Result<RequirementCatalog> {
-  let mut requirements = output.requirements;
-  for requirement in &mut requirements {
-    requirement.required = true;
-  }
-
-  let mut acceptance_criteria = output.acceptance_criteria;
-  for criterion in &mut acceptance_criteria {
-    criterion.mandatory = true;
-  }
-
-  let mut verification_obligations = output.verification_obligations;
-  for obligation in &mut verification_obligations {
-    obligation.required = true;
-    obligation.authority = VerificationAuthority::AgentProposed;
-    obligation.dependency_scope_authority = DependencyScopeAuthority::AgentProposed;
-  }
-
-  let mut promoted = BTreeSet::new();
-  for gate in &config.verification.gates {
-    for obligation_id in &gate.obligation_ids {
-      if !promoted.insert(obligation_id.clone()) {
-        bail!("multiple project gates target verification obligation {obligation_id}");
-      }
-      let obligation = verification_obligations
-        .iter_mut()
-        .find(|obligation| obligation.id == *obligation_id)
-        .with_context(|| {
-          format!("project gate targets unknown verification obligation {obligation_id}")
-        })?;
-      obligation.spec = gate.spec.clone();
-      obligation.authority = VerificationAuthority::ProjectConfigured;
-      obligation
-        .dependency_scope
-        .clone_from(&gate.dependency_scope);
-      obligation.dependency_scope_authority = DependencyScopeAuthority::ProjectConfigured;
-    }
-  }
-
-  let coverage = CatalogCoverage::derive(specification, &requirements);
-  Ok(RequirementCatalog {
-    spec_hash,
-    requirements,
-    acceptance_criteria,
-    verification_obligations,
-    coverage,
-  })
-}
-
-fn validate_catalog_coverage(catalog: &RequirementCatalog, specification: &str) -> Result<()> {
-  catalog
-    .coverage
-    .validate_references(&catalog.requirements)
-    .map_err(anyhow::Error::msg)?;
-  let expected = CatalogCoverage::derive(specification, &catalog.requirements);
-  if catalog.coverage != expected {
-    bail!("catalog coverage does not match controller-derived specification fragments");
-  }
-  if !catalog.coverage.is_complete() {
-    let uncovered = catalog
-      .coverage
-      .uncovered_fragment_ids
-      .iter()
-      .map(ToString::to_string)
-      .collect::<Vec<_>>()
-      .join(", ");
-    bail!("catalog does not cover normative specification fragments: {uncovered}");
-  }
-  Ok(())
-}
-
-fn validate_catalog(catalog: &RequirementCatalog) -> Result<()> {
-  if catalog.requirements.is_empty() {
-    bail!("architect produced no requirements");
-  }
-  let mut requirement_ids = BTreeSet::new();
-  for (index, requirement) in catalog.requirements.iter().enumerate() {
-    let expected = format!("REQ-{:03}", index + 1);
-    if requirement.id.as_str() != expected {
-      bail!(
-        "requirement id {} is unstable; expected {expected}",
-        requirement.id
-      );
-    }
-    if !requirement_ids.insert(requirement.id.clone()) {
-      bail!("duplicate requirement id {}", requirement.id);
-    }
-    if requirement.title.trim().is_empty() || requirement.description.trim().is_empty() {
-      bail!("{} is missing title or description", requirement.id);
-    }
-  }
-
-  let mut criterion_ids = BTreeSet::new();
-  for requirement in &catalog.requirements {
-    let criteria: Vec<_> = catalog
-      .acceptance_criteria
-      .iter()
-      .filter(|criterion| criterion.requirement_id == requirement.id)
-      .collect();
-    if requirement.required && !criteria.iter().any(|criterion| criterion.mandatory) {
-      bail!("{} has no mandatory acceptance criterion", requirement.id);
-    }
-    for (index, criterion) in criteria.iter().enumerate() {
-      let expected = format!("{}/AC-{:02}", requirement.id, index + 1);
-      if criterion.id.as_str() != expected {
-        bail!(
-          "criterion id {} is unstable; expected {expected}",
-          criterion.id
-        );
-      }
-      if !criterion_ids.insert(criterion.id.clone()) {
-        bail!("duplicate criterion id {}", criterion.id);
-      }
-    }
-  }
-  if catalog
-    .acceptance_criteria
-    .iter()
-    .any(|criterion| !requirement_ids.contains(&criterion.requirement_id))
-  {
-    bail!("acceptance criterion targets an unknown requirement");
-  }
-
-  let mut obligation_ids = BTreeSet::new();
-  for criterion in &catalog.acceptance_criteria {
-    let obligations: Vec<_> = catalog
-      .verification_obligations
-      .iter()
-      .filter(|obligation| obligation.criterion_id == criterion.id)
-      .collect();
-    if criterion.mandatory && !obligations.iter().any(|obligation| obligation.required) {
-      bail!("{} has no required verification obligation", criterion.id);
-    }
-    for (index, obligation) in obligations.iter().enumerate() {
-      let expected = format!("{}/VO-{:02}", criterion.id, index + 1);
-      if obligation.id.as_str() != expected {
-        bail!(
-          "verification obligation id {} is unstable; expected {expected}",
-          obligation.id
-        );
-      }
-      if !obligation_ids.insert(obligation.id.clone()) {
-        bail!("duplicate verification obligation id {}", obligation.id);
-      }
-    }
-  }
-  if catalog
-    .verification_obligations
-    .iter()
-    .any(|obligation| !criterion_ids.contains(&obligation.criterion_id))
-  {
-    bail!("verification obligation targets an unknown acceptance criterion");
-  }
-  evidence_graph::graph_from_catalog(catalog)?;
-  Ok(())
 }
 
 fn validate_reconcile(catalog: &RequirementCatalog, result: &ReconcileResult) -> Result<()> {
@@ -1384,26 +1126,15 @@ pub async fn manual_verify(cwd: &Path) -> Result<VerificationReport> {
   let catalog = store::read_catalog(cwd)
     .await?
     .context("manual verification requires an initialized requirement catalog")?;
-  validate_catalog(&catalog)?;
+  catalog::validate(&catalog)?;
   let (specification, _) = store::spec_text_and_hash(cwd, &config).await?;
-  validate_catalog_coverage(&catalog, &specification)?;
+  catalog::validate_coverage(&catalog, &specification)?;
   let revision = git::head(cwd).await?;
-  let run_id = VerificationRunId::new();
-  let requests: Vec<_> = catalog
-    .verification_obligations
-    .iter()
-    .filter(|obligation| obligation.required)
-    .map(|obligation| VerificationExecutionRequest {
-      run_id,
-      obligation_id: obligation.id.clone(),
-      spec: obligation.spec.clone(),
-      authority: obligation.authority,
-    })
-    .collect();
+  let requests = verification::required_requests(&catalog, VerificationRunId::new());
   let report =
     verifier::run_execution_requests_cancelled(cwd, &config, &requests, &CancellationToken::new())
       .await?;
-  let mut graph = store::read_evidence_graph(cwd, &catalog).await?;
+  let mut graph = evidence_graph::load(cwd, &catalog).await?;
   evidence_graph::invalidate_for_revision(cwd, &mut graph, &revision).await?;
   evidence_graph::record_report(&mut graph, &revision, &report)?;
   store::write_evidence_graph(cwd, &graph).await?;
@@ -1414,9 +1145,10 @@ pub async fn manual_verify(cwd: &Path) -> Result<VerificationReport> {
 mod tests {
   use super::*;
   use tenet_domain::{
+    config::Config,
     evidence::{AcceptanceCriterion, VerificationKind, VerificationObligation},
-    ids::{ObligationId, RequirementId},
-    model::{Requirement, RequirementAssessment},
+    ids::{CriterionId, ObligationId, RequirementId},
+    model::{ArchitectOutput, Requirement, RequirementAssessment},
     verification::{DependencyScopeAuthority, VerificationAuthority, VerificationSpec},
     worker::{derive_normative_fragments, CatalogCoverage},
   };
@@ -1531,7 +1263,7 @@ mod tests {
     let mut invalid = catalog();
     invalid.acceptance_criteria[0].description = " ".into();
 
-    assert!(validate_catalog(&invalid).is_err());
+    assert!(catalog::validate(&invalid).is_err());
   }
   fn architect_output(requirement: Requirement) -> ArchitectOutput {
     ArchitectOutput {
@@ -1548,7 +1280,7 @@ mod tests {
     let mut output = architect_output(requirement);
     output.acceptance_criteria[0].mandatory = false;
     output.verification_obligations[0].required = false;
-    let built = build_catalog("Description", "spec".into(), output, &Config::default())
+    let built = catalog::build("Description", "spec".into(), output, &Config::default())
       .expect("build catalog");
 
     assert!(built.requirements[0].required);
@@ -1566,7 +1298,7 @@ mod tests {
     let fragments = derive_normative_fragments(specification);
     let mut requirement = catalog().requirements.remove(0);
     requirement.source_refs = vec![fragments[0].reference()];
-    let built = build_catalog(
+    let built = catalog::build(
       specification,
       "spec".into(),
       architect_output(requirement),
@@ -1574,8 +1306,8 @@ mod tests {
     )
     .expect("build catalog");
 
-    assert!(validate_catalog(&built).is_ok());
-    assert!(validate_catalog_coverage(&built, specification).is_err());
+    assert!(catalog::validate(&built).is_ok());
+    assert!(catalog::validate_coverage(&built, specification).is_err());
     assert_eq!(
       built.coverage.uncovered_fragment_ids,
       vec![fragments[1].id.clone()]

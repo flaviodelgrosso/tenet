@@ -19,11 +19,12 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use crossterm::event::{self, Event};
+use tenet_controller::{AgentBackend, Controller};
 use tenet_domain::{
   events::{EventSink, RunEvent},
   model::State,
 };
-use tenet_runtime::{backend::AgentBackend, controller::Controller, store};
+use tenet_runtime::store;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 

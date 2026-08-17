@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
+tenet-controller = { path = "../tenet-controller" }
 tenet-runtime = { path = "../tenet-runtime" }
 tenet-domain = { path = "../tenet-domain" }
 tenet-projection = { path = "../tenet-projection" }

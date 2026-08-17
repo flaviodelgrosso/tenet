@@ -3309,6 +3309,7 @@ dependencies = [
  "sha2 0.11.0",
  "tar",
  "tempfile",
+ "tenet-controller",
  "tenet-domain",
  "tenet-runtime",
  "thiserror 2.0.20",
@@ -3326,6 +3327,7 @@ dependencies = [
  "clap",
  "serde_json",
  "tenet-acp",
+ "tenet-controller",
  "tenet-domain",
  "tenet-projection",
  "tenet-runtime",
@@ -3333,6 +3335,26 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+]
+
+[[package]]
+name = "tenet-controller"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "globset",
+ "proptest",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tenet-domain",
+ "tenet-runtime",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -3393,6 +3415,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "tempfile",
+ "tenet-controller",
  "tenet-domain",
  "tenet-projection",
  "tenet-runtime",

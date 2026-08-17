@@ -5,12 +5,13 @@ use std::{
 };
 
 use anyhow::Result;
+use tenet_controller::{AgentBackend, Controller};
 use tenet_domain::{
   events::EventSink,
   model::{RunStatus, State},
 };
 use tenet_projection::{status_label, Activity, ActivityCategory, RunProjection};
-use tenet_runtime::{backend::AgentBackend, controller::Controller, store};
+use tenet_runtime::store;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 

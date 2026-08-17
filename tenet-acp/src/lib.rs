@@ -1,4 +1,4 @@
-//! ACP agent runtime and Registry integration for Tenet.
+//! ACP adapter implementing `tenet-controller` agent ports over coding-agent runtimes and Registry launches.
 
 pub mod acp;
 mod prompts;

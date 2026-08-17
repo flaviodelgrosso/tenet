@@ -35,9 +35,9 @@ use tokio::sync::oneshot;
 
 use crate::registry::RegistryClient;
 use crate::schemas::{schema_for, validate_structured_output};
+use tenet_controller::ports::agent::AgentBackend;
 use tenet_runtime::backend::{
-  AgentBackend, AgentRuntime, BackendContext, LaunchMetadata, WorkerOutputValidator, WorkerRequest,
-  WorkerResult,
+  AgentRuntime, BackendContext, LaunchMetadata, WorkerOutputValidator, WorkerRequest, WorkerResult,
 };
 
 use crate::prompts::full_role_prompt;

@@ -1,4 +1,4 @@
-//! Shared domain types, configuration, and run events for Tenet.
+//! Semantic domain models and pure invariants for Tenet state, catalogs, verification, and evidence.
 
 pub mod config;
 pub mod error;

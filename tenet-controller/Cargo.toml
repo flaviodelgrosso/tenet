@@ -1,0 +1,24 @@
+[package]
+name = "tenet-controller"
+version.workspace = true
+edition.workspace = true
+description = "Deterministic orchestration and trust-policy control plane for Tenet"
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+globset.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tenet-domain = { path = "../tenet-domain" }
+tenet-runtime = { path = "../tenet-runtime" }
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile = "3"
+toml.workspace = true

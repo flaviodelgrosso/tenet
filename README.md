@@ -136,6 +136,16 @@ But **agents do not get to redefine the process just because the conversation dr
 
 ---
 
+## Crate boundaries
+
+- `tenet-domain` defines Tenet's semantic state, evidence model, and pure invariants.
+- `tenet-runtime` provides repository, workspace, scheduling, integration, verification-execution, and persistence mechanisms.
+- `tenet-controller` owns the deterministic control loop, catalog and evidence trust policy, verification authorization, and completion authority.
+- `tenet-acp` adapts ACP coding-agent runtimes to the `tenet-controller::AgentBackend` port.
+- `tenet-cli` composes the controller, ACP adapter, projections, and terminal UI.
+
+The dependency direction is deliberate: the controller uses runtime mechanisms; ACP implements a controller-owned port. Runtime never depends on the controller, and the controller never depends on ACP.
+
 ## Why fresh agents?
 
 A long-running coding conversation has memory.

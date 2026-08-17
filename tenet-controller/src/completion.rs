@@ -269,8 +269,11 @@ mod tests {
     }
   }
 
-  fn graph(catalog: &RequirementCatalog, passed: bool) -> EvidenceGraphState {
-    let mut graph = crate::evidence::graph_from_catalog(catalog).expect("graph");
+  fn record_execution(
+    graph: &mut EvidenceGraphState,
+    authority: VerificationAuthority,
+    passed: bool,
+  ) {
     graph
       .record_execution_result(
         "abc123",
@@ -279,7 +282,7 @@ mod tests {
           run_id: VerificationRunId::new(),
           obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
           spec: spec(),
-          authority: VerificationAuthority::ProjectConfigured,
+          authority,
           result: CommandResult {
             command: spec().identity(),
             exit_code: Some(if passed { 0 } else { 1 }),
@@ -291,6 +294,11 @@ mod tests {
         },
       )
       .expect("evidence");
+  }
+
+  fn graph(catalog: &RequirementCatalog, passed: bool) -> EvidenceGraphState {
+    let mut graph = crate::evidence::graph_from_catalog(catalog).expect("graph");
+    record_execution(&mut graph, VerificationAuthority::ProjectConfigured, passed);
     graph
   }
 
@@ -397,6 +405,114 @@ mod tests {
     assert!(blockers.contains(&CompletionBlocker::RequirementUnverified(
       RequirementId::from("REQ-001")
     )));
+    assert!(
+      blockers.contains(&CompletionBlocker::CriterionUnverified(CriterionId::from(
+        "REQ-001/AC-01"
+      )))
+    );
+  }
+
+  #[test]
+  fn required_unverified_requirement_blocks_completion() {
+    let catalog = catalog();
+    let graph = crate::evidence::graph_from_catalog(&catalog).expect("graph");
+
+    assert!(matches!(
+      decision(&catalog, &graph),
+      CompletionDecision::NotReady(blockers)
+        if blockers.contains(&CompletionBlocker::RequirementUnverified(
+          RequirementId::from("REQ-001")
+        ))
+    ));
+  }
+
+  #[test]
+  fn mandatory_unverified_criterion_blocks_completion() {
+    let catalog = catalog();
+    let graph = crate::evidence::graph_from_catalog(&catalog).expect("graph");
+
+    assert!(matches!(
+      decision(&catalog, &graph),
+      CompletionDecision::NotReady(blockers)
+        if blockers.contains(&CompletionBlocker::CriterionUnverified(
+          CriterionId::from("REQ-001/AC-01")
+        ))
+    ));
+  }
+
+  #[test]
+  fn stale_evidence_produces_typed_blocker() {
+    let catalog = catalog();
+    let mut graph = graph(&catalog, true);
+    graph.invalidate_where(
+      "def456",
+      Utc.with_ymd_and_hms(2026, 8, 16, 11, 0, 0).unwrap(),
+      |_| true,
+    );
+
+    assert!(matches!(
+      decision(&catalog, &graph),
+      CompletionDecision::NotReady(blockers)
+        if blockers.iter().any(|blocker| matches!(blocker, CompletionBlocker::EvidenceStale(_)))
+    ));
+  }
+
+  #[test]
+  fn contradictory_evidence_produces_typed_blocker() {
+    let catalog = catalog();
+    let mut graph = graph(&catalog, true);
+    record_execution(&mut graph, VerificationAuthority::ProjectConfigured, false);
+
+    assert!(matches!(
+      decision(&catalog, &graph),
+      CompletionDecision::NotReady(blockers)
+        if blockers.contains(&CompletionBlocker::EvidenceContradicted(
+          ObligationId::from("REQ-001/AC-01/VO-01")
+        ))
+    ));
+  }
+
+  #[test]
+  fn agent_proposed_passing_evidence_is_untrusted() {
+    let mut catalog = catalog();
+    catalog.verification_obligations[0].authority = VerificationAuthority::AgentProposed;
+    let mut graph = crate::evidence::graph_from_catalog(&catalog).expect("graph");
+    record_execution(&mut graph, VerificationAuthority::AgentProposed, true);
+
+    assert!(matches!(
+      decision(&catalog, &graph),
+      CompletionDecision::NotReady(blockers)
+        if blockers.contains(&CompletionBlocker::UntrustedEvidence(
+          ObligationId::from("REQ-001/AC-01/VO-01")
+        ))
+    ));
+  }
+
+  #[test]
+  fn assessment_implementation_gap_blocks_completion() {
+    let catalog = catalog();
+    let graph = graph(&catalog, true);
+    let mut assessment = assessment();
+    assessment.requirements[0].missing_implementation = vec!["gap".into()];
+    let decision = CompletionPolicy.evaluate(&CompletionContext {
+      catalog: &catalog,
+      evidence: &graph,
+      assessment: &assessment,
+      deterministic_gate_passed: true,
+      verified_revision: "abc123",
+      current_revision: "abc123",
+      repository_clean: true,
+      has_active_leases: false,
+      has_pending_integrations: false,
+    });
+
+    assert!(matches!(
+      decision,
+      CompletionDecision::NotReady(blockers)
+        if blockers.contains(&CompletionBlocker::AssessmentFoundImplementationGap(
+          RequirementId::from("REQ-001")
+        ))
+    ));
   }
 
   proptest! {
