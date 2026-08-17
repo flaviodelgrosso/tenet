@@ -1,220 +1,447 @@
 <div align="center">
 
-<img width="1530" height="689" alt="logo" src="https://github.com/user-attachments/assets/4c078e90-69f5-44d9-a634-91eefbc4470f" />
+<img width="1530" height="689" alt="Tenet" src="https://github.com/user-attachments/assets/4c078e90-69f5-44d9-a634-91eefbc4470f" />
 
 <br />
 
 [![CI](https://github.com/flaviodelgrosso/tenet/actions/workflows/ci.yml/badge.svg)](https://github.com/flaviodelgrosso/tenet/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Status: MVP](https://img.shields.io/badge/status-MVP-orange)](#mvp-read-this-first)
+[![Status: Experimental MVP](https://img.shields.io/badge/status-experimental_MVP-orange)](#current-status)
 
-### Give an agent a task and it can write code
+## Coding agents write code
 
-### Give **Tenet** a spec and it keeps asking whether the software is actually done
+## **Tenet decides whether the repository has earned `DONE`.**
 
-**A deterministic control loop for autonomous, spec-driven software development.**
+**An evidence-driven control plane for autonomous, spec-driven software development.**
 
 </div>
 
 ---
 
-Coding agents are getting very good at changing code.
+## Current status
+
+> **Tenet is an experimental MVP.**
+>
+> The core control architecture is implemented.
+> Its advantage over simpler coding-agent loops has **not yet been demonstrated experimentally**.
+
+Tenet is built around a research hypothesis:
+
+> **Separating probabilistic coding work from deterministic process authority can reduce false completion, regressions, and long-horizon drift in autonomous software development.**
+
+That hypothesis still needs benchmarks.
+
+Tenet does **not** currently claim to be faster, cheaper, safer, or more reliable than a strong single coding agent or a simple iterative agent loop.
+
+The project exists to find out.
+
+### What exists today
+
+| Capability                                                                    | Status          |
+| ----------------------------------------------------------------------------- | --------------- |
+| Specification → requirements / acceptance criteria / verification obligations | ✅ Implemented  |
+| Architect, Reconcile, Implement, Repair, and Assess roles                     | ✅ Implemented  |
+| Fresh role-specific agent sessions                                            | ✅ Implemented  |
+| ACP-based agent execution                                                     | ✅ Implemented  |
+| Controller-owned completion authority                                         | ✅ Implemented  |
+| Controller-executed deterministic verification                                | ✅ Implemented  |
+| Revision-scoped requirement evidence graph                                    | ✅ Implemented  |
+| Evidence invalidation after relevant changes                                  | ✅ Implemented  |
+| Isolated Git worktrees                                                        | ✅ Implemented  |
+| Candidate scope enforcement                                                   | ✅ Implemented  |
+| Protected controller-owned paths                                              | ✅ Implemented  |
+| Dependency-aware scheduling                                                   | ✅ Implemented  |
+| Transactional integration and recovery journal                                | ✅ Implemented  |
+| Persistent controller state                                                   | ✅ Implemented  |
+| TUI and headless execution                                                    | ✅ Implemented  |
+| Comparative evaluation harness                                                | 🚧 Planned      |
+| Published single-agent / simple-loop / Tenet benchmarks                       | ❌ Not yet      |
+| Failure-specific recovery routing                                             | 🚧 Planned      |
+| Controller-owned engineering memory                                           | 🚧 Planned      |
+| Safe parallel work units                                                      | 🚧 Planned      |
+| Host/container security sandbox                                               | ❌ Not provided |
+| GitHub PR / merge-readiness workflow                                          | 🚧 Planned      |
+
+---
+
+# The problem
+
+Coding agents are becoming very good at **changing code**.
 
 That is not the same thing as being good at **finishing software autonomously**.
 
-Long-running agent workflows have a different problem:
+Long-running coding workflows have a different set of failure modes:
 
 - context accumulates;
 - assumptions become stale;
 - plans drift away from the repository;
-- failed tests become another paragraph in a conversation;
-- the agent that wrote the code is often the same agent deciding whether it worked;
-- and eventually something says _“done”_.
+- failures get summarized instead of preserved as evidence;
+- later changes regress earlier work;
+- the agent that wrote the implementation often evaluates its own work;
+- weak tests create false confidence;
+- and eventually something says _“done.”_
 
-**Tenet is an experiment in moving that responsibility out of the conversation.**
-
-The model writes code.
-
-**The controller owns the process.**
+Tenet moves process authority out of the conversation.
 
 ```text
-spec
- │
- ▼
-understand what must be true
- │
- ▼
-inspect the repository
- │
- ▼
-choose the next bounded work
- │
- ▼
-fresh coding-agent session
- │
- ▼
-isolated Git worktree
- │
- ▼
-run real verification
- │
- ├── failed ──► repair with actual failure evidence ──┐
- │                                                  │
- └── passed ──► integrate ──► inspect again ◄───────┘
-                              │
-                              ▼
-                     independent assessment
-                              │
-                              ▼
-                            DONE?
+                         probabilistic
+                            workers
+                               │
+                               ▼
+spec ─────────────────► ┌───────────────┐
+repo ─────────────────► │     TENET     │
+                        │               │
+                        │ requirements  │
+                        │ scheduling    │
+                        │ verification  │
+                        │ evidence      │
+                        │ integration   │
+                        │ stopping      │
+                        └───────┬───────┘
+                                │
+                                ▼
+                            repository
 ```
 
-There is no immortal master conversation that has to remember everything.
+Agents still reason.
 
-Agent context is disposable.
+Agents still write code.
 
-**The repository, specification, evidence, and controller state are not.**
+Agents still repair failures.
+
+Agents still inspect the result.
+
+But **agents do not decide what counts as authoritative verification, and they cannot declare the entire run complete by saying that the work is finished.**
 
 ---
 
-## The idea
+# The control loop
 
-Tenet starts from a simple observation:
+A Tenet run repeatedly asks one question:
 
-> **Autonomous coding is partly an intelligence problem, but it is also a control problem.**
-
-A strong model can already solve surprisingly difficult bounded coding tasks.
-
-But an autonomous engineering system also needs to answer questions like:
-
-- What are we actually trying to satisfy?
-- What is already implemented?
-- What should happen next?
-- Which work can safely run?
-- Did the change really pass the project's checks?
-- Did the fix break something that was already working?
-- Are we repeating ourselves?
-- Should we retry, repair, stop, or reassess?
-- Who decides that the repository is finished?
-
-Those decisions should not live only inside model context.
-
-Tenet puts them in a Rust controller.
+> **Given the specification, the current repository, and the evidence we actually have, what still needs to become true?**
 
 ```text
-probabilistic workers
-        │
-        ▼
-┌──────────────────────────────┐
-│            TENET             │
-│                              │
-│ requirements                 │
-│ state transitions            │
-│ dependency validation        │
-│ worktree isolation           │
-│ verification                 │
-│ retries                      │
-│ integration                  │
-│ evidence                     │
-│ stopping conditions          │
-└──────────────────────────────┘
-        │
-        ▼
-      repository
+specification
+     │
+     ▼
+ Architect
+     │
+     ▼
+requirements + acceptance criteria + verification obligations
+     │
+     ▼
+ Reconcile ◄──────────────────────────────────────┐
+     │                                            │
+     ▼                                            │
+bounded work unit                                 │
+     │                                            │
+     ▼                                            │
+fresh implementation session                     │
+     │                                            │
+     ▼                                            │
+isolated Git worktree                             │
+     │                                            │
+     ▼                                            │
+immutable candidate commit                        │
+     │                                            │
+     ▼                                            │
+controller-run verification                       │
+     │                                            │
+     ├── fail ──► bounded Repair ──► verify ──────┤
+     │                                            │
+     └── pass ──► controlled integration ─────────┘
+                                      │
+                                      ▼
+                              skeptical Assess
+                                      │
+                                      ▼
+                                    DONE?
 ```
 
-Agents reason.
+The repository evolves.
 
-Agents implement.
+The plan is allowed to evolve with it.
 
-Agents repair.
-
-Agents assess.
-
-But **agents do not get to redefine the process just because the conversation drifted there**.
+The specification and controller-owned evidence remain the reference points.
 
 ---
 
-## Crate boundaries
+# `DONE` is a state, not a sentence
 
-- `tenet-domain` defines Tenet's semantic state, evidence model, and pure invariants.
-- `tenet-runtime` provides repository, workspace, scheduling, integration, verification-execution, and persistence mechanisms.
-- `tenet-controller` owns the deterministic control loop, catalog and evidence trust policy, verification authorization, and completion authority.
-- `tenet-acp` adapts ACP coding-agent runtimes to the `tenet-controller::AgentBackend` port.
-- `tenet-cli` composes the controller, ACP adapter, projections, and terminal UI.
+A coding agent can always produce:
 
-The dependency direction is deliberate: the controller uses runtime mechanisms; ACP implements a controller-owned port. Runtime never depends on the controller, and the controller never depends on ACP.
+```text
+Everything has been implemented successfully.
+```
 
-## Why fresh agents?
+Tenet does not treat that statement as completion.
 
-A long-running coding conversation has memory.
+Conceptually, `DONE(R)` is derived for one exact canonical repository revision `R`.
 
-That sounds like an advantage.
+It requires, among other invariants:
 
-Sometimes it is.
+```text
+authoritative specification
+        +
+valid requirement catalog
+        +
+mandatory acceptance criteria
+        +
+required verification obligations
+        +
+controller-observed passing evidence at revision R
+        +
+no blocking contradictory evidence
+        +
+no remaining work from current reconciliation
+        +
+no concrete gap from skeptical assessment
+        +
+repository-wide deterministic gates pass
+        +
+canonical HEAD is still R
+        +
+canonical working tree is clean
+        +
+no active candidate / lease / integration transaction
+        +
+state and evidence are persisted successfully
+        =
+DONE(R)
+```
 
-It can also become baggage.
+`DONE` does **not** mean mathematically proven correct.
 
-An agent may carry forward:
+It means:
 
-- an obsolete mental model of the codebase;
-- a plan that made sense three changes ago;
-- assumptions it never re-checked;
-- compressed summaries of previous failures;
+> **the repository satisfied the specification through the evidence and assessment mechanisms available to this run.**
+
+That distinction matters.
+
+A bad specification can still produce the wrong software.
+
+Weak tests can still produce weak evidence.
+
+An agent can still miss something.
+
+Tenet does not remove uncertainty from software engineering.
+
+It tries to make that uncertainty **explicit, revision-bound, inspectable, and harder to hand-wave away**.
+
+---
+
+# Evidence, not agent confidence
+
+Suppose the specification contains:
+
+```text
+REQ-003
+Password reset tokens expire after 15 minutes.
+```
+
+An acceptance criterion might require:
+
+```text
+AC-003-01
+A token is accepted before expiry and rejected after expiry.
+```
+
+And a verification obligation might bind that requirement to:
+
+```text
+VO-003-01
+cargo test password_reset_expiry
+```
+
+Tenet's authoritative evidence is not:
+
+```text
+Agent: "I ran the tests and they pass."
+```
+
+It is closer to:
+
+```text
+requirement:  REQ-003
+criterion:    AC-003-01
+obligation:   VO-003-01
+revision:     abc123...
+program:      cargo
+arguments:    test password_reset_expiry
+exit_code:    0
+observed_by:  controller
+```
+
+If a later change touches the dependency scope supporting that evidence, Tenet can mark it stale and require verification again.
+
+The model proposes.
+
+**The controller observes.**
+
+---
+
+# Why not just use a simple loop?
+
+A simple coding-agent loop can be extremely effective:
+
+```text
+inspect
+  ↓
+change
+  ↓
+test
+  ↓
+repeat
+```
+
+Tenet deliberately adds more machinery:
+
+```text
+specification
+  ↓
+explicit requirements
+  ↓
+repository reconciliation
+  ↓
+bounded work
+  ↓
+isolated candidate
+  ↓
+controller-run verification
+  ↓
+revision-scoped evidence
+  ↓
+controlled integration
+  ↓
+independent reassessment
+  ↓
+controller-owned completion
+```
+
+The additional complexity is only justified if it produces measurable benefits.
+
+That is an empirical question.
+
+Tenet needs to demonstrate whether this architecture reduces things such as:
+
+- false `DONE`;
+- regressions;
+- requirement drift;
+- repeated failed work;
+- unrecoverable repository mutations;
+- run-to-run variance;
+
+without imposing unacceptable:
+
+- token cost;
+- wall-clock cost;
+- model-call overhead;
+- orchestration complexity.
+
+Until comparative benchmarks exist, **simpler loops remain a completely reasonable alternative**.
+
+---
+
+# Replaceable context, durable engineering state
+
+Tenet deliberately avoids relying on one permanent master conversation.
+
+Different roles use fresh sessions.
+
+```text
+model reasoning          → replaceable
+repository changes       → durable
+specification            → durable
+requirements             → durable
+verification results     → durable
+controller state         → durable
+```
+
+The motivation is straightforward.
+
+A long-lived agent context can accumulate:
+
+- obsolete architecture assumptions;
+- old plans;
+- compressed versions of previous failures;
+- unverified conclusions;
 - confidence inherited from its own earlier reasoning.
 
-Tenet deliberately uses fresh sessions for different roles.
+A fresh worker can instead inspect current repository state.
 
-The next worker does not need to believe the previous worker.
+But this design has a cost: fresh workers may repeatedly rediscover stable facts.
 
-It can inspect what actually exists.
+So this is a **hypothesis, not dogma**.
 
-```text
-previous reasoning    → disposable
-repository changes    → durable
-verification results  → durable
-requirements          → durable
-controller state      → durable
-```
-
-This is the central bet behind the project:
-
-> **Keep engineering state explicit. Keep model context replaceable.**
-
-Whether that architecture ultimately beats simpler agent workflows is something that still needs to be measured.
-
-Tenet does **not** claim that result today.
+One important future direction is controller-owned engineering memory: structured, revision-aware facts that can survive sessions without recreating one giant permanent conversation.
 
 ---
 
-## What happens during a run
+# What happens during a run
 
-A run is a sequence of bounded engineering cycles.
+## 1. Architect
 
-### 1. Architect
+Architect turns the specification into a typed catalog containing:
 
-The specification is turned into explicit requirements, acceptance criteria, and verification obligations with stable semantic IDs.
+- requirements;
+- acceptance criteria;
+- verification obligations;
+- stable semantic IDs.
 
-An acceptance criterion states what must be true. A verification obligation separately states how the controller must demonstrate it.
+An acceptance criterion describes **what must be true**.
 
-### 2. Reconcile
+A verification obligation describes **how that truth must be demonstrated**.
 
-A fresh worker compares the repository implementation with the catalog **as it exists now**.
+Architect proposes the catalog.
 
-It proposes implementation observations, missing implementation, missing evidence obligations, candidate checks, and bounded work units. These are proposals: Reconcile cannot declare a requirement verified or complete.
+The controller validates its structure.
 
-Tenet validates the relationships and work graph before execution. The plan may change as the code changes.
+---
 
-### 3. Implement
+## 2. Reconcile
 
-A coding worker receives a bounded unit of work.
+A fresh worker inspects the repository as it exists now and compares it with the catalog.
 
-Implementation happens inside an isolated Git worktree rather than treating the canonical checkout as scratch space.
+It can propose:
 
-### 4. Verify
+- implementation observations;
+- missing implementation;
+- missing evidence;
+- candidate verification;
+- bounded work units;
+- dependencies between work.
 
-The controller executes real project commands.
+Reconcile controls planning input.
+
+It does **not** have verification authority.
+
+A model believing that something is implemented is not the same as the controller possessing evidence that it is implemented.
+
+---
+
+## 3. Implement
+
+A worker receives bounded work and an explicit repository scope.
+
+Implementation occurs in an isolated detached Git worktree.
+
+Before a candidate can proceed, Tenet checks the complete candidate diff against the authority granted to that work unit.
+
+Unexpected out-of-scope modifications are rejected.
+
+A worker that discovers legitimate additional work can request scope expansion for a future reconciliation instead of silently widening its own authority.
+
+---
+
+## 4. Verify
+
+The candidate is committed first.
+
+Verification then runs against an immutable checkout of that candidate revision.
+
+Examples:
 
 ```bash
 cargo test
@@ -222,283 +449,178 @@ make ci
 ./scripts/acceptance.sh
 ```
 
-Each matching command result becomes a first-class evidence fact tied to its requirement, criterion, obligation, verification run, command output, timestamp, provenance, and exact Git revision. An agent saying _“tests pass”_ is advisory; it cannot authorize verification.
+Configured project gates can produce authoritative evidence.
 
-### 5. Repair
+Agent-proposed checks remain advisory unless explicitly authorized by project configuration.
 
-If deterministic verification fails, the failure becomes input to a fresh repair attempt:
+Passing and failing evidence are both preserved.
+
+A valid contradictory failure cannot be erased by a later optimistic model statement.
+
+---
+
+## 5. Repair
+
+A failed verification attempt becomes structured input to a new repair attempt:
 
 ```text
-changed repository
+candidate repository
 +
-failing command
+verification command
 +
 exit code
 +
-stdout / stderr
+stdout
++
+stderr
         │
         ▼
-   repair worker
+fresh Repair worker
 ```
 
-Retries are bounded.
+Repairs are bounded.
 
-Tenet is designed to block rather than spend forever rediscovering the same failure.
+Tenet prefers an explicit blocked state over infinite retry.
 
-### 6. Integrate
+Today, failure routing is still relatively coarse.
 
-Verified candidate work is integrated into the repository through the controller.
-
-Then the repository is examined again.
-
-Because after code changes, yesterday's plan is only a hypothesis.
-
-### 7. Assess
-
-After deterministic gates establish the required evidence, another fresh worker skeptically searches for implementation and evidence gaps.
-
-Assess may veto completion by proposing a concrete gap and work, but it cannot authorize completion. The controller derives completion from the persisted evidence graph and deterministic policies.
-
-### Controller-enforced repository invariants
-
-Architect, Reconcile, and Assess run in disposable detached worktrees at the exact canonical revision they inspect. Their worktrees are always discarded. Tenet also compares canonical `HEAD` and canonical status before and after each read-only worker; any unexpected change fails the run. ACP permission requests from these roles are rejected rather than automatically granted.
-
-Reconcile and Assess results must also pass deterministic catalog relationship validation and work-graph construction. Invalid semantic output is regenerated with the exact validation failure for up to `agent.completion_retries` additional attempts, each in a fresh disposable read-only worktree. Scope entries are repository-relative globs: directory descendants require `path/**`, while a trailing-slash entry such as `path/` is rejected with corrective feedback. Tenet never guesses or rewrites malformed identifiers or paths; retry exhaustion returns the validation error.
-
-Implement and Repair run in leased detached worktrees. Before Tenet accepts a candidate, every added, modified, deleted, renamed, generated, mode-changed, or symlink path must match the current work unit's declared scope. A worker may request wider authority through a `scope_expansion` discovery. When Git deterministically observes undeclared non-protected paths, Tenet discards the candidate and records those exact paths as a controller-observed `scope_expansion` for later reconciliation. A later reconciliation proposal must explicitly authorize them before another candidate can be integrated; Tenet never widens authority automatically. Protected mutations and malformed scope globs remain fatal.
-
-Candidates are committed before verification. Suggested checks and configured project gates run in disposable worktrees at that immutable commit, so relative command effects cannot alter the commit that is integrated. Protected paths are compared as repository objects, including recursive directories, file contents, executable mode, symlink targets, additions, and deletions. Configured protected paths must be normalized repository-relative paths.
-
-Current Reconcile output is authoritative for scheduling, not verification. Historical completed-work records are context only. Verification authority comes from controller-executed evidence persisted in `.tenet/evidence/graph.json`.
-
-Evidence retains stable typed relationships rather than graph-container indices. Passing and failing facts are both preserved. A valid controller-observed failure blocks a conflicting pass. When changed paths intersect an evidence dependency scope, that evidence becomes stale and the requirement requires re-verification; unrelated changes preserve the graph.
-
-Implement and Repair discoveries are persisted with catalog hash, repository revision, work-unit ID, role, cycle, deterministic fingerprint, and lifecycle status. Active discoveries are supplied to the next reconciliation once, then marked consumed; deterministic duplicates are not accumulated indefinitely.
-
-Canonical advancement uses a durable integration journal. Verification evidence and a `prepared` transaction are persisted before fast-forward. Cancellation is checked during verification and immediately before canonical advancement. After Git advances, the journal moves through `git_committed` and `state_committed`; startup reconciles an incomplete journal against actual `HEAD`, recovers when `HEAD` is the intended revision, abandons a prepared transaction when `HEAD` is still old, and fails closed for any third revision.
-
-`EvidenceGraphState` stores authoritative evidence facts. `EvidencePolicy` derives verification, and read projections feed the CLI/TUI. Persisted `State` remains an observable run projection, not completion authority.
-
-The cancellation boundary is the canonical fast-forward: cancellation observed before that operation prevents advancement. If the atomic Git operation completed before cancellation became observable, journal recovery records the completed advancement deterministically.
-
-
----
-
-## `DONE` is a state, not a sentence
-
-This is one of the most important ideas in Tenet.
-
-A coding model can always emit:
+A future controller should distinguish failures such as:
 
 ```text
-Everything is implemented successfully.
+implementation defect
+regression
+environment failure
+dependency failure
+flaky verification
+requirement misunderstanding
+ambiguous specification
 ```
 
-Tenet does not treat that sentence as completion.
+because they should not all lead to the same recovery action.
 
-Conceptually, `DONE(R)` requires all of the following for one exact canonical revision `R`:
+---
+
+## 6. Integrate
+
+A verified candidate is integrated through the controller rather than being allowed to mutate canonical state directly.
+
+Tenet maintains a durable integration journal around canonical advancement.
+
+If interruption occurs during integration, startup reconciles the journal against the actual Git revision rather than guessing whether the operation succeeded.
+
+After integration, the repository is reconciled again.
+
+Yesterday's plan is not automatically trusted after today's code change.
+
+---
+
+## 7. Assess
+
+Once deterministic evidence gates pass, a fresh skeptical worker searches for concrete implementation or evidence gaps.
+
+Assess can veto completion by proposing a specific gap.
+
+It cannot authorize completion.
+
+The controller remains the final authority.
+
+---
+
+# Repository integrity
+
+Tenet treats agent execution and canonical repository state as separate concerns.
+
+### Read-oriented workers
+
+Architect, Reconcile, and Assess operate in disposable detached worktrees at the exact revision they inspect.
+
+Their worktrees are discarded afterward.
+
+Tenet also checks canonical repository state around these workers and fails if a supposedly read-only role unexpectedly changes it.
+
+### Implementation workers
+
+Implement and Repair use leased detached worktrees.
+
+Candidate changes are inspected before acceptance, including:
+
+- additions;
+- modifications;
+- deletions;
+- renames;
+- generated files;
+- executable-mode changes;
+- symlink changes.
+
+### Protected paths
+
+Tenet always protects controller-owned project state including:
+
+- the configured specification;
+- `tenet.toml`;
+- `AGENTS.md`;
+- `.tenet`.
+
+Projects can add more protected paths.
+
+They cannot remove the mandatory ones.
+
+---
+
+# Security boundary
+
+**Git worktree isolation is not a security sandbox.**
+
+This is important.
+
+Worktrees protect canonical repository state from uncontrolled mutations.
+
+They do **not** inherently isolate a coding agent from the host environment.
+
+Depending on the configured agent/runtime, a worker may still inherit access to things such as:
 
 ```text
-valid authoritative specification and typed catalog
-        +
-every required requirement has mandatory acceptance criteria
-        +
-every mandatory criterion has all required verification obligations
-        +
-every required obligation has valid controller-executed passing evidence at R
-        +
-no valid blocking contradictory evidence
-        +
-current reconciliation and skeptical assessment propose no implementation work
-        +
-repository-wide deterministic gates pass on an immutable checkout of R
-        +
-canonical HEAD is still R and the working tree is clean
-        +
-no active lease, candidate, or integration transaction
-        +
-required workspace cleanup, evidence logging, and atomic state persistence succeed
-        =
-DONE(R)
+filesystem outside the repository
+network
+environment variables
+credentials
+local services
+processes
+Docker
+SSH configuration
+cloud tooling
 ```
 
-Even then, `DONE` does **not** mean mathematically proven correct.
+Tenet does not currently claim that arbitrary coding-agent execution is safe on a sensitive host.
 
-It means:
-
-> the repository satisfied the evidence and assessment mechanisms available to this run.
-
-If your tests are weak, your evidence is weak.
-
-If your specification is ambiguous, the result can still be wrong.
-
-If the model misses something, assessment can still be wrong.
-
-Tenet cannot remove uncertainty from software engineering.
-
-The goal is to make that uncertainty **visible, bounded, and harder to hand-wave away**.
+Use appropriate external sandboxing and credential isolation when the threat model requires it.
 
 ---
 
-# MVP: read this first
-
-**Tenet is an MVP.**
-
-It is real software and the core control loop exists.
-
-It is also young, experimental software that is changing quickly.
-
-Today, the project already contains the foundations for:
-
-- spec-driven requirement analysis;
-- repository reconciliation;
-- separate Architect, Reconcile, Implement, Repair, and Assess sessions;
-- ACP-based coding-agent execution;
-- isolated Git worktrees for coding workers;
-- deterministic project verification;
-- bounded repair attempts;
-- bounded project cycles;
-- persistent controller state;
-- versioned requirement evidence graph persistence with revision-scoped invalidation;
-- dependency-aware scheduling;
-- controlled integration;
-- protected controller-owned paths;
-- role-specific model configuration;
-- interactive terminal UI;
-- headless execution for automation and logs.
-
-That is the promising part.
-
-Here is the equally important part.
-
-## What Tenet has **not** proven
-
-There is not yet enough comparative evaluation to claim that Tenet is:
-
-- more reliable than a strong single-agent workflow;
-- better than a simple Ralph-style loop;
-- cheaper;
-- faster;
-- safer for unattended production development;
-- or less likely to produce false completion.
-
-Those are hypotheses.
-
-They need benchmarks.
-
-They need failed runs.
-
-They need ugly repositories.
-
-They need adversarial specs.
-
-They need real evidence.
-
-That is where this project should earn its claims.
-
-## Expect rough edges
-
-If you try Tenet today, expect bugs.
-
-Particularly around the places where real systems get messy:
-
-- different ACP agents and their capabilities;
-- model/configuration compatibility;
-- unusual Git repository states;
-- worktree lifecycle edge cases;
-- terminal rendering and streaming output;
-- cancellation and recovery;
-- incomplete or misleading verification suites;
-- agent output that violates the expected structure;
-- workflows nobody has tested yet.
-
-Do not point it at an important repository, walk away, and assume autonomous perfection.
-
-Use Git.
-
-Use backups.
-
-Review the result.
-
-Give it strong acceptance tests.
-
-And when it breaks, open an issue.
-
-**The current product is an engineering experiment, not an autonomous software factory.**
-
-That distinction matters.
-
----
-
-## Why this could become interesting
-
-The interesting future for coding agents is probably not just:
-
-```text
-bigger model
-+
-bigger context window
-+
-longer conversation
-```
-
-It may also require better machinery around the model.
-
-Software engineering already has machinery:
-
-- version control;
-- CI;
-- tests;
-- dependency graphs;
-- transaction boundaries;
-- schedulers;
-- logs;
-- state machines;
-- review;
-- rollback;
-- observability.
-
-Tenet asks:
-
-> **What happens if autonomous coding starts looking more like an engineering system and less like one very long chat?**
-
-If the answer is “nothing, simpler tenet work just as well,” that is useful to learn.
-
-If the answer is that explicit control substantially reduces false completion, regressions, drift, or wasted retries, that is much more interesting.
-
-The project exists to find out.
-
----
-
-## Agent-neutral by design
+# Agent-neutral by design
 
 Tenet communicates with coding agents through the **[Agent Client Protocol (ACP)](https://agentclientprotocol.com/)**.
 
-The controller should not need to become a different product every time a better coding model appears.
-
-Bring an ACP-compatible agent.
-
-Tenet provides the surrounding process.
-
 ```text
-                         ┌───────────────────┐
-                         │       Tenet       │
-                         │                   │
-spec ───────────────────►│ controller        │
-repo ───────────────────►│ verification      │
-                         │ state + evidence  │
-                         └─────────┬─────────┘
-                                   │
-                                  ACP
-                                   │
-                 ┌─────────────────┼─────────────────┐
-                 ▼                 ▼                 ▼
-              Agent A           Agent B        custom ACP
+                         ┌─────────────────┐
+spec ───────────────────►│                 │
+repo ───────────────────►│      Tenet      │
+                         │                 │
+                         │ controller      │
+                         │ verification    │
+                         │ evidence        │
+                         └────────┬────────┘
+                                  │
+                                 ACP
+                                  │
+                  ┌───────────────┼───────────────┐
+                  ▼               ▼               ▼
+               Agent A         Agent B       custom ACP
 ```
 
-A project selects an agent source.
+The controller should not have to become a different product every time a better coding model appears.
 
-Different Tenet roles can then use fresh sessions and role-specific model preferences while preserving the same controller semantics.
+Different Tenet roles can also use different model preferences while preserving the same surrounding control semantics.
 
 ---
 
@@ -506,16 +628,13 @@ Different Tenet roles can then use fresh sessions and role-specific model prefer
 
 ## 1. Build Tenet
 
-Tenet is currently a Rust project distributed from source.
+Tenet is currently distributed from source.
 
 ```bash
 git clone https://github.com/flaviodelgrosso/tenet.git
 cd tenet
-
 make install
 ```
-
-Or work directly from the repository during development.
 
 A current stable Rust toolchain is required.
 
@@ -523,45 +642,47 @@ A current stable Rust toolchain is required.
 
 ## 2. Initialize a project
 
-From the repository you want Tenet to work on:
+Inside the repository Tenet should operate on:
 
 ```bash
 tenet init
 ```
 
-This creates the project configuration and Tenet state directory.
+A run requires:
 
-Tenet runs require an existing Git repository with at least one commit and a clean canonical working tree. Worker changes execute in isolated worktrees and are integrated back into that canonical checkout.
+- an existing Git repository;
+- at least one commit;
+- a clean canonical working tree.
+
+`tenet init` creates the project configuration and Tenet state directory.
 
 ---
 
 ## 3. Write the specification
 
-Tell Tenet what should be true when the work is finished.
+The default specification is `spec.md`.
 
 For example:
 
 ```markdown
-# Product specification
-
-Build a JSON API for bookmarks.
+# Bookmark API
 
 ## Requirements
 
 - Users can create a bookmark with a URL and title.
-- URLs must be unique.
+- Bookmark URLs must be unique.
 - Users can list bookmarks ordered by creation time.
 - Users can delete bookmarks.
-- Invalid URLs return a 400 response.
-- The API must have integration tests.
-- `cargo test` must pass.
+- Invalid URLs return HTTP 400.
+- The API has integration tests.
+- `cargo test` passes.
 ```
 
-The spec is not a prompt asking an agent to “please implement this.”
+The specification is not merely a one-shot prompt.
 
-It is the reference against which the repository keeps being reconsidered.
+It remains the reference against which the repository is reconciled throughout the run.
 
-The default spec path is `spec.md`; it can be changed in `tenet.toml`.
+The path can be changed in `tenet.toml`.
 
 ---
 
@@ -575,84 +696,92 @@ tenet agents search <query>
 tenet agents select <id>
 ```
 
-Check the configured runtime:
+Inspect the configured runtime:
 
 ```bash
 tenet agents doctor
 ```
 
-Tenet also supports an advanced custom ACP command in `tenet.toml`.
+Tenet also supports custom ACP commands through `tenet.toml`.
 
 ---
 
-## 5. Configure real verification
+## 5. Configure verification
 
-This part matters more than almost anything else.
+This is one of the most important parts of a Tenet project.
+
+Example:
 
 ```toml
 [verification]
+
 [[verification.gates]]
 obligation_ids = ["REQ-001/AC-01/VO-01"]
 dependency_scope = ["src/**", "tests/**"]
-spec = { program = "cargo", args = ["test"], workingDirectory = ".", environment = {} }
+spec = {
+  program = "cargo",
+  args = ["test"],
+  workingDirectory = ".",
+  environment = {}
+}
 ```
 
-Project-configured gates are trusted because the project owner explicitly binds each structured
-execution specification to verification obligation identities. Agent-proposed checks remain
-advisory even when they exit successfully.
+Project-configured gates bind executable verification to explicit verification obligations.
 
-A perfectly orchestrated agent cannot compensate for a test suite that proves nothing.
+An agent cannot promote its own successful command execution into trusted evidence merely by reporting that it passed.
+
+And no orchestration system can compensate for a verification suite that proves the wrong thing.
 
 ---
 
 ## 6. Run
 
+Interactive mode:
+
 ```bash
 tenet run
 ```
 
-For non-interactive execution:
+Headless:
 
 ```bash
 tenet run --headless
 ```
 
-For less output:
+Less output:
 
 ```bash
 tenet run --headless --quiet
 ```
 
-For more worker diagnostics:
+More diagnostics:
 
 ```bash
 tenet run --headless --verbose
 ```
 
-State is persisted, so a later invocation can reconcile the current repository again:
+Continue from persisted state:
 
 ```bash
 tenet resume
 ```
 
-Resume does not trust serialized in-flight leases or candidates as recovery proof. Recovery-critical canonical advancement is handled separately by the integration journal described above.
-
 ---
 
-# The terminal UI
+# Terminal UI
 
-By default Tenet provides an interactive terminal interface for watching the controller rather than staring at an opaque agent stream.
+The default terminal interface focuses on the engineering process rather than only displaying an agent transcript.
 
-The important views are about **process**, not just tokens:
+Views expose things such as:
 
-- current worker activity;
+- active worker;
 - requirement progress;
 - evidence;
 - verification;
-- state transitions;
+- controller transitions;
 - timeline.
 
-Useful controls:
+Controls:
 
 ```text
 Tab                 switch view
@@ -663,7 +792,7 @@ PageUp / PageDown   faster scroll
 q / Ctrl-C          stop / exit
 ```
 
-For servers, CI, SSH sessions, or log capture, use headless mode instead.
+For CI, SSH, server execution, or log capture:
 
 ```bash
 tenet run --headless > tenet.log
@@ -673,7 +802,7 @@ tenet run --headless > tenet.log
 
 # Configuration
 
-A project is controlled through `tenet.toml`. A fresh `tenet init` writes only required project choices and an empty agent section:
+A new project starts with a small `tenet.toml`:
 
 ```toml
 version = 1
@@ -684,56 +813,63 @@ max_repair_attempts = 3
 [agent]
 ```
 
-Select a Registry agent with `tenet agents select <id>` or configure `[agent.custom]` before running.
+Select an ACP Registry agent:
 
-Project verification gates appear only when configured. Their presence is sufficient: every configured gate participates in controller-authoritative project verification, while agent-proposed checks remain advisory.
-
-```toml
-[verification]
-gates = [{ obligation_ids = ["REQ-001/AC-01/VO-01"], dependency_scope = ["**"], spec = { program = "make", args = ["ci"], workingDirectory = ".", environment = {} } }]
+```bash
+tenet agents select <id>
 ```
 
-Stable defaults are omitted. Advanced overrides remain available for `stagnation_limit`, `agent.completion_retries`, `agent.turn_timeout_secs`, `verification.timeout_secs`, `verification.max_output_bytes`, and `execution.max_parallel_workers`; see `schemas/config.schema.json` for their defaults. The stagnation limit bounds consecutive cycles without requirement progress.
+or configure a custom ACP source.
 
-Tenet always protects the configured specification, `tenet.toml`, `AGENTS.md`, and controller state under `.tenet`. Projects may add protection but cannot remove those mandatory paths:
+Additional project paths can be protected:
 
 ```toml
-additional_protected_paths = ["secrets", "deployment/production"]
+additional_protected_paths = [
+  "secrets",
+  "deployment/production"
+]
 ```
 
-Integration policy is controller-owned: Tenet cherry-picks candidates, verifies every candidate's suggested checks when present, and runs project regression gates before canonical advancement.
+Advanced controller, agent, verification, and execution settings are documented by:
 
+```text
+schemas/config.schema.json
+```
+
+Stable defaults are intentionally omitted from normal project configuration.
 
 ---
 
-## Useful commands
+# Useful commands
+
+Initialize a project:
 
 ```bash
 tenet init
 ```
 
-Initialize Tenet in a project.
+Run or continue:
 
 ```bash
 tenet run
 tenet resume
 ```
 
-Start or continue autonomous development.
+Inspect persisted state:
 
 ```bash
 tenet status
 tenet status --json
 ```
 
-Inspect persisted controller state.
+Run configured deterministic verification without invoking an LLM:
 
 ```bash
 tenet verify
 tenet verify --json
 ```
 
-Run the configured deterministic verification **without invoking an LLM**.
+Manage ACP agents:
 
 ```bash
 tenet agents list
@@ -744,80 +880,194 @@ tenet agents doctor
 tenet agents login
 ```
 
-Discover, configure, install, inspect, and authenticate ACP agents.
+---
+
+# Architecture
+
+Tenet is split into Rust crates with deliberate dependency boundaries.
+
+### `tenet-domain`
+
+Semantic state, IDs, evidence types, worker contracts, configuration, and pure invariants.
+
+### `tenet-runtime`
+
+Repository operations, workspaces, scheduling mechanisms, verification execution, integration, and persistence.
+
+### `tenet-controller`
+
+The control loop.
+
+It owns:
+
+- catalog trust policy;
+- evidence trust policy;
+- verification authorization;
+- scheduling decisions;
+- stopping conditions;
+- completion authority.
+
+### `tenet-acp`
+
+Adapts ACP-compatible coding-agent runtimes to the controller's agent backend interface.
+
+### `tenet-projection`
+
+Read-side projections of controller state and evidence.
+
+### `tenet-tui`
+
+Interactive terminal presentation.
+
+### `tenet-cli`
+
+Application composition and command-line entry point.
+
+The dependency direction is deliberate.
+
+The runtime does not own completion semantics.
+
+ACP does not own controller policy.
+
+The model adapter is replaceable.
+
+---
+
+# What Tenet has not proven
+
+This section is intentionally explicit.
+
+There is not yet enough comparative evidence to claim that Tenet:
+
+- solves more software tasks than a strong single-agent workflow;
+- beats a simple Ralph-style loop;
+- reduces false completion;
+- reduces regressions;
+- uses fewer tokens;
+- costs less;
+- finishes faster;
+- has lower run-to-run variance;
+- is safer for unattended production development.
+
+Those are testable hypotheses.
+
+They should be treated as such.
+
+---
+
+# Evaluation is the next major milestone
+
+The most important next feature is not another worker role.
+
+It is measurement.
+
+Tenet should eventually make experiments like this reproducible:
+
+| Strategy                  | Task success | Hidden tests | False `DONE` | Regressions | Tokens | Cost | Wall time |
+| ------------------------- | -----------: | -----------: | -----------: | ----------: | -----: | ---: | --------: |
+| Single agent              |            — |            — |            — |           — |      — |    — |         — |
+| Simple iterative loop     |            — |            — |            — |           — |      — |    — |         — |
+| Tenet                     |            — |            — |            — |           — |      — |    — |         — |
+| Tenet without Assess      |            — |            — |            — |           — |      — |    — |         — |
+| Tenet without Reconcile   |            — |            — |            — |           — |      — |    — |         — |
+| Tenet with shared context |            — |            — |            — |           — |      — |    — |         — |
+
+No numbers are published here because those experiments have not yet been run rigorously enough to justify them.
+
+Of particular interest is **false `DONE`**:
+
+> How often does a workflow declare the repository complete when independent acceptance criteria show that it is not?
+
+That may be a more important metric for autonomous engineering than raw task completion alone.
 
 ---
 
 # What Tenet is not
 
-Tenet is **not**:
+### Not a coding model
 
-### A coding model
+Tenet does not compete with coding agents.
 
-It does not compete with coding agents.
+It controls the process around them.
 
-It orchestrates them.
-
-### A magic correctness machine
+### Not a correctness oracle
 
 Passing tests can still mean shipping the wrong thing.
 
-### A security sandbox
+### Not a specification oracle
 
-Disposable Git worktrees isolate repository mutations made by Architect, Reconcile, Assess, and
-verification processes from the canonical checkout. They are not security sandboxes: workers retain
-the host process's filesystem, network, and credential access. Agent-generated checks are advisory;
-controller execution alone does not promote them to trusted evidence.
+An ambiguous or incomplete specification can lead to an incomplete requirement catalog.
 
-### A replacement for specifications
+### Not a security sandbox
 
-If the desired behavior is unclear, the controller cannot manufacture product truth.
+Git isolation protects repository state.
 
-### Proven better than simpler tenet
+It does not provide complete host isolation.
+
+### Not proof that multi-agent systems are better
+
+The use of separate roles is an architectural choice whose value should be measured through ablation.
+
+### Not proven better than simpler loops
 
 Not yet.
 
-That claim should be earned with data.
-
-### Production-ready
+### Not production-ready
 
 Also not yet.
 
 ---
 
-# The project principles
-
-A few rules shape Tenet.
+# Project principles
 
 ### The repository outranks the conversation
 
-If a previous worker believed something that the repository contradicts, inspect the repository again.
+If model context and repository reality disagree, inspect reality again.
 
 ### Agent claims are hypotheses
 
-If the controller can obtain deterministic evidence, obtain it.
+Where deterministic evidence can be obtained, obtain it.
 
-### Context should be cheap to throw away
+### Completion authority should be separate from implementation
 
-Important engineering state should not exist only in hidden conversational memory.
+The worker that wrote the code should not be able to finish the entire process by asserting success.
+
+### Engineering state should survive model context
+
+Important facts should not exist only inside a conversation.
 
 ### Planning is provisional
 
-A roadmap should change when repository reality changes.
+After the repository changes, yesterday's plan is only a hypothesis.
+
+### Verification should have provenance
+
+A passing command matters more when the controller knows:
+
+- what it verified;
+- why it was authorized;
+- which revision it ran against;
+- what output it produced.
 
 ### Failure should become structured input
 
-A failing command, exit code, stdout, and stderr are more useful than “something went wrong.”
+```text
+command
+exit code
+stdout
+stderr
+repository revision
+```
 
-### Completion should be difficult to fake
+is better recovery input than:
 
-The implementation worker should not be able to end the entire process by confidently declaring success.
+```text
+something failed
+```
 
-### Autonomous execution needs stopping conditions
+### Infinite retries are not autonomy
 
-Infinite persistence is not intelligence.
-
-Sometimes the correct controller action is:
+Sometimes the correct state is:
 
 ```text
 BLOCKED
@@ -825,66 +1075,110 @@ BLOCKED
 
 ---
 
-# Where Tenet needs to go
+# Roadmap
 
-The most valuable next steps are not more impressive demos.
+The project should prioritize evidence over architectural expansion.
 
-They are better evidence.
+## Evaluation
 
-Important directions include:
+Build reproducible comparison infrastructure for:
 
-**Evaluation.**
-Run the same tasks through single-agent, simple-loop, and Tenet workflows. Measure completion, false-DONE rate, regressions, cost, wall time, and variance.
+- single-agent execution;
+- simple iterative loops;
+- full Tenet;
+- architectural ablations.
 
-**Replayability.**
-Make complete autonomous runs inspectable as structured episodes rather than terminal archaeology.
+Measure successful and failed runs.
 
-**Requirement evidence.**
-Make it obvious why each requirement is considered satisfied and what deterministic evidence supports that conclusion.
+## Specification quality
 
-**Regression obligations.**
-Do not allow later work to quietly invalidate earlier progress.
+Strengthen specification analysis and adversarial review before implementation begins.
 
-**Better failure routing.**
-A code defect, broken environment, flaky test, and misunderstood requirement should not all produce the same retry behavior.
+The controller cannot verify requirements that were never captured.
 
-**Safer concurrency.**
-Parallel agents are useful only when independence is established and integration remains controlled.
+## Failure attribution
 
-**Engineering memory.**
-Preserve useful repository knowledge without recreating one giant permanent conversation.
+Differentiate:
 
-**CI and pull-request workflows.**
-Turn a run into an evidence-backed merge-readiness report.
+- code defects;
+- regressions;
+- environment failures;
+- dependency failures;
+- flaky tests;
+- specification ambiguity;
+- requirement misunderstanding.
 
-The long-term goal is not “more agents.”
+Route recovery accordingly.
 
-It is a better autonomous engineering process.
+## Verification quality
+
+Go beyond merely invoking existing project tests.
+
+Potential future evidence sources include:
+
+- generated acceptance tests;
+- property testing;
+- mutation testing;
+- static analysis;
+- security checks;
+- differential testing;
+- hidden evaluation suites.
+
+## Engineering memory
+
+Preserve stable, structured repository knowledge without recreating one permanent conversational context.
+
+## Security
+
+Add stronger execution boundaries where appropriate:
+
+- filesystem capabilities;
+- network policy;
+- secret isolation;
+- resource limits;
+- container / VM execution.
+
+## Safe concurrency
+
+Parallel workers should be introduced only where independence can be established and final integrated verification remains controller-owned.
+
+## GitHub / CI workflows
+
+Turn a Tenet run into an evidence-backed merge-readiness report containing things such as:
+
+- requirements satisfied;
+- verification evidence;
+- regressions;
+- repair attempts;
+- cost;
+- human interventions;
+- unresolved assumptions.
 
 ---
 
 # Contributing
 
-Tenet is early enough that experiments are unusually valuable.
+Tenet is early enough that failed experiments are particularly valuable.
 
 Useful contributions include:
 
-- bug reports with reproducible runs;
-- weird repositories that break assumptions;
+- reproducible bug reports;
+- adversarial or ambiguous specifications;
+- repositories that break Tenet's assumptions;
 - ACP compatibility fixes;
+- controller correctness work;
 - verification improvements;
-- failure cases;
+- worktree and Git edge cases;
 - benchmark tasks;
-- benchmark infrastructure;
+- evaluation infrastructure;
 - run observability;
-- Git/worktree edge cases;
-- controller correctness;
+- security improvements;
 - documentation;
-- negative results.
+- negative benchmark results.
 
 Especially negative results.
 
-If a simpler architecture consistently beats Tenet, that is something this project should discover rather than hide.
+If a simpler architecture consistently beats Tenet, the project should discover that rather than hide it.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -898,9 +1192,15 @@ Tenet is built around that idea.
 
 The project should be held to the same standard.
 
-Right now there is an interesting architecture, a functioning MVP, and a lot left to prove.
+Today there is:
 
-That is enough.
+- a functioning control architecture;
+- a serious evidence model;
+- strong repository-integrity mechanisms;
+- an experimental MVP;
+- and a large amount still to prove.
+
+That is enough for now.
 
 ---
 
@@ -908,9 +1208,11 @@ That is enough.
 
 ## Agents write the code
 
-## **Tenet makes them prove the work.**
+## **Tenet makes the repository earn `DONE`.**
 
-If that idea is useful to you, try it, break it, measure it, and help make the loop harder to fool.
+Try it. Break it. Measure it.
+
+And help make the loop harder to fool.
 
 [Report a bug](https://github.com/flaviodelgrosso/tenet/issues) · [Contribute](CONTRIBUTING.md) · [MIT License](LICENSE)
 
