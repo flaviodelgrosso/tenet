@@ -123,7 +123,7 @@ fn advisory_shell_spec(command: &str) -> VerificationSpec {
     vec!["/D".into(), "/C".into(), command.into()],
   );
   #[cfg(not(windows))]
-  let (program, args) = ("sh".into(), vec!["-lc".into(), command.into()]);
+  let (program, args) = ("sh".into(), vec!["-c".into(), command.into()]);
 
   VerificationSpec {
     program,
@@ -220,7 +220,6 @@ async fn run_spec(
   let start = Instant::now();
   let mut child = Command::new(&spec.program)
     .args(&spec.args)
-    .env_clear()
     .envs(&spec.environment)
     .current_dir(working_directory)
     .stdout(Stdio::piped())
@@ -308,5 +307,71 @@ mod tests {
       truncate_utf8("éé".as_bytes(), 3),
       "é�\n… output truncated by tenet"
     );
+  }
+
+  #[cfg(not(windows))]
+  #[test]
+  fn advisory_shell_does_not_load_user_profile() {
+    let spec = advisory_shell_spec("true");
+
+    assert_eq!(spec.program, "sh");
+    assert_eq!(spec.args, ["-c", "true"]);
+  }
+
+  #[cfg(not(windows))]
+  #[tokio::test]
+  async fn verification_inherits_host_tool_environment() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let expected_path = std::env::var("PATH").expect("test process PATH");
+    let spec = VerificationSpec {
+      program: "/bin/sh".into(),
+      args: vec!["-c".into(), "printf %s \"$PATH\"".into()],
+      working_directory: ".".into(),
+      environment: Default::default(),
+    };
+
+    let result = run_spec(
+      workspace.path(),
+      &spec,
+      Duration::from_secs(5),
+      4096,
+      &CancellationToken::new(),
+    )
+    .await
+    .expect("run verification");
+
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.stdout, expected_path);
+  }
+
+  #[cfg(not(windows))]
+  #[tokio::test]
+  async fn advisory_shell_runs_offline_cargo_build_from_host_toolchain() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    std::fs::create_dir(workspace.path().join("src")).expect("create source directory");
+    std::fs::write(
+      workspace.path().join("Cargo.toml"),
+      "[package]\nname = \"verification-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("write manifest");
+    std::fs::write(
+      workspace.path().join("Cargo.lock"),
+      "version = 4\n\n[[package]]\nname = \"verification-fixture\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("write lockfile");
+    std::fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("write source");
+    let spec = advisory_shell_spec("CARGO_NET_OFFLINE=true cargo build --locked");
+
+    let result = run_spec(
+      workspace.path(),
+      &spec,
+      Duration::from_secs(30),
+      4096,
+      &CancellationToken::new(),
+    )
+    .await
+    .expect("run Cargo verification");
+
+    assert_eq!(result.exit_code, Some(0), "{}", result.stderr);
   }
 }
