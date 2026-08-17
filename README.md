@@ -589,8 +589,6 @@ This part matters more than almost anything else.
 
 ```toml
 [verification]
-require_project_gate = true
-
 [[verification.gates]]
 obligation_ids = ["REQ-001/AC-01/VO-01"]
 dependency_scope = ["src/**", "tests/**"]
@@ -673,43 +671,36 @@ tenet run --headless > tenet.log
 
 # Configuration
 
-A project is controlled through `tenet.toml`.
-
-A simplified example:
+A project is controlled through `tenet.toml`. A fresh `tenet init` writes only required project choices and an empty agent section:
 
 ```toml
 version = 1
 spec_file = "spec.md"
-
 max_cycles = 25
 max_repair_attempts = 3
-stagnation_limit = 3
 
 [agent]
-completion_retries = 2
-turn_timeout_secs = 900
+```
 
+Select a Registry agent with `tenet agents select <id>` or configure `[agent.custom]` before running.
+
+Project verification gates appear only when configured. Their presence is sufficient: every configured gate participates in controller-authoritative project verification, while agent-proposed checks remain advisory.
+
+```toml
 [verification]
-require_project_gate = true
 gates = [{ obligation_ids = ["REQ-001/AC-01/VO-01"], dependency_scope = ["**"], spec = { program = "make", args = ["ci"], workingDirectory = ".", environment = {} } }]
-timeout_secs = 120
-[execution]
-max_parallel_workers = 1
-
-[integration]
-strategy = "cherry_pick"
-verify_each_candidate = true
 ```
 
-These limits are intentional.
+Stable defaults are omitted. Advanced overrides remain available for `stagnation_limit`, `agent.completion_retries`, `agent.turn_timeout_secs`, `verification.timeout_secs`, `verification.max_output_bytes`, and `execution.max_parallel_workers`; see `schemas/config.schema.json` for their defaults. The stagnation limit bounds consecutive cycles without requirement progress.
 
-An autonomous system needs a way to say:
+Tenet always protects the configured specification, `tenet.toml`, `AGENTS.md`, and controller state under `.tenet`. Projects may add protection but cannot remove those mandatory paths:
 
-```text
-this is not making progress
+```toml
+additional_protected_paths = ["secrets", "deployment/production"]
 ```
 
-instead of converting more tokens into more confidence.
+Integration policy is controller-owned: Tenet cherry-picks candidates, verifies every candidate's suggested checks when present, and runs project regression gates before canonical advancement.
+
 
 ---
 

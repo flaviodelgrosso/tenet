@@ -15,6 +15,7 @@ use tokio::{
 use uuid::Uuid;
 
 use tenet_domain::{
+  config::Config,
   events::RunEvent,
   model::{
     RequirementCatalog, VerificationReport, WorkExecution, WorkLease, WorkUnit, WorkerDiscovery,
@@ -43,8 +44,8 @@ pub struct SchedulerOutcome {
 }
 
 enum LeaseOutcome {
-  Verified(WorkExecution),
-  Blocked(BlockedExecution),
+  Verified(Box<WorkExecution>),
+  Blocked(Box<BlockedExecution>),
 }
 
 /// Supplies candidate mutations while the scheduler owns execution mechanics.
@@ -110,8 +111,8 @@ impl Scheduler {
       )?;
       for completed in self.execute_batch(batch).await? {
         match completed {
-          LeaseOutcome::Verified(execution) => outcome.executions.push(execution),
-          LeaseOutcome::Blocked(blocked) => outcome.blocked.push(blocked),
+          LeaseOutcome::Verified(execution) => outcome.executions.push(*execution),
+          LeaseOutcome::Blocked(blocked) => outcome.blocked.push(*blocked),
         }
       }
     }
@@ -260,7 +261,7 @@ async fn execute_and_commit(
   lease: &WorkLease,
   updates: &mpsc::UnboundedSender<ExecutionUpdate>,
 ) -> Result<LeaseOutcome> {
-  let protected_paths = protected_paths(context);
+  let protected_paths = protected_paths(&context.config);
   let protected = protection::snapshot(&lease.workspace, &protected_paths).await?;
   let _ = updates.send(ExecutionUpdate::Implementing {
     work_unit_id: lease.work_unit.id.clone(),
@@ -324,10 +325,10 @@ async fn execute_and_commit(
         .events
         .emit(RunEvent::Verification(verification.clone()))
         .await?;
-      return Ok(LeaseOutcome::Blocked(BlockedExecution {
+      return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
         lease: lease.clone(),
         discoveries,
-      }));
+      })));
     }
     candidate_revision = commit_candidate(&lease.workspace, lease).await?;
     changed_paths =
@@ -366,7 +367,7 @@ async fn execute_and_commit(
     .events
     .emit(RunEvent::CandidateProduced(execution.clone()))
     .await?;
-  Ok(LeaseOutcome::Verified(execution))
+  Ok(LeaseOutcome::Verified(Box::new(execution)))
 }
 
 async fn reject_protected_changes(
@@ -452,10 +453,18 @@ fn validate_changed_paths(unit: &WorkUnit, changed_paths: &[String]) -> Result<(
   Ok(())
 }
 
-fn protected_paths(context: &BackendContext) -> Vec<String> {
-  let mut paths = context.config.protected_paths.clone();
-  if !paths.iter().any(|path| path == &context.config.spec_file) {
-    paths.push(context.config.spec_file.clone());
+const MANDATORY_PROTECTED_PATHS: [&str; 3] = ["AGENTS.md", "tenet.toml", ".tenet"];
+
+fn protected_paths(config: &Config) -> Vec<String> {
+  let mut paths: Vec<_> = MANDATORY_PROTECTED_PATHS
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+  paths.push(config.spec_file.clone());
+  for additional in &config.additional_protected_paths {
+    if !paths.iter().any(|path| path == additional) {
+      paths.push(additional.clone());
+    }
   }
   paths
 }
@@ -548,6 +557,26 @@ mod tests {
         paths: paths.iter().map(|path| (*path).into()).collect(),
       },
     }
+  }
+
+  #[test]
+  fn protected_paths_always_include_controller_policy_and_user_additions() {
+    let config = Config {
+      spec_file: "requirements/spec.md".into(),
+      additional_protected_paths: vec!["secrets".into(), "tenet.toml".into()],
+      ..Config::default()
+    };
+
+    assert_eq!(
+      protected_paths(&config),
+      [
+        "AGENTS.md",
+        "tenet.toml",
+        ".tenet",
+        "requirements/spec.md",
+        "secrets",
+      ]
+    );
   }
 
   #[test]

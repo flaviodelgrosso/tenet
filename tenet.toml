@@ -4,21 +4,8 @@ version = 1
 spec_file = "spec.md"
 max_cycles = 25
 max_repair_attempts = 3
-stagnation_limit = 3
-protected_paths = [
-  "spec.md",
-  "AGENTS.md",
-  "tenet.toml",
-  ".tenet/state.json",
-  ".tenet/requirements.json",
-  ".tenet/roadmap.json",
-  ".tenet/STOP",
-  ".tenet/run.lock",
-]
 
 [agent]
-completion_retries = 2
-turn_timeout_secs = 900
 
 [agent.custom]
 command = "omp"
@@ -36,7 +23,6 @@ repair = { thought_level = "high", model = "github-copilot/gpt-5.6-luna" }
 assess = { thought_level = "high", model = "github-copilot/gpt-5.6-luna" }
 
 [verification]
-require_project_gate = true
 gates = [
   { obligation_ids = [
     "REQ-001/AC-01/VO-01",
@@ -46,12 +32,7 @@ gates = [
     "ci",
   ], workingDirectory = ".", environment = {} } },
 ]
-timeout_secs = 120
-max_output_bytes = 65536
 
 [execution]
 max_parallel_workers = 3
 
-[integration]
-strategy = "cherry_pick"
-verify_each_candidate = true

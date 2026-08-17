@@ -102,9 +102,7 @@ impl Integrator {
     }
 
     let revision = git::head(&self.workspace).await?;
-    if self.config.integration.verify_each_candidate
-      && !candidate.lease.work_unit.suggested_checks.is_empty()
-    {
+    if !candidate.lease.work_unit.suggested_checks.is_empty() {
       let report = self
         .verify_revision(
           &revision,

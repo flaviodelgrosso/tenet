@@ -64,10 +64,11 @@ pub async fn run_execution_requests_cancelled(
       break;
     }
   }
+  let project_gates_configured = !config.verification.gates.is_empty();
   let passed = commands
     .iter()
     .all(|result| result.exit_code == Some(0) && !result.timed_out)
-    && (!config.verification.require_project_gate
+    && (!project_gates_configured
       || requests
         .iter()
         .any(|request| request.authority.is_trusted()));
@@ -157,18 +158,13 @@ async fn run_specs<'a>(
       break;
     }
   }
-  let project_gate_count = config.verification.gates.len();
   let mut warnings = Vec::new();
   if results.is_empty() {
     warnings.push("No deterministic verification gates configured.".into());
   }
-  if config.verification.require_project_gate && project_gate_count == 0 {
-    warnings.push("Completion requires at least one project-configured gate.".into());
-  }
   let passed = results
     .iter()
-    .all(|result| result.exit_code == Some(0) && !result.timed_out)
-    && (!config.verification.require_project_gate || project_gate_count > 0);
+    .all(|result| result.exit_code == Some(0) && !result.timed_out);
   Ok(VerificationReport {
     passed,
     started_at,
@@ -293,12 +289,53 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 mod tests {
   use super::*;
 
+  fn configured_gate() -> tenet_domain::config::ProjectVerificationGate {
+    tenet_domain::config::ProjectVerificationGate {
+      obligation_ids: vec![tenet_domain::ids::ObligationId::from("REQ-001/AC-01/VO-01")],
+      spec: VerificationSpec {
+        program: "true".into(),
+        args: Vec::new(),
+        working_directory: ".".into(),
+        environment: Default::default(),
+      },
+      dependency_scope: vec!["**".into()],
+    }
+  }
+
   #[test]
   fn working_directory_rejects_parent_traversal() {
     let workspace = tempfile::tempdir().expect("workspace");
     let error = resolve_working_directory(workspace.path(), "../outside")
       .expect_err("parent traversal rejected");
     assert!(error.to_string().contains("relative path"));
+  }
+
+  #[tokio::test]
+  async fn no_project_gates_preserve_advisory_only_default_behavior() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let report = run_execution_requests_cancelled(
+      workspace.path(),
+      &Config::default(),
+      &[],
+      &CancellationToken::new(),
+    )
+    .await
+    .expect("verification report");
+
+    assert!(report.passed);
+  }
+
+  #[tokio::test]
+  async fn configured_project_gates_require_trusted_execution_authority() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = Config::default();
+    config.verification.gates = vec![configured_gate()];
+    let report =
+      run_execution_requests_cancelled(workspace.path(), &config, &[], &CancellationToken::new())
+        .await
+        .expect("verification report");
+
+    assert!(!report.passed);
   }
 
   #[test]

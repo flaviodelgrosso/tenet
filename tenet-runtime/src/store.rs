@@ -403,8 +403,10 @@ mod tests {
   #[tokio::test]
   async fn ensure_spec_uses_the_configured_nested_path() {
     let project = tempfile::tempdir().expect("temporary project");
-    let mut config = Config::default();
-    config.spec_file = "requirements/product.md".into();
+    let config = Config {
+      spec_file: "requirements/product.md".into(),
+      ..Config::default()
+    };
 
     ensure_spec(project.path(), &config)
       .await

@@ -5,18 +5,7 @@
   "description": "Configuration for autonomous Tenet runs.",
   "type": "object",
   "additionalProperties": false,
-  "required": [
-    "version",
-    "spec_file",
-    "max_cycles",
-    "max_repair_attempts",
-    "stagnation_limit",
-    "agent",
-    "verification",
-    "execution",
-    "integration",
-    "protected_paths"
-  ],
+  "required": ["version", "spec_file", "max_cycles", "max_repair_attempts", "agent"],
   "properties": {
     "version": {
       "type": "integer",
@@ -46,7 +35,7 @@
       "type": "integer",
       "minimum": 1,
       "default": 3,
-      "description": "Number of consecutive cycles without requirement progress before the run is blocked."
+      "description": "Advanced override for consecutive cycles without requirement progress before the run is blocked."
     },
     "agent": {
       "$ref": "#/$defs/agentConfig"
@@ -57,23 +46,10 @@
     "execution": {
       "$ref": "#/$defs/executionConfig"
     },
-    "integration": {
-      "$ref": "#/$defs/integrationConfig"
-    },
-    "protected_paths": {
+    "additional_protected_paths": {
       "$ref": "#/$defs/stringList",
-      "default": [
-        "spec.md",
-        "AGENTS.md",
-        "tenet.toml",
-        ".tenet/state.json",
-        ".tenet/requirements.json",
-        ".tenet/roadmap.json",
-        ".tenet/STOP",
-        ".tenet/run.lock"
-      ],
-      "description": "Project-relative paths restored if a coding worker modifies them.",
-      "examples": [["spec.md", "AGENTS.md", "tenet.toml"]]
+      "default": [],
+      "description": "Additional project-relative paths protected in addition to Tenet's mandatory controller-owned paths."
     }
   },
   "$defs": {
@@ -87,7 +63,7 @@
       "type": "object",
       "additionalProperties": false,
       "description": "Vendor-neutral ACP launch and session settings.",
-      "required": ["turn_timeout_secs"],
+      "required": [],
       "oneOf": [{ "required": ["id"] }, { "required": ["custom"] }],
       "properties": {
         "id": {
@@ -184,76 +160,38 @@
     "verificationConfig": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Structured, controller-trusted verification gates and execution limits.",
-      "required": [
-        "require_project_gate",
-        "gates",
-        "timeout_secs",
-        "max_output_bytes"
-      ],
+      "description": "Structured, controller-trusted verification gates and optional execution-limit overrides.",
       "properties": {
-        "require_project_gate": {
-          "type": "boolean",
-          "default": false,
-          "description": "Requires at least one explicitly obligation-bound project gate before work can pass."
-        },
         "gates": {
           "type": "array",
           "items": { "$ref": "#/$defs/projectVerificationGate" },
           "default": [],
-          "description": "Project-configured verification specs explicitly bound to obligation identities."
+          "description": "Project-configured verification specs explicitly bound to obligation identities. Configured gates participate in authoritative verification."
         },
         "timeout_secs": {
           "type": "integer",
           "minimum": 0,
           "default": 120,
-          "description": "Maximum duration in seconds allowed for each verification command."
+          "description": "Advanced override for the maximum duration of each verification command."
         },
         "max_output_bytes": {
           "type": "integer",
           "minimum": 0,
           "default": 65536,
-          "description": "Maximum number of output bytes retained from each verification command."
+          "description": "Advanced override for output bytes retained from each verification command."
         }
-      },
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "require_project_gate": { "const": true }
-            }
-          },
-          "then": {
-            "properties": {
-              "gates": { "minItems": 1 }
-            }
-          }
-        }
-      ]
+      }
     },
     "executionConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["max_parallel_workers"],
       "properties": {
         "max_parallel_workers": {
           "type": "integer",
           "minimum": 1,
-          "default": 1
+          "default": 1,
+          "description": "Advanced override for concurrent coding workers."
         }
-      }
-    },
-    "integrationConfig": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["strategy", "verify_each_candidate"],
-      "properties": {
-        "strategy": {
-          "type": "string",
-          "const": "cherry_pick",
-          "default": "cherry_pick"
-        },
-        "verify_each_candidate": { "type": "boolean", "default": true }
       }
     }
   }

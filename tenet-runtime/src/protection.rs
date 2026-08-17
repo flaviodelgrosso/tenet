@@ -1,9 +1,10 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
-  path::{Component, Path, PathBuf},
+  path::{Path, PathBuf},
 };
 
 use anyhow::{bail, Context, Result};
+use tenet_domain::config::normalize_protected_path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EntryState {
@@ -23,7 +24,7 @@ pub async fn snapshot(cwd: &Path, paths: &[String]) -> Result<Snapshot> {
   let mut entries = BTreeMap::new();
   let mut roots = Vec::with_capacity(paths.len());
   for configured in paths {
-    let rel = normalize_relative(configured)?;
+    let rel = normalize_protected_path(configured)?;
     roots.push(rel.clone());
     collect_entry(cwd, &rel, &mut entries)?;
   }
@@ -92,27 +93,6 @@ fn collect_entry(
   Ok(())
 }
 
-fn normalize_relative(value: &str) -> Result<PathBuf> {
-  let path = Path::new(value);
-  if value.trim().is_empty() || path.is_absolute() {
-    bail!("protected path must be a nonblank repository-relative path: {value:?}");
-  }
-  let mut normalized = PathBuf::new();
-  for component in path.components() {
-    match component {
-      Component::Normal(value) => normalized.push(value),
-      Component::CurDir => {}
-      Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-        bail!("protected path escapes the repository: {value:?}")
-      }
-    }
-  }
-  if normalized.as_os_str().is_empty() {
-    bail!("protected path resolves to the repository root: {value:?}");
-  }
-  Ok(normalized)
-}
-
 #[cfg(unix)]
 fn is_executable(metadata: &std::fs::Metadata) -> bool {
   use std::os::unix::fs::PermissionsExt;
@@ -130,8 +110,8 @@ mod tests {
 
   #[test]
   fn unsafe_protected_paths_are_rejected() {
-    assert!(normalize_relative("../outside").is_err());
-    assert!(normalize_relative("/absolute").is_err());
+    assert!(normalize_protected_path("../outside").is_err());
+    assert!(normalize_protected_path("/absolute").is_err());
   }
 
   #[cfg(unix)]

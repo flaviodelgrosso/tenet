@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::{ids::ObligationId, model::WorkerRole, verification::VerificationSpec};
 use anyhow::{Context, Result};
@@ -11,6 +11,13 @@ pub const CONFIG_SCHEMA_URL: &str =
   "https://cdn.jsdelivr.net/gh/flaviodelgrosso/tenet@main/schemas/config.schema.json";
 pub const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
+const DEFAULT_COMPLETION_RETRIES: u32 = 2;
+const DEFAULT_TURN_TIMEOUT_SECS: u64 = 900;
+const DEFAULT_VERIFICATION_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const DEFAULT_STAGNATION_LIMIT: u32 = 3;
+const DEFAULT_MAX_PARALLEL_WORKERS: usize = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -18,12 +25,18 @@ pub struct Config {
   pub spec_file: String,
   pub max_cycles: u32,
   pub max_repair_attempts: u32,
+  #[serde(
+    default = "default_stagnation_limit",
+    skip_serializing_if = "is_default_stagnation_limit"
+  )]
   pub stagnation_limit: u32,
   pub agent: AgentConfig,
+  #[serde(default, skip_serializing_if = "VerificationConfig::is_default")]
   pub verification: VerificationConfig,
+  #[serde(default, skip_serializing_if = "ExecutionConfig::is_default")]
   pub execution: ExecutionConfig,
-  pub integration: IntegrationConfig,
-  pub protected_paths: Vec<String>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub additional_protected_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,7 +51,27 @@ pub struct RolePreference {
 }
 
 fn default_completion_retries() -> u32 {
-  2
+  DEFAULT_COMPLETION_RETRIES
+}
+
+fn default_turn_timeout_secs() -> u64 {
+  DEFAULT_TURN_TIMEOUT_SECS
+}
+
+fn default_verification_timeout_secs() -> u64 {
+  DEFAULT_VERIFICATION_TIMEOUT_SECS
+}
+
+fn default_max_output_bytes() -> usize {
+  DEFAULT_MAX_OUTPUT_BYTES
+}
+
+fn default_stagnation_limit() -> u32 {
+  DEFAULT_STAGNATION_LIMIT
+}
+
+fn is_default_stagnation_limit(value: &u32) -> bool {
+  *value == DEFAULT_STAGNATION_LIMIT
 }
 
 #[derive(Debug, Clone)]
@@ -55,8 +88,6 @@ impl Serialize for AgentConfig {
   where
     S: serde::Serializer,
   {
-    let preferences = &self.preferences;
-
     let mut state = serializer.serialize_struct("AgentConfig", 5)?;
     if let Some(id) = &self.id {
       state.serialize_field("id", id)?;
@@ -64,9 +95,15 @@ impl Serialize for AgentConfig {
     if let Some(custom) = &self.custom {
       state.serialize_field("custom", custom)?;
     }
-    state.serialize_field("completion_retries", &self.completion_retries)?;
-    state.serialize_field("preferences", &preferences)?;
-    state.serialize_field("turn_timeout_secs", &self.turn_timeout_secs)?;
+    if self.completion_retries != DEFAULT_COMPLETION_RETRIES {
+      state.serialize_field("completion_retries", &self.completion_retries)?;
+    }
+    if self.preferences != AgentPreferences::default() {
+      state.serialize_field("preferences", &self.preferences)?;
+    }
+    if self.turn_timeout_secs != DEFAULT_TURN_TIMEOUT_SECS {
+      state.serialize_field("turn_timeout_secs", &self.turn_timeout_secs)?;
+    }
     state.end()
   }
 }
@@ -80,6 +117,7 @@ struct AgentConfigWire {
   completion_retries: u32,
   #[serde(default)]
   preferences: AgentPreferences,
+  #[serde(default = "default_turn_timeout_secs")]
   turn_timeout_secs: u64,
 }
 
@@ -159,14 +197,6 @@ impl AgentConfig {
   pub fn preferences_for(&self, role: WorkerRole) -> RolePreference {
     self.preferences.for_role(role)
   }
-
-  fn populate_role_defaults(&mut self) {
-    self
-      .preferences
-      .default
-      .thought_level
-      .get_or_insert_with(|| "high".into());
-  }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -241,11 +271,19 @@ impl AgentPreferences {
   }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VerificationConfig {
-  pub require_project_gate: bool,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub gates: Vec<ProjectVerificationGate>,
+  #[serde(
+    default = "default_verification_timeout_secs",
+    skip_serializing_if = "VerificationConfig::has_default_timeout"
+  )]
   pub timeout_secs: u64,
+  #[serde(
+    default = "default_max_output_bytes",
+    skip_serializing_if = "VerificationConfig::has_default_max_output"
+  )]
   pub max_output_bytes: usize,
 }
 
@@ -261,9 +299,11 @@ pub struct ProjectVerificationGate {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VerificationConfigWire {
-  require_project_gate: bool,
+  #[serde(default)]
   gates: Vec<ProjectVerificationGate>,
+  #[serde(default = "default_verification_timeout_secs")]
   timeout_secs: u64,
+  #[serde(default = "default_max_output_bytes")]
   max_output_bytes: usize,
 }
 
@@ -274,7 +314,6 @@ impl<'de> Deserialize<'de> for VerificationConfig {
   {
     let wire = VerificationConfigWire::deserialize(deserializer)?;
     let config = Self {
-      require_project_gate: wire.require_project_gate,
       gates: wire.gates,
       timeout_secs: wire.timeout_secs,
       max_output_bytes: wire.max_output_bytes,
@@ -284,11 +323,18 @@ impl<'de> Deserialize<'de> for VerificationConfig {
   }
 }
 
+impl Default for VerificationConfig {
+  fn default() -> Self {
+    Self {
+      gates: Vec::new(),
+      timeout_secs: DEFAULT_VERIFICATION_TIMEOUT_SECS,
+      max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+    }
+  }
+}
+
 impl VerificationConfig {
   fn validate(&self) -> Result<()> {
-    if self.require_project_gate && self.gates.is_empty() {
-      anyhow::bail!("verification.gates must contain at least one gate when verification.require_project_gate is enabled");
-    }
     for gate in &self.gates {
       if gate.obligation_ids.is_empty() {
         anyhow::bail!("verification gate must explicitly bind at least one obligation_id");
@@ -307,74 +353,63 @@ impl VerificationConfig {
     }
     Ok(())
   }
+
+  fn is_default(&self) -> bool {
+    self == &Self::default()
+  }
+
+  fn has_default_timeout(value: &u64) -> bool {
+    *value == DEFAULT_VERIFICATION_TIMEOUT_SECS
+  }
+
+  fn has_default_max_output(value: &usize) -> bool {
+    *value == DEFAULT_MAX_OUTPUT_BYTES
+  }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct ExecutionConfig {
+  #[serde(skip_serializing_if = "ExecutionConfig::has_default_worker_count")]
   pub max_parallel_workers: usize,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum IntegrationStrategy {
-  CherryPick,
+impl Default for ExecutionConfig {
+  fn default() -> Self {
+    Self {
+      max_parallel_workers: DEFAULT_MAX_PARALLEL_WORKERS,
+    }
+  }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct IntegrationConfig {
-  pub strategy: IntegrationStrategy,
-  pub verify_each_candidate: bool,
+impl ExecutionConfig {
+  fn is_default(&self) -> bool {
+    self == &Self::default()
+  }
+
+  fn has_default_worker_count(value: &usize) -> bool {
+    *value == DEFAULT_MAX_PARALLEL_WORKERS
+  }
 }
 
 impl Default for Config {
   fn default() -> Self {
     Self {
-      version: 1,
+      version: SUPPORTED_CONFIG_VERSION,
       spec_file: "spec.md".into(),
       max_cycles: 25,
       max_repair_attempts: 3,
-      stagnation_limit: 3,
+      stagnation_limit: DEFAULT_STAGNATION_LIMIT,
       agent: AgentConfig {
         id: None,
         custom: None,
-        completion_retries: 2,
-        preferences: AgentPreferences {
-          default: RolePreference {
-            thought_level: Some("high".into()),
-            ..RolePreference::default()
-          },
-          roles: std::collections::BTreeMap::new(),
-        },
-        turn_timeout_secs: 900,
+        completion_retries: DEFAULT_COMPLETION_RETRIES,
+        preferences: AgentPreferences::default(),
+        turn_timeout_secs: DEFAULT_TURN_TIMEOUT_SECS,
       },
-      verification: VerificationConfig {
-        require_project_gate: false,
-        gates: Vec::new(),
-        timeout_secs: 120,
-        max_output_bytes: 64 * 1024,
-      },
-      execution: ExecutionConfig {
-        max_parallel_workers: 1,
-      },
-      integration: IntegrationConfig {
-        strategy: IntegrationStrategy::CherryPick,
-        verify_each_candidate: true,
-      },
-      protected_paths: vec![
-        "spec.md",
-        "AGENTS.md",
-        "tenet.toml",
-        ".tenet/state.json",
-        ".tenet/requirements.json",
-        ".tenet/roadmap.json",
-        ".tenet/STOP",
-        ".tenet/run.lock",
-      ]
-      .into_iter()
-      .map(str::to_owned)
-      .collect(),
+      verification: VerificationConfig::default(),
+      execution: ExecutionConfig::default(),
+      additional_protected_paths: Vec::new(),
     }
   }
 }
@@ -386,8 +421,7 @@ pub fn config_path(cwd: &Path) -> PathBuf {
 pub async fn ensure_config(cwd: &Path) -> Result<Config> {
   let path = config_path(cwd);
   if !path.exists() {
-    let mut config = Config::default();
-    config.agent.populate_role_defaults();
+    let config = Config::default();
     let body = toml::to_string_pretty(&config)?;
     let text = format!("#:schema {CONFIG_SCHEMA_URL}\n\n{body}");
     fs::write(&path, text).await?;
@@ -403,13 +437,23 @@ pub async fn read_config(cwd: &Path) -> Result<Config> {
     .with_context(|| format!("read {}", path.display()))?;
   let config: Config =
     toml::from_str(&text).map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))?;
-  config.agent.validate_launch_source()?;
   if config.version != SUPPORTED_CONFIG_VERSION {
     anyhow::bail!(
-      "unsupported configuration version {}; supported version is {}; migrate tenet.toml before running",
+      "unsupported configuration version {}; supported version is {}",
       config.version,
       SUPPORTED_CONFIG_VERSION
     );
+  }
+  normalize_protected_path(&config.spec_file).map_err(|error| {
+    anyhow::anyhow!(
+      "invalid spec_file protected path {:?}: {error}",
+      config.spec_file
+    )
+  })?;
+  for path in &config.additional_protected_paths {
+    normalize_protected_path(path).map_err(|error| {
+      anyhow::anyhow!("invalid additional_protected_paths entry {path:?}: {error}")
+    })?;
   }
   if config.stagnation_limit == 0 {
     anyhow::bail!("stagnation_limit must be at least 1");
@@ -418,6 +462,27 @@ pub async fn read_config(cwd: &Path) -> Result<Config> {
     anyhow::bail!("execution.max_parallel_workers must be at least 1");
   }
   Ok(config)
+}
+
+pub fn normalize_protected_path(value: &str) -> Result<PathBuf> {
+  let path = Path::new(value);
+  if value.trim().is_empty() || path.is_absolute() {
+    anyhow::bail!("protected path must be a nonblank repository-relative path: {value:?}");
+  }
+  let mut normalized = PathBuf::new();
+  for component in path.components() {
+    match component {
+      Component::Normal(value) => normalized.push(value),
+      Component::CurDir => {}
+      Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+        anyhow::bail!("protected path escapes the repository: {value:?}")
+      }
+    }
+  }
+  if normalized.as_os_str().is_empty() {
+    anyhow::bail!("protected path resolves to the repository root: {value:?}");
+  }
+  Ok(normalized)
 }
 
 #[cfg(test)]
@@ -480,8 +545,7 @@ mod tests {
       "agent",
       "verification",
       "execution",
-      "integration",
-      "protected_paths",
+      "additional_protected_paths",
     ];
     expected_root.sort_unstable();
 
@@ -540,8 +604,8 @@ mod tests {
       config.stagnation_limit
     );
     assert_eq!(
-      schema["properties"]["protected_paths"]["default"],
-      serde_json::to_value(config.protected_paths).unwrap()
+      schema["properties"]["additional_protected_paths"]["default"],
+      serde_json::json!([])
     );
     assert!(schema["$defs"]["agentConfig"]["properties"]["id"].is_object());
     assert!(schema["$defs"]["agentConfig"]["properties"]["custom"].is_object());
@@ -556,10 +620,6 @@ mod tests {
     assert_eq!(
       schema["$defs"]["agentConfig"]["properties"]["turn_timeout_secs"]["default"],
       config.agent.turn_timeout_secs
-    );
-    assert_eq!(
-      schema["$defs"]["verificationConfig"]["properties"]["require_project_gate"]["default"],
-      config.verification.require_project_gate
     );
     assert_eq!(
       schema["$defs"]["verificationConfig"]["properties"]["gates"]["default"],
@@ -577,33 +637,21 @@ mod tests {
       schema["$defs"]["executionConfig"]["properties"]["max_parallel_workers"]["default"],
       config.execution.max_parallel_workers
     );
-    assert_eq!(
-      schema["$defs"]["integrationConfig"]["properties"]["strategy"]["default"],
-      serde_json::to_value(config.integration.strategy).unwrap()
-    );
-    assert_eq!(
-      schema["$defs"]["integrationConfig"]["properties"]["verify_each_candidate"]["default"],
-      config.integration.verify_each_candidate
-    );
   }
 
   #[test]
-  fn config_schema_requires_gates_when_project_gate_is_enabled() {
+  fn config_schema_excludes_controller_owned_policy_fields() {
     let schema = config_schema();
 
-    assert_eq!(
-      (
-        &schema["$defs"]["verificationConfig"]["allOf"][0]["if"]["properties"]
-          ["require_project_gate"]["const"],
-        &schema["$defs"]["verificationConfig"]["allOf"][0]["then"]["properties"]["gates"]
-          ["minItems"],
-      ),
-      (&serde_json::json!(true), &serde_json::json!(1)),
-    );
+    assert!(schema["properties"].get("integration").is_none());
+    assert!(schema["properties"].get("protected_paths").is_none());
+    assert!(schema["$defs"]["verificationConfig"]["properties"]
+      .get("require_project_gate")
+      .is_none());
   }
 
   #[tokio::test]
-  async fn generated_config_is_created_at_the_project_root_and_requires_a_source() {
+  async fn generated_config_is_small_and_requires_a_launch_source() {
     let project = tempdir().unwrap();
 
     ensure_config(project.path()).await.unwrap();
@@ -613,11 +661,24 @@ mod tests {
 
     assert_eq!(path, project.path().join("tenet.toml"));
     assert!(!project.path().join(TENET_DIR).join("config.toml").exists());
-    assert!(generated.contains("spec_file = \"spec.md\""));
-    assert!(!generated.contains("[git]"));
-    assert!(!generated.contains("workspace"));
-    assert!(!generated.contains("require_clean_base"));
     assert!(generated.starts_with(&format!("#:schema {CONFIG_SCHEMA_URL}\n\n")));
+    assert!(generated.contains("version = 1"));
+    assert!(generated.contains("spec_file = \"spec.md\""));
+    for omitted in [
+      "stagnation_limit",
+      "completion_retries",
+      "turn_timeout_secs",
+      "verification",
+      "max_output_bytes",
+      "max_parallel_workers",
+      "integration",
+      "protected_paths",
+    ] {
+      assert!(
+        !generated.contains(omitted),
+        "generated config contains {omitted}"
+      );
+    }
     assert!(error.contains("no ACP launch source configured"));
   }
 
@@ -715,19 +776,49 @@ mod tests {
     assert!(error.contains("ambiguous ACP launch source"));
   }
 
-  #[tokio::test]
-  async fn read_config_rejects_empty_gates_when_project_gate_is_required() {
-    let text = serialized_config(|config| config.verification.require_project_gate = true, "");
-    let error = read_error(text).await;
+  #[test]
+  fn omitted_advanced_settings_resolve_to_runtime_defaults() {
+    let loaded: Config = toml::from_str(concat!(
+      "version = 1\n",
+      "spec_file = \"spec.md\"\n",
+      "max_cycles = 25\n",
+      "max_repair_attempts = 3\n",
+      "[agent]\n",
+      "id = \"test-agent\"\n",
+    ))
+    .unwrap();
+    let defaults = Config::default();
 
-    assert!(error.contains("verification.gates must contain at least one gate"));
+    assert_eq!(loaded.stagnation_limit, defaults.stagnation_limit);
+    assert_eq!(
+      loaded.agent.completion_retries,
+      defaults.agent.completion_retries
+    );
+    assert_eq!(
+      loaded.agent.turn_timeout_secs,
+      defaults.agent.turn_timeout_secs
+    );
+    assert_eq!(loaded.verification, defaults.verification);
+    assert_eq!(loaded.execution, defaults.execution);
   }
 
   #[test]
-  fn empty_gates_are_allowed_when_project_gate_is_disabled() {
-    let text = serialized_config(|_| {}, "");
+  fn explicit_advanced_settings_round_trip() {
+    let text = serialized_config(
+      |config| {
+        config.stagnation_limit = 7;
+        config.agent.completion_retries = 4;
+        config.agent.turn_timeout_secs = 30;
+        config.verification.timeout_secs = 45;
+        config.verification.max_output_bytes = 2048;
+        config.execution.max_parallel_workers = 3;
+        config.additional_protected_paths = vec!["secrets".into()];
+      },
+      "",
+    );
+    let loaded: Config = toml::from_str(&text).unwrap();
 
-    assert!(toml::from_str::<Config>(&text).is_ok());
+    assert_eq!(toml::to_string_pretty(&loaded).unwrap(), text);
   }
 
   #[tokio::test]
@@ -758,11 +849,8 @@ mod tests {
 
   #[tokio::test]
   async fn read_config_rejects_unknown_agent_fields() {
-    let text = serialized_config(|_| {}, "").replacen(
-      "turn_timeout_secs = 900\n",
-      "turn_timeout_secs = 900\nauto_approve = true\n",
-      1,
-    );
+    let text =
+      serialized_config(|_| {}, "").replacen("[agent]\n", "[agent]\nauto_approve = true\n", 1);
     let error = read_error(text).await;
 
     assert!(error.contains("auto_approve"));
@@ -775,8 +863,8 @@ mod tests {
       ("roles = {}", "roles"),
     ] {
       let text = serialized_config(|_| {}, "").replacen(
-        "turn_timeout_secs = 900\n",
-        &format!("turn_timeout_secs = 900\n{legacy_field}\n"),
+        "[agent]\n",
+        &format!("[agent]\n{legacy_field}\n"),
         1,
       );
 
@@ -784,19 +872,18 @@ mod tests {
       assert!(error.contains(expected_error), "unexpected error: {error}");
     }
 
-    let text =
-      serialized_config(|_| {}, "").replacen("thought_level = \"high\"", "thinking = \"high\"", 1);
+    let text = serialized_config(
+      |_| {},
+      "\n[agent.preferences.default]\nthinking = \"high\"\n",
+    );
     let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
     assert!(error.contains("thinking"), "unexpected error: {error}");
   }
 
   #[test]
   fn required_role_preference_field_is_rejected() {
-    let default_preference = serialized_config(|_| {}, "").replacen(
-      "thought_level = \"high\"",
-      "thought_level = \"high\"\nrequired = true",
-      1,
-    );
+    let default_preference =
+      serialized_config(|_| {}, "\n[agent.preferences.default]\nrequired = true\n");
     let role_preference = serialized_config(
       |_| {},
       "\n[agent.preferences.roles.implement]\nrequired = true\n",
@@ -878,6 +965,18 @@ mod tests {
 
     assert!(error.contains("unsupported configuration version 99"));
     assert!(error.contains("supported version is 1"));
+  }
+
+  #[tokio::test]
+  async fn unsafe_additional_protected_path_is_rejected() {
+    let text = serialized_config(
+      |config| config.additional_protected_paths = vec!["../outside".into()],
+      "",
+    );
+    let error = read_error(text).await;
+
+    assert!(error.contains("invalid additional_protected_paths entry"));
+    assert!(error.contains("escapes the repository"));
   }
 
   #[tokio::test]
