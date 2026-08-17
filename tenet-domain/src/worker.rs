@@ -399,6 +399,9 @@ pub enum Discovery {
   Blocker {
     description: String,
   },
+  VerificationBlocker {
+    description: String,
+  },
   ScopeExpansion {
     paths: Vec<String>,
     reason: String,

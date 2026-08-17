@@ -346,32 +346,28 @@ mod tests {
 
   #[cfg(not(windows))]
   #[tokio::test]
-  async fn advisory_shell_runs_offline_cargo_build_from_host_toolchain() {
+  async fn verification_spec_environment_overrides_host_environment() {
     let workspace = tempfile::tempdir().expect("workspace");
-    std::fs::create_dir(workspace.path().join("src")).expect("create source directory");
-    std::fs::write(
-      workspace.path().join("Cargo.toml"),
-      "[package]\nname = \"verification-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-    )
-    .expect("write manifest");
-    std::fs::write(
-      workspace.path().join("Cargo.lock"),
-      "version = 4\n\n[[package]]\nname = \"verification-fixture\"\nversion = \"0.1.0\"\n",
-    )
-    .expect("write lockfile");
-    std::fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").expect("write source");
-    let spec = advisory_shell_spec("CARGO_NET_OFFLINE=true cargo build --locked");
+    let spec = VerificationSpec {
+      program: "/bin/sh".into(),
+      args: vec!["-c".into(), "printf %s \"$TENET_ENV_TEST\"".into()],
+      working_directory: ".".into(),
+      environment: [("TENET_ENV_TEST".into(), "specified".into())]
+        .into_iter()
+        .collect(),
+    };
 
     let result = run_spec(
       workspace.path(),
       &spec,
-      Duration::from_secs(30),
+      Duration::from_secs(5),
       4096,
       &CancellationToken::new(),
     )
     .await
-    .expect("run Cargo verification");
+    .expect("run verification");
 
-    assert_eq!(result.exit_code, Some(0), "{}", result.stderr);
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(result.stdout, "specified");
   }
 }

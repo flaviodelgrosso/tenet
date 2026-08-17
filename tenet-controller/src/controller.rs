@@ -22,7 +22,7 @@ use tenet_domain::{
   model::{
     CompletedWorkUnit, DiscoveryRecord, DiscoveryStatus, IntegrationPhase, Phase, ReconcileResult,
     RepairProgress, RequirementCatalog, RequirementCounts, RunStatus, State, VerificationReport,
-    WorkExecution, WorkStatus,
+    WorkExecution, WorkStatus, WorkerDiscovery,
   },
 };
 
@@ -279,7 +279,7 @@ impl Controller {
         .collect();
       let evidence_for_worker = evidence_graph::projections(&evidence_graph)?;
       let backend = self.backend.clone();
-      let reconciliation = self
+      let mut reconciliation = self
         .read_only_worker(
           context,
           "reconciliation",
@@ -296,6 +296,7 @@ impl Controller {
           },
         )
         .await?;
+      normalize_reconcile_relationships(&catalog, &mut reconciliation)?;
       validate_reconcile(&catalog, &reconciliation)?;
       let graph = WorkGraph::from_reconcile(&catalog, &reconciliation)?;
       let fingerprint = progress_fingerprint(&self.cwd, &catalog, &reconciliation, state).await?;
@@ -439,16 +440,29 @@ impl Controller {
       let cleanup_result = scheduler.cleanup().await;
       state.active_leases.clear();
       state.current_repair = None;
-      let mut candidates = match (execution_result, cleanup_result) {
-        (Ok(candidates), Ok(())) => candidates,
+      let outcome = match (execution_result, cleanup_result) {
+        (Ok(outcome), Ok(())) => outcome,
         (Err(error), Ok(())) => return Err(error),
         (Ok(_), Err(error)) => return Err(error.context("scheduler cleanup")),
         (Err(error), Err(cleanup)) => {
           return Err(error.context(format!("scheduler cleanup also failed: {cleanup:#}")))
         }
       };
+      let mut candidates = outcome.executions;
       deterministic_order(&mut candidates);
       state.candidate_integrations = candidates.clone();
+      for blocked in outcome.blocked {
+        state
+          .work_statuses
+          .insert(blocked.lease.work_unit.id.clone(), WorkStatus::Pending);
+        record_discoveries(
+          state,
+          &catalog,
+          &blocked.lease.base_revision,
+          &blocked.lease.work_unit.id,
+          &blocked.discoveries,
+        )?;
+      }
       for candidate in &candidates {
         state
           .work_statuses
@@ -456,6 +470,10 @@ impl Controller {
         record_candidate_discoveries(state, &catalog, candidate)?;
       }
       self.publish(&context.events, state).await?;
+
+      if candidates.is_empty() {
+        continue;
+      }
 
       let integrated = self
         .integrate_candidates(
@@ -895,6 +913,68 @@ impl Controller {
   }
 }
 
+fn normalize_reconcile_relationships(
+  catalog: &RequirementCatalog,
+  result: &mut ReconcileResult,
+) -> Result<()> {
+  let criterion_requirements: BTreeMap<_, _> = catalog
+    .acceptance_criteria
+    .iter()
+    .map(|criterion| (criterion.id.clone(), criterion.requirement_id.clone()))
+    .collect();
+  let obligation_criteria: BTreeMap<_, _> = catalog
+    .verification_obligations
+    .iter()
+    .map(|obligation| (obligation.id.clone(), obligation.criterion_id.clone()))
+    .collect();
+
+  for work in &mut result.work_units {
+    let obligation_ids: BTreeSet<_> = work
+      .verification_obligation_ids
+      .iter()
+      .cloned()
+      .chain(
+        work
+          .suggested_checks
+          .iter()
+          .map(|check| check.obligation_id.clone()),
+      )
+      .collect();
+    let mut criterion_ids: BTreeSet<_> = work.criterion_ids.iter().cloned().collect();
+    for obligation_id in &obligation_ids {
+      criterion_ids.insert(
+        obligation_criteria
+          .get(obligation_id)
+          .with_context(|| {
+            format!(
+              "{} targets unknown verification obligation {obligation_id}",
+              work.id
+            )
+          })?
+          .clone(),
+      );
+    }
+    let mut requirement_ids: BTreeSet<_> = work.requirement_ids.iter().cloned().collect();
+    for criterion_id in &criterion_ids {
+      requirement_ids.insert(
+        criterion_requirements
+          .get(criterion_id)
+          .with_context(|| {
+            format!(
+              "{} targets unknown acceptance criterion {criterion_id}",
+              work.id
+            )
+          })?
+          .clone(),
+      );
+    }
+    work.verification_obligation_ids = obligation_ids.into_iter().collect();
+    work.criterion_ids = criterion_ids.into_iter().collect();
+    work.requirement_ids = requirement_ids.into_iter().collect();
+  }
+  Ok(())
+}
+
 fn validate_reconcile(catalog: &RequirementCatalog, result: &ReconcileResult) -> Result<()> {
   let expected: BTreeSet<_> = catalog
     .requirements
@@ -1074,11 +1154,27 @@ fn record_candidate_discoveries(
   catalog: &RequirementCatalog,
   candidate: &WorkExecution,
 ) -> Result<()> {
-  for discovered in &candidate.discoveries {
+  record_discoveries(
+    state,
+    catalog,
+    &candidate.candidate_revision,
+    &candidate.lease.work_unit.id,
+    &candidate.discoveries,
+  )
+}
+
+fn record_discoveries(
+  state: &mut State,
+  catalog: &RequirementCatalog,
+  repository_revision: &str,
+  work_unit_id: &str,
+  discoveries: &[WorkerDiscovery],
+) -> Result<()> {
+  for discovered in discoveries {
     let identity = serde_json::to_vec(&(
       &catalog.spec_hash,
-      &candidate.candidate_revision,
-      &candidate.lease.work_unit.id,
+      repository_revision,
+      work_unit_id,
       discovered.role,
       &discovered.discovery,
     ))?;
@@ -1098,8 +1194,8 @@ fn record_candidate_discoveries(
       fingerprint,
       discovery: discovered.discovery.clone(),
       catalog_hash: catalog.spec_hash.clone(),
-      repository_revision: candidate.candidate_revision.clone(),
-      work_unit_id: candidate.lease.work_unit.id.clone(),
+      repository_revision: repository_revision.into(),
+      work_unit_id: work_unit_id.into(),
       role: discovered.role,
       cycle: state.cycle,
       status: DiscoveryStatus::Active,
@@ -1231,6 +1327,28 @@ mod tests {
       &result(ImplementationState::Present, Vec::new(), false)
     )
     .is_ok());
+  }
+
+  #[test]
+  fn work_relationships_are_closed_from_verification_obligations() {
+    let catalog = catalog();
+    let mut reconciliation = result(ImplementationState::Partial, vec!["missing behavior"], true);
+    let work = &mut reconciliation.work_units[0];
+    work.requirement_ids.clear();
+    work.criterion_ids.clear();
+
+    normalize_reconcile_relationships(&catalog, &mut reconciliation)
+      .expect("normalize relationships");
+
+    assert_eq!(
+      reconciliation.work_units[0].requirement_ids,
+      [RequirementId::from("REQ-001")]
+    );
+    assert_eq!(
+      reconciliation.work_units[0].criterion_ids,
+      [CriterionId::from("REQ-001/AC-01")]
+    );
+    assert!(validate_reconcile(&catalog, &reconciliation).is_ok());
   }
 
   #[test]

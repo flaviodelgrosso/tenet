@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use tenet_controller::{evidence as controller_evidence, AgentBackend, Controller};
 use tenet_domain::{
-  config::{Config, CustomAgentConfig, ProjectVerificationGate},
+  config::{read_config, Config, CustomAgentConfig, ProjectVerificationGate},
   events::{EventSink, RunEvent},
   evidence::{
     AcceptanceCriterion, EvidencePolicy, ImplementationState, VerificationKind,
@@ -223,6 +223,7 @@ enum BackendMode {
   ProtectedMutation,
   WaitForCancellation,
   RepairDiscovery,
+  InvalidVerificationCheck,
   NeverPassingVerification,
   IncompleteAssessment,
   CleanupFailure,
@@ -360,6 +361,14 @@ impl AgentBackend for FakeBackend {
         }];
       }
     }
+    if matches!(self.mode, BackendMode::InvalidVerificationCheck) {
+      if let Some(unit) = work_units.iter_mut().find(|unit| unit.id == "A") {
+        unit.suggested_checks = vec![CandidateCheck {
+          obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+          command: "false".into(),
+        }];
+      }
+    }
     Ok(ReconcileResult {
       summary: if satisfied {
         "implementation present; evidence pending".into()
@@ -448,6 +457,11 @@ impl AgentBackend for FakeBackend {
       fs::write(ctx.cwd.join("A.txt"), "repaired").await?;
       return Ok(summary(vec![Discovery::Blocker {
         description: "repair found a dependent concern".into(),
+      }]));
+    }
+    if matches!(self.mode, BackendMode::InvalidVerificationCheck) && work_unit.id == "A" {
+      return Ok(summary(vec![Discovery::VerificationBlocker {
+        description: "verification command hides its required tool environment".into(),
       }]));
     }
     bail!("repair not expected")
@@ -923,6 +937,37 @@ async fn repair_discovery_reaches_next_reconciliation_once() {
     .expect("repair phase includes current repair details");
   assert_eq!(repair.work_unit_id, "A");
   assert_eq!(repair.attempt, 1);
+}
+
+#[tokio::test]
+async fn invalid_verification_discovery_returns_to_reconciliation_without_repair_loop() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::InvalidVerificationCheck));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  let mut config = read_config(repository.path()).await.expect("read config");
+  config.max_cycles = 1;
+  fs::write(
+    repository.path().join("tenet.toml"),
+    toml::to_string_pretty(&config).expect("serialize config"),
+  )
+  .await
+  .expect("limit cycles");
+  run_git(repository.path(), &["add", "tenet.toml"]);
+  run_git(repository.path(), &["commit", "-m", "limit cycles"]);
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("invalid verification is deferred to reconciliation");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Blocked);
+  assert_eq!(backend.repair_calls.load(Ordering::SeqCst), 1);
+  assert!(state
+    .discoveries
+    .iter()
+    .any(|record| matches!(record.discovery, Discovery::VerificationBlocker { .. })));
+  let list = run_git(repository.path(), &["worktree", "list", "--porcelain"]);
+  assert_eq!(list.matches("worktree ").count(), 1);
 }
 
 #[tokio::test]

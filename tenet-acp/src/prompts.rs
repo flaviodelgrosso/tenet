@@ -50,6 +50,7 @@ Rules:
 - Bind every proposed check to an existing verification obligation. Each command must be executable, non-interactive, deterministic, self-contained, and perform its own assertion.
 - Work units must name explicit requirementIds, criterionIds, verificationObligationIds, dependencies, and conservative path scopes.
 - Incorporate structured worker discoveries into a revised proposal. Never treat discoveries as direct graph mutations.
+- Treat a `verification_blocker` discovery as evidence that the prior suggested check is invalid: replace it with an environment-safe check and never re-propose the blocked command unchanged.
 - Checks must not depend on external network access, mutable user state, a previous check, or an executable produced outside the command.
 - Isolate application state without hiding verification tooling. Prefer application-specific state overrides; otherwise resolve tools and dependencies before isolation, invoke produced artifacts by explicit path, and preserve unrelated environment needed by the command runner.
 - Do not implement anything. You are read-only.
@@ -74,7 +75,7 @@ Repair the assigned work unit using the deterministic verification evidence.
 Constraints:
 - Do not edit the configured authoritative specification, tenet.toml, .tenet/, or AGENTS.md.
 - Do not weaken verification or tests to obtain a green result.
-- If the evidence shows that a suggested check is invalid or its environment prevents the command from running, do not modify product code to compensate; report a blocker discovery naming the command and cause.
+- If verification fails because a suggested check hides or corrupts its own tooling environment, do not modify product code to compensate. Return a `verification_blocker` discovery naming the command and cause so the controller can send the immutable check back to reconciliation.
 - Report newly found dependencies, blockers, and scope expansions only through structured discoveries.
 - Never modify the work graph or coordinate with other workers.
 "#;
@@ -138,7 +139,7 @@ mod tests {
   fn repair_role_reports_invalid_checks_without_product_changes() {
     let prompt = full_role_prompt(WorkerRole::Repair, "requirements/product.md");
 
-    assert!(prompt.contains("report a blocker discovery naming the command and cause"));
+    assert!(prompt.contains("Return a `verification_blocker` discovery"));
   }
 
   #[test]

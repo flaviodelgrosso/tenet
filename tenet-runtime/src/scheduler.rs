@@ -30,6 +30,23 @@ pub enum ExecutionUpdate {
   Repairing { work_unit_id: String, attempt: u32 },
 }
 
+#[derive(Debug)]
+pub struct BlockedExecution {
+  pub lease: WorkLease,
+  pub discoveries: Vec<WorkerDiscovery>,
+}
+
+#[derive(Debug, Default)]
+pub struct SchedulerOutcome {
+  pub executions: Vec<WorkExecution>,
+  pub blocked: Vec<BlockedExecution>,
+}
+
+enum LeaseOutcome {
+  Verified(WorkExecution),
+  Blocked(BlockedExecution),
+}
+
 /// Supplies candidate mutations while the scheduler owns execution mechanics.
 #[async_trait]
 pub trait CandidateExecutor: Send + Sync {
@@ -79,9 +96,9 @@ impl Scheduler {
       .collect()
   }
 
-  pub async fn execute_leases(&self, leases: Vec<WorkLease>) -> Result<Vec<WorkExecution>> {
+  pub async fn execute_leases(&self, leases: Vec<WorkLease>) -> Result<SchedulerOutcome> {
     let mut pending = VecDeque::from(leases);
-    let mut executions = Vec::new();
+    let mut outcome = SchedulerOutcome::default();
 
     while !pending.is_empty() {
       if self.context.cancel.is_cancelled() {
@@ -91,19 +108,28 @@ impl Scheduler {
         &mut pending,
         self.context.config.execution.max_parallel_workers,
       )?;
-      let mut completed = self.execute_batch(batch).await?;
-      executions.append(&mut completed);
+      for completed in self.execute_batch(batch).await? {
+        match completed {
+          LeaseOutcome::Verified(execution) => outcome.executions.push(execution),
+          LeaseOutcome::Blocked(blocked) => outcome.blocked.push(blocked),
+        }
+      }
     }
 
-    executions.sort_by(|left, right| left.lease.work_unit.id.cmp(&right.lease.work_unit.id));
-    Ok(executions)
+    outcome
+      .executions
+      .sort_by(|left, right| left.lease.work_unit.id.cmp(&right.lease.work_unit.id));
+    outcome
+      .blocked
+      .sort_by(|left, right| left.lease.work_unit.id.cmp(&right.lease.work_unit.id));
+    Ok(outcome)
   }
 
   pub async fn cleanup(&self) -> Result<()> {
     self.workspaces.cleanup_run().await
   }
 
-  async fn execute_batch(&self, batch: Vec<WorkLease>) -> Result<Vec<WorkExecution>> {
+  async fn execute_batch(&self, batch: Vec<WorkLease>) -> Result<Vec<LeaseOutcome>> {
     let semaphore = Arc::new(Semaphore::new(
       self.context.config.execution.max_parallel_workers,
     ));
@@ -180,7 +206,7 @@ async fn execute_lease(
   catalog: Arc<RequirementCatalog>,
   mut lease: WorkLease,
   updates: mpsc::UnboundedSender<ExecutionUpdate>,
-) -> Result<WorkExecution> {
+) -> Result<LeaseOutcome> {
   let workspace = workspaces
     .create_worker(&lease.id, &lease.base_revision)
     .await?;
@@ -233,7 +259,7 @@ async fn execute_and_commit(
   catalog: &RequirementCatalog,
   lease: &WorkLease,
   updates: &mpsc::UnboundedSender<ExecutionUpdate>,
-) -> Result<WorkExecution> {
+) -> Result<LeaseOutcome> {
   let protected_paths = protected_paths(context);
   let protected = protection::snapshot(&lease.workspace, &protected_paths).await?;
   let _ = updates.send(ExecutionUpdate::Implementing {
@@ -277,16 +303,32 @@ async fn execute_and_commit(
       .execute(context, catalog, &lease.work_unit, Some(&verification))
       .await
       .context("repair worker")?;
-    discoveries.extend(
-      repair_summary
-        .discoveries
-        .into_iter()
-        .map(|discovery| WorkerDiscovery {
-          discovery,
-          role: WorkerRole::Repair,
-        }),
-    );
+    let repair_discoveries: Vec<_> = repair_summary
+      .discoveries
+      .into_iter()
+      .map(|discovery| WorkerDiscovery {
+        discovery,
+        role: WorkerRole::Repair,
+      })
+      .collect();
+    let verification_blocked = repair_discoveries.iter().any(|discovered| {
+      matches!(
+        discovered.discovery,
+        tenet_domain::model::Discovery::VerificationBlocker { .. }
+      )
+    });
+    discoveries.extend(repair_discoveries);
     reject_protected_changes(&lease.workspace, &protected, "repair worker").await?;
+    if verification_blocked {
+      context
+        .events
+        .emit(RunEvent::Verification(verification.clone()))
+        .await?;
+      return Ok(LeaseOutcome::Blocked(BlockedExecution {
+        lease: lease.clone(),
+        discoveries,
+      }));
+    }
     candidate_revision = commit_candidate(&lease.workspace, lease).await?;
     changed_paths =
       git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
@@ -324,7 +366,7 @@ async fn execute_and_commit(
     .events
     .emit(RunEvent::CandidateProduced(execution.clone()))
     .await?;
-  Ok(execution)
+  Ok(LeaseOutcome::Verified(execution))
 }
 
 async fn reject_protected_changes(
