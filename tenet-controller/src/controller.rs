@@ -1296,6 +1296,32 @@ mod tests {
   }
 
   #[test]
+  fn architect_fragment_metadata_is_controller_normalized() {
+    let specification = "Description";
+    let fragment = derive_normative_fragments(specification)
+      .into_iter()
+      .next()
+      .expect("normative fragment");
+    let mut requirement = catalog().requirements.remove(0);
+    requirement.source_refs[0].section = Some("Incorrect".into());
+    requirement.source_refs[0].text_hash = fragment.text_hash[..63].into();
+
+    let built = catalog::build(
+      specification,
+      "spec".into(),
+      architect_output(requirement),
+      &Config::default(),
+    )
+    .expect("build catalog");
+
+    assert_eq!(
+      built.requirements[0].source_refs,
+      vec![fragment.reference()]
+    );
+    assert!(catalog::validate_coverage(&built, specification).is_ok());
+  }
+
+  #[test]
   fn omitted_normative_fragment_blocks_catalog_coverage() {
     let specification = "First normative statement.\n\nSecond normative statement.";
     let fragments = derive_normative_fragments(specification);

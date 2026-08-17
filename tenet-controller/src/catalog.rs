@@ -1,6 +1,10 @@
 //! Requirement-catalog lifecycle, authority, and specification-coverage policy.
 
-use std::{collections::BTreeSet, fmt::Write as _, path::Path};
+use std::{
+  collections::{BTreeMap, BTreeSet},
+  fmt::Write as _,
+  path::Path,
+};
 
 use anyhow::{bail, Context, Result};
 use tenet_domain::{
@@ -77,6 +81,17 @@ pub fn build(
   let mut requirements = output.requirements;
   for requirement in &mut requirements {
     requirement.required = true;
+  }
+  let fragments: BTreeMap<_, _> = tenet_domain::worker::derive_normative_fragments(specification)
+    .into_iter()
+    .map(|fragment| (fragment.id.clone(), fragment.reference()))
+    .collect();
+  for requirement in &mut requirements {
+    for reference in &mut requirement.source_refs {
+      if let Some(authoritative) = fragments.get(&reference.fragment_id) {
+        reference.clone_from(authoritative);
+      }
+    }
   }
 
   let mut acceptance_criteria = output.acceptance_criteria;
