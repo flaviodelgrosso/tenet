@@ -8,7 +8,7 @@ use tokio::fs;
 pub const TENET_DIR: &str = ".tenet";
 pub const CONFIG_FILE: &str = "tenet.toml";
 pub const CONFIG_SCHEMA_URL: &str =
-  "https://raw.githubusercontent.com/flaviodelgrosso/tenet/main/schemas/config.schema.json";
+  "https://cdn.jsdelivr.net/gh/flaviodelgrosso/tenet@main/schemas/config.schema.json";
 pub const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

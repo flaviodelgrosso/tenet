@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/flaviodelgrosso/tenet/main/schemas/config.schema.json",
+  "$id": "https://cdn.jsdelivr.net/gh/flaviodelgrosso/tenet@main/schemas/config.schema.json",
   "title": "Tenet configuration",
   "description": "Configuration for autonomous Tenet runs.",
   "type": "object",
@@ -90,7 +90,12 @@
       "required": ["turn_timeout_secs"],
       "oneOf": [{ "required": ["id"] }, { "required": ["custom"] }],
       "properties": {
-        "id": { "type": "string", "minLength": 1, "pattern": ".*\\S.*", "description": "Canonical ACP Registry identity." },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "description": "Canonical ACP Registry identity."
+        },
         "custom": { "$ref": "#/$defs/customAgentConfig" },
         "completion_retries": { "type": "integer", "minimum": 0, "default": 2 },
         "preferences": {
@@ -107,7 +112,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "default": { "$ref": "#/$defs/rolePreference", "default": { "thought_level": "high" } },
+        "default": {
+          "$ref": "#/$defs/rolePreference",
+          "default": { "thought_level": "high" }
+        },
         "roles": { "$ref": "#/$defs/agentPreferenceRoles", "default": {} }
       }
     },
@@ -138,7 +146,10 @@
       "properties": {
         "command": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
         "args": { "$ref": "#/$defs/stringList", "default": [] },
-        "env": { "type": "object", "additionalProperties": { "type": "string" } }
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
       }
     },
     "verificationSpec": {
@@ -148,8 +159,16 @@
       "properties": {
         "program": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
         "args": { "$ref": "#/$defs/stringList", "default": [] },
-        "workingDirectory": { "type": "string", "default": ".", "minLength": 1 },
-        "environment": { "type": "object", "default": {}, "additionalProperties": { "type": "string" } }
+        "workingDirectory": {
+          "type": "string",
+          "default": ".",
+          "minLength": 1
+        },
+        "environment": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": { "type": "string" }
+        }
       }
     },
     "projectVerificationGate": {
@@ -217,7 +236,11 @@
       "additionalProperties": false,
       "required": ["max_parallel_workers"],
       "properties": {
-        "max_parallel_workers": { "type": "integer", "minimum": 1, "default": 1 }
+        "max_parallel_workers": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1
+        }
       }
     },
     "integrationConfig": {
@@ -225,7 +248,11 @@
       "additionalProperties": false,
       "required": ["strategy", "verify_each_candidate"],
       "properties": {
-        "strategy": { "type": "string", "const": "cherry_pick", "default": "cherry_pick" },
+        "strategy": {
+          "type": "string",
+          "const": "cherry_pick",
+          "default": "cherry_pick"
+        },
         "verify_each_candidate": { "type": "boolean", "default": true }
       }
     }
