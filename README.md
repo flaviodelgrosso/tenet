@@ -110,17 +110,17 @@ Tenet moves process authority out of the conversation:
                                ▼
 spec ─────────────────► ┌───────────────┐
 repo ─────────────────► │     TENET     │
-                         │               │
-                         │ requirements  │
-                         │ scheduling    │
-                         │ verification  │
-                         │ evidence      │
-                         │ integration   │
-                         │ stopping      │
-                         └───────┬───────┘
-                                 │
-                                 ▼
-                             repository
+                        │               │
+                        │ requirements  │
+                        │ scheduling    │
+                        │ verification  │
+                        │ evidence      │
+                        │ integration   │
+                        │ stopping      │
+                        └───────┬───────┘
+                                │
+                                ▼
+                            repository
 ```
 
 Agents still reason. Agents still write code. Agents still repair failures. Agents still inspect the result.
@@ -146,25 +146,25 @@ requirements + acceptance criteria + verification obligations
      │
      ▼
  Reconcile ◄──────────────────────────────────────┐
-     │                                             │
-     ▼                                             │
-bounded work unit                                  │
-     │                                             │
-     ▼                                             │
-fresh implementation session                       │
-     │                                             │
-     ▼                                             │
-isolated Git worktree                              │
-     │                                             │
-     ▼                                             │
-immutable candidate commit                         │
-     │                                             │
-     ▼                                             │
-controller-run verification                        │
-     │                                             │
-     ├── fail ──► bounded Repair ──► verify ────────┤
-     │                                             │
-     └── pass ──► controlled integration ───────────┘
+     │                                            │
+     ▼                                            │
+bounded work unit                                 │
+     │                                            │
+     ▼                                            │
+fresh implementation session                      │
+     │                                            │
+     ▼                                            │
+isolated Git worktree                             │
+     │                                            │
+     ▼                                            │
+immutable candidate commit                        │
+     │                                            │
+     ▼                                            │
+controller-run verification                       │
+     │                                            │
+     ├── fail ──► bounded Repair ──► verify ──────┤
+     │                                            │
+     └── pass ──► controlled integration ─────────┘
                                        │
                                        ▼
                                skeptical Assess
