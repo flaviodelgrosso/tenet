@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::process::Command;
@@ -59,6 +59,17 @@ pub async fn remove_worktree(repository: &Path, workspace: &Path) -> Result<()> 
   run(repository, &["worktree", "remove", "--force", workspace])
     .await
     .map(|_| ())
+}
+
+pub async fn is_worktree_registered(repository: &Path, workspace: &Path) -> Result<bool> {
+  let workspace = normalized_path(workspace);
+  let output = run(repository, &["worktree", "list", "--porcelain"]).await?;
+  Ok(
+    output
+      .lines()
+      .filter_map(|line| line.strip_prefix("worktree "))
+      .any(|registered| normalized_path(Path::new(registered)) == workspace),
+  )
 }
 
 pub async fn commit_all(cwd: &Path, message: &str) -> Result<String> {
@@ -143,6 +154,15 @@ pub async fn fast_forward(cwd: &Path, revision: &str) -> Result<()> {
     .map(|_| ())
 }
 
+fn normalized_path(path: &Path) -> PathBuf {
+  std::fs::canonicalize(path).unwrap_or_else(|_| {
+    path
+      .parent()
+      .and_then(|parent| std::fs::canonicalize(parent).ok())
+      .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+      .unwrap_or_else(|| path.to_path_buf())
+  })
+}
 async fn run(cwd: &Path, args: &[&str]) -> Result<String> {
   let output = Command::new("git")
     .args(args)

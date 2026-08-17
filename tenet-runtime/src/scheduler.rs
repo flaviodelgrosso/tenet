@@ -64,6 +64,17 @@ struct LeaseExecution {
   updates: mpsc::UnboundedSender<ExecutionUpdate>,
 }
 
+struct CandidateDeferral<'a> {
+  repository: &'a Path,
+  catalog: &'a RequirementCatalog,
+  lease: &'a WorkLease,
+  authorized_unit: &'a WorkUnit,
+  worker_summary: &'a WorkerSummary,
+  candidate_revision: &'a str,
+  changed_paths: &'a [String],
+  discoveries: &'a [WorkerDiscovery],
+}
+
 /// Supplies candidate mutations while the scheduler owns execution mechanics.
 #[async_trait]
 pub trait CandidateExecutor: Send + Sync {
@@ -356,20 +367,22 @@ async fn execute_and_commit(
         changed_paths,
       )
     };
+  let scope_unit = cumulative_scope_unit(deferred, &lease.work_unit);
 
   if let Some(discovery) =
-    scope_expansion_discovery(&lease.work_unit, &changed_paths, WorkerRole::Implement)?
+    scope_expansion_discovery(&scope_unit, &changed_paths, WorkerRole::Implement)?
   {
     discoveries.push(discovery);
-    let candidate = defer_candidate(
+    let candidate = defer_candidate(CandidateDeferral {
       repository,
       catalog,
       lease,
-      &worker_summary,
-      &candidate_revision,
-      &changed_paths,
-      &discoveries,
-    )
+      authorized_unit: &scope_unit,
+      worker_summary: &worker_summary,
+      candidate_revision: &candidate_revision,
+      changed_paths: &changed_paths,
+      discoveries: &discoveries,
+    })
     .await?;
     return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
       lease: lease.clone(),
@@ -417,28 +430,40 @@ async fn execute_and_commit(
         .events
         .emit(RunEvent::Verification(verification.clone()))
         .await?;
+      let candidate = defer_candidate(CandidateDeferral {
+        repository,
+        catalog,
+        lease,
+        authorized_unit: &scope_unit,
+        worker_summary: &worker_summary,
+        candidate_revision: &candidate_revision,
+        changed_paths: &changed_paths,
+        discoveries: &discoveries,
+      })
+      .await?;
       return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
         lease: lease.clone(),
         discoveries,
-        candidate: None,
+        candidate: Some(candidate),
       })));
     }
     candidate_revision = commit_candidate(&lease.workspace, lease).await?;
     changed_paths =
       git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
     if let Some(discovery) =
-      scope_expansion_discovery(&lease.work_unit, &changed_paths, WorkerRole::Repair)?
+      scope_expansion_discovery(&scope_unit, &changed_paths, WorkerRole::Repair)?
     {
       discoveries.push(discovery);
-      let candidate = defer_candidate(
+      let candidate = defer_candidate(CandidateDeferral {
         repository,
         catalog,
         lease,
-        &worker_summary,
-        &candidate_revision,
-        &changed_paths,
-        &discoveries,
-      )
+        authorized_unit: &scope_unit,
+        worker_summary: &worker_summary,
+        candidate_revision: &candidate_revision,
+        changed_paths: &changed_paths,
+        discoveries: &discoveries,
+      })
       .await?;
       return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
         lease: lease.clone(),
@@ -482,20 +507,24 @@ async fn execute_and_commit(
   Ok(LeaseOutcome::Verified(Box::new(execution)))
 }
 
-async fn defer_candidate(
-  repository: &Path,
-  catalog: &RequirementCatalog,
-  lease: &WorkLease,
-  worker_summary: &WorkerSummary,
-  candidate_revision: &str,
-  changed_paths: &[String],
-  discoveries: &[WorkerDiscovery],
-) -> Result<DeferredCandidate> {
+async fn defer_candidate(input: CandidateDeferral<'_>) -> Result<DeferredCandidate> {
+  let CandidateDeferral {
+    repository,
+    catalog,
+    lease,
+    authorized_unit,
+    worker_summary,
+    candidate_revision,
+    changed_paths,
+    discoveries,
+  } = input;
   let safe_id = lease.id.replace(['/', '\\'], "-");
   let git_ref = format!("refs/tenet/candidates/{safe_id}");
   git::update_ref(repository, &git_ref, candidate_revision).await?;
+  let mut deferred_lease = lease.clone();
+  deferred_lease.work_unit.scope = authorized_unit.scope.clone();
   Ok(DeferredCandidate {
-    lease: lease.clone(),
+    lease: deferred_lease,
     worker_summary: worker_summary.clone(),
     base_revision: lease.base_revision.clone(),
     candidate_revision: candidate_revision.to_owned(),
@@ -514,7 +543,7 @@ async fn validate_deferred_candidate(
 ) -> Result<()> {
   if candidate.catalog_hash != catalog.spec_hash
     || candidate.base_revision != lease.base_revision
-    || !same_authority(&candidate.lease.work_unit, &lease.work_unit)
+    || !authority_covers(&candidate.lease.work_unit, &lease.work_unit)
   {
     bail!("deferred candidate authority no longer matches the scheduled work unit");
   }
@@ -537,7 +566,7 @@ pub fn deferred_candidate_targets_unit(
   candidate: &DeferredCandidate,
   unit: &WorkUnit,
 ) -> Result<bool> {
-  if !same_authority(&candidate.lease.work_unit, unit) {
+  if !authority_covers(&candidate.lease.work_unit, unit) {
     return Ok(false);
   }
   let allowed = compile_scope(&unit.scope.paths)?;
@@ -557,19 +586,42 @@ pub fn deferred_candidate_authorized(
   if !deferred_candidate_targets_unit(candidate, unit)? {
     return Ok(false);
   }
-  let allowed = compile_scope(&unit.scope.paths)?;
+  let previous = compile_scope(&candidate.lease.work_unit.scope.paths)?;
+  let current = compile_scope(&unit.scope.paths)?;
   Ok(
     candidate
       .changed_paths
       .iter()
-      .all(|path| allowed.is_match(path)),
+      .all(|path| previous.is_match(path) || current.is_match(path)),
   )
 }
 
-fn same_authority(left: &WorkUnit, right: &WorkUnit) -> bool {
-  left.requirement_ids == right.requirement_ids
-    && left.criterion_ids == right.criterion_ids
-    && left.verification_obligation_ids == right.verification_obligation_ids
+fn cumulative_scope_unit(deferred: Option<&DeferredCandidate>, unit: &WorkUnit) -> WorkUnit {
+  let mut effective = unit.clone();
+  if let Some(deferred) = deferred {
+    effective
+      .scope
+      .paths
+      .extend(deferred.lease.work_unit.scope.paths.iter().cloned());
+    effective.scope.paths.sort();
+    effective.scope.paths.dedup();
+  }
+  effective
+}
+
+fn authority_covers(previous: &WorkUnit, current: &WorkUnit) -> bool {
+  current
+    .requirement_ids
+    .iter()
+    .all(|id| previous.requirement_ids.contains(id))
+    && current
+      .criterion_ids
+      .iter()
+      .all(|id| previous.criterion_ids.contains(id))
+    && current
+      .verification_obligation_ids
+      .iter()
+      .all(|id| previous.verification_obligation_ids.contains(id))
 }
 
 async fn reject_protected_changes(
@@ -798,6 +850,34 @@ mod tests {
       tenet_domain::model::Discovery::ScopeExpansion { paths, reason }
         if paths == ["outside.txt"] && reason.starts_with("Controller observed")
     ));
+  }
+
+  #[test]
+  fn preserved_authority_covers_a_reconciled_subset() {
+    let current = unit("A", &["A.txt"]);
+    let mut previous = current.clone();
+    previous
+      .criterion_ids
+      .push(CriterionId::from("REQ-001/AC-02"));
+    previous
+      .verification_obligation_ids
+      .push(ObligationId::from("REQ-001/AC-02/VO-01"));
+
+    assert!(authority_covers(&previous, &current));
+  }
+
+  #[test]
+  fn preserved_authority_rejects_a_reconciled_expansion() {
+    let previous = unit("A", &["A.txt"]);
+    let mut current = previous.clone();
+    current
+      .criterion_ids
+      .push(CriterionId::from("REQ-001/AC-02"));
+    current
+      .verification_obligation_ids
+      .push(ObligationId::from("REQ-001/AC-02/VO-01"));
+
+    assert!(!authority_covers(&previous, &current));
   }
 
   #[test]

@@ -378,13 +378,21 @@ impl AgentBackend for FakeBackend {
       BackendMode::ScopeMutation(_) | BackendMode::RepairScopeMutation
     ) {
       if let Some(unit) = work_units.iter_mut().find(|unit| unit.id == "A") {
-        for discovery in discoveries {
-          if let Discovery::ScopeExpansion { paths, .. } = discovery {
-            unit.scope.paths.extend(paths.iter().cloned());
-          }
+        let expanded: Vec<_> = discoveries
+          .iter()
+          .filter_map(|discovery| {
+            let Discovery::ScopeExpansion { paths, .. } = discovery else {
+              return None;
+            };
+            Some(paths.iter().cloned())
+          })
+          .flatten()
+          .collect();
+        if !expanded.is_empty() {
+          unit.scope.paths = expanded;
+          unit.scope.paths.sort();
+          unit.scope.paths.dedup();
         }
-        unit.scope.paths.sort();
-        unit.scope.paths.dedup();
       }
     }
     if matches!(
@@ -1130,7 +1138,6 @@ async fn stale_deferred_candidate_is_rejected_and_its_ref_is_removed() {
   assert_eq!(second.status, tenet_domain::model::RunStatus::Blocked);
   assert_eq!(a_attempts, 2, "stale candidate must not be reused");
   assert!(!references.contains(&first_ref));
-  assert!(second.deferred_candidates.is_empty());
 }
 #[tokio::test]
 async fn repair_candidate_outside_scope_is_preserved_and_reauthorized() {
@@ -1421,6 +1428,16 @@ async fn invalid_verification_discovery_returns_to_reconciliation_without_repair
     .discoveries
     .iter()
     .any(|record| matches!(record.discovery, Discovery::VerificationBlocker { .. })));
+  assert_eq!(state.deferred_candidates.len(), 1);
+  assert!(!run_git(
+    repository.path(),
+    &[
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/tenet/candidates",
+    ],
+  )
+  .is_empty());
   let list = run_git(repository.path(), &["worktree", "list", "--porcelain"]);
   assert_eq!(list.matches("worktree ").count(), 1);
 }

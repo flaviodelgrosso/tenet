@@ -66,12 +66,22 @@ impl WorkspaceManager {
   }
 
   pub async fn remove(&self, path: &Path) -> Result<()> {
-    if !path.exists() {
+    let registered = git::is_worktree_registered(&self.repository, path).await?;
+    if !path.exists() && !registered {
       return Ok(());
     }
-    git::remove_worktree(&self.repository, path)
-      .await
-      .with_context(|| format!("remove worktree {}", path.display()))?;
+    if registered {
+      if let Err(error) = git::remove_worktree(&self.repository, path).await {
+        if git::is_worktree_registered(&self.repository, path).await? {
+          return Err(error).with_context(|| format!("remove worktree {}", path.display()));
+        }
+      }
+    }
+    if path.exists() {
+      fs::remove_dir_all(path)
+        .await
+        .with_context(|| format!("remove residual workspace {}", path.display()))?;
+    }
     Ok(())
   }
 
