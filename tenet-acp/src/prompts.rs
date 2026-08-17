@@ -34,7 +34,7 @@ Rules:
 - Mark proposed obligation authority and dependencyScopeAuthority as agent_proposed. The controller alone may promote them.
 - Use conservative dependencyScope globs. Unknown dependency relations use ** rather than an empty or narrow guess.
 - You propose checks; only the controller executes them and establishes evidence.
-- Every verification spec must terminate on its own, be non-interactive, deterministic, self-contained, and assert its result. Never propose development servers, watch modes, or other long-lived processes as checks.
+- Every verification spec must terminate on its own, be non-interactive, deterministic, self-contained, and assert its result.
 - You are read-only. Inspect only when useful; do not modify the repository.
 - `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence.
 "#;
@@ -156,7 +156,6 @@ mod tests {
     let prompt = full_role_prompt(WorkerRole::Architect, "requirements/product.md");
 
     assert!(prompt.contains("Every verification spec must terminate on its own"));
-    assert!(prompt.contains("Never propose development servers"));
   }
 
   #[test]
