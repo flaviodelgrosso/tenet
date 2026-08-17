@@ -26,9 +26,9 @@
     },
     "spec_file": {
       "type": "string",
-      "default": ".tenet/spec.md",
+      "default": "spec.md",
       "description": "Project-relative path to the specification that drives the run.",
-      "examples": [".tenet/spec.md"]
+      "examples": ["spec.md"]
     },
     "max_cycles": {
       "type": "integer",
@@ -63,7 +63,7 @@
     "protected_paths": {
       "$ref": "#/$defs/stringList",
       "default": [
-        ".tenet/spec.md",
+        "spec.md",
         "AGENTS.md",
         "tenet.toml",
         ".tenet/state.json",
@@ -73,7 +73,7 @@
         ".tenet/run.lock"
       ],
       "description": "Project-relative paths restored if a coding worker modifies them.",
-      "examples": [[".tenet/spec.md", "AGENTS.md", "tenet.toml"]]
+      "examples": [["spec.md", "AGENTS.md", "tenet.toml"]]
     }
   },
   "$defs": {

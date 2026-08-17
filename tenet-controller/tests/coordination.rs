@@ -524,10 +524,10 @@ async fn configured_controller(
   fs::create_dir_all(repository.path().join(".tenet"))
     .await
     .expect("create tenet dir");
-  fs::write(repository.path().join(".tenet/spec.md"), "diamond")
+  fs::write(repository.path().join("spec.md"), "diamond")
     .await
     .expect("write spec");
-  run_git(repository.path(), &["add", "tenet.toml"]);
+  run_git(repository.path(), &["add", "tenet.toml", "spec.md"]);
   run_git(repository.path(), &["commit", "-m", "configure"]);
   let (_, spec_hash) = store::spec_text_and_hash(repository.path(), &config)
     .await
@@ -864,12 +864,11 @@ async fn specification_change_invalidates_completion_and_discovery_history() {
   store::write_state(repository.path(), &first)
     .await
     .expect("persist stale discovery");
-  fs::write(
-    repository.path().join(".tenet/spec.md"),
-    "changed specification",
-  )
-  .await
-  .expect("change specification");
+  fs::write(repository.path().join("spec.md"), "changed specification")
+    .await
+    .expect("change specification");
+  run_git(repository.path(), &["add", "spec.md"]);
+  run_git(repository.path(), &["commit", "-m", "change specification"]);
 
   let second = controller
     .run(CancellationToken::new())

@@ -332,7 +332,7 @@ impl Default for Config {
   fn default() -> Self {
     Self {
       version: 1,
-      spec_file: ".tenet/spec.md".into(),
+      spec_file: "spec.md".into(),
       max_cycles: 25,
       max_repair_attempts: 3,
       stagnation_limit: 3,
@@ -363,7 +363,7 @@ impl Default for Config {
         verify_each_candidate: true,
       },
       protected_paths: vec![
-        ".tenet/spec.md",
+        "spec.md",
         "AGENTS.md",
         "tenet.toml",
         ".tenet/state.json",
@@ -613,7 +613,7 @@ mod tests {
 
     assert_eq!(path, project.path().join("tenet.toml"));
     assert!(!project.path().join(TENET_DIR).join("config.toml").exists());
-    assert!(generated.contains("spec_file = \".tenet/spec.md\""));
+    assert!(generated.contains("spec_file = \"spec.md\""));
     assert!(!generated.contains("[git]"));
     assert!(!generated.contains("workspace"));
     assert!(!generated.contains("require_clean_base"));

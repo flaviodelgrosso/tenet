@@ -559,7 +559,7 @@ The spec is not a prompt asking an agent to “please implement this.”
 
 It is the reference against which the repository keeps being reconsidered.
 
-The spec path is configurable in `tenet.toml`.
+The default spec path is `spec.md`; it can be changed in `tenet.toml`.
 
 ---
 
