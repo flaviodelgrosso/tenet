@@ -27,6 +27,7 @@ pub trait AgentBackend: Send + Sync {
     recent_completed: &[CompletedWorkUnit],
     discoveries: &[Discovery],
     evidence: &[EvidenceProjection],
+    semantic_validation_feedback: Option<&str>,
   ) -> Result<ReconcileResult>;
 
   async fn implement(
@@ -49,5 +50,6 @@ pub trait AgentBackend: Send + Sync {
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
     evidence: &[EvidenceProjection],
+    semantic_validation_feedback: Option<&str>,
   ) -> Result<ReconcileResult>;
 }

@@ -5,8 +5,6 @@ spec_file = "spec.md"
 max_cycles = 25
 max_repair_attempts = 3
 
-[agent]
-
 [agent.custom]
 command = "omp"
 args = ["acp"]
@@ -35,4 +33,3 @@ gates = [
 
 [execution]
 max_parallel_workers = 3
-

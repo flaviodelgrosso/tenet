@@ -227,6 +227,9 @@ enum BackendMode {
   NeverPassingVerification,
   IncompleteAssessment,
   CleanupFailure,
+  InvalidReconcileThenCorrect,
+  InvalidAssessmentThenCorrect,
+  AlwaysInvalidReconcile,
   ScopeMutation(ScopeMutation),
   ReadOnlyMutation {
     role: tenet_domain::model::WorkerRole,
@@ -243,6 +246,8 @@ struct FakeBackend {
   max_active: AtomicUsize,
   discoveries_seen: AtomicUsize,
   repair_calls: AtomicUsize,
+  reconcile_calls: AtomicUsize,
+  semantic_feedback: Mutex<Vec<(WorkerRole, String)>>,
   assessment_calls: AtomicUsize,
 }
 
@@ -257,6 +262,8 @@ impl FakeBackend {
       waiting: Notify::new(),
       discoveries_seen: AtomicUsize::new(0),
       repair_calls: AtomicUsize::new(0),
+      reconcile_calls: AtomicUsize::new(0),
+      semantic_feedback: Mutex::new(Vec::new()),
       assessment_calls: AtomicUsize::new(0),
     }
   }
@@ -324,10 +331,27 @@ impl AgentBackend for FakeBackend {
     _recent: &[CompletedWorkUnit],
     discoveries: &[Discovery],
     _evidence: &[tenet_domain::evidence::EvidenceProjection],
+    semantic_validation_feedback: Option<&str>,
   ) -> Result<ReconcileResult> {
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Reconcile)
       .await?;
+    let reconcile_call = self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
+    if let Some(feedback) = semantic_validation_feedback {
+      self
+        .semantic_feedback
+        .lock()
+        .expect("semantic feedback lock")
+        .push((WorkerRole::Reconcile, feedback.into()));
+    }
+    if matches!(self.mode, BackendMode::InvalidReconcileThenCorrect) {
+      let marker = ctx.cwd.join("semantic-reconcile-attempt.txt");
+      if reconcile_call == 0 {
+        fs::write(marker, "discard me").await?;
+      } else if marker.exists() {
+        bail!("reconciliation retry reused a dirty inspection workspace");
+      }
+    }
     self
       .discoveries_seen
       .fetch_add(discoveries.len(), Ordering::SeqCst);
@@ -368,6 +392,11 @@ impl AgentBackend for FakeBackend {
           command: "false".into(),
         }];
       }
+    }
+    if matches!(self.mode, BackendMode::AlwaysInvalidReconcile)
+      || matches!(self.mode, BackendMode::InvalidReconcileThenCorrect) && reconcile_call == 0
+    {
+      work_units[0].verification_obligation_ids = vec![ObligationId::from("REQ-999/AC-01/VO-01")];
     }
     Ok(ReconcileResult {
       summary: if satisfied {
@@ -472,11 +501,27 @@ impl AgentBackend for FakeBackend {
     ctx: &BackendContext,
     _catalog: &RequirementCatalog,
     _evidence: &[tenet_domain::evidence::EvidenceProjection],
+    semantic_validation_feedback: Option<&str>,
   ) -> Result<ReconcileResult> {
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Assess)
       .await?;
-    self.assessment_calls.fetch_add(1, Ordering::SeqCst);
+    let assessment_call = self.assessment_calls.fetch_add(1, Ordering::SeqCst);
+    if let Some(feedback) = semantic_validation_feedback {
+      self
+        .semantic_feedback
+        .lock()
+        .expect("semantic feedback lock")
+        .push((WorkerRole::Assess, feedback.into()));
+    }
+    if matches!(self.mode, BackendMode::InvalidAssessmentThenCorrect) {
+      let marker = ctx.cwd.join("semantic-assessment-attempt.txt");
+      if assessment_call == 0 {
+        fs::write(marker, "discard me").await?;
+      } else if marker.exists() {
+        bail!("assessment retry reused a dirty inspection workspace");
+      }
+    }
     let satisfied = ["A", "B", "C", "D"]
       .iter()
       .all(|id| ctx.cwd.join(format!("{id}.txt")).exists());
@@ -501,6 +546,15 @@ impl AgentBackend for FakeBackend {
         summary: "assessment still finds a gap".into(),
         requirements: vec![assessment(false)],
         work_units: vec![unit("assessment-gap", &[])],
+      });
+    }
+    if matches!(self.mode, BackendMode::InvalidAssessmentThenCorrect) && assessment_call == 0 {
+      let mut invalid = unit("assessment-invalid", &[]);
+      invalid.verification_obligation_ids = vec![ObligationId::from("REQ-999/AC-01/VO-01")];
+      return Ok(ReconcileResult {
+        summary: "malformed assessment".into(),
+        requirements: vec![assessment(satisfied)],
+        work_units: vec![invalid],
       });
     }
     Ok(ReconcileResult {
@@ -627,6 +681,91 @@ async fn assess_uncommitted_mutation_is_discarded_after_final_verification() {
 #[tokio::test]
 async fn assess_committed_mutation_is_discarded_after_final_verification() {
   assert_read_only_role_is_isolated(tenet_domain::model::WorkerRole::Assess, true).await;
+}
+
+#[tokio::test]
+async fn malformed_reconciliation_is_retried_with_feedback_and_corrected() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::InvalidReconcileThenCorrect));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("corrected reconciliation proceeds");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert!(!repository
+    .path()
+    .join("semantic-reconcile-attempt.txt")
+    .exists());
+  let feedback = backend
+    .semantic_feedback
+    .lock()
+    .expect("semantic feedback lock");
+  assert_eq!(feedback.len(), 1);
+  assert_eq!(feedback[0].0, WorkerRole::Reconcile);
+  assert!(feedback[0]
+    .1
+    .contains("A targets unknown verification obligation REQ-999/AC-01/VO-01"));
+  assert!(feedback[0]
+    .1
+    .contains("Do not guess, repair, or normalize identifiers"));
+}
+
+#[tokio::test]
+async fn malformed_assessment_is_retried_with_feedback_and_corrected() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::InvalidAssessmentThenCorrect));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("corrected assessment proceeds");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 2);
+  assert!(!repository
+    .path()
+    .join("semantic-assessment-attempt.txt")
+    .exists());
+  let feedback = backend
+    .semantic_feedback
+    .lock()
+    .expect("semantic feedback lock");
+  assert_eq!(feedback.len(), 1);
+  assert_eq!(feedback[0].0, WorkerRole::Assess);
+  assert!(feedback[0]
+    .1
+    .contains("assessment-invalid targets unknown verification obligation REQ-999/AC-01/VO-01"));
+}
+
+#[tokio::test]
+async fn exhausted_semantic_retries_return_precise_validation_error() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::AlwaysInvalidReconcile));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  rewrite_config(&repository, |config| config.agent.completion_retries = 1).await;
+
+  let error = controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("invalid reconciliation exhausts retries");
+
+  assert_eq!(
+    error.to_string(),
+    "A targets unknown verification obligation REQ-999/AC-01/VO-01"
+  );
+  assert_eq!(backend.reconcile_calls.load(Ordering::SeqCst), 2);
+  let feedback = backend
+    .semantic_feedback
+    .lock()
+    .expect("semantic feedback lock");
+  assert_eq!(feedback.len(), 1);
+  assert!(feedback.iter().all(
+    |(role, message)| *role == WorkerRole::Reconcile && message.contains("REQ-999/AC-01/VO-01")
+  ));
 }
 
 #[tokio::test]

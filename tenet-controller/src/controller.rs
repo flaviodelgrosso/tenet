@@ -279,25 +279,32 @@ impl Controller {
         .collect();
       let evidence_for_worker = evidence_graph::projections(&evidence_graph)?;
       let backend = self.backend.clone();
-      let mut reconciliation = self
-        .read_only_worker(
+      let reconciliation = self
+        .validated_read_only_proposal(
           context,
+          &catalog,
           "reconciliation",
-          move |inspection_context| async move {
-            backend
-              .reconcile(
-                &inspection_context,
-                &catalog_for_worker,
-                &completed_for_worker,
-                &discoveries_for_worker,
-                &evidence_for_worker,
-              )
-              .await
+          move |inspection_context, feedback| {
+            let backend = backend.clone();
+            let catalog = catalog_for_worker.clone();
+            let completed = completed_for_worker.clone();
+            let discoveries = discoveries_for_worker.clone();
+            let evidence = evidence_for_worker.clone();
+            async move {
+              backend
+                .reconcile(
+                  &inspection_context,
+                  &catalog,
+                  &completed,
+                  &discoveries,
+                  &evidence,
+                  feedback.as_deref(),
+                )
+                .await
+            }
           },
         )
         .await?;
-      normalize_reconcile_relationships(&catalog, &mut reconciliation)?;
-      validate_reconcile(&catalog, &reconciliation)?;
       let graph = WorkGraph::from_reconcile(&catalog, &reconciliation)?;
       let fingerprint = progress_fingerprint(&self.cwd, &catalog, &reconciliation, state).await?;
       if advance_stagnation(state, fingerprint, context.config.stagnation_limit) {
@@ -659,22 +666,27 @@ impl Controller {
     let evidence_for_worker = evidence_graph::projections(evidence_graph)?;
     let backend = self.backend.clone();
     let assessment = self
-      .read_only_worker(
+      .validated_read_only_proposal(
         context,
+        catalog,
         "assessment",
-        move |inspection_context| async move {
-          backend
-            .assess(
-              &inspection_context,
-              &catalog_for_worker,
-              &evidence_for_worker,
-            )
-            .await
+        move |inspection_context, feedback| {
+          let backend = backend.clone();
+          let catalog = catalog_for_worker.clone();
+          let evidence = evidence_for_worker.clone();
+          async move {
+            backend
+              .assess(
+                &inspection_context,
+                &catalog,
+                &evidence,
+                feedback.as_deref(),
+              )
+              .await
+          }
         },
       )
       .await?;
-    validate_reconcile(catalog, &assessment)?;
-    WorkGraph::from_reconcile(catalog, &assessment)?;
     store::write_roadmap(&self.cwd, &assessment).await?;
     state.requirement_counts = requirement_counts(catalog, &assessment, evidence_graph)?;
     state.last_summary.clone_from(&assessment.summary);
@@ -809,6 +821,43 @@ impl Controller {
       bail!("final verification command modified canonical repository state");
     }
     result
+  }
+
+  async fn validated_read_only_proposal<F, Fut>(
+    &self,
+    context: &BackendContext,
+    catalog: &RequirementCatalog,
+    name: &str,
+    generate: F,
+  ) -> Result<ReconcileResult>
+  where
+    F: Fn(BackendContext, Option<String>) -> Fut + Clone,
+    Fut: Future<Output = Result<ReconcileResult>>,
+  {
+    let mut feedback = None;
+    for attempt in 0..=context.config.agent.completion_retries {
+      let generate = generate.clone();
+      let attempt_feedback = feedback.clone();
+      let mut result = self
+        .read_only_worker(context, name, move |inspection_context| {
+          generate(inspection_context, attempt_feedback)
+        })
+        .await?;
+      let validation = normalize_reconcile_relationships(catalog, &mut result);
+      let validation = validation
+        .and_then(|()| validate_reconcile(catalog, &result))
+        .and_then(|()| WorkGraph::from_reconcile(catalog, &result).map(|_| ()));
+      match validation {
+        Ok(()) => return Ok(result),
+        Err(error) if attempt == context.config.agent.completion_retries => return Err(error),
+        Err(error) => {
+          feedback = Some(format!(
+            "{error:#}\nUse requirement, criterion, and verification-obligation IDs exactly as supplied by the authoritative catalog. Do not guess, repair, or normalize identifiers."
+          ));
+        }
+      }
+    }
+    unreachable!("semantic proposal retry loop always returns")
   }
 
   async fn read_only_worker<T, F, Fut>(

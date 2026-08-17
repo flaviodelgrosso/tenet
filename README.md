@@ -263,6 +263,8 @@ Assess may veto completion by proposing a concrete gap and work, but it cannot a
 
 Architect, Reconcile, and Assess run in disposable detached worktrees at the exact canonical revision they inspect. Their worktrees are always discarded. Tenet also compares canonical `HEAD` and canonical status before and after each read-only worker; any unexpected change fails the run. ACP permission requests from these roles are rejected rather than automatically granted.
 
+Reconcile and Assess results must also pass deterministic catalog relationship validation and work-graph construction. Invalid semantic output is regenerated with the exact validation failure for up to `agent.completion_retries` additional attempts, each in a fresh disposable read-only worktree. Tenet never guesses or rewrites malformed identifiers; retry exhaustion returns the validation error.
+
 Implement and Repair run in leased detached worktrees. Before Tenet accepts a candidate, every added, modified, deleted, renamed, generated, mode-changed, or symlink path must match the current work unit's declared scope. A worker can request wider authority only by returning a `scope_expansion` discovery for a later reconciliation; the current out-of-scope candidate is rejected.
 
 Candidates are committed before verification. Suggested checks and configured project gates run in disposable worktrees at that immutable commit, so relative command effects cannot alter the commit that is integrated. Protected paths are compared as repository objects, including recursive directories, file contents, executable mode, symlink targets, additions, and deletions. Configured protected paths must be normalized repository-relative paths.
