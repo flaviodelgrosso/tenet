@@ -16,6 +16,8 @@ Do not use markdown or add prose around the JSON value.
 Use an MCP `tenet_yield` tool only if it is supplied and available; it is optional and never mandatory.
 "#;
 
+const SPEC_PATH_LABEL: &str = "Configured authoritative specification path";
+
 const ARCHITECT: &str = r#"You are the architecture layer of an autonomous spec-driven development controller.
 
 Translate the authoritative product spec into a stable, exhaustive catalog of independently verifiable product requirements, acceptance criteria, and verification obligations.
@@ -59,7 +61,7 @@ const IMPLEMENT: &str = r#"You are the implementation layer of an autonomous spe
 Implement only the assigned work unit while respecting the product specification and repository conventions.
 
 Constraints:
-- .tenet/spec.md, tenet.toml, .tenet/, and AGENTS.md are controller-protected and must never be modified.
+- The configured authoritative specification, tenet.toml, .tenet/, and AGENTS.md are controller-protected and must never be modified.
 - Do not claim completion for unrelated requirements.
 - Report newly found dependencies, blockers, and scope expansions only through structured discoveries.
 - Never modify the work graph or coordinate with other workers.
@@ -70,7 +72,7 @@ const REPAIR: &str = r#"You are the repair layer of an autonomous spec-driven de
 Repair the assigned work unit using the deterministic verification evidence.
 
 Constraints:
-- Do not edit .tenet/spec.md, tenet.toml, .tenet/, or AGENTS.md.
+- Do not edit the configured authoritative specification, tenet.toml, .tenet/, or AGENTS.md.
 - Do not weaken verification or tests to obtain a green result.
 - If the evidence shows that a suggested check is invalid or its environment prevents the command from running, do not modify product code to compensate; report a blocker discovery naming the command and cause.
 - Report newly found dependencies, blockers, and scope expansions only through structured discoveries.
@@ -94,8 +96,12 @@ Rules:
 - `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence. Independently verify source/tests/configuration.
 "#;
 
-pub fn full_role_prompt(role: WorkerRole) -> String {
-  format!("{}{}", role_prompt(role), COMMON_END)
+pub fn full_role_prompt(role: WorkerRole, spec_file: &str) -> String {
+  format!(
+    "{}\n{SPEC_PATH_LABEL}: `{spec_file}`.\n{}",
+    role_prompt(role),
+    COMMON_END
+  )
 }
 
 #[cfg(test)]
@@ -105,14 +111,14 @@ mod tests {
   #[test]
   fn planning_roles_isolate_application_state_without_hiding_tools() {
     for role in [WorkerRole::Reconcile, WorkerRole::Assess] {
-      let prompt = full_role_prompt(role);
+      let prompt = full_role_prompt(role, "requirements/product.md");
       assert!(prompt.contains("Isolate application state without hiding verification tooling"));
     }
   }
 
   #[test]
   fn reconcile_proposes_implementation_and_evidence_gaps_without_verification_authority() {
-    let prompt = full_role_prompt(WorkerRole::Reconcile);
+    let prompt = full_role_prompt(WorkerRole::Reconcile, "requirements/product.md");
 
     assert!(prompt.contains("Report implementationState independently from verification"));
     assert!(prompt.contains("missingEvidence"));
@@ -121,7 +127,7 @@ mod tests {
 
   #[test]
   fn assess_is_a_skeptical_gap_finder_not_completion_oracle() {
-    let prompt = full_role_prompt(WorkerRole::Assess);
+    let prompt = full_role_prompt(WorkerRole::Assess, "requirements/product.md");
 
     assert!(prompt.contains("skeptical"));
     assert!(prompt.contains("stale evidence as gaps"));
@@ -130,8 +136,18 @@ mod tests {
 
   #[test]
   fn repair_role_reports_invalid_checks_without_product_changes() {
-    let prompt = full_role_prompt(WorkerRole::Repair);
+    let prompt = full_role_prompt(WorkerRole::Repair, "requirements/product.md");
 
     assert!(prompt.contains("report a blocker discovery naming the command and cause"));
+  }
+
+  #[test]
+  fn role_prompt_names_the_configured_specification_path() {
+    let prompt = full_role_prompt(WorkerRole::Implement, "requirements/product.md");
+
+    assert!(
+      prompt.contains("Configured authoritative specification path: `requirements/product.md`")
+    );
+    assert!(!prompt.contains(".tenet/spec.md"));
   }
 }

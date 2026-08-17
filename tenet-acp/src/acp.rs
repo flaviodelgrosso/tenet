@@ -271,7 +271,7 @@ impl AcpRuntime {
       worker_id: ctx.worker_id.clone(),
       lease_id: ctx.lease_id.clone(),
       work_unit_id: ctx.work_unit_id.clone(),
-      prompt: build_worker_prompt(role, &schema, &prompt)?,
+      prompt: build_worker_prompt(role, &ctx.config.spec_file, &schema, &prompt)?,
       cwd: ctx.cwd.clone(),
       runtime_dir: ctx.runtime_dir.clone(),
       schema,
@@ -1155,10 +1155,15 @@ where
   }
 }
 
-fn build_worker_prompt(role: WorkerRole, schema: &Value, work_context: &str) -> Result<String> {
+fn build_worker_prompt(
+  role: WorkerRole,
+  spec_file: &str,
+  schema: &Value,
+  work_context: &str,
+) -> Result<String> {
   Ok(format!(
     "{}\n\nROLE OUTPUT SCHEMA (return exactly one JSON value and no surrounding prose):\n{}\n\nWORK CONTEXT:\n{}",
-    full_role_prompt(role),
+    full_role_prompt(role, spec_file),
     serde_json::to_string_pretty(schema)?,
     work_context
   ))

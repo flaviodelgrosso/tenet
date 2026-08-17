@@ -726,7 +726,10 @@ impl Controller {
       state.discoveries.clear();
     }
     let architect_spec = catalog::annotated_specification(&spec);
-    state.last_summary = "Deriving requirement catalog from .tenet/spec.md".into();
+    state.last_summary = format!(
+      "Deriving requirement catalog from {}",
+      context.config.spec_file
+    );
     self.publish(&context.events, state).await?;
     let backend = self.backend.clone();
     let output = self

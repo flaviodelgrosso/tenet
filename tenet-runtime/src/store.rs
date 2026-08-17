@@ -34,6 +34,9 @@ pub async fn ensure_layout(cwd: &Path) -> Result<()> {
 pub async fn ensure_spec(cwd: &Path, config: &Config) -> Result<()> {
   let path = cwd.join(&config.spec_file);
   if !path.exists() {
+    if let Some(parent) = path.parent() {
+      fs::create_dir_all(parent).await?;
+    }
     fs::write(path, SPEC_TEMPLATE).await?;
   }
   Ok(())
@@ -395,6 +398,20 @@ mod tests {
     state.phase = tenet_domain::model::Phase::Reconciling;
 
     assert!(validate_state(&state).is_err());
+  }
+
+  #[tokio::test]
+  async fn ensure_spec_uses_the_configured_nested_path() {
+    let project = tempfile::tempdir().expect("temporary project");
+    let mut config = Config::default();
+    config.spec_file = "requirements/product.md".into();
+
+    ensure_spec(project.path(), &config)
+      .await
+      .expect("create configured spec");
+
+    assert!(project.path().join("requirements/product.md").exists());
+    assert!(!project.path().join(TENET_DIR).join("spec.md").exists());
   }
 
   #[tokio::test]
