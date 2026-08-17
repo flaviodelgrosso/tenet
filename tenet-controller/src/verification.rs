@@ -1,25 +1,41 @@
 //! Verification authorization and obligation-bound request construction.
 
+use anyhow::{bail, Result};
 use tenet_domain::{
   ids::VerificationRunId, model::RequirementCatalog, verification::VerificationExecutionRequest,
 };
 
-/// Constructs authorized execution requests for every required catalog obligation.
+/// Constructs obligation-bound requests only when every required check has trusted authority.
 pub fn required_requests(
   catalog: &RequirementCatalog,
   run_id: VerificationRunId,
-) -> Vec<VerificationExecutionRequest> {
-  catalog
+) -> Result<Vec<VerificationExecutionRequest>> {
+  let untrusted = catalog
     .verification_obligations
     .iter()
-    .filter(|obligation| obligation.required)
-    .map(|obligation| VerificationExecutionRequest {
-      run_id,
-      obligation_id: obligation.id.clone(),
-      spec: obligation.spec.clone(),
-      authority: obligation.authority,
-    })
-    .collect()
+    .filter(|obligation| obligation.required && !obligation.authority.is_trusted())
+    .map(|obligation| obligation.id.to_string())
+    .collect::<Vec<_>>();
+  if !untrusted.is_empty() {
+    bail!(
+      "required verification obligations lack trusted execution authority: {}",
+      untrusted.join(", ")
+    );
+  }
+
+  Ok(
+    catalog
+      .verification_obligations
+      .iter()
+      .filter(|obligation| obligation.required)
+      .map(|obligation| VerificationExecutionRequest {
+        run_id,
+        obligation_id: obligation.id.clone(),
+        spec: obligation.spec.clone(),
+        authority: obligation.authority,
+      })
+      .collect(),
+  )
 }
 
 #[cfg(test)]
@@ -66,7 +82,8 @@ mod tests {
     let requests = required_requests(
       &catalog(VerificationAuthority::ProjectConfigured),
       VerificationRunId::new(),
-    );
+    )
+    .expect("trusted request");
 
     assert_eq!(
       requests[0].obligation_id,
@@ -75,13 +92,14 @@ mod tests {
   }
 
   #[test]
-  fn agent_proposed_authority_remains_advisory() {
-    let requests = required_requests(
+  fn agent_proposed_obligation_is_not_executed_as_final_verification() {
+    let error = required_requests(
       &catalog(VerificationAuthority::AgentProposed),
       VerificationRunId::new(),
-    );
+    )
+    .expect_err("agent-proposed command must remain advisory");
 
-    assert_eq!(requests[0].authority, VerificationAuthority::AgentProposed);
+    assert!(error.to_string().contains("REQ-001/AC-01/VO-01"));
   }
 
   #[test]
@@ -89,7 +107,8 @@ mod tests {
     let requests = required_requests(
       &catalog(VerificationAuthority::ProjectConfigured),
       VerificationRunId::new(),
-    );
+    )
+    .expect("trusted request");
 
     assert!(requests[0].authority.is_trusted());
   }

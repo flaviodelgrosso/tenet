@@ -24,6 +24,7 @@ use tenet_domain::{
     ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus, State,
     VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
   },
+  verification::VerificationExecutionRequest,
 };
 
 use tenet_runtime::{
@@ -691,8 +692,15 @@ impl Controller {
     state.phase = Phase::Verifying;
     state.last_summary = "Running final deterministic verification".into();
     self.publish(&context.events, state).await?;
+    let requests = match verification::required_requests(catalog, VerificationRunId::new()) {
+      Ok(requests) => requests,
+      Err(error) => {
+        let reason = format!("Final deterministic verification unavailable: {error}");
+        return Ok(Some(self.block(context, state, &reason).await?));
+      }
+    };
     let report = self
-      .verify_revision(context, &verified_revision, catalog)
+      .verify_revision(context, &verified_revision, &requests)
       .await?;
     context
       .events
@@ -865,7 +873,7 @@ impl Controller {
     &self,
     context: &BackendContext,
     revision: &str,
-    catalog: &RequirementCatalog,
+    requests: &[VerificationExecutionRequest],
   ) -> Result<VerificationReport> {
     let canonical_before = git::repository_state(&self.cwd).await?;
     let run_id = context
@@ -877,11 +885,10 @@ impl Controller {
     let workspace = workspaces
       .create_disposable("final-verification", revision)
       .await?;
-    let requests = verification::required_requests(catalog, VerificationRunId::new());
     let result = verifier::run_execution_requests_cancelled(
       &workspace,
       &context.config,
-      &requests,
+      requests,
       &context.cancel,
     )
     .await;
@@ -1397,7 +1404,7 @@ pub async fn manual_verify(cwd: &Path) -> Result<VerificationReport> {
   let (specification, _) = store::spec_text_and_hash(cwd, &config).await?;
   catalog::validate_coverage(&catalog, &specification)?;
   let revision = git::head(cwd).await?;
-  let requests = verification::required_requests(&catalog, VerificationRunId::new());
+  let requests = verification::required_requests(&catalog, VerificationRunId::new())?;
   let report =
     verifier::run_execution_requests_cancelled(cwd, &config, &requests, &CancellationToken::new())
       .await?;
