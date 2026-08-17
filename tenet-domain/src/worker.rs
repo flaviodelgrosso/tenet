@@ -281,6 +281,19 @@ impl WorkUnit {
     if self.scope.paths.is_empty() || self.scope.paths.iter().any(|path| path.trim().is_empty()) {
       return Err(DomainValidationError::EmptyWorkScope(self.id.clone()));
     }
+    if let Some(path) = self
+      .scope
+      .paths
+      .iter()
+      .map(|path| path.trim())
+      .find(|path| path.ends_with('/'))
+    {
+      return Err(DomainValidationError::NonRecursiveDirectoryScope {
+        work_unit_id: self.id.clone(),
+        path: path.into(),
+        recursive: format!("{path}**"),
+      });
+    }
     for check in &self.suggested_checks {
       if check.command.trim().is_empty() || check.command.contains(['\r', '\n', '`']) {
         return Err(DomainValidationError::InvalidSuggestedCheck {
@@ -358,6 +371,36 @@ mod tests {
       Err(DomainValidationError::UnknownRequirement {
         work_unit_id: "WU-001".into(),
         requirement_id: "REQ-002".into(),
+      })
+    );
+  }
+
+  #[test]
+  fn work_unit_validation_rejects_directory_scope_without_recursive_glob() {
+    let unit = WorkUnit {
+      id: "WU-001".into(),
+      title: "Implement requirement".into(),
+      objective: "Make behavior observable".into(),
+      requirement_ids: vec![RequirementId::from("REQ-001")],
+      criterion_ids: vec![CriterionId::from("REQ-001/AC-01")],
+      verification_obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
+      suggested_checks: Vec::new(),
+      depends_on: Vec::new(),
+      scope: WorkScope {
+        paths: vec!["src/".into()],
+      },
+    };
+
+    assert_eq!(
+      unit.validate(
+        &BTreeSet::from([RequirementId::from("REQ-001")]),
+        &BTreeSet::from([CriterionId::from("REQ-001/AC-01")]),
+        &BTreeSet::from([ObligationId::from("REQ-001/AC-01/VO-01")]),
+      ),
+      Err(DomainValidationError::NonRecursiveDirectoryScope {
+        work_unit_id: "WU-001".into(),
+        path: "src/".into(),
+        recursive: "src/**".into(),
       })
     );
   }

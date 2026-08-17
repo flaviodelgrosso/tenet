@@ -49,7 +49,8 @@ Rules:
 - If implementation work remains, propose the smallest coherent dependency graph of candidate work units.
 - Bind every proposed check to an existing verification obligation. Each command must be executable, non-interactive, deterministic, self-contained, and perform its own assertion.
 - Work units must name explicit requirementIds, criterionIds, verificationObligationIds, dependencies, and conservative path scopes.
-- Incorporate structured worker discoveries into a revised proposal. Never treat discoveries as direct graph mutations.
+- Work-unit scope paths are repository-relative glob patterns. To authorize a directory tree use `path/**`; a trailing-slash path such as `path/` does not include descendants and is invalid.
+- Incorporate structured worker- and controller-derived discoveries into a revised proposal. Never treat discoveries as direct graph mutations.
 - Treat a `verification_blocker` discovery as evidence that the prior suggested check is invalid: replace it with an environment-safe check and never re-propose the blocked command unchanged.
 - Checks must not depend on external network access, mutable user state, a previous check, or an executable produced outside the command.
 - Isolate application state without hiding verification tooling. Prefer application-specific state overrides; otherwise resolve tools and dependencies before isolation, invoke produced artifacts by explicit path, and preserve unrelated environment needed by the command runner.
@@ -91,6 +92,7 @@ Rules:
 - If implementation work remains, propose the smallest coherent dependency graph of candidate work units.
 - Bind every suggested check to an existing verification obligation and provide one executable, non-interactive command that performs its own assertion.
 - Declare explicit requirement, criterion, and obligation relationships, dependencies, and conservative path scopes; never decide concurrency.
+- Work-unit scope paths are repository-relative glob patterns. To authorize a directory tree use `path/**`; a trailing-slash path such as `path/` does not include descendants and is invalid.
 - Checks must be deterministic and self-contained: do not depend on external network access, mutable user state, a previous check, or an executable produced outside the command.
 - Isolate application state without hiding verification tooling. Prefer application-specific state overrides; otherwise resolve tools and dependencies before isolation, invoke produced artifacts by explicit path, and preserve unrelated environment needed by the command runner.
 - Do not modify the repository. You are read-only.
@@ -118,12 +120,22 @@ mod tests {
   }
 
   #[test]
+  fn planning_roles_require_recursive_directory_globs() {
+    for role in [WorkerRole::Reconcile, WorkerRole::Assess] {
+      let prompt = full_role_prompt(role, "requirements/product.md");
+      assert!(prompt.contains("use `path/**`"));
+      assert!(prompt.contains("`path/` does not include descendants and is invalid"));
+    }
+  }
+
+  #[test]
   fn reconcile_proposes_implementation_and_evidence_gaps_without_verification_authority() {
     let prompt = full_role_prompt(WorkerRole::Reconcile, "requirements/product.md");
 
     assert!(prompt.contains("Report implementationState independently from verification"));
     assert!(prompt.contains("missingEvidence"));
     assert!(prompt.contains("Do not declare requirements verified or complete"));
+    assert!(prompt.contains("controller-derived discoveries"));
   }
 
   #[test]

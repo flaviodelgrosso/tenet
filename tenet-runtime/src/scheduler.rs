@@ -284,7 +284,15 @@ async fn execute_and_commit(
   let mut candidate_revision = commit_candidate(&lease.workspace, lease).await?;
   let mut changed_paths =
     git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
-  validate_changed_paths(&lease.work_unit, &changed_paths)?;
+  if let Some(discovery) =
+    scope_expansion_discovery(&lease.work_unit, &changed_paths, WorkerRole::Implement)?
+  {
+    discoveries.push(discovery);
+    return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
+      lease: lease.clone(),
+      discoveries,
+    })));
+  }
   let mut verification =
     verify_candidate(repository, context, &candidate_revision, &lease.work_unit).await?;
 
@@ -333,7 +341,15 @@ async fn execute_and_commit(
     candidate_revision = commit_candidate(&lease.workspace, lease).await?;
     changed_paths =
       git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
-    validate_changed_paths(&lease.work_unit, &changed_paths)?;
+    if let Some(discovery) =
+      scope_expansion_discovery(&lease.work_unit, &changed_paths, WorkerRole::Repair)?
+    {
+      discoveries.push(discovery);
+      return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
+        lease: lease.clone(),
+        discoveries,
+      })));
+    }
     verification =
       verify_candidate(repository, context, &candidate_revision, &lease.work_unit).await?;
   }
@@ -436,21 +452,28 @@ async fn verify_candidate(
   result
 }
 
-fn validate_changed_paths(unit: &WorkUnit, changed_paths: &[String]) -> Result<()> {
+fn scope_expansion_discovery(
+  unit: &WorkUnit,
+  changed_paths: &[String],
+  role: WorkerRole,
+) -> Result<Option<WorkerDiscovery>> {
   let allowed = compile_scope(&unit.scope.paths)?;
-  let unauthorized: Vec<_> = changed_paths
+  let paths: Vec<_> = changed_paths
     .iter()
     .filter(|path| !allowed.is_match(path))
     .cloned()
     .collect();
-  if !unauthorized.is_empty() {
-    bail!(
-      "candidate {} changed paths outside its declared scope: {}",
-      unit.id,
-      unauthorized.join(", ")
-    );
+  if paths.is_empty() {
+    return Ok(None);
   }
-  Ok(())
+  Ok(Some(WorkerDiscovery {
+    discovery: tenet_domain::model::Discovery::ScopeExpansion {
+      paths,
+      reason: "Controller observed candidate changes outside the declared scope. The candidate was discarded; reconciliation must explicitly approve these paths before they can be integrated."
+        .into(),
+    },
+    role,
+  }))
 }
 
 const MANDATORY_PROTECTED_PATHS: [&str; 3] = ["AGENTS.md", "tenet.toml", ".tenet"];
@@ -557,6 +580,36 @@ mod tests {
         paths: paths.iter().map(|path| (*path).into()).collect(),
       },
     }
+  }
+
+  #[test]
+  fn malformed_scope_glob_remains_fatal() {
+    let error = scope_expansion_discovery(
+      &unit("A", &["["]),
+      &["outside.txt".into()],
+      WorkerRole::Implement,
+    )
+    .expect_err("malformed glob must not become a scope expansion");
+
+    assert!(error.to_string().contains("invalid scope glob ["));
+  }
+
+  #[test]
+  fn controller_observed_scope_expansion_preserves_exact_paths() {
+    let discovery = scope_expansion_discovery(
+      &unit("A", &["A.txt"]),
+      &["A.txt".into(), "outside.txt".into()],
+      WorkerRole::Repair,
+    )
+    .expect("valid scope")
+    .expect("scope expansion");
+
+    assert_eq!(discovery.role, WorkerRole::Repair);
+    assert!(matches!(
+      discovery.discovery,
+      tenet_domain::model::Discovery::ScopeExpansion { paths, reason }
+        if paths == ["outside.txt"] && reason.starts_with("Controller observed")
+    ));
   }
 
   #[test]

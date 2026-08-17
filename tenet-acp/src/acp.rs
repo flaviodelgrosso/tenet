@@ -132,7 +132,7 @@ impl AgentBackend for AcpRuntime {
     evidence: &[EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
   ) -> Result<ReconcileResult> {
-    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository implementation against this catalog. Inspect it directly. Identify implementation gaps and missing evidence; propose a dependency graph of candidate work units when implementation work remains. The controller alone decides verification and concurrency.\n\nCatalog:\n{}\n\nController-derived evidence projections:\n{}\n\nRecent completed work:\n{}\n\nWorker discoveries requiring reconsideration:\n{}{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(evidence)?, serde_json::to_string_pretty(recent)?, serde_json::to_string_pretty(discoveries)?, semantic_feedback(semantic_validation_feedback))).await
+    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository implementation against this catalog. Inspect it directly. Identify implementation gaps and missing evidence; propose a dependency graph of candidate work units when implementation work remains. The controller alone decides verification and concurrency.\n\nCatalog:\n{}\n\nController-derived evidence projections:\n{}\n\nRecent completed work:\n{}\n\nWorker- and controller-derived discoveries requiring reconsideration:\n{}{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(evidence)?, serde_json::to_string_pretty(recent)?, serde_json::to_string_pretty(discoveries)?, semantic_feedback(semantic_validation_feedback))).await
   }
 
   async fn implement(

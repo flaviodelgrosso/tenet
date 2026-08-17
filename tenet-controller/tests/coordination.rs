@@ -230,6 +230,10 @@ enum BackendMode {
   InvalidReconcileThenCorrect,
   InvalidAssessmentThenCorrect,
   AlwaysInvalidReconcile,
+  InvalidScopeThenCorrect,
+  InvalidAssessmentScopeThenCorrect,
+  RepairScopeMutation,
+  UnapprovedScopeMutation,
   ScopeMutation(ScopeMutation),
   ReadOnlyMutation {
     role: tenet_domain::model::WorkerRole,
@@ -369,7 +373,24 @@ impl AgentBackend for FakeBackend {
         .depends_on
         .retain(|dependency| missing.contains(dependency.as_str()));
     }
-    if matches!(self.mode, BackendMode::RepairDiscovery) {
+    if matches!(
+      self.mode,
+      BackendMode::ScopeMutation(_) | BackendMode::RepairScopeMutation
+    ) {
+      if let Some(unit) = work_units.iter_mut().find(|unit| unit.id == "A") {
+        for discovery in discoveries {
+          if let Discovery::ScopeExpansion { paths, .. } = discovery {
+            unit.scope.paths.extend(paths.iter().cloned());
+          }
+        }
+        unit.scope.paths.sort();
+        unit.scope.paths.dedup();
+      }
+    }
+    if matches!(
+      self.mode,
+      BackendMode::RepairDiscovery | BackendMode::RepairScopeMutation
+    ) {
       if let Some(unit) = work_units.iter_mut().find(|unit| unit.id == "A") {
         unit.suggested_checks = vec![CandidateCheck {
           obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
@@ -397,6 +418,9 @@ impl AgentBackend for FakeBackend {
       || matches!(self.mode, BackendMode::InvalidReconcileThenCorrect) && reconcile_call == 0
     {
       work_units[0].verification_obligation_ids = vec![ObligationId::from("REQ-999/AC-01/VO-01")];
+    }
+    if matches!(self.mode, BackendMode::InvalidScopeThenCorrect) && reconcile_call == 0 {
+      work_units[0].scope.paths = vec!["src/".into()];
     }
     Ok(ReconcileResult {
       summary: if satisfied {
@@ -446,6 +470,9 @@ impl AgentBackend for FakeBackend {
         BackendMode::ScopeMutation(ScopeMutation::Rename) => {
           fs::rename(ctx.cwd.join("README.txt"), ctx.cwd.join("renamed.txt")).await?;
         }
+        BackendMode::UnapprovedScopeMutation => {
+          fs::write(ctx.cwd.join("outside.txt"), "unauthorized addition").await?;
+        }
         _ => {}
       }
     }
@@ -480,6 +507,11 @@ impl AgentBackend for FakeBackend {
     let repair_number = self.repair_calls.fetch_add(1, Ordering::SeqCst) + 1;
     if matches!(self.mode, BackendMode::NeverPassingVerification) && work_unit.id == "A" {
       fs::write(ctx.cwd.join("A.txt"), format!("repair-{repair_number}")).await?;
+      return Ok(summary(Vec::new()));
+    }
+    if matches!(self.mode, BackendMode::RepairScopeMutation) && work_unit.id == "A" {
+      fs::write(ctx.cwd.join("A.txt"), "repaired").await?;
+      fs::write(ctx.cwd.join("outside.txt"), "repair expansion").await?;
       return Ok(summary(Vec::new()));
     }
     if matches!(self.mode, BackendMode::RepairDiscovery) && work_unit.id == "A" {
@@ -553,6 +585,15 @@ impl AgentBackend for FakeBackend {
       invalid.verification_obligation_ids = vec![ObligationId::from("REQ-999/AC-01/VO-01")];
       return Ok(ReconcileResult {
         summary: "malformed assessment".into(),
+        requirements: vec![assessment(satisfied)],
+        work_units: vec![invalid],
+      });
+    }
+    if matches!(self.mode, BackendMode::InvalidAssessmentScopeThenCorrect) && assessment_call == 0 {
+      let mut invalid = unit("assessment-scope", &[]);
+      invalid.scope.paths = vec!["src/".into()];
+      return Ok(ReconcileResult {
+        summary: "malformed assessment scope".into(),
         requirements: vec![assessment(satisfied)],
         work_units: vec![invalid],
       });
@@ -681,6 +722,54 @@ async fn assess_uncommitted_mutation_is_discarded_after_final_verification() {
 #[tokio::test]
 async fn assess_committed_mutation_is_discarded_after_final_verification() {
   assert_read_only_role_is_isolated(tenet_domain::model::WorkerRole::Assess, true).await;
+}
+#[tokio::test]
+async fn directory_scope_is_retried_with_recursive_glob_feedback() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::InvalidScopeThenCorrect));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("corrected recursive scope proceeds");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  let feedback = backend
+    .semantic_feedback
+    .lock()
+    .expect("semantic feedback lock");
+  assert_eq!(feedback.len(), 1);
+  assert_eq!(feedback[0].0, WorkerRole::Reconcile);
+  assert!(feedback[0].1.contains(
+    "A scope path \"src/\" does not include descendants; use \"src/**\" or explicit files"
+  ));
+}
+
+#[tokio::test]
+async fn assessment_directory_scope_is_retried_with_recursive_glob_feedback() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(
+    BackendMode::InvalidAssessmentScopeThenCorrect,
+  ));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("corrected assessment scope proceeds");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 2);
+  let feedback = backend
+    .semantic_feedback
+    .lock()
+    .expect("semantic feedback lock");
+  assert_eq!(feedback.len(), 1);
+  assert_eq!(feedback[0].0, WorkerRole::Assess);
+  assert!(feedback[0]
+    .1
+    .contains("assessment-scope scope path \"src/\" does not include descendants; use \"src/**\" or explicit files"));
 }
 
 #[tokio::test]
@@ -860,42 +949,148 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
     .iter()
     .all(|id| repository.path().join(format!("{id}.txt")).exists()));
 }
-async fn assert_out_of_scope_change_is_rejected(mutation: ScopeMutation) {
+async fn assert_out_of_scope_change_is_discarded_and_replanned(mutation: ScopeMutation) {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::ScopeMutation(mutation)));
-  let (controller, _) = configured_controller(&repository, backend, 1).await;
+  let (controller, mut events) = configured_controller(&repository, backend.clone(), 1).await;
   let head_before = git::head(repository.path()).await.expect("head before run");
 
-  let error = controller
+  let state = controller
     .run(CancellationToken::new())
     .await
-    .expect_err("out-of-scope candidate must fail closed");
+    .expect("scope expansion is reconsidered by reconciliation");
 
-  assert!(error.to_string().contains("outside its declared scope"));
-  assert_eq!(
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert_ne!(
     git::head(repository.path()).await.expect("canonical head"),
     head_before
+  );
+  let expected_paths: Vec<String> = match mutation {
+    ScopeMutation::Modification | ScopeMutation::Deletion => vec!["README.txt".into()],
+    ScopeMutation::Addition => vec!["outside.txt".into()],
+    ScopeMutation::Rename => vec!["renamed.txt".into()],
+  };
+  let a_attempts = backend
+    .workspaces
+    .lock()
+    .expect("workspace lock")
+    .iter()
+    .filter(|(id, _)| id == "A")
+    .count();
+  assert_eq!(a_attempts, 2);
+  let mut produced_a = 0;
+  let mut observed_expansion = false;
+  while let Ok(event) = events.try_recv() {
+    match event {
+      RunEvent::CandidateProduced(candidate) if candidate.lease.work_unit.id == "A" => {
+        produced_a += 1;
+      }
+      RunEvent::State(snapshot) => {
+        observed_expansion |= snapshot.discoveries.iter().any(|record| {
+          matches!(
+            &record.discovery,
+            Discovery::ScopeExpansion { paths, reason }
+              if paths == &expected_paths && reason.starts_with("Controller observed")
+          )
+        });
+      }
+      _ => {}
+    }
+  }
+  assert!(observed_expansion);
+  assert_eq!(
+    produced_a, 1,
+    "discarded candidate must never be integrable"
   );
 }
 
 #[tokio::test]
-async fn candidate_modification_outside_scope_is_rejected() {
-  assert_out_of_scope_change_is_rejected(ScopeMutation::Modification).await;
+async fn candidate_modification_outside_scope_is_replanned() {
+  assert_out_of_scope_change_is_discarded_and_replanned(ScopeMutation::Modification).await;
 }
 
 #[tokio::test]
-async fn candidate_addition_outside_scope_is_rejected() {
-  assert_out_of_scope_change_is_rejected(ScopeMutation::Addition).await;
+async fn candidate_addition_outside_scope_is_replanned() {
+  assert_out_of_scope_change_is_discarded_and_replanned(ScopeMutation::Addition).await;
 }
 
 #[tokio::test]
-async fn candidate_deletion_outside_scope_is_rejected() {
-  assert_out_of_scope_change_is_rejected(ScopeMutation::Deletion).await;
+async fn candidate_deletion_outside_scope_is_replanned() {
+  assert_out_of_scope_change_is_discarded_and_replanned(ScopeMutation::Deletion).await;
 }
 
 #[tokio::test]
-async fn candidate_rename_outside_scope_is_rejected() {
-  assert_out_of_scope_change_is_rejected(ScopeMutation::Rename).await;
+async fn candidate_rename_outside_scope_is_replanned() {
+  assert_out_of_scope_change_is_discarded_and_replanned(ScopeMutation::Rename).await;
+}
+
+#[tokio::test]
+async fn repair_candidate_outside_scope_is_discarded_and_replanned() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::RepairScopeMutation));
+  let (controller, mut events) = configured_controller(&repository, backend.clone(), 1).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("repair scope expansion is reconsidered");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert_eq!(backend.repair_calls.load(Ordering::SeqCst), 2);
+  assert!(repository.path().join("outside.txt").exists());
+  let mut observed_expansion = false;
+  while let Ok(event) = events.try_recv() {
+    if let RunEvent::State(snapshot) = event {
+      observed_expansion |= snapshot.discoveries.iter().any(|record| {
+        record.role == WorkerRole::Repair
+          && matches!(
+            &record.discovery,
+            Discovery::ScopeExpansion { paths, reason }
+              if paths == &["outside.txt".to_owned()] && reason.starts_with("Controller observed")
+          )
+      });
+    }
+  }
+  assert!(observed_expansion);
+}
+
+#[tokio::test]
+async fn repeated_unapproved_scope_expansion_is_bounded_by_stagnation() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::UnapprovedScopeMutation));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  rewrite_config(&repository, |config| {
+    config.max_cycles = 10;
+    config.stagnation_limit = 1;
+  })
+  .await;
+  let head_before = git::head(repository.path()).await.expect("head before run");
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("stagnation blocks repeated unapproved expansion");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Blocked);
+  assert_eq!(state.cycle, 3);
+  assert!(state
+    .blocked_reason
+    .as_deref()
+    .is_some_and(|reason| reason.contains("Stagnation limit (1)")));
+  assert_eq!(
+    git::head(repository.path()).await.expect("canonical head"),
+    head_before
+  );
+  assert!(!repository.path().join("A.txt").exists());
+  assert!(!repository.path().join("outside.txt").exists());
+  let a_attempts = backend
+    .workspaces
+    .lock()
+    .expect("workspace lock")
+    .iter()
+    .filter(|(id, _)| id == "A")
+    .count();
+  assert_eq!(a_attempts, 2);
 }
 
 async fn run_with_historical_a(mut historical: WorkUnit) {
