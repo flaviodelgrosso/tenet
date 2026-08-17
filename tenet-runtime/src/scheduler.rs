@@ -18,8 +18,8 @@ use tenet_domain::{
   config::Config,
   events::RunEvent,
   model::{
-    DeferredCandidate, RequirementCatalog, VerificationReport, WorkExecution, WorkLease, WorkUnit,
-    WorkerDiscovery, WorkerRole, WorkerSummary,
+    CommandResult, DeferredCandidate, RequirementCatalog, VerificationReport, WorkExecution,
+    WorkLease, WorkUnit, WorkerDiscovery, WorkerRole, WorkerSummary,
   },
 };
 
@@ -347,7 +347,7 @@ async fn execute_and_commit(
         .execute(context, catalog, &lease.work_unit, None)
         .await
         .context("implementation worker")?;
-      let discoveries: Vec<WorkerDiscovery> = worker_summary
+      let mut discoveries: Vec<WorkerDiscovery> = worker_summary
         .discoveries
         .iter()
         .cloned()
@@ -357,6 +357,30 @@ async fn execute_and_commit(
         })
         .collect();
       reject_protected_changes(&lease.workspace, &protected, "worker").await?;
+      for attempt in 1..=context.config.max_repair_attempts {
+        if !git::is_clean(&lease.workspace).await? {
+          break;
+        }
+        let _ = updates.send(ExecutionUpdate::Repairing {
+          work_unit_id: lease.work_unit.id.clone(),
+          attempt,
+        });
+        let report = no_repository_changes_report();
+        let repair_summary = executor
+          .execute(context, catalog, &lease.work_unit, Some(&report))
+          .await
+          .context("repair worker after empty implementation")?;
+        discoveries.extend(repair_summary.discoveries.into_iter().map(|discovery| {
+          WorkerDiscovery {
+            discovery,
+            role: WorkerRole::Repair,
+          }
+        }));
+        reject_protected_changes(&lease.workspace, &protected, "repair worker").await?;
+      }
+      if git::is_clean(&lease.workspace).await? {
+        bail!("worker produced no repository changes after bounded repair");
+      }
       let candidate_revision = commit_candidate(&lease.workspace, lease).await?;
       let changed_paths =
         git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
@@ -505,6 +529,26 @@ async fn execute_and_commit(
     .emit(RunEvent::CandidateProduced(execution.clone()))
     .await?;
   Ok(LeaseOutcome::Verified(Box::new(execution)))
+}
+
+fn no_repository_changes_report() -> VerificationReport {
+  let now = Utc::now();
+  VerificationReport {
+    passed: false,
+    started_at: now,
+    finished_at: now,
+    commands: vec![CommandResult {
+      command: "git status --short".into(),
+      exit_code: Some(1),
+      timed_out: false,
+      duration_ms: 0,
+      stdout: String::new(),
+      stderr: "The implementation worker reported completion, but its assigned Git worktree is unchanged. Reapply the implementation using relative paths inside the session working directory; never write to its parent or a sibling workspace."
+        .into(),
+    }],
+    executions: Vec::new(),
+    warnings: Vec::new(),
+  }
 }
 
 async fn defer_candidate(input: CandidateDeferral<'_>) -> Result<DeferredCandidate> {

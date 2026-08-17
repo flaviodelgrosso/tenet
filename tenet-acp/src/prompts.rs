@@ -64,6 +64,8 @@ Implement only the assigned work unit while respecting the product specification
 
 Constraints:
 - The configured authoritative specification, tenet.toml, .tenet/, and AGENTS.md are controller-protected and must never be modified.
+- The session working directory is the only assigned repository workspace. Use relative paths within it. Never shorten its absolute path, switch to its parent, or write to a sibling worktree.
+- Before yielding, confirm the assigned worktree contains the intended repository changes; files created outside it are not candidate changes and will be discarded.
 - Do not claim completion for unrelated requirements.
 - Report newly found dependencies, blockers, and scope expansions only through structured discoveries.
 - Never modify the work graph or coordinate with other workers.
@@ -75,6 +77,7 @@ Repair the assigned work unit using the deterministic verification evidence.
 
 Constraints:
 - Do not edit the configured authoritative specification, tenet.toml, .tenet/, or AGENTS.md.
+- The session working directory is the only assigned repository workspace. Use relative paths within it. Never shorten its absolute path, switch to its parent, or write to a sibling worktree.
 - Do not weaken verification or tests to obtain a green result.
 - If verification fails because a suggested check hides or corrupts its own tooling environment, do not modify product code to compensate. Return a `verification_blocker` discovery naming the command and cause so the controller can send the immutable check back to reconciliation.
 - Report newly found dependencies, blockers, and scope expansions only through structured discoveries.
@@ -145,6 +148,15 @@ mod tests {
     assert!(prompt.contains("skeptical"));
     assert!(prompt.contains("stale evidence as gaps"));
     assert!(prompt.contains("you are not the completion oracle"));
+  }
+
+  #[test]
+  fn mutation_roles_pin_all_changes_to_the_assigned_worktree() {
+    for role in [WorkerRole::Implement, WorkerRole::Repair] {
+      let prompt = full_role_prompt(role, "requirements/product.md");
+      assert!(prompt.contains("only assigned repository workspace"));
+      assert!(prompt.contains("Never shorten its absolute path"));
+    }
   }
 
   #[test]

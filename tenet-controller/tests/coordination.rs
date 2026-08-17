@@ -218,6 +218,7 @@ enum ScopeMutation {
 #[derive(Clone, Copy)]
 enum BackendMode {
   Normal,
+  EmptyImplementationThenRepair,
   FailB,
   WorkerTimeout,
   ProtectedMutation,
@@ -464,6 +465,9 @@ impl AgentBackend for FakeBackend {
       ctx.cancel.cancelled().await;
       bail!("run cancelled");
     }
+    if matches!(self.mode, BackendMode::EmptyImplementationThenRepair) {
+      return Ok(summary(Vec::new()));
+    }
     if work_unit.id == "A" {
       match self.mode {
         BackendMode::ScopeMutation(ScopeMutation::Modification) => {
@@ -513,6 +517,14 @@ impl AgentBackend for FakeBackend {
     _report: &VerificationReport,
   ) -> Result<WorkerSummary> {
     let repair_number = self.repair_calls.fetch_add(1, Ordering::SeqCst) + 1;
+    if matches!(self.mode, BackendMode::EmptyImplementationThenRepair) {
+      fs::write(
+        ctx.cwd.join(format!("{}.txt", work_unit.id)),
+        work_unit.id.as_bytes(),
+      )
+      .await?;
+      return Ok(summary(Vec::new()));
+    }
     if matches!(self.mode, BackendMode::NeverPassingVerification) && work_unit.id == "A" {
       fs::write(ctx.cwd.join("A.txt"), format!("repair-{repair_number}")).await?;
       return Ok(summary(Vec::new()));
@@ -1458,6 +1470,21 @@ async fn dirty_canonical_tree_is_rejected_before_worktree_execution() {
   assert!(error
     .to_string()
     .contains("worktree execution requires a clean canonical working tree"));
+}
+
+#[tokio::test]
+async fn empty_implementation_is_repaired_in_the_assigned_worktree() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::EmptyImplementationThenRepair));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("empty implementation is repaired");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert_eq!(backend.repair_calls.load(Ordering::SeqCst), 4);
 }
 
 #[tokio::test]
