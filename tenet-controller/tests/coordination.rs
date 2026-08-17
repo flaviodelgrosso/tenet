@@ -949,7 +949,7 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
     .iter()
     .all(|id| repository.path().join(format!("{id}.txt")).exists()));
 }
-async fn assert_out_of_scope_change_is_discarded_and_replanned(mutation: ScopeMutation) {
+async fn assert_out_of_scope_change_is_preserved_and_reauthorized(mutation: ScopeMutation) {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::ScopeMutation(mutation)));
   let (controller, mut events) = configured_controller(&repository, backend.clone(), 1).await;
@@ -977,7 +977,7 @@ async fn assert_out_of_scope_change_is_discarded_and_replanned(mutation: ScopeMu
     .iter()
     .filter(|(id, _)| id == "A")
     .count();
-  assert_eq!(a_attempts, 2);
+  assert_eq!(a_attempts, 1, "authorized candidate must be reused");
   let mut produced_a = 0;
   let mut observed_expansion = false;
   while let Ok(event) = events.try_recv() {
@@ -1000,32 +1000,140 @@ async fn assert_out_of_scope_change_is_discarded_and_replanned(mutation: ScopeMu
   assert!(observed_expansion);
   assert_eq!(
     produced_a, 1,
-    "discarded candidate must never be integrable"
+    "candidate must become integrable only after reauthorization"
   );
+  assert!(state.deferred_candidates.is_empty());
+  assert!(run_git(
+    repository.path(),
+    &[
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/tenet/candidates"
+    ]
+  )
+  .is_empty());
 }
 
 #[tokio::test]
 async fn candidate_modification_outside_scope_is_replanned() {
-  assert_out_of_scope_change_is_discarded_and_replanned(ScopeMutation::Modification).await;
+  assert_out_of_scope_change_is_preserved_and_reauthorized(ScopeMutation::Modification).await;
 }
 
 #[tokio::test]
 async fn candidate_addition_outside_scope_is_replanned() {
-  assert_out_of_scope_change_is_discarded_and_replanned(ScopeMutation::Addition).await;
+  assert_out_of_scope_change_is_preserved_and_reauthorized(ScopeMutation::Addition).await;
 }
 
 #[tokio::test]
 async fn candidate_deletion_outside_scope_is_replanned() {
-  assert_out_of_scope_change_is_discarded_and_replanned(ScopeMutation::Deletion).await;
+  assert_out_of_scope_change_is_preserved_and_reauthorized(ScopeMutation::Deletion).await;
 }
 
 #[tokio::test]
 async fn candidate_rename_outside_scope_is_replanned() {
-  assert_out_of_scope_change_is_discarded_and_replanned(ScopeMutation::Rename).await;
+  assert_out_of_scope_change_is_preserved_and_reauthorized(ScopeMutation::Rename).await;
 }
 
 #[tokio::test]
-async fn repair_candidate_outside_scope_is_discarded_and_replanned() {
+async fn scope_expansion_candidate_survives_resume_without_reimplementation() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::ScopeMutation(
+    ScopeMutation::Addition,
+  )));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  rewrite_config(&repository, |config| config.max_cycles = 1).await;
+
+  let first = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("first run preserves deferred candidate");
+  assert_eq!(first.status, tenet_domain::model::RunStatus::Blocked);
+  assert_eq!(first.deferred_candidates.len(), 1);
+  assert!(!run_git(
+    repository.path(),
+    &[
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/tenet/candidates"
+    ]
+  )
+  .is_empty());
+
+  let second = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("resumed run reuses deferred candidate");
+
+  let a_attempts = backend
+    .workspaces
+    .lock()
+    .expect("workspace lock")
+    .iter()
+    .filter(|(id, _)| id == "A")
+    .count();
+  assert_eq!(second.status, tenet_domain::model::RunStatus::Blocked);
+  assert_eq!(a_attempts, 1, "resume must not rerun implementation A");
+  assert!(second.deferred_candidates.is_empty());
+  assert!(run_git(
+    repository.path(),
+    &[
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/tenet/candidates"
+    ]
+  )
+  .is_empty());
+}
+
+#[tokio::test]
+async fn stale_deferred_candidate_is_rejected_and_its_ref_is_removed() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::ScopeMutation(
+    ScopeMutation::Addition,
+  )));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  rewrite_config(&repository, |config| config.max_cycles = 1).await;
+
+  let first = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("first run preserves deferred candidate");
+  let first_ref = first.deferred_candidates[0].git_ref.clone();
+  std::fs::write(repository.path().join("user-change.txt"), "advance base")
+    .expect("write user change");
+  run_git(repository.path(), &["add", "user-change.txt"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "advance canonical base"],
+  );
+
+  let second = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("stale candidate is replanned");
+  let references = run_git(
+    repository.path(),
+    &[
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/tenet/candidates",
+    ],
+  );
+  let a_attempts = backend
+    .workspaces
+    .lock()
+    .expect("workspace lock")
+    .iter()
+    .filter(|(id, _)| id == "A")
+    .count();
+
+  assert_eq!(second.status, tenet_domain::model::RunStatus::Blocked);
+  assert_eq!(a_attempts, 2, "stale candidate must not be reused");
+  assert!(!references.contains(&first_ref));
+  assert!(second.deferred_candidates.is_empty());
+}
+#[tokio::test]
+async fn repair_candidate_outside_scope_is_preserved_and_reauthorized() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::RepairScopeMutation));
   let (controller, mut events) = configured_controller(&repository, backend.clone(), 1).await;
@@ -1036,7 +1144,7 @@ async fn repair_candidate_outside_scope_is_discarded_and_replanned() {
     .expect("repair scope expansion is reconsidered");
 
   assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
-  assert_eq!(backend.repair_calls.load(Ordering::SeqCst), 2);
+  assert_eq!(backend.repair_calls.load(Ordering::SeqCst), 1);
   assert!(repository.path().join("outside.txt").exists());
   let mut observed_expansion = false;
   while let Ok(event) = events.try_recv() {
@@ -1090,7 +1198,20 @@ async fn repeated_unapproved_scope_expansion_is_bounded_by_stagnation() {
     .iter()
     .filter(|(id, _)| id == "A")
     .count();
-  assert_eq!(a_attempts, 2);
+  assert_eq!(
+    a_attempts, 1,
+    "unapproved scope must not rerun implementation"
+  );
+  assert_eq!(state.deferred_candidates.len(), 1);
+  assert!(!run_git(
+    repository.path(),
+    &[
+      "for-each-ref",
+      "--format=%(refname)",
+      "refs/tenet/candidates"
+    ]
+  )
+  .is_empty());
 }
 
 async fn run_with_historical_a(mut historical: WorkUnit) {

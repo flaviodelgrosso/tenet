@@ -20,9 +20,9 @@ use tenet_domain::{
   evidence::{EvidenceGraphState, EvidencePolicy, ImplementationState, VerificationState},
   ids::VerificationRunId,
   model::{
-    CompletedWorkUnit, DiscoveryRecord, DiscoveryStatus, IntegrationPhase, Phase, ReconcileResult,
-    RepairProgress, RequirementCatalog, RequirementCounts, RunStatus, State, VerificationReport,
-    WorkExecution, WorkStatus, WorkerDiscovery,
+    CompletedWorkUnit, Discovery, DiscoveryRecord, DiscoveryStatus, IntegrationPhase, Phase,
+    ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus, State,
+    VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
   },
 };
 
@@ -31,7 +31,10 @@ use tenet_runtime::{
   git,
   graph::WorkGraph,
   integration::{deterministic_order, IntegrationOutcome, Integrator},
-  scheduler::{CandidateExecutor, ExecutionUpdate, Scheduler},
+  scheduler::{
+    deferred_candidate_authorized, deferred_candidate_targets_unit, CandidateExecutor,
+    ExecutionUpdate, Scheduler,
+  },
   store::{self, RunLock},
   verifier,
   workspace::WorkspaceManager,
@@ -252,6 +255,7 @@ impl Controller {
       evidence_graph = evidence_graph::load(&self.cwd, &catalog).await?;
       store::write_evidence_graph(&self.cwd, &evidence_graph).await?;
       let current_revision = git::head(&self.cwd).await?;
+      prune_deferred_candidates(&self.cwd, state, &catalog, &current_revision).await?;
       evidence_graph::invalidate(
         &self.cwd,
         &context.events,
@@ -320,7 +324,17 @@ impl Controller {
           .await;
       }
       for record in &mut state.discoveries {
-        record.status = DiscoveryStatus::Consumed;
+        let deferred = state.deferred_candidates.iter().any(|candidate| {
+          candidate.catalog_hash == record.catalog_hash
+            && candidate.base_revision == record.repository_revision
+            && candidate.lease.work_unit.id == record.work_unit_id
+            && matches!(record.discovery, Discovery::ScopeExpansion { .. })
+        });
+        record.status = if deferred {
+          DiscoveryStatus::Active
+        } else {
+          DiscoveryStatus::Consumed
+        };
       }
       store::write_roadmap(&self.cwd, &reconciliation).await?;
       state.requirement_counts = requirement_counts(&catalog, &reconciliation, &evidence_graph)?;
@@ -401,7 +415,50 @@ impl Controller {
         Arc::new(catalog.clone()),
         updates,
       );
-      let leases = scheduler.issue_leases(frontier, &base_revision);
+      let mut scheduled_frontier = Vec::new();
+      let mut selected_candidates = Vec::new();
+      for unit in frontier {
+        let mut target = None;
+        for candidate in &state.deferred_candidates {
+          if candidate.base_revision == base_revision
+            && candidate.catalog_hash == catalog.spec_hash
+            && deferred_candidate_targets_unit(candidate, &unit)?
+          {
+            target = Some(candidate.clone());
+            if deferred_candidate_authorized(candidate, &unit)? {
+              break;
+            }
+          }
+        }
+        match target {
+          Some(candidate) if deferred_candidate_authorized(&candidate, &unit)? => {
+            scheduled_frontier.push(unit);
+            selected_candidates.push(Some(candidate));
+          }
+          Some(_) => {
+            state
+              .work_statuses
+              .insert(unit.id.clone(), WorkStatus::Pending);
+          }
+          None => {
+            scheduled_frontier.push(unit);
+            selected_candidates.push(None);
+          }
+        }
+      }
+      if scheduled_frontier.is_empty() {
+        self.publish(&context.events, state).await?;
+        continue;
+      }
+      let leases = scheduler.issue_leases(scheduled_frontier, &base_revision);
+      let mut deferred_by_lease = BTreeMap::new();
+      let mut selected_refs = Vec::new();
+      for (lease, candidate) in leases.iter().zip(selected_candidates) {
+        if let Some(candidate) = candidate {
+          selected_refs.push(candidate.git_ref.clone());
+          deferred_by_lease.insert(lease.id.clone(), candidate);
+        }
+      }
       state.active_leases = leases
         .iter()
         .map(|lease| (lease.id.clone(), lease.clone()))
@@ -419,7 +476,7 @@ impl Controller {
       self.publish(&context.events, state).await?;
 
       let execution_result = {
-        let mut execution = Box::pin(scheduler.execute_leases(leases));
+        let mut execution = Box::pin(scheduler.execute_leases(leases, deferred_by_lease));
         loop {
           tokio::select! {
             result = &mut execution => break result,
@@ -469,6 +526,12 @@ impl Controller {
           &blocked.lease.work_unit.id,
           &blocked.discoveries,
         )?;
+        if let Some(candidate) = blocked.candidate {
+          state
+            .deferred_candidates
+            .retain(|existing| existing.git_ref != candidate.git_ref);
+          state.deferred_candidates.push(candidate);
+        }
       }
       for candidate in &candidates {
         state
@@ -479,6 +542,8 @@ impl Controller {
       self.publish(&context.events, state).await?;
 
       if candidates.is_empty() {
+        retire_deferred_candidates(&self.cwd, state, &selected_refs).await?;
+        self.publish(&context.events, state).await?;
         continue;
       }
 
@@ -495,6 +560,7 @@ impl Controller {
       if !integrated {
         return Ok(state.clone());
       }
+      retire_deferred_candidates(&self.cwd, state, &selected_refs).await?;
       state.candidate_integrations.clear();
       state.current_repair = None;
       self.publish(&context.events, state).await?;
@@ -710,7 +776,9 @@ impl Controller {
       current_revision: &current_revision,
       repository_clean,
       has_active_leases: !state.active_leases.is_empty(),
-      has_pending_integrations: !state.candidate_integrations.is_empty() || pending_journal,
+      has_pending_integrations: !state.candidate_integrations.is_empty()
+        || !state.deferred_candidates.is_empty()
+        || pending_journal,
     });
     match decision {
       CompletionDecision::Done => {
@@ -749,8 +817,17 @@ impl Controller {
         .await?;
       return Ok(catalog);
     }
-    if had_cached_catalog || !state.completed_work_units.is_empty() || !state.discoveries.is_empty()
+    if had_cached_catalog
+      || !state.completed_work_units.is_empty()
+      || !state.discoveries.is_empty()
+      || !state.deferred_candidates.is_empty()
     {
+      let references: Vec<_> = state
+        .deferred_candidates
+        .iter()
+        .map(|candidate| candidate.git_ref.clone())
+        .collect();
+      retire_deferred_candidates(&self.cwd, state, &references).await?;
       state.completed_work_units.clear();
       state.work_statuses.clear();
       state.discoveries.clear();
@@ -922,6 +999,12 @@ impl Controller {
       *status = WorkStatus::Invalidated;
     }
     state.discoveries.clear();
+    let references: Vec<_> = state
+      .deferred_candidates
+      .iter()
+      .map(|candidate| candidate.git_ref.clone())
+      .collect();
+    retire_deferred_candidates(&self.cwd, state, &references).await?;
     self.ensure_catalog(context, state).await
   }
 
@@ -1133,6 +1216,42 @@ fn validate_reconcile(catalog: &RequirementCatalog, result: &ReconcileResult) ->
   }
   Ok(())
 }
+async fn prune_deferred_candidates(
+  cwd: &Path,
+  state: &mut State,
+  catalog: &RequirementCatalog,
+  revision: &str,
+) -> Result<()> {
+  let mut retained = Vec::with_capacity(state.deferred_candidates.len());
+  for candidate in std::mem::take(&mut state.deferred_candidates) {
+    if candidate.catalog_hash == catalog.spec_hash && candidate.base_revision == revision {
+      let resolved = git::resolve_ref(cwd, &candidate.git_ref).await?;
+      if resolved != candidate.candidate_revision {
+        bail!("deferred candidate Git ref does not match persisted revision");
+      }
+      retained.push(candidate);
+    } else {
+      git::delete_ref(cwd, &candidate.git_ref).await?;
+    }
+  }
+  state.deferred_candidates = retained;
+  Ok(())
+}
+
+async fn retire_deferred_candidates(
+  cwd: &Path,
+  state: &mut State,
+  references: &[String],
+) -> Result<()> {
+  for reference in references {
+    git::delete_ref(cwd, reference).await?;
+  }
+  state
+    .deferred_candidates
+    .retain(|candidate| !references.contains(&candidate.git_ref));
+  Ok(())
+}
+
 async fn progress_fingerprint(
   cwd: &Path,
   catalog: &RequirementCatalog,

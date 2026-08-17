@@ -82,6 +82,20 @@ pub async fn commit_all(cwd: &Path, message: &str) -> Result<String> {
   head(cwd).await
 }
 
+pub async fn update_ref(cwd: &Path, reference: &str, revision: &str) -> Result<()> {
+  run(cwd, &["update-ref", reference, revision])
+    .await
+    .map(|_| ())
+}
+
+pub async fn delete_ref(cwd: &Path, reference: &str) -> Result<()> {
+  run(cwd, &["update-ref", "-d", reference]).await.map(|_| ())
+}
+
+pub async fn resolve_ref(cwd: &Path, reference: &str) -> Result<String> {
+  run(cwd, &["rev-parse", "--verify", reference]).await
+}
+
 pub async fn is_ancestor(cwd: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
   let status = Command::new("git")
     .args(["merge-base", "--is-ancestor", ancestor, descendant])

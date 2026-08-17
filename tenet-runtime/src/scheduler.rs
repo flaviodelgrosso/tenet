@@ -1,5 +1,5 @@
 use std::{
-  collections::VecDeque,
+  collections::{BTreeMap, VecDeque},
   path::{Path, PathBuf},
   sync::Arc,
 };
@@ -18,8 +18,8 @@ use tenet_domain::{
   config::Config,
   events::RunEvent,
   model::{
-    RequirementCatalog, VerificationReport, WorkExecution, WorkLease, WorkUnit, WorkerDiscovery,
-    WorkerRole, WorkerSummary,
+    DeferredCandidate, RequirementCatalog, VerificationReport, WorkExecution, WorkLease, WorkUnit,
+    WorkerDiscovery, WorkerRole, WorkerSummary,
   },
 };
 
@@ -35,6 +35,7 @@ pub enum ExecutionUpdate {
 pub struct BlockedExecution {
   pub lease: WorkLease,
   pub discoveries: Vec<WorkerDiscovery>,
+  pub candidate: Option<DeferredCandidate>,
 }
 
 #[derive(Debug, Default)]
@@ -46,6 +47,21 @@ pub struct SchedulerOutcome {
 enum LeaseOutcome {
   Verified(Box<WorkExecution>),
   Blocked(Box<BlockedExecution>),
+}
+
+#[derive(Debug)]
+struct ScheduledLease {
+  lease: WorkLease,
+  candidate: Option<DeferredCandidate>,
+}
+
+struct LeaseExecution {
+  repository: PathBuf,
+  workspaces: WorkspaceManager,
+  executor: Arc<dyn CandidateExecutor>,
+  context: BackendContext,
+  catalog: Arc<RequirementCatalog>,
+  updates: mpsc::UnboundedSender<ExecutionUpdate>,
 }
 
 /// Supplies candidate mutations while the scheduler owns execution mechanics.
@@ -97,8 +113,20 @@ impl Scheduler {
       .collect()
   }
 
-  pub async fn execute_leases(&self, leases: Vec<WorkLease>) -> Result<SchedulerOutcome> {
-    let mut pending = VecDeque::from(leases);
+  pub async fn execute_leases(
+    &self,
+    leases: Vec<WorkLease>,
+    mut candidates: BTreeMap<String, DeferredCandidate>,
+  ) -> Result<SchedulerOutcome> {
+    let mut pending = VecDeque::from(
+      leases
+        .into_iter()
+        .map(|lease| ScheduledLease {
+          candidate: candidates.remove(&lease.id),
+          lease,
+        })
+        .collect::<Vec<_>>(),
+    );
     let mut outcome = SchedulerOutcome::default();
 
     while !pending.is_empty() {
@@ -130,36 +158,38 @@ impl Scheduler {
     self.workspaces.cleanup_run().await
   }
 
-  async fn execute_batch(&self, batch: Vec<WorkLease>) -> Result<Vec<LeaseOutcome>> {
+  async fn execute_batch(&self, batch: Vec<ScheduledLease>) -> Result<Vec<LeaseOutcome>> {
     let semaphore = Arc::new(Semaphore::new(
       self.context.config.execution.max_parallel_workers,
     ));
     let batch_cancel = self.context.cancel.child_token();
     let mut tasks = JoinSet::new();
 
-    for lease in batch {
+    for scheduled in batch {
+      let lease = scheduled.lease;
+      let candidate = scheduled.candidate;
       self
         .context
         .events
         .emit(RunEvent::LeaseIssued(lease.clone()))
         .await?;
       let permit_pool = semaphore.clone();
-      let executor = self.executor.clone();
       let mut context = self.context.clone();
       context.cancel = batch_cancel.clone();
-      let catalog = self.catalog.clone();
-      let repository = self.repository.clone();
-      let workspaces = self.workspaces.clone();
-      let updates = self.updates.clone();
+      let execution = LeaseExecution {
+        repository: self.repository.clone(),
+        workspaces: self.workspaces.clone(),
+        executor: self.executor.clone(),
+        context,
+        catalog: self.catalog.clone(),
+        updates: self.updates.clone(),
+      };
       tasks.spawn(async move {
         let _permit = permit_pool
           .acquire_owned()
           .await
           .map_err(|_| anyhow!("worker semaphore closed"))?;
-        execute_lease(
-          repository, workspaces, executor, context, catalog, lease, updates,
-        )
-        .await
+        execute_lease(execution, lease, candidate).await
       });
     }
 
@@ -200,17 +230,24 @@ impl Scheduler {
 }
 
 async fn execute_lease(
-  repository: PathBuf,
-  workspaces: WorkspaceManager,
-  executor: Arc<dyn CandidateExecutor>,
-  mut context: BackendContext,
-  catalog: Arc<RequirementCatalog>,
+  execution: LeaseExecution,
   mut lease: WorkLease,
-  updates: mpsc::UnboundedSender<ExecutionUpdate>,
+  candidate: Option<DeferredCandidate>,
 ) -> Result<LeaseOutcome> {
-  let workspace = workspaces
-    .create_worker(&lease.id, &lease.base_revision)
-    .await?;
+  let LeaseExecution {
+    repository,
+    workspaces,
+    executor,
+    mut context,
+    catalog,
+    updates,
+  } = execution;
+  let revision = candidate
+    .as_ref()
+    .map_or(lease.base_revision.as_str(), |candidate| {
+      candidate.candidate_revision.as_str()
+    });
+  let workspace = workspaces.create_worker(&lease.id, revision).await?;
   lease.workspace.clone_from(&workspace);
   context.cwd.clone_from(&workspace);
   context.runtime_dir = context.runtime_dir.join(&lease.id);
@@ -233,8 +270,16 @@ async fn execute_lease(
     })
     .await?;
 
-  let result =
-    execute_and_commit(&repository, &executor, &context, &catalog, &lease, &updates).await;
+  let result = execute_and_commit(
+    &repository,
+    &executor,
+    &context,
+    &catalog,
+    &lease,
+    candidate.as_ref(),
+    &updates,
+  )
+  .await;
   let cleanup = workspaces.remove(&workspace).await;
   context
     .events
@@ -259,38 +304,77 @@ async fn execute_and_commit(
   context: &BackendContext,
   catalog: &RequirementCatalog,
   lease: &WorkLease,
+  deferred: Option<&DeferredCandidate>,
   updates: &mpsc::UnboundedSender<ExecutionUpdate>,
 ) -> Result<LeaseOutcome> {
   let protected_paths = protected_paths(&context.config);
   let protected = protection::snapshot(&lease.workspace, &protected_paths).await?;
-  let _ = updates.send(ExecutionUpdate::Implementing {
-    work_unit_id: lease.work_unit.id.clone(),
-  });
-  let worker_summary = executor
-    .execute(context, catalog, &lease.work_unit, None)
-    .await
-    .context("implementation worker")?;
-  let mut discoveries: Vec<_> = worker_summary
-    .discoveries
-    .iter()
-    .cloned()
-    .map(|discovery| WorkerDiscovery {
-      discovery,
-      role: WorkerRole::Implement,
-    })
-    .collect();
-  reject_protected_changes(&lease.workspace, &protected, "worker").await?;
+  let (worker_summary, mut discoveries, mut candidate_revision, mut changed_paths) =
+    if let Some(deferred) = deferred {
+      validate_deferred_candidate(repository, catalog, lease, deferred).await?;
+      (
+        deferred.worker_summary.clone(),
+        deferred
+          .discoveries
+          .iter()
+          .filter(|discovered| {
+            !matches!(
+              discovered.discovery,
+              tenet_domain::model::Discovery::ScopeExpansion { .. }
+            )
+          })
+          .cloned()
+          .collect(),
+        deferred.candidate_revision.clone(),
+        deferred.changed_paths.clone(),
+      )
+    } else {
+      let _ = updates.send(ExecutionUpdate::Implementing {
+        work_unit_id: lease.work_unit.id.clone(),
+      });
+      let worker_summary = executor
+        .execute(context, catalog, &lease.work_unit, None)
+        .await
+        .context("implementation worker")?;
+      let discoveries: Vec<WorkerDiscovery> = worker_summary
+        .discoveries
+        .iter()
+        .cloned()
+        .map(|discovery| WorkerDiscovery {
+          discovery,
+          role: WorkerRole::Implement,
+        })
+        .collect();
+      reject_protected_changes(&lease.workspace, &protected, "worker").await?;
+      let candidate_revision = commit_candidate(&lease.workspace, lease).await?;
+      let changed_paths =
+        git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
+      (
+        worker_summary,
+        discoveries,
+        candidate_revision,
+        changed_paths,
+      )
+    };
 
-  let mut candidate_revision = commit_candidate(&lease.workspace, lease).await?;
-  let mut changed_paths =
-    git::changed_paths(repository, &lease.base_revision, &candidate_revision).await?;
   if let Some(discovery) =
     scope_expansion_discovery(&lease.work_unit, &changed_paths, WorkerRole::Implement)?
   {
     discoveries.push(discovery);
+    let candidate = defer_candidate(
+      repository,
+      catalog,
+      lease,
+      &worker_summary,
+      &candidate_revision,
+      &changed_paths,
+      &discoveries,
+    )
+    .await?;
     return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
       lease: lease.clone(),
       discoveries,
+      candidate: Some(candidate),
     })));
   }
   let mut verification =
@@ -336,6 +420,7 @@ async fn execute_and_commit(
       return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
         lease: lease.clone(),
         discoveries,
+        candidate: None,
       })));
     }
     candidate_revision = commit_candidate(&lease.workspace, lease).await?;
@@ -345,9 +430,20 @@ async fn execute_and_commit(
       scope_expansion_discovery(&lease.work_unit, &changed_paths, WorkerRole::Repair)?
     {
       discoveries.push(discovery);
+      let candidate = defer_candidate(
+        repository,
+        catalog,
+        lease,
+        &worker_summary,
+        &candidate_revision,
+        &changed_paths,
+        &discoveries,
+      )
+      .await?;
       return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
         lease: lease.clone(),
         discoveries,
+        candidate: Some(candidate),
       })));
     }
     verification =
@@ -384,6 +480,96 @@ async fn execute_and_commit(
     .emit(RunEvent::CandidateProduced(execution.clone()))
     .await?;
   Ok(LeaseOutcome::Verified(Box::new(execution)))
+}
+
+async fn defer_candidate(
+  repository: &Path,
+  catalog: &RequirementCatalog,
+  lease: &WorkLease,
+  worker_summary: &WorkerSummary,
+  candidate_revision: &str,
+  changed_paths: &[String],
+  discoveries: &[WorkerDiscovery],
+) -> Result<DeferredCandidate> {
+  let safe_id = lease.id.replace(['/', '\\'], "-");
+  let git_ref = format!("refs/tenet/candidates/{safe_id}");
+  git::update_ref(repository, &git_ref, candidate_revision).await?;
+  Ok(DeferredCandidate {
+    lease: lease.clone(),
+    worker_summary: worker_summary.clone(),
+    base_revision: lease.base_revision.clone(),
+    candidate_revision: candidate_revision.to_owned(),
+    changed_paths: changed_paths.to_vec(),
+    discoveries: discoveries.to_vec(),
+    catalog_hash: catalog.spec_hash.clone(),
+    git_ref,
+  })
+}
+
+async fn validate_deferred_candidate(
+  repository: &Path,
+  catalog: &RequirementCatalog,
+  lease: &WorkLease,
+  candidate: &DeferredCandidate,
+) -> Result<()> {
+  if candidate.catalog_hash != catalog.spec_hash
+    || candidate.base_revision != lease.base_revision
+    || !same_authority(&candidate.lease.work_unit, &lease.work_unit)
+  {
+    bail!("deferred candidate authority no longer matches the scheduled work unit");
+  }
+  if git::resolve_ref(repository, &candidate.git_ref).await? != candidate.candidate_revision {
+    bail!("deferred candidate Git ref does not resolve to its immutable revision");
+  }
+  let changed_paths = git::changed_paths(
+    repository,
+    &candidate.base_revision,
+    &candidate.candidate_revision,
+  )
+  .await?;
+  if changed_paths != candidate.changed_paths {
+    bail!("deferred candidate changed paths no longer match its immutable revision");
+  }
+  Ok(())
+}
+
+pub fn deferred_candidate_targets_unit(
+  candidate: &DeferredCandidate,
+  unit: &WorkUnit,
+) -> Result<bool> {
+  if !same_authority(&candidate.lease.work_unit, unit) {
+    return Ok(false);
+  }
+  let allowed = compile_scope(&unit.scope.paths)?;
+  Ok(
+    candidate.lease.work_unit.id == unit.id
+      || candidate
+        .changed_paths
+        .iter()
+        .any(|path| allowed.is_match(path)),
+  )
+}
+
+pub fn deferred_candidate_authorized(
+  candidate: &DeferredCandidate,
+  unit: &WorkUnit,
+) -> Result<bool> {
+  if !deferred_candidate_targets_unit(candidate, unit)? {
+    return Ok(false);
+  }
+  let allowed = compile_scope(&unit.scope.paths)?;
+  Ok(
+    candidate
+      .changed_paths
+      .iter()
+      .all(|path| allowed.is_match(path)),
+  )
+}
+
+fn same_authority(left: &WorkUnit, right: &WorkUnit) -> bool {
+  left.requirement_ids == right.requirement_ids
+    && left.criterion_ids == right.criterion_ids
+    && left.verification_obligation_ids == right.verification_obligation_ids
 }
 
 async fn reject_protected_changes(
@@ -469,7 +655,7 @@ fn scope_expansion_discovery(
   Ok(Some(WorkerDiscovery {
     discovery: tenet_domain::model::Discovery::ScopeExpansion {
       paths,
-      reason: "Controller observed candidate changes outside the declared scope. The candidate was discarded; reconciliation must explicitly approve these paths before they can be integrated."
+      reason: "Controller observed candidate changes outside the declared scope and preserved the immutable candidate. Reconciliation must explicitly approve these exact paths before verification and integration can proceed."
         .into(),
     },
     role,
@@ -493,9 +679,9 @@ fn protected_paths(config: &Config) -> Vec<String> {
 }
 
 fn select_non_conflicting_batch(
-  pending: &mut VecDeque<WorkLease>,
+  pending: &mut VecDeque<ScheduledLease>,
   limit: usize,
-) -> Result<Vec<WorkLease>> {
+) -> Result<Vec<ScheduledLease>> {
   let mut selected = Vec::new();
   let count = pending.len();
   for _ in 0..count {
@@ -504,8 +690,10 @@ fn select_non_conflicting_batch(
     };
     let conflict = selected
       .iter()
-      .try_fold(false, |conflict, lease: &WorkLease| {
-        Ok::<_, anyhow::Error>(conflict || scopes_conflict(&lease.work_unit, &candidate.work_unit)?)
+      .try_fold(false, |conflict, scheduled: &ScheduledLease| {
+        Ok::<_, anyhow::Error>(
+          conflict || scopes_conflict(&scheduled.lease.work_unit, &candidate.lease.work_unit)?,
+        )
       })?;
     if selected.len() < limit && !conflict {
       selected.push(candidate);

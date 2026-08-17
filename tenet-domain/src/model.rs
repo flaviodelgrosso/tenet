@@ -105,6 +105,25 @@ pub struct WorkExecution {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DeferredCandidate {
+  pub lease: WorkLease,
+  #[serde(rename = "workerSummary")]
+  pub worker_summary: WorkerSummary,
+  #[serde(rename = "baseRevision")]
+  pub base_revision: String,
+  #[serde(rename = "candidateRevision")]
+  pub candidate_revision: String,
+  #[serde(rename = "changedPaths")]
+  pub changed_paths: Vec<String>,
+  pub discoveries: Vec<WorkerDiscovery>,
+  #[serde(rename = "catalogHash")]
+  pub catalog_hash: String,
+  #[serde(rename = "gitRef")]
+  pub git_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum IntegrationPhase {
   Prepared,
@@ -163,6 +182,8 @@ pub struct State {
   pub active_leases: std::collections::BTreeMap<String, WorkLease>,
   #[serde(rename = "candidateIntegrations")]
   pub candidate_integrations: Vec<WorkExecution>,
+  #[serde(default, rename = "deferredCandidates")]
+  pub deferred_candidates: Vec<DeferredCandidate>,
   #[serde(rename = "workStatuses")]
   pub work_statuses: std::collections::BTreeMap<String, WorkStatus>,
   #[serde(rename = "requirementCounts")]
@@ -198,6 +219,7 @@ impl State {
       cycle: 0,
       active_leases: std::collections::BTreeMap::new(),
       candidate_integrations: Vec::new(),
+      deferred_candidates: Vec::new(),
       work_statuses: std::collections::BTreeMap::new(),
       requirement_counts: RequirementCounts::default(),
       completed_work_units: Vec::new(),

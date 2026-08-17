@@ -337,7 +337,7 @@ A fresh worker inspects the repository as it exists now and compares it with the
 
 ### 3 · Implement
 
-A worker receives bounded work and an explicit repository scope, in an isolated detached Git worktree. Before a candidate can proceed, Tenet checks the complete candidate diff against the authority granted to that work unit — unexpected out-of-scope modifications are rejected. A worker that discovers legitimate additional work can request scope expansion for a future reconciliation instead of silently widening its own authority.
+A worker receives bounded work and an explicit repository scope, in an isolated detached Git worktree. Before a candidate can proceed, Tenet checks the complete candidate diff against the authority granted to that work unit. An out-of-scope immutable candidate is pinned under a controller-owned Git ref and carried across reconciliation; it can proceed only when a later validated work unit explicitly authorizes every changed path under the same requirement and verification authority. Stale, superseded, or integrated candidate refs are removed.
 
 ### 4 · Verify
 
