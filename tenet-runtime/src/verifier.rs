@@ -214,15 +214,23 @@ async fn run_spec(
   let working_directory = resolve_working_directory(workspace, &spec.working_directory)?;
   let identity = spec.identity();
   let start = Instant::now();
-  let mut child = Command::new(&spec.program)
+  let mut command = Command::new(&spec.program);
+  command
     .args(&spec.args)
     .envs(&spec.environment)
     .current_dir(working_directory)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
-    .kill_on_drop(true)
+    .kill_on_drop(true);
+  #[cfg(unix)]
+  {
+    use std::os::unix::process::CommandExt;
+    command.as_std_mut().process_group(0);
+  }
+  let mut child = command
     .spawn()
     .with_context(|| format!("spawn verification specification: {identity}"))?;
+  let process_id = child.id();
 
   let mut stdout = child
     .stdout
@@ -243,17 +251,18 @@ async fn run_spec(
 
   let (status, timed_out) = tokio::select! {
     _ = cancel.cancelled() => {
-      terminate(&mut child).await;
+      terminate(&mut child, process_id).await;
       bail!("run cancelled during verification specification: {identity}");
     }
     result = timeout(limit, child.wait()) => match result {
       Ok(status) => (Some(status?), false),
       Err(_) => {
-        terminate(&mut child).await;
+        terminate(&mut child, process_id).await;
         (None, true)
       }
     }
   };
+  terminate_process_group(process_id);
 
   let stdout = stdout_task.await??;
   let stderr = stderr_task.await??;
@@ -267,10 +276,24 @@ async fn run_spec(
   })
 }
 
-async fn terminate(child: &mut tokio::process::Child) {
+async fn terminate(child: &mut tokio::process::Child, process_id: Option<u32>) {
+  terminate_process_group(process_id);
   let _ = child.kill().await;
   let _ = child.wait().await;
 }
+
+#[cfg(unix)]
+fn terminate_process_group(process_id: Option<u32>) {
+  if let Some(process_id) = process_id.and_then(|id| i32::try_from(id).ok()) {
+    // SAFETY: the spawned command owns a dedicated process group whose id is its process id.
+    unsafe {
+      libc::killpg(process_id, libc::SIGKILL);
+    }
+  }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_process_id: Option<u32>) {}
 
 fn truncate_utf8(bytes: &[u8], max: usize) -> String {
   let slice = if bytes.len() > max {
@@ -406,5 +429,61 @@ mod tests {
 
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.stdout, "specified");
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn timed_out_command_terminates_descendants_that_hold_output_open() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let spec = VerificationSpec {
+      program: "/bin/sh".into(),
+      args: vec!["-c".into(), "sleep 30".into()],
+      working_directory: ".".into(),
+      environment: Default::default(),
+    };
+
+    let result = timeout(
+      Duration::from_secs(2),
+      run_spec(
+        workspace.path(),
+        &spec,
+        Duration::from_millis(10),
+        4096,
+        &CancellationToken::new(),
+      ),
+    )
+    .await
+    .expect("descendant must not keep timed-out verification pending")
+    .expect("run verification");
+
+    assert!(result.timed_out);
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn completed_command_terminates_background_processes_that_hold_output_open() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let spec = VerificationSpec {
+      program: "/bin/sh".into(),
+      args: vec!["-c".into(), "sleep 30 &".into()],
+      working_directory: ".".into(),
+      environment: Default::default(),
+    };
+
+    let result = timeout(
+      Duration::from_secs(2),
+      run_spec(
+        workspace.path(),
+        &spec,
+        Duration::from_secs(5),
+        4096,
+        &CancellationToken::new(),
+      ),
+    )
+    .await
+    .expect("background process must not keep verification pending")
+    .expect("run verification");
+
+    assert_eq!(result.exit_code, Some(0));
   }
 }
