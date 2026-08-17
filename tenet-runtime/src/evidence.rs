@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -8,7 +8,7 @@ use tenet_domain::{
   evidence::{
     EvidenceGraphState, EvidencePolicy, EvidenceProjection, EvidenceValidity, VerificationState,
   },
-  ids::{EvidenceId, RequirementId, VerificationRunId},
+  ids::{EvidenceId, RequirementId},
   model::{RequirementCatalog, VerificationReport},
 };
 
@@ -81,51 +81,15 @@ pub fn record_report(
   revision: &str,
   report: &VerificationReport,
 ) -> Result<Vec<EvidenceId>> {
-  record_report_with_bindings(
-    graph,
-    revision,
-    report,
-    std::iter::empty::<(&tenet_domain::ids::ObligationId, &str)>(),
-  )
-}
-
-pub fn record_report_with_bindings<'a>(
-  graph: &mut EvidenceGraphState,
-  revision: &str,
-  report: &VerificationReport,
-  bindings: impl IntoIterator<Item = (&'a tenet_domain::ids::ObligationId, &'a str)>,
-) -> Result<Vec<EvidenceId>> {
-  let bindings: Vec<_> = bindings.into_iter().collect();
-  let run_id = VerificationRunId::new();
-  let mut established = Vec::new();
-  for command in &report.commands {
-    let mut obligation_ids: BTreeSet<_> = graph
-      .obligations
-      .values()
-      .filter(|obligation| obligation.command.trim() == command.command.trim())
-      .map(|obligation| obligation.id.clone())
-      .collect();
-    obligation_ids.extend(
-      bindings
-        .iter()
-        .filter(|(_, bound_command)| bound_command.trim() == command.command.trim())
-        .map(|(obligation_id, _)| (*obligation_id).clone()),
-    );
-    for obligation_id in obligation_ids {
-      established.push(
-        graph
-          .record_command_result(
-            &obligation_id,
-            revision,
-            run_id,
-            report.finished_at,
-            command,
-          )
-          .context("record verification command evidence")?,
-      );
-    }
-  }
-  Ok(established)
+  report
+    .executions
+    .iter()
+    .map(|execution| {
+      graph
+        .record_execution_result(revision, report.finished_at, execution)
+        .context("record obligation-bound verification evidence")
+    })
+    .collect()
 }
 
 pub async fn invalidate_for_revision(
@@ -134,7 +98,7 @@ pub async fn invalidate_for_revision(
   revision: &str,
 ) -> Result<Vec<EvidenceId>> {
   let mut changed_by_revision = BTreeMap::new();
-  let mut affected = BTreeSet::new();
+  let mut affected = std::collections::BTreeSet::new();
   for evidence in graph.evidence.values() {
     if !matches!(evidence.validity, EvidenceValidity::Valid) || evidence.revision == revision {
       continue;
@@ -147,7 +111,14 @@ pub async fn invalidate_for_revision(
         &changed_by_revision[&evidence.revision]
       }
     };
-    if scope_matches(&evidence.dependency_scope, changed_paths)? {
+    if changed_paths.is_empty() {
+      continue;
+    }
+    let unsafe_scope =
+      !evidence.dependency_scope_authority.is_trusted() || evidence.dependency_scope.is_empty();
+    let scope_affected =
+      unsafe_scope || scope_matches(&evidence.dependency_scope, changed_paths).unwrap_or(true);
+    if scope_affected {
       affected.insert(evidence.id);
     }
   }
@@ -155,7 +126,6 @@ pub async fn invalidate_for_revision(
     affected.contains(&evidence.id)
   }))
 }
-
 fn scope_matches(scope: &[String], changed_paths: &[String]) -> Result<bool> {
   let mut builder = GlobSetBuilder::new();
   for pattern in scope {
@@ -172,13 +142,27 @@ mod tests {
   use chrono::TimeZone;
   use tenet_domain::{
     evidence::{AcceptanceCriterion, VerificationKind, VerificationObligation},
-    ids::{CriterionId, ObligationId},
+    ids::{CriterionId, ObligationId, VerificationRunId},
     model::{CommandResult, Requirement},
+    verification::{
+      DependencyScopeAuthority, VerificationAuthority, VerificationExecutionResult,
+      VerificationSpec,
+    },
+    worker::CatalogCoverage,
   };
 
   use super::*;
 
-  fn catalog() -> RequirementCatalog {
+  fn spec() -> VerificationSpec {
+    VerificationSpec {
+      program: "true".into(),
+      args: Vec::new(),
+      working_directory: ".".into(),
+      environment: Default::default(),
+    }
+  }
+
+  fn catalog(scope_authority: DependencyScopeAuthority) -> RequirementCatalog {
     RequirementCatalog {
       spec_hash: "spec".into(),
       requirements: vec![Requirement {
@@ -186,6 +170,7 @@ mod tests {
         title: "Auth".into(),
         description: "Authenticate requests".into(),
         required: true,
+        source_refs: Vec::new(),
       }],
       acceptance_criteria: vec![AcceptanceCriterion {
         id: CriterionId::from("REQ-001/AC-01"),
@@ -199,79 +184,65 @@ mod tests {
         description: "Run the expired token test".into(),
         kind: VerificationKind::AutomatedTest,
         required: true,
-        command: "cargo test expired_token".into(),
+        spec: spec(),
+        authority: VerificationAuthority::ProjectConfigured,
         dependency_scope: vec!["src/auth.rs".into()],
+        dependency_scope_authority: scope_authority,
       }],
+      coverage: CatalogCoverage {
+        normative_fragments: Vec::new(),
+        uncovered_fragment_ids: Vec::new(),
+      },
     }
   }
 
-  #[test]
-  fn report_commands_create_individual_revision_bound_evidence() {
-    let mut graph = graph_from_catalog(&catalog()).expect("graph");
-    let finished_at = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
-    let report = VerificationReport {
-      passed: true,
-      started_at: finished_at,
-      finished_at,
-      commands: vec![CommandResult {
-        command: "cargo test expired_token".into(),
+  fn execution(obligation_id: &str) -> VerificationExecutionResult {
+    VerificationExecutionResult {
+      run_id: VerificationRunId::new(),
+      obligation_id: ObligationId::from(obligation_id),
+      spec: spec(),
+      authority: VerificationAuthority::ProjectConfigured,
+      result: CommandResult {
+        command: spec().identity(),
         exit_code: Some(0),
         timed_out: false,
         duration_ms: 1,
         stdout: "ok".into(),
         stderr: String::new(),
-      }],
-      warnings: Vec::new(),
-    };
-
-    let ids = record_report(&mut graph, "abc123", &report).expect("record report");
-    assert_eq!(graph.evidence[&ids[0]].revision, "abc123");
+      },
+    }
   }
 
-  #[test]
-  fn explicit_candidate_check_binding_creates_obligation_evidence() {
-    let mut graph = graph_from_catalog(&catalog()).expect("graph");
+  fn verified_graph(
+    revision: &str,
+    scope_authority: DependencyScopeAuthority,
+  ) -> EvidenceGraphState {
+    let mut graph = graph_from_catalog(&catalog(scope_authority)).expect("graph");
     let finished_at = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
     let report = VerificationReport {
       passed: true,
       started_at: finished_at,
       finished_at,
-      commands: vec![CommandResult {
-        command: "custom candidate check".into(),
-        exit_code: Some(0),
-        timed_out: false,
-        duration_ms: 1,
-        stdout: "ok".into(),
-        stderr: String::new(),
-      }],
+      commands: Vec::new(),
+      executions: vec![execution("REQ-001/AC-01/VO-01")],
       warnings: Vec::new(),
     };
-    let obligation_id = ObligationId::from("REQ-001/AC-01/VO-01");
-
-    let ids = record_report_with_bindings(
-      &mut graph,
-      "abc123",
-      &report,
-      [(&obligation_id, "custom candidate check")],
-    )
-    .expect("record bound check");
-
-    assert_eq!(graph.evidence[&ids[0]].obligation_id, obligation_id);
+    record_report(&mut graph, revision, &report).expect("record evidence");
+    graph
   }
 
   fn commit(cwd: &std::path::Path, message: &str) -> String {
-    let status = std::process::Command::new("git")
-      .args(["add", "-A"])
-      .current_dir(cwd)
-      .status()
-      .expect("git add");
-    assert!(status.success());
-    let status = std::process::Command::new("git")
-      .args(["commit", "-m", message])
-      .current_dir(cwd)
-      .status()
-      .expect("git commit");
-    assert!(status.success());
+    for args in [
+      ["add", "-A"].as_slice(),
+      ["commit", "-m", message].as_slice(),
+    ] {
+      let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .expect("git command");
+      assert!(status.success());
+    }
     std::process::Command::new("git")
       .args(["rev-parse", "HEAD"])
       .current_dir(cwd)
@@ -287,12 +258,12 @@ mod tests {
       vec!["config", "user.name", "Tenet Test"],
       vec!["config", "user.email", "tenet@example.invalid"],
     ] {
-      let status = std::process::Command::new("git")
+      assert!(std::process::Command::new("git")
         .args(args)
         .current_dir(repository.path())
         .status()
-        .expect("configure git");
-      assert!(status.success());
+        .expect("configure git")
+        .success());
     }
     std::fs::create_dir_all(repository.path().join("src")).expect("source directory");
     std::fs::write(repository.path().join("src/auth.rs"), "base").expect("auth source");
@@ -301,89 +272,77 @@ mod tests {
     repository
   }
 
-  fn verified_graph(revision: &str) -> EvidenceGraphState {
-    let mut graph = graph_from_catalog(&catalog()).expect("graph");
-    let finished_at = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
-    record_report(
-      &mut graph,
-      revision,
-      &VerificationReport {
-        passed: true,
-        started_at: finished_at,
-        finished_at,
-        commands: vec![CommandResult {
-          command: "cargo test expired_token".into(),
-          exit_code: Some(0),
-          timed_out: false,
-          duration_ms: 1,
-          stdout: "ok".into(),
-          stderr: String::new(),
-        }],
-        warnings: Vec::new(),
-      },
-    )
-    .expect("record evidence");
-    graph
-  }
+  #[test]
+  fn execution_records_only_its_explicit_obligation() {
+    let mut catalog = catalog(DependencyScopeAuthority::ProjectConfigured);
+    catalog.acceptance_criteria.push(AcceptanceCriterion {
+      id: CriterionId::from("REQ-001/AC-02"),
+      requirement_id: RequirementId::from("REQ-001"),
+      description: "Second criterion".into(),
+      mandatory: true,
+    });
+    let mut second = catalog.verification_obligations[0].clone();
+    second.id = ObligationId::from("REQ-001/AC-02/VO-01");
+    second.criterion_id = CriterionId::from("REQ-001/AC-02");
+    catalog.verification_obligations.push(second);
+    let mut graph = graph_from_catalog(&catalog).expect("graph");
+    let now = Utc.with_ymd_and_hms(2026, 8, 16, 12, 0, 0).unwrap();
+    let report = VerificationReport {
+      passed: true,
+      started_at: now,
+      finished_at: now,
+      commands: Vec::new(),
+      executions: vec![execution("REQ-001/AC-01/VO-01")],
+      warnings: Vec::new(),
+    };
+    record_report(&mut graph, "abc123", &report).expect("record report");
 
-  #[tokio::test]
-  async fn relevant_repository_change_stales_evidence() {
-    let repository = repository();
-    let base = git::head(repository.path()).await.expect("base revision");
-    let mut graph = verified_graph(&base);
-    std::fs::write(repository.path().join("src/auth.rs"), "changed").expect("change auth");
-    let revision = commit(repository.path(), "change auth");
-
-    let invalidated = invalidate_for_revision(repository.path(), &mut graph, &revision)
-      .await
-      .expect("invalidate");
-
-    assert_eq!(invalidated.len(), 1);
+    assert_eq!(graph.evidence.len(), 1);
     assert_eq!(
-      graph.requirement_verification_state(&RequirementId::from("REQ-001"), &EvidencePolicy),
-      Ok(VerificationState::Stale)
+      graph.criterion_verification_state(&CriterionId::from("REQ-001/AC-02"), &EvidencePolicy),
+      Ok(VerificationState::Unverified)
     );
   }
 
   #[tokio::test]
-  async fn unrelated_repository_change_preserves_graph_and_evidence() {
+  async fn agent_proposed_narrow_scope_invalidates_on_unrelated_change() {
     let repository = repository();
     let base = git::head(repository.path()).await.expect("base revision");
-    let mut graph = verified_graph(&base);
-    let structure = (
-      graph.requirements.clone(),
-      graph.criteria.clone(),
-      graph.obligations.clone(),
-    );
+    let mut graph = verified_graph(&base, DependencyScopeAuthority::AgentProposed);
     std::fs::write(repository.path().join("README.md"), "changed").expect("change readme");
     let revision = commit(repository.path(), "change readme");
 
     let invalidated = invalidate_for_revision(repository.path(), &mut graph, &revision)
       .await
       .expect("invalidate");
+    assert_eq!(invalidated.len(), 1);
+  }
 
+  #[tokio::test]
+  async fn unknown_scope_invalidates_on_repository_change() {
+    let repository = repository();
+    let base = git::head(repository.path()).await.expect("base revision");
+    let mut graph = verified_graph(&base, DependencyScopeAuthority::Unknown);
+    std::fs::write(repository.path().join("README.md"), "changed").expect("change readme");
+    let revision = commit(repository.path(), "change readme");
+
+    let invalidated = invalidate_for_revision(repository.path(), &mut graph, &revision)
+      .await
+      .expect("invalidate");
+    assert_eq!(invalidated.len(), 1);
+  }
+
+  #[tokio::test]
+  async fn trusted_scope_preserves_evidence_for_unrelated_change() {
+    let repository = repository();
+    let base = git::head(repository.path()).await.expect("base revision");
+    let mut graph = verified_graph(&base, DependencyScopeAuthority::ProjectConfigured);
+    std::fs::write(repository.path().join("README.md"), "changed").expect("change readme");
+    let revision = commit(repository.path(), "change readme");
+
+    let invalidated = invalidate_for_revision(repository.path(), &mut graph, &revision)
+      .await
+      .expect("invalidate");
     assert!(invalidated.is_empty());
-    assert_eq!(
-      structure,
-      (
-        graph.requirements.clone(),
-        graph.criteria.clone(),
-        graph.obligations.clone()
-      )
-    );
-    assert_eq!(
-      graph.requirement_verification_state(&RequirementId::from("REQ-001"), &EvidencePolicy),
-      Ok(VerificationState::Verified)
-    );
-  }
-
-  #[test]
-  fn unrelated_paths_do_not_match_dependency_scope() {
-    assert!(!scope_matches(&["src/auth.rs".into()], &["README.md".into()]).expect("scope"));
-  }
-
-  #[test]
-  fn related_paths_match_dependency_scope() {
-    assert!(scope_matches(&["src/**".into()], &["src/auth.rs".into()]).expect("scope"));
   }
 }

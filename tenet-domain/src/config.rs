@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::model::WorkerRole;
+use crate::{ids::ObligationId, model::WorkerRole, verification::VerificationSpec};
 use anyhow::{Context, Result};
 use serde::{de, ser::SerializeStruct, Deserialize, Serialize};
 use tokio::fs;
@@ -244,16 +244,25 @@ impl AgentPreferences {
 #[derive(Debug, Clone, Serialize)]
 pub struct VerificationConfig {
   pub require_project_gate: bool,
-  pub commands: Vec<String>,
+  pub gates: Vec<ProjectVerificationGate>,
   pub timeout_secs: u64,
   pub max_output_bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectVerificationGate {
+  #[serde(rename = "obligation_ids")]
+  pub obligation_ids: Vec<ObligationId>,
+  pub spec: VerificationSpec,
+  pub dependency_scope: Vec<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VerificationConfigWire {
   require_project_gate: bool,
-  commands: Vec<String>,
+  gates: Vec<ProjectVerificationGate>,
   timeout_secs: u64,
   max_output_bytes: usize,
 }
@@ -266,7 +275,7 @@ impl<'de> Deserialize<'de> for VerificationConfig {
     let wire = VerificationConfigWire::deserialize(deserializer)?;
     let config = Self {
       require_project_gate: wire.require_project_gate,
-      commands: wire.commands,
+      gates: wire.gates,
       timeout_secs: wire.timeout_secs,
       max_output_bytes: wire.max_output_bytes,
     };
@@ -277,8 +286,24 @@ impl<'de> Deserialize<'de> for VerificationConfig {
 
 impl VerificationConfig {
   fn validate(&self) -> Result<()> {
-    if self.require_project_gate && self.commands.is_empty() {
-      anyhow::bail!("verification.commands must contain at least one command when verification.require_project_gate is enabled");
+    if self.require_project_gate && self.gates.is_empty() {
+      anyhow::bail!("verification.gates must contain at least one gate when verification.require_project_gate is enabled");
+    }
+    for gate in &self.gates {
+      if gate.obligation_ids.is_empty() {
+        anyhow::bail!("verification gate must explicitly bind at least one obligation_id");
+      }
+      if gate.spec.program.trim().is_empty() {
+        anyhow::bail!("verification gate program must not be blank");
+      }
+      if gate.dependency_scope.is_empty()
+        || gate
+          .dependency_scope
+          .iter()
+          .any(|pattern| pattern.trim().is_empty())
+      {
+        anyhow::bail!("verification gate dependency_scope must not be empty");
+      }
     }
     Ok(())
   }
@@ -326,7 +351,7 @@ impl Default for Config {
       },
       verification: VerificationConfig {
         require_project_gate: false,
-        commands: Vec::new(),
+        gates: Vec::new(),
         timeout_secs: 120,
         max_output_bytes: 64 * 1024,
       },
@@ -537,8 +562,8 @@ mod tests {
       config.verification.require_project_gate
     );
     assert_eq!(
-      schema["$defs"]["verificationConfig"]["properties"]["commands"]["default"],
-      serde_json::to_value(config.verification.commands).unwrap()
+      schema["$defs"]["verificationConfig"]["properties"]["gates"]["default"],
+      serde_json::to_value(config.verification.gates).unwrap()
     );
     assert_eq!(
       schema["$defs"]["verificationConfig"]["properties"]["timeout_secs"]["default"],
@@ -563,14 +588,14 @@ mod tests {
   }
 
   #[test]
-  fn config_schema_requires_commands_when_project_gate_is_enabled() {
+  fn config_schema_requires_gates_when_project_gate_is_enabled() {
     let schema = config_schema();
 
     assert_eq!(
       (
         &schema["$defs"]["verificationConfig"]["allOf"][0]["if"]["properties"]
           ["require_project_gate"]["const"],
-        &schema["$defs"]["verificationConfig"]["allOf"][0]["then"]["properties"]["commands"]
+        &schema["$defs"]["verificationConfig"]["allOf"][0]["then"]["properties"]["gates"]
           ["minItems"],
       ),
       (&serde_json::json!(true), &serde_json::json!(1)),
@@ -691,15 +716,15 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn read_config_rejects_empty_commands_when_project_gate_is_required() {
+  async fn read_config_rejects_empty_gates_when_project_gate_is_required() {
     let text = serialized_config(|config| config.verification.require_project_gate = true, "");
     let error = read_error(text).await;
 
-    assert!(error.contains("verification.commands must contain at least one command"));
+    assert!(error.contains("verification.gates must contain at least one gate"));
   }
 
   #[test]
-  fn empty_commands_are_allowed_when_project_gate_is_disabled() {
+  fn empty_gates_are_allowed_when_project_gate_is_disabled() {
     let text = serialized_config(|_| {}, "");
 
     assert!(toml::from_str::<Config>(&text).is_ok());

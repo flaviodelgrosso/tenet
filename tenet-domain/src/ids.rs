@@ -63,6 +63,10 @@ semantic_id!(
   "Stable semantic verification-obligation identity."
 );
 semantic_id!(
+  SpecFragmentId,
+  "Stable identity for one normative specification fragment."
+);
+semantic_id!(
   WorkUnitId,
   "Stable work-unit identity used in serialized domain relationships."
 );

@@ -19,12 +19,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use tenet_domain::{
-  config::{Config, CustomAgentConfig},
+  config::{Config, CustomAgentConfig, ProjectVerificationGate},
   events::{EventSink, RunEvent},
   evidence::{
     AcceptanceCriterion, EvidencePolicy, ImplementationState, VerificationKind,
     VerificationObligation, VerificationState,
   },
+  ids::SpecFragmentId,
   ids::{CriterionId, ObligationId, RequirementId},
   model::{
     ArchitectOutput, CandidateCheck, CompletedWorkUnit, Discovery, DiscoveryRecord,
@@ -32,6 +33,8 @@ use tenet_domain::{
     RequirementAssessment, RequirementCatalog, State, VerificationReport, WorkExecution, WorkLease,
     WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
+  verification::{DependencyScopeAuthority, VerificationAuthority, VerificationSpec},
+  worker::{derive_normative_fragments, CatalogCoverage, SpecReference},
 };
 use tenet_runtime::{
   backend::{AgentBackend, BackendContext, LaunchMetadata},
@@ -84,13 +87,35 @@ fn run_git(cwd: &Path, args: &[&str]) -> String {
   String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-fn requirement() -> Requirement {
+fn annotated_reference(spec: &str) -> SpecReference {
+  let metadata = spec
+    .lines()
+    .find(|line| line.starts_with("[fragmentId="))
+    .expect("annotated fragment metadata");
+  let metadata = metadata.trim_matches(['[', ']']);
+  let fields: BTreeMap<_, _> = metadata
+    .split_whitespace()
+    .filter_map(|field| field.split_once('='))
+    .collect();
+  SpecReference {
+    section: (fields["section"] != "<none>").then(|| fields["section"].to_owned()),
+    fragment_id: SpecFragmentId::from(fields["fragmentId"]),
+    text_hash: fields["textHash"].to_owned(),
+  }
+}
+
+fn requirement_for(spec: &str) -> Requirement {
   Requirement {
     id: RequirementId::from("REQ-001"),
     title: "Diamond".into(),
     description: "Complete the diamond graph".into(),
     required: true,
+    source_refs: vec![derive_normative_fragments(spec)[0].reference()],
   }
+}
+
+fn requirement() -> Requirement {
+  requirement_for("diamond")
 }
 
 fn criterion() -> AcceptanceCriterion {
@@ -109,8 +134,15 @@ fn obligation() -> VerificationObligation {
     description: "Verify every diamond output".into(),
     kind: VerificationKind::Command,
     required: true,
-    command: "test -f A.txt && test -f B.txt && test -f C.txt && test -f D.txt".into(),
+    spec: VerificationSpec {
+      program: "git".into(),
+      args: vec!["diff".into(), "--check".into()],
+      working_directory: ".".into(),
+      environment: Default::default(),
+    },
+    authority: VerificationAuthority::ProjectConfigured,
     dependency_scope: vec!["*.txt".into()],
+    dependency_scope_authority: DependencyScopeAuthority::ProjectConfigured,
   }
 }
 
@@ -267,12 +299,14 @@ impl Drop for ActiveGuard<'_> {
 
 #[async_trait]
 impl AgentBackend for FakeBackend {
-  async fn architect(&self, ctx: &BackendContext, _spec: &str) -> Result<ArchitectOutput> {
+  async fn architect(&self, ctx: &BackendContext, spec: &str) -> Result<ArchitectOutput> {
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Architect)
       .await?;
+    let mut requirement = requirement();
+    requirement.source_refs = vec![annotated_reference(spec)];
     Ok(ArchitectOutput {
-      requirements: vec![requirement()],
+      requirements: vec![requirement],
       acceptance_criteria: vec![criterion()],
       verification_obligations: vec![obligation()],
     })
@@ -476,7 +510,11 @@ async fn configured_controller(
     env: BTreeMap::new(),
   });
   config.execution.max_parallel_workers = max_parallel_workers;
-  config.verification.commands = vec!["true".into()];
+  config.verification.gates = vec![ProjectVerificationGate {
+    obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
+    spec: obligation().spec,
+    dependency_scope: vec!["*.txt".into()],
+  }];
   fs::write(
     repository.path().join("tenet.toml"),
     toml::to_string_pretty(&config).expect("serialize config"),
@@ -501,6 +539,7 @@ async fn configured_controller(
       requirements: vec![requirement()],
       acceptance_criteria: vec![criterion()],
       verification_obligations: vec![obligation()],
+      coverage: CatalogCoverage::derive("diamond", &[requirement()]),
     },
   )
   .await
@@ -982,6 +1021,7 @@ fn passing_report() -> VerificationReport {
     started_at: "2026-08-16T10:00:00Z".parse().expect("valid timestamp"),
     finished_at: "2026-08-16T10:00:01Z".parse().expect("valid timestamp"),
     commands: Vec::new(),
+    executions: Vec::new(),
     warnings: Vec::new(),
   }
 }
@@ -1182,7 +1222,16 @@ async fn integration_rejects_candidate_check_and_global_regression() {
   )
   .await;
   let mut config = Config::default();
-  config.verification.commands = vec!["test ! -f regression".into()];
+  config.verification.gates = vec![ProjectVerificationGate {
+    obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
+    spec: VerificationSpec {
+      program: "sh".into(),
+      args: vec!["-lc".into(), "test ! -f regression".into()],
+      working_directory: ".".into(),
+      environment: Default::default(),
+    },
+    dependency_scope: vec!["**".into()],
+  }];
   let mut regression_integrator = Integrator::create(
     repository.path().to_path_buf(),
     &regression_manager,
@@ -1398,7 +1447,16 @@ async fn assert_cancellation_during_integration_verification(global: bool) {
   .await;
   let mut config = Config::default();
   if global {
-    config.verification.commands = vec![command];
+    config.verification.gates = vec![ProjectVerificationGate {
+      obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
+      spec: VerificationSpec {
+        program: "sh".into(),
+        args: vec!["-lc".into(), command],
+        working_directory: ".".into(),
+        environment: Default::default(),
+      },
+      dependency_scope: vec!["**".into()],
+    }];
   }
   let cancel = CancellationToken::new();
   let trigger = cancel.clone();

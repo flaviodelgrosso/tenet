@@ -37,7 +37,7 @@ assess = { thought_level = "high", model = "github-copilot/gpt-5.6-luna" }
 
 [verification]
 require_project_gate = true
-commands = ["make ci"]
+gates = [{ obligation_ids = ["REQ-001/AC-01/VO-01"], dependency_scope = ["**"], spec = { program = "make", args = ["ci"], workingDirectory = ".", environment = {} } }]
 timeout_secs = 120
 max_output_bytes = 65536
 

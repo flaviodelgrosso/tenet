@@ -448,6 +448,8 @@ mod tests {
       evidence::{AcceptanceCriterion, VerificationKind, VerificationObligation},
       ids::{CriterionId, ObligationId, RequirementId},
       model::Requirement,
+      verification::{DependencyScopeAuthority, VerificationAuthority, VerificationSpec},
+      worker::CatalogCoverage,
     };
 
     RequirementCatalog {
@@ -457,6 +459,7 @@ mod tests {
         title: "Requirement".into(),
         description: "Description".into(),
         required: true,
+        source_refs: Vec::new(),
       }],
       acceptance_criteria: vec![AcceptanceCriterion {
         id: CriterionId::from("REQ-001/AC-01"),
@@ -470,9 +473,20 @@ mod tests {
         description: "Run check".into(),
         kind: VerificationKind::Command,
         required: true,
-        command: "true".into(),
+        spec: VerificationSpec {
+          program: "true".into(),
+          args: Vec::new(),
+          working_directory: ".".into(),
+          environment: Default::default(),
+        },
+        authority: VerificationAuthority::ProjectConfigured,
         dependency_scope: vec!["src/**".into()],
+        dependency_scope_authority: DependencyScopeAuthority::ProjectConfigured,
       }],
+      coverage: CatalogCoverage {
+        normative_fragments: Vec::new(),
+        uncovered_fragment_ids: Vec::new(),
+      },
     }
   }
 
@@ -483,6 +497,7 @@ mod tests {
       evidence::{EvidencePolicy, VerificationState},
       ids::{ObligationId, RequirementId, VerificationRunId},
       model::CommandResult,
+      verification::{VerificationAuthority, VerificationExecutionResult, VerificationSpec},
     };
 
     let project = tempfile::tempdir().expect("temporary project");
@@ -490,18 +505,33 @@ mod tests {
     let catalog = evidence_catalog();
     let mut graph = graph_from_catalog(&catalog).expect("graph");
     graph
-      .record_command_result(
-        &ObligationId::from("REQ-001/AC-01/VO-01"),
+      .record_execution_result(
         "abc123",
-        VerificationRunId::new(),
         Utc::now(),
-        &CommandResult {
-          command: "true".into(),
-          exit_code: Some(0),
-          timed_out: false,
-          duration_ms: 1,
-          stdout: String::new(),
-          stderr: String::new(),
+        &VerificationExecutionResult {
+          run_id: VerificationRunId::new(),
+          obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+          spec: VerificationSpec {
+            program: "true".into(),
+            args: Vec::new(),
+            working_directory: ".".into(),
+            environment: Default::default(),
+          },
+          authority: VerificationAuthority::ProjectConfigured,
+          result: CommandResult {
+            command: VerificationSpec {
+              program: "true".into(),
+              args: Vec::new(),
+              working_directory: ".".into(),
+              environment: Default::default(),
+            }
+            .identity(),
+            exit_code: Some(0),
+            timed_out: false,
+            duration_ms: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+          },
         },
       )
       .expect("evidence");

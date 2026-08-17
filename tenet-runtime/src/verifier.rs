@@ -1,6 +1,10 @@
-use std::{collections::BTreeSet, path::Path, process::Stdio, time::Instant};
+use std::{
+  path::{Component, Path, PathBuf},
+  process::Stdio,
+  time::Instant,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use tokio::{
   io::AsyncReadExt,
@@ -12,18 +16,69 @@ use tokio_util::sync::CancellationToken;
 use tenet_domain::{
   config::Config,
   model::{CommandResult, VerificationReport},
+  verification::{VerificationExecutionRequest, VerificationExecutionResult, VerificationSpec},
 };
-
-pub async fn verification_commands(config: &Config) -> Result<Vec<String>> {
-  deduplicate_commands(config.verification.commands.iter().cloned())
-}
 
 pub async fn run_verification_cancelled(
   cwd: &Path,
   config: &Config,
   cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
-  run_commands(cwd, config, verification_commands(config).await?, cancel).await
+  run_specs(
+    cwd,
+    config,
+    config.verification.gates.iter().map(|gate| &gate.spec),
+    cancel,
+  )
+  .await
+}
+
+pub async fn run_execution_requests_cancelled(
+  cwd: &Path,
+  config: &Config,
+  requests: &[VerificationExecutionRequest],
+  cancel: &CancellationToken,
+) -> Result<VerificationReport> {
+  let started_at = Utc::now();
+  let mut commands = Vec::new();
+  let mut executions = Vec::new();
+  for request in requests {
+    let result = run_spec(
+      cwd,
+      &request.spec,
+      Duration::from_secs(config.verification.timeout_secs),
+      config.verification.max_output_bytes,
+      cancel,
+    )
+    .await?;
+    let failed = result.exit_code != Some(0) || result.timed_out;
+    commands.push(result.clone());
+    executions.push(VerificationExecutionResult {
+      run_id: request.run_id,
+      obligation_id: request.obligation_id.clone(),
+      spec: request.spec.clone(),
+      authority: request.authority,
+      result,
+    });
+    if failed {
+      break;
+    }
+  }
+  let passed = commands
+    .iter()
+    .all(|result| result.exit_code == Some(0) && !result.timed_out)
+    && (!config.verification.require_project_gate
+      || requests
+        .iter()
+        .any(|request| request.authority.is_trusted()));
+  Ok(VerificationReport {
+    passed,
+    started_at,
+    finished_at: Utc::now(),
+    commands,
+    executions,
+    warnings: Vec::new(),
+  })
 }
 
 pub async fn run_verification_with_checks_cancelled<'a>(
@@ -32,13 +87,19 @@ pub async fn run_verification_with_checks_cancelled<'a>(
   suggested_checks: impl IntoIterator<Item = &'a str>,
   cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
-  let commands = deduplicate_commands(
-    suggested_checks
-      .into_iter()
-      .map(str::to_owned)
-      .chain(config.verification.commands.iter().cloned()),
-  )?;
-  run_commands(cwd, config, commands, cancel).await
+  let mut specs: Vec<_> = suggested_checks
+    .into_iter()
+    .filter(|command| !command.trim().is_empty())
+    .map(advisory_shell_spec)
+    .collect();
+  specs.extend(
+    config
+      .verification
+      .gates
+      .iter()
+      .map(|gate| gate.spec.clone()),
+  );
+  run_specs(cwd, config, specs.iter(), cancel).await
 }
 
 pub async fn run_suggested_checks_cancelled<'a>(
@@ -47,52 +108,44 @@ pub async fn run_suggested_checks_cancelled<'a>(
   suggested_checks: impl IntoIterator<Item = &'a str>,
   cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
-  run_commands(
-    cwd,
-    config,
-    deduplicate_commands(suggested_checks.into_iter().map(str::to_owned))?,
-    cancel,
-  )
-  .await
+  let specs: Vec<_> = suggested_checks
+    .into_iter()
+    .filter(|command| !command.trim().is_empty())
+    .map(advisory_shell_spec)
+    .collect();
+  run_specs(cwd, config, specs.iter(), cancel).await
 }
 
-fn deduplicate_commands(commands: impl Iterator<Item = String>) -> Result<Vec<String>> {
-  let mut seen = BTreeSet::new();
-  Ok(
-    commands
-      .filter(|command| !command.trim().is_empty())
-      .filter(|command| seen.insert(command.trim().to_owned()))
-      .collect(),
-  )
+fn advisory_shell_spec(command: &str) -> VerificationSpec {
+  #[cfg(windows)]
+  let (program, args) = (
+    std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into()),
+    vec!["/D".into(), "/C".into(), command.into()],
+  );
+  #[cfg(not(windows))]
+  let (program, args) = ("sh".into(), vec!["-lc".into(), command.into()]);
+
+  VerificationSpec {
+    program,
+    args,
+    working_directory: ".".into(),
+    environment: Default::default(),
+  }
 }
 
-async fn run_commands(
+async fn run_specs<'a>(
   cwd: &Path,
   config: &Config,
-  commands: Vec<String>,
+  specs: impl IntoIterator<Item = &'a VerificationSpec>,
   cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
   let started_at = Utc::now();
-  let project_gate_count = commands
-    .iter()
-    .filter(|command| command.as_str() != "git diff --check")
-    .count();
-  let mut warnings = Vec::new();
-  if commands.is_empty() {
-    warnings.push("No deterministic verification commands configured.".into());
-  }
-  if config.verification.require_project_gate && project_gate_count == 0 {
-    warnings.push(
-      "Completion requires at least one project gate; git diff --check alone is insufficient."
-        .into(),
-    );
-  }
-
+  let specs: Vec<_> = specs.into_iter().cloned().collect();
   let mut results = Vec::new();
-  for command in commands {
-    let result = run_shell(
+  for spec in &specs {
+    let result = run_spec(
       cwd,
-      &command,
+      spec,
       Duration::from_secs(config.verification.timeout_secs),
       config.verification.max_output_bytes,
       cancel,
@@ -104,55 +157,77 @@ async fn run_commands(
       break;
     }
   }
-
+  let project_gate_count = config.verification.gates.len();
+  let mut warnings = Vec::new();
+  if results.is_empty() {
+    warnings.push("No deterministic verification gates configured.".into());
+  }
+  if config.verification.require_project_gate && project_gate_count == 0 {
+    warnings.push("Completion requires at least one project-configured gate.".into());
+  }
   let passed = results
     .iter()
     .all(|result| result.exit_code == Some(0) && !result.timed_out)
     && (!config.verification.require_project_gate || project_gate_count > 0);
-
   Ok(VerificationReport {
     passed,
     started_at,
     finished_at: Utc::now(),
     commands: results,
+    executions: Vec::new(),
     warnings,
   })
 }
 
-fn shell_command(command: &str) -> Command {
-  #[cfg(windows)]
+fn resolve_working_directory(workspace: &Path, relative: &str) -> Result<PathBuf> {
+  let relative = Path::new(relative);
+  if relative.as_os_str().is_empty()
+    || relative.is_absolute()
+    || relative
+      .components()
+      .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
   {
-    // `ComSpec` points to the user's configured Windows command interpreter;
-    // `cmd.exe` remains a stable fallback for stripped-down environments.
-    let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
-    let mut command_process = Command::new(shell);
-    command_process.args(["/D", "/C", command]);
-    command_process
+    bail!("verification working directory must be a relative path within the workspace");
   }
-
-  #[cfg(not(windows))]
-  {
-    let mut command_process = Command::new("sh");
-    command_process.args(["-lc", command]);
-    command_process
+  let workspace = workspace
+    .canonicalize()
+    .context("canonicalize verification workspace")?;
+  let directory = workspace.join(relative);
+  let directory = directory.canonicalize().with_context(|| {
+    format!(
+      "canonicalize verification working directory {}",
+      directory.display()
+    )
+  })?;
+  if !directory.starts_with(&workspace) {
+    bail!("verification working directory escapes the workspace");
   }
+  Ok(directory)
 }
 
-async fn run_shell(
-  cwd: &Path,
-  command: &str,
+async fn run_spec(
+  workspace: &Path,
+  spec: &VerificationSpec,
   limit: Duration,
   max_output: usize,
   cancel: &CancellationToken,
 ) -> Result<CommandResult> {
+  if spec.program.trim().is_empty() {
+    bail!("verification program must not be blank");
+  }
+  let working_directory = resolve_working_directory(workspace, &spec.working_directory)?;
+  let identity = spec.identity();
   let start = Instant::now();
-  let mut child = shell_command(command)
-    .current_dir(cwd)
+  let mut child = Command::new(&spec.program)
+    .args(&spec.args)
+    .env_clear()
+    .envs(&spec.environment)
+    .current_dir(working_directory)
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .kill_on_drop(true)
     .spawn()
-    .with_context(|| format!("spawn verification command: {command}"))?;
+    .with_context(|| format!("spawn verification specification: {identity}"))?;
 
   let mut stdout = child
     .stdout
@@ -163,18 +238,18 @@ async fn run_shell(
     .take()
     .context("verification stderr unavailable")?;
   let stdout_task = tokio::spawn(async move {
-    let mut buf = Vec::new();
-    stdout.read_to_end(&mut buf).await.map(|_| buf)
+    let mut buffer = Vec::new();
+    stdout.read_to_end(&mut buffer).await.map(|_| buffer)
   });
   let stderr_task = tokio::spawn(async move {
-    let mut buf = Vec::new();
-    stderr.read_to_end(&mut buf).await.map(|_| buf)
+    let mut buffer = Vec::new();
+    stderr.read_to_end(&mut buffer).await.map(|_| buffer)
   });
 
   let (status, timed_out) = tokio::select! {
     _ = cancel.cancelled() => {
       terminate(&mut child).await;
-      anyhow::bail!("run cancelled during verification command: {command}");
+      bail!("run cancelled during verification specification: {identity}");
     }
     result = timeout(limit, child.wait()) => match result {
       Ok(status) => (Some(status?), false),
@@ -188,8 +263,8 @@ async fn run_shell(
   let stdout = stdout_task.await??;
   let stderr = stderr_task.await??;
   Ok(CommandResult {
-    command: command.into(),
-    exit_code: status.and_then(|s| s.code()),
+    command: identity,
+    exit_code: status.and_then(|status| status.code()),
     timed_out,
     duration_ms: start.elapsed().as_millis(),
     stdout: truncate_utf8(&stdout, max_output),
@@ -219,34 +294,19 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 mod tests {
   use super::*;
 
-  #[tokio::test]
-  async fn run_shell_executes_command_with_platform_shell() {
-    let result = run_shell(
-      Path::new("."),
-      "echo tenet-shell-test",
-      Duration::from_secs(5),
-      1024,
-      &CancellationToken::new(),
-    )
-    .await
-    .expect("platform shell should start");
-
-    assert_eq!(result.exit_code, Some(0));
-    assert!(!result.timed_out);
-    assert!(result.stdout.contains("tenet-shell-test"));
+  #[test]
+  fn working_directory_rejects_parent_traversal() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let error = resolve_working_directory(workspace.path(), "../outside")
+      .expect_err("parent traversal rejected");
+    assert!(error.to_string().contains("relative path"));
   }
-  #[tokio::test]
-  async fn run_shell_marks_timeout_and_terminates_child() {
-    let result = run_shell(
-      Path::new("."),
-      "sleep 1",
-      Duration::from_millis(10),
-      1024,
-      &CancellationToken::new(),
-    )
-    .await
-    .expect("platform shell should start");
 
-    assert!(result.timed_out);
+  #[test]
+  fn truncation_preserves_utf8_boundary() {
+    assert_eq!(
+      truncate_utf8("éé".as_bytes(), 3),
+      "é�\n… output truncated by tenet"
+    );
   }
 }

@@ -890,6 +890,7 @@ mod tests {
       started_at: "2026-08-16T10:00:00Z".parse().expect("valid timestamp"),
       finished_at: "2026-08-16T10:00:01Z".parse().expect("valid timestamp"),
       warnings: Vec::new(),
+      executions: Vec::new(),
       commands: vec![CommandResult {
         command: "cargo test".into(),
         exit_code: passed.then_some(0).or(Some(1)),

@@ -1242,9 +1242,9 @@ mod tests {
   #[test]
   fn generated_contracts_deserialize_valid_architect_reconcile_and_worker_output() {
     let architect = json!({
-      "requirements":[{"id":"REQ-001","title":"Title","description":"Description","required":true}],
+      "requirements":[{"id":"REQ-001","title":"Title","description":"Description","required":true,"sourceRefs":[{"section":null,"fragmentId":"SPEC-0001-example","textHash":"hash"}]}],
       "acceptanceCriteria":[{"id":"REQ-001/AC-01","requirementId":"REQ-001","description":"Observable","mandatory":true}],
-      "verificationObligations":[{"id":"REQ-001/AC-01/VO-01","criterionId":"REQ-001/AC-01","description":"Run check","kind":"automated_test","required":true,"command":"cargo test","dependencyScope":["src/**"]}]
+      "verificationObligations":[{"id":"REQ-001/AC-01/VO-01","criterionId":"REQ-001/AC-01","description":"Run check","kind":"automated_test","required":true,"spec":{"program":"cargo","args":["test"],"workingDirectory":".","environment":{}},"authority":"agent_proposed","dependencyScope":["src/**"],"dependencyScopeAuthority":"agent_proposed"}]
     });
     let worker = json!({"summary":"done","changedFiles":["src/lib.rs"],"testsRun":["cargo test"],"notes":[],"discoveries":[{"type":"blocker","description":"blocked"}]});
 

@@ -104,6 +104,8 @@ mod tests {
     },
     ids::{CriterionId, ObligationId, RequirementId},
     model::{CandidateCheck, Requirement, RequirementAssessment, WorkScope},
+    verification::{DependencyScopeAuthority, VerificationAuthority, VerificationSpec},
+    worker::CatalogCoverage,
   };
 
   fn catalog() -> RequirementCatalog {
@@ -114,6 +116,7 @@ mod tests {
         title: "Requirement".into(),
         description: "Description".into(),
         required: true,
+        source_refs: Vec::new(),
       }],
       acceptance_criteria: vec![AcceptanceCriterion {
         id: CriterionId::from("REQ-001/AC-01"),
@@ -127,9 +130,20 @@ mod tests {
         description: "Run check".into(),
         kind: VerificationKind::Command,
         required: true,
-        command: "cargo test".into(),
+        spec: VerificationSpec {
+          program: "cargo".into(),
+          args: vec!["test".into()],
+          working_directory: ".".into(),
+          environment: Default::default(),
+        },
+        authority: VerificationAuthority::AgentProposed,
         dependency_scope: vec!["src/**".into()],
+        dependency_scope_authority: DependencyScopeAuthority::AgentProposed,
       }],
+      coverage: CatalogCoverage {
+        normative_fragments: Vec::new(),
+        uncovered_fragment_ids: Vec::new(),
+      },
     }
   }
 

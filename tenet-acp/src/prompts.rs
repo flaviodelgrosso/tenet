@@ -25,9 +25,12 @@ Rules:
 - Requirements are product/quality requirements, not implementation micro-tasks.
 - Use stable sequential ids REQ-001, REQ-002, ... in spec order.
 - Use criterion ids REQ-NNN/AC-NN and obligation ids REQ-NNN/AC-NN/VO-NN in parent order.
-- Every important normative statement in the spec must map to at least one requirement.
+- Every controller-annotated normative fragment must map to at least one requirement. Copy its fragmentId, textHash, and section exactly into sourceRefs.
+- Treat every normative requirement as required, every acceptance criterion as mandatory, and every supporting obligation as required. Do not use false flags to remove scope.
 - Acceptance criteria describe observable, falsifiable truths. Verification obligations separately describe how each truth must be demonstrated.
-- Every mandatory criterion needs at least one required deterministic obligation with an executable command and conservative dependencyScope globs.
+- Verification specs separate program, args, workingDirectory, and environment. Do not encode shell syntax in program or args unless the check intrinsically requires a shell.
+- Mark proposed obligation authority and dependencyScopeAuthority as agent_proposed. The controller alone may promote them.
+- Use conservative dependencyScope globs. Unknown dependency relations use ** rather than an empty or narrow guess.
 - You propose checks; only the controller executes them and establishes evidence.
 - You are read-only. Inspect only when useful; do not modify the repository.
 - `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence.

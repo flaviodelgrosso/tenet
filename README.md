@@ -580,13 +580,16 @@ This part matters more than almost anything else.
 ```toml
 [verification]
 require_project_gate = true
-commands = [
-  "cargo test",
-  "./scripts/acceptance.sh",
-]
+
+[[verification.gates]]
+obligation_ids = ["REQ-001/AC-01/VO-01"]
+dependency_scope = ["src/**", "tests/**"]
+spec = { program = "cargo", args = ["test"], workingDirectory = ".", environment = {} }
 ```
 
-The stronger your verification, the stronger the evidence Tenet can use.
+Project-configured gates are trusted because the project owner explicitly binds each structured
+execution specification to verification obligation identities. Agent-proposed checks remain
+advisory even when they exit successfully.
 
 A perfectly orchestrated agent cannot compensate for a test suite that proves nothing.
 
@@ -678,9 +681,8 @@ turn_timeout_secs = 900
 
 [verification]
 require_project_gate = true
-commands = ["make ci"]
+gates = [{ obligation_ids = ["REQ-001/AC-01/VO-01"], dependency_scope = ["**"], spec = { program = "make", args = ["ci"], workingDirectory = ".", environment = {} } }]
 timeout_secs = 120
-
 [execution]
 max_parallel_workers = 1
 
@@ -759,9 +761,10 @@ Passing tests can still mean shipping the wrong thing.
 
 ### A security sandbox
 
-Git worktree isolation protects workflow boundaries.
-
-It does not make arbitrary model-generated commands safe.
+Disposable Git worktrees isolate repository mutations made by Architect, Reconcile, Assess, and
+verification processes from the canonical checkout. They are not security sandboxes: workers retain
+the host process's filesystem, network, and credential access. Agent-generated checks are advisory;
+controller execution alone does not promote them to trusted evidence.
 
 ### A replacement for specifications
 

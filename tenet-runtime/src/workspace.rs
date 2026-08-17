@@ -6,6 +6,10 @@ use tokio::fs;
 
 use crate::git;
 
+/// Creates disposable Git worktrees that isolate repository mutations.
+///
+/// Worktrees are not security sandboxes: workers retain the host process's filesystem,
+/// network, and credential access.
 #[derive(Clone)]
 pub struct WorkspaceManager {
   repository: PathBuf,

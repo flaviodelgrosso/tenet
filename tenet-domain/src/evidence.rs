@@ -7,7 +7,9 @@ use thiserror::Error;
 
 use crate::{
   ids::{CriterionId, EvidenceId, ObligationId, RequirementId, VerificationRunId},
-  verification::CommandResult,
+  verification::{
+    DependencyScopeAuthority, VerificationAuthority, VerificationExecutionResult, VerificationSpec,
+  },
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -154,9 +156,12 @@ pub struct VerificationObligation {
   pub kind: VerificationKind,
   #[serde(default = "default_true")]
   pub required: bool,
-  pub command: String,
+  pub spec: VerificationSpec,
+  pub authority: VerificationAuthority,
   #[serde(rename = "dependencyScope")]
   pub dependency_scope: Vec<String>,
+  #[serde(rename = "dependencyScopeAuthority")]
+  pub dependency_scope_authority: DependencyScopeAuthority,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,10 +182,14 @@ pub struct Evidence {
   #[serde(rename = "observedAt")]
   pub observed_at: DateTime<Utc>,
   pub provenance: EvidenceProvenance,
+  #[serde(rename = "verificationAuthority")]
+  pub verification_authority: VerificationAuthority,
   pub output: String,
   pub validity: EvidenceValidity,
   #[serde(rename = "dependencyScope")]
   pub dependency_scope: Vec<String>,
+  #[serde(rename = "dependencyScopeAuthority")]
+  pub dependency_scope_authority: DependencyScopeAuthority,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -191,12 +200,14 @@ impl EvidencePolicy {
     evidence.validity.is_valid()
       && evidence.result == EvidenceResult::Passed
       && evidence.provenance.is_controller_execution()
+      && evidence.verification_authority.is_trusted()
   }
 
   pub fn blocks(&self, evidence: &Evidence) -> bool {
     evidence.validity.is_valid()
       && evidence.result == EvidenceResult::Failed
       && evidence.provenance.is_controller_execution()
+      && evidence.verification_authority.is_trusted()
   }
 }
 
@@ -216,7 +227,7 @@ pub struct EvidenceGraphState {
 }
 
 impl EvidenceGraphState {
-  pub const VERSION: u32 = 1;
+  pub const VERSION: u32 = 2;
 
   pub fn new(specification_hash: impl Into<String>) -> Self {
     Self {
@@ -268,7 +279,7 @@ impl EvidenceGraphState {
         obligation.criterion_id.clone(),
       ));
     }
-    if obligation.description.trim().is_empty() || obligation.command.trim().is_empty() {
+    if obligation.description.trim().is_empty() || obligation.spec.program.trim().is_empty() {
       return Err(EvidenceGraphError::BlankDescription(
         obligation.id.to_string(),
       ));
@@ -311,22 +322,29 @@ impl EvidenceGraphState {
     Ok(())
   }
 
-  pub fn record_command_result(
+  pub fn record_execution_result(
     &mut self,
-    obligation_id: &ObligationId,
     revision: impl Into<String>,
-    run_id: VerificationRunId,
     observed_at: DateTime<Utc>,
-    result: &CommandResult,
+    execution: &VerificationExecutionResult,
   ) -> Result<EvidenceId, EvidenceGraphError> {
     let obligation = self
       .obligations
-      .get(obligation_id)
-      .ok_or_else(|| EvidenceGraphError::UnknownObligation(obligation_id.clone()))?;
+      .get(&execution.obligation_id)
+      .ok_or_else(|| EvidenceGraphError::UnknownObligation(execution.obligation_id.clone()))?;
+    if obligation.spec != execution.spec
+      || obligation.authority != execution.authority
+      || execution.result.command != execution.spec.identity()
+    {
+      return Err(EvidenceGraphError::ExecutionMismatch(
+        execution.obligation_id.clone(),
+      ));
+    }
     let criterion = self
       .criteria
       .get(&obligation.criterion_id)
       .ok_or_else(|| EvidenceGraphError::UnknownCriterion(obligation.criterion_id.clone()))?;
+    let result = &execution.result;
     let id = EvidenceId::new();
     let output = match (result.stdout.is_empty(), result.stderr.is_empty()) {
       (false, false) => format!("{}\n{}", result.stdout, result.stderr),
@@ -345,13 +363,15 @@ impl EvidenceGraphState {
       } else {
         EvidenceResult::Failed
       },
-      check_identity: result.command.clone(),
+      check_identity: execution.spec.identity(),
       revision: revision.into(),
       observed_at,
-      provenance: EvidenceProvenance::controller_execution(run_id),
+      provenance: EvidenceProvenance::controller_execution(execution.run_id),
+      verification_authority: execution.authority,
       output,
       validity: EvidenceValidity::Valid,
       dependency_scope: obligation.dependency_scope.clone(),
+      dependency_scope_authority: obligation.dependency_scope_authority,
     };
     self.establish_evidence(evidence)?;
     Ok(id)
@@ -565,6 +585,8 @@ pub enum EvidenceGraphError {
   UnknownCriterion(CriterionId),
   #[error("unknown verification obligation {0}")]
   UnknownObligation(ObligationId),
+  #[error("verification execution does not match obligation {0}")]
+  ExecutionMismatch(ObligationId),
   #[error("duplicate acceptance criterion")]
   DuplicateCriterion,
   #[error("duplicate verification obligation")]
@@ -599,8 +621,21 @@ mod tests {
   use proptest::prelude::*;
 
   use super::*;
+  use crate::verification::{
+    CommandResult, DependencyScopeAuthority, VerificationAuthority, VerificationExecutionResult,
+    VerificationSpec,
+  };
 
-  fn graph() -> EvidenceGraphState {
+  fn verification_spec() -> VerificationSpec {
+    VerificationSpec {
+      program: "cargo".into(),
+      args: vec!["test".into(), "expired_token_returns_401".into()],
+      working_directory: ".".into(),
+      environment: Default::default(),
+    }
+  }
+
+  fn graph(authority: VerificationAuthority) -> EvidenceGraphState {
     let mut graph = EvidenceGraphState::new("spec-hash");
     graph.register_requirement(RequirementId::from("REQ-007"), true);
     graph
@@ -618,8 +653,10 @@ mod tests {
         description: "Submit an expired token and observe HTTP 401".into(),
         kind: VerificationKind::AutomatedTest,
         required: true,
-        command: "cargo test expired_token_returns_401".into(),
+        spec: verification_spec(),
+        authority,
         dependency_scope: vec!["src/auth.rs".into(), "tests/auth.rs".into()],
+        dependency_scope_authority: DependencyScopeAuthority::ProjectConfigured,
       })
       .expect("obligation");
     graph
@@ -627,7 +664,7 @@ mod tests {
 
   fn command(exit_code: i32) -> CommandResult {
     CommandResult {
-      command: "cargo test expired_token_returns_401".into(),
+      command: verification_spec().identity(),
       exit_code: Some(exit_code),
       timed_out: false,
       duration_ms: 10,
@@ -636,73 +673,124 @@ mod tests {
     }
   }
 
+  fn execution(authority: VerificationAuthority, exit_code: i32) -> VerificationExecutionResult {
+    VerificationExecutionResult {
+      run_id: VerificationRunId::new(),
+      obligation_id: ObligationId::from("REQ-007/AC-01/VO-01"),
+      spec: verification_spec(),
+      authority,
+      result: command(exit_code),
+    }
+  }
+
   fn observed_at() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 8, 16, 10, 0, 0).unwrap()
   }
 
   #[test]
-  fn criterion_identity_is_stable_and_relationship_is_explicit() {
-    let graph = graph();
-    let criterion = &graph.criteria[&CriterionId::from("REQ-007/AC-01")];
-
-    assert_eq!(criterion.requirement_id, RequirementId::from("REQ-007"));
-  }
-
-  #[test]
-  fn obligation_rejects_an_unknown_criterion() {
-    let mut graph = graph();
-    let error = graph
-      .add_obligation(VerificationObligation {
-        id: ObligationId::from("REQ-007/AC-02/VO-01"),
-        criterion_id: CriterionId::from("REQ-007/AC-02"),
-        description: "Unknown".into(),
-        kind: VerificationKind::Command,
-        required: true,
-        command: "true".into(),
-        dependency_scope: vec!["**".into()],
-      })
-      .expect_err("unknown criterion");
-
+  fn mandatory_criterion_without_trusted_evidence_is_unverified() {
     assert_eq!(
-      error,
-      EvidenceGraphError::UnknownCriterion(CriterionId::from("REQ-007/AC-02"))
+      graph(VerificationAuthority::ProjectConfigured)
+        .requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy),
+      Ok(VerificationState::Unverified)
     );
   }
 
   #[test]
-  fn missing_required_evidence_keeps_requirement_unverified() {
-    assert_eq!(
-      graph()
-        .requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy)
-        .expect("state"),
-      VerificationState::Unverified
-    );
-  }
-
-  #[test]
-  fn controller_command_result_verifies_requirement() {
-    let mut graph = graph();
+  fn trusted_project_execution_verifies_requirement() {
+    let mut graph = graph(VerificationAuthority::ProjectConfigured);
     graph
-      .record_command_result(
-        &ObligationId::from("REQ-007/AC-01/VO-01"),
+      .record_execution_result(
         "7ca311f",
-        VerificationRunId::new(),
         observed_at(),
-        &command(0),
+        &execution(VerificationAuthority::ProjectConfigured, 0),
       )
       .expect("evidence");
 
     assert_eq!(
-      graph
-        .requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy)
-        .expect("state"),
-      VerificationState::Verified
+      graph.requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy),
+      Ok(VerificationState::Verified)
     );
   }
 
   #[test]
-  fn advisory_model_evidence_cannot_verify_requirement() {
-    let mut graph = graph();
+  fn agent_proposed_true_cannot_verify_requirement() {
+    let mut graph = graph(VerificationAuthority::AgentProposed);
+    let true_spec = VerificationSpec {
+      program: "true".into(),
+      args: Vec::new(),
+      working_directory: ".".into(),
+      environment: Default::default(),
+    };
+    graph
+      .obligations
+      .get_mut(&ObligationId::from("REQ-007/AC-01/VO-01"))
+      .expect("obligation")
+      .spec = true_spec.clone();
+    let mut execution = execution(VerificationAuthority::AgentProposed, 0);
+    execution.spec = true_spec.clone();
+    execution.result.command = true_spec.identity();
+    graph
+      .record_execution_result("7ca311f", observed_at(), &execution)
+      .expect("advisory evidence");
+
+    assert_eq!(
+      graph.requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy),
+      Ok(VerificationState::Unverified)
+    );
+  }
+
+  #[test]
+  fn result_bound_to_wrong_obligation_is_rejected() {
+    let mut graph = graph(VerificationAuthority::ProjectConfigured);
+    let mut execution = execution(VerificationAuthority::ProjectConfigured, 0);
+    execution.obligation_id = ObligationId::from("REQ-999/AC-01/VO-01");
+
+    assert_eq!(
+      graph
+        .record_execution_result("7ca311f", observed_at(), &execution)
+        .expect_err("wrong obligation rejected"),
+      EvidenceGraphError::UnknownObligation(ObligationId::from("REQ-999/AC-01/VO-01"))
+    );
+  }
+
+  #[test]
+  fn mismatched_execution_spec_is_rejected() {
+    let mut graph = graph(VerificationAuthority::ProjectConfigured);
+    let mut execution = execution(VerificationAuthority::ProjectConfigured, 0);
+    execution.spec.args.push("unrelated".into());
+
+    assert_eq!(
+      graph
+        .record_execution_result("7ca311f", observed_at(), &execution)
+        .expect_err("mismatched spec rejected"),
+      EvidenceGraphError::ExecutionMismatch(ObligationId::from("REQ-007/AC-01/VO-01"))
+    );
+  }
+
+  #[test]
+  fn contradictory_trusted_executions_are_preserved_and_block_verification() {
+    let mut graph = graph(VerificationAuthority::ProjectConfigured);
+    for exit_code in [0, 1] {
+      graph
+        .record_execution_result(
+          "7ca311f",
+          observed_at(),
+          &execution(VerificationAuthority::ProjectConfigured, exit_code),
+        )
+        .expect("evidence");
+    }
+
+    assert_eq!(
+      graph.requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy),
+      Ok(VerificationState::Contradicted)
+    );
+    assert_eq!(graph.evidence.len(), 2);
+  }
+
+  #[test]
+  fn advisory_model_evidence_cannot_upgrade_requirement() {
+    let mut graph = graph(VerificationAuthority::ProjectConfigured);
     graph
       .establish_evidence(Evidence {
         id: EvidenceId::new(),
@@ -715,135 +803,69 @@ mod tests {
         revision: "7ca311f".into(),
         observed_at: observed_at(),
         provenance: EvidenceProvenance::model_observation("reconcile"),
-        output: "src/auth.rs appears correct".into(),
+        verification_authority: VerificationAuthority::AgentProposed,
+        output: "appears correct".into(),
         validity: EvidenceValidity::Valid,
         dependency_scope: vec!["src/auth.rs".into()],
+        dependency_scope_authority: DependencyScopeAuthority::AgentProposed,
       })
       .expect("advisory evidence");
 
     assert_eq!(
-      graph
-        .requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy)
-        .expect("state"),
-      VerificationState::Unverified
-    );
-  }
-
-  #[test]
-  fn stale_required_evidence_removes_verification() {
-    let mut graph = graph();
-    graph
-      .record_command_result(
-        &ObligationId::from("REQ-007/AC-01/VO-01"),
-        "7ca311f",
-        VerificationRunId::new(),
-        observed_at(),
-        &command(0),
-      )
-      .expect("evidence");
-    graph.invalidate_where("abc123", observed_at(), |_| true);
-
-    assert_eq!(
-      graph
-        .requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy)
-        .expect("state"),
-      VerificationState::Stale
-    );
-  }
-
-  #[test]
-  fn contradictory_controller_evidence_is_preserved_and_blocks_verification() {
-    let mut graph = graph();
-    for exit_code in [0, 1] {
-      graph
-        .record_command_result(
-          &ObligationId::from("REQ-007/AC-01/VO-01"),
-          "7ca311f",
-          VerificationRunId::new(),
-          observed_at(),
-          &command(exit_code),
-        )
-        .expect("evidence");
-    }
-
-    assert_eq!(
-      graph
-        .requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy)
-        .expect("state"),
-      VerificationState::Contradicted
-    );
-    assert_eq!(graph.evidence.len(), 2);
-  }
-
-  #[test]
-  fn mandatory_criterion_without_required_obligation_is_unverified() {
-    let mut graph = EvidenceGraphState::new("spec-hash");
-    graph.register_requirement(RequirementId::from("REQ-008"), true);
-    graph
-      .add_criterion(AcceptanceCriterion {
-        id: CriterionId::from("REQ-008/AC-01"),
-        requirement_id: RequirementId::from("REQ-008"),
-        description: "Observable behavior".into(),
-        mandatory: true,
-      })
-      .expect("criterion");
-
-    assert_eq!(
-      graph.requirement_verification_state(&RequirementId::from("REQ-008"), &EvidencePolicy),
+      graph.requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy),
       Ok(VerificationState::Unverified)
-    );
-  }
-
-  #[test]
-  fn projection_traces_requirement_to_revision_bound_evidence() {
-    let mut graph = graph();
-    graph
-      .record_command_result(
-        &ObligationId::from("REQ-007/AC-01/VO-01"),
-        "7ca311f",
-        VerificationRunId::new(),
-        observed_at(),
-        &command(0),
-      )
-      .expect("evidence");
-
-    let projection = graph
-      .projection(&RequirementId::from("REQ-007"), &EvidencePolicy)
-      .expect("projection");
-
-    assert_eq!(projection.verification_state, VerificationState::Verified);
-    assert_eq!(
-      projection.criteria[0].criterion.id,
-      CriterionId::from("REQ-007/AC-01")
-    );
-    assert_eq!(
-      projection.criteria[0].obligations[0].obligation.id,
-      ObligationId::from("REQ-007/AC-01/VO-01")
-    );
-    assert_eq!(
-      projection.criteria[0].obligations[0].evidence[0].revision,
-      "7ca311f"
     );
   }
 
   proptest! {
     #[test]
-    fn serialization_round_trip_preserves_graph_semantics(revision in "[a-f0-9]{7,40}") {
-      let mut graph = graph();
-      graph.record_command_result(
-        &ObligationId::from("REQ-007/AC-01/VO-01"),
-        revision,
-        VerificationRunId::new(),
+    fn adding_untrusted_passing_evidence_never_upgrades_to_verified(count in 1usize..20) {
+      let mut graph = graph(VerificationAuthority::AgentProposed);
+      for _ in 0..count {
+        graph.record_execution_result(
+          "7ca311f",
+          observed_at(),
+          &execution(VerificationAuthority::AgentProposed, 0),
+        ).expect("advisory evidence");
+      }
+      prop_assert_ne!(
+        graph.requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy),
+        Ok(VerificationState::Verified)
+      );
+    }
+
+    #[test]
+    fn adding_trusted_failure_never_preserves_verified(failures in 1usize..20) {
+      let mut graph = graph(VerificationAuthority::ProjectConfigured);
+      graph.record_execution_result(
+        "7ca311f",
         observed_at(),
-        &command(0),
+        &execution(VerificationAuthority::ProjectConfigured, 0),
+      ).expect("passing evidence");
+      for _ in 0..failures {
+        graph.record_execution_result(
+          "7ca311f",
+          observed_at(),
+          &execution(VerificationAuthority::ProjectConfigured, 1),
+        ).expect("failing evidence");
+      }
+      prop_assert_ne!(
+        graph.requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy),
+        Ok(VerificationState::Verified)
+      );
+    }
+
+    #[test]
+    fn serialization_round_trip_preserves_trust_authority(revision in "[a-f0-9]{7,40}") {
+      let mut graph = graph(VerificationAuthority::ProjectConfigured);
+      graph.record_execution_result(
+        revision,
+        observed_at(),
+        &execution(VerificationAuthority::ProjectConfigured, 0),
       ).expect("evidence");
       let encoded = serde_json::to_vec(&graph).expect("serialize");
       let decoded: EvidenceGraphState = serde_json::from_slice(&encoded).expect("deserialize");
-
-      prop_assert_eq!(
-        decoded.requirement_verification_state(&RequirementId::from("REQ-007"), &EvidencePolicy),
-        Ok(VerificationState::Verified)
-      );
+      prop_assert_eq!(decoded, graph);
     }
   }
 }

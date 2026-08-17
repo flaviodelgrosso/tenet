@@ -1,5 +1,82 @@
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use crate::ids::{ObligationId, VerificationRunId};
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationSpec {
+  pub program: String,
+  #[serde(default)]
+  pub args: Vec<String>,
+  #[serde(rename = "workingDirectory", default = "default_working_directory")]
+  pub working_directory: String,
+  #[serde(default)]
+  pub environment: BTreeMap<String, String>,
+}
+
+impl VerificationSpec {
+  pub fn identity(&self) -> String {
+    serde_json::to_string(self).unwrap_or_default()
+  }
+}
+
+fn default_working_directory() -> String {
+  ".".into()
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationAuthority {
+  ProjectConfigured,
+  ControllerDerived,
+  AgentProposed,
+}
+
+impl VerificationAuthority {
+  pub fn is_trusted(self) -> bool {
+    matches!(self, Self::ProjectConfigured | Self::ControllerDerived)
+  }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyScopeAuthority {
+  ProjectConfigured,
+  ControllerDerived,
+  AgentProposed,
+  Unknown,
+}
+
+impl DependencyScopeAuthority {
+  pub fn is_trusted(self) -> bool {
+    matches!(self, Self::ProjectConfigured | Self::ControllerDerived)
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationExecutionRequest {
+  #[serde(rename = "verificationRunId")]
+  pub run_id: VerificationRunId,
+  #[serde(rename = "obligationId")]
+  pub obligation_id: ObligationId,
+  pub spec: VerificationSpec,
+  pub authority: VerificationAuthority,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VerificationExecutionResult {
+  #[serde(rename = "verificationRunId")]
+  pub run_id: VerificationRunId,
+  #[serde(rename = "obligationId")]
+  pub obligation_id: ObligationId,
+  pub spec: VerificationSpec,
+  pub authority: VerificationAuthority,
+  pub result: CommandResult,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandResult {
@@ -27,6 +104,8 @@ pub struct VerificationReport {
   #[serde(rename = "finishedAt", with = "rfc3339")]
   pub finished_at: DateTime<Utc>,
   pub commands: Vec<CommandResult>,
+  #[serde(default)]
+  pub executions: Vec<VerificationExecutionResult>,
   pub warnings: Vec<String>,
 }
 
@@ -65,6 +144,7 @@ mod tests {
       started_at: Utc.with_ymd_and_hms(2026, 8, 16, 10, 0, 0).unwrap(),
       finished_at: Utc.with_ymd_and_hms(2026, 8, 16, 10, 0, 1).unwrap(),
       commands: Vec::new(),
+      executions: Vec::new(),
       warnings: Vec::new(),
     };
 

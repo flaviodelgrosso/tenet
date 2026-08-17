@@ -1,6 +1,7 @@
 //! Runtime orchestration, persistence, and deterministic verification for Tenet.
 
 pub mod backend;
+pub mod completion;
 pub mod controller;
 pub mod evidence;
 pub mod git;

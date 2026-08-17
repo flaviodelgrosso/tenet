@@ -1,13 +1,169 @@
-use std::collections::BTreeSet;
+use std::{
+  collections::{BTreeMap, BTreeSet},
+  fmt::Write as _,
+};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
   error::DomainValidationError,
   evidence::{AcceptanceCriterion, ImplementationState, VerificationObligation},
-  ids::{CriterionId, ObligationId, RequirementId, WorkUnitId},
+  ids::{CriterionId, ObligationId, RequirementId, SpecFragmentId, WorkUnitId},
 };
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpecReference {
+  pub section: Option<String>,
+  #[serde(rename = "fragmentId")]
+  pub fragment_id: SpecFragmentId,
+  #[serde(rename = "textHash")]
+  pub text_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpecFragment {
+  pub id: SpecFragmentId,
+  pub section: Option<String>,
+  pub text: String,
+  #[serde(rename = "textHash")]
+  pub text_hash: String,
+}
+
+impl SpecFragment {
+  pub fn reference(&self) -> SpecReference {
+    SpecReference {
+      section: self.section.clone(),
+      fragment_id: self.id.clone(),
+      text_hash: self.text_hash.clone(),
+    }
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogCoverage {
+  #[serde(rename = "normativeFragments")]
+  pub normative_fragments: Vec<SpecFragment>,
+  #[serde(rename = "uncoveredFragmentIds")]
+  pub uncovered_fragment_ids: Vec<SpecFragmentId>,
+}
+
+impl CatalogCoverage {
+  pub fn derive(specification: &str, requirements: &[Requirement]) -> Self {
+    let normative_fragments = derive_normative_fragments(specification);
+    let covered: BTreeSet<_> = requirements
+      .iter()
+      .flat_map(|requirement| requirement.source_refs.iter())
+      .map(|reference| reference.fragment_id.clone())
+      .collect();
+    let uncovered_fragment_ids = normative_fragments
+      .iter()
+      .filter(|fragment| !covered.contains(&fragment.id))
+      .map(|fragment| fragment.id.clone())
+      .collect();
+    Self {
+      normative_fragments,
+      uncovered_fragment_ids,
+    }
+  }
+
+  pub fn is_complete(&self) -> bool {
+    !self.normative_fragments.is_empty() && self.uncovered_fragment_ids.is_empty()
+  }
+
+  pub fn validate_references(&self, requirements: &[Requirement]) -> Result<(), String> {
+    let fragments: BTreeMap<_, _> = self
+      .normative_fragments
+      .iter()
+      .map(|fragment| (&fragment.id, fragment))
+      .collect();
+    for requirement in requirements {
+      if requirement.source_refs.is_empty() {
+        return Err(format!(
+          "{} has no specification source reference",
+          requirement.id
+        ));
+      }
+      let mut seen = BTreeSet::new();
+      for reference in &requirement.source_refs {
+        if !seen.insert(reference.fragment_id.clone()) {
+          return Err(format!(
+            "{} references specification fragment {} more than once",
+            requirement.id, reference.fragment_id
+          ));
+        }
+        let fragment = fragments.get(&reference.fragment_id).ok_or_else(|| {
+          format!(
+            "{} references unknown specification fragment {}",
+            requirement.id, reference.fragment_id
+          )
+        })?;
+        if fragment.text_hash != reference.text_hash || fragment.section != reference.section {
+          return Err(format!(
+            "{} has stale specification reference {}",
+            requirement.id, reference.fragment_id
+          ));
+        }
+      }
+    }
+    Ok(())
+  }
+}
+
+pub fn derive_normative_fragments(specification: &str) -> Vec<SpecFragment> {
+  let mut section = None;
+  let mut paragraphs = Vec::new();
+  let mut paragraph = Vec::new();
+  let flush = |paragraph: &mut Vec<&str>, section: &Option<String>, output: &mut Vec<_>| {
+    if paragraph.is_empty() {
+      return;
+    }
+    let text = paragraph.join("\n").trim().to_owned();
+    paragraph.clear();
+    if text.is_empty() {
+      return;
+    }
+    let text_hash = sha256_hex(text.as_bytes());
+    let ordinal = output.len() + 1;
+    output.push(SpecFragment {
+      id: SpecFragmentId::from(format!("SPEC-{ordinal:04}-{}", &text_hash[..12])),
+      section: section.clone(),
+      text,
+      text_hash,
+    });
+  };
+
+  for line in specification.lines() {
+    let trimmed = line.trim();
+    if trimmed.starts_with("```") {
+      flush(&mut paragraph, &section, &mut paragraphs);
+      continue;
+    }
+    if let Some(heading) = trimmed.strip_prefix('#') {
+      flush(&mut paragraph, &section, &mut paragraphs);
+      section = Some(heading.trim_start_matches('#').trim().to_owned());
+    } else if trimmed.is_empty() {
+      flush(&mut paragraph, &section, &mut paragraphs);
+    } else {
+      paragraph.push(trimmed);
+    }
+  }
+  flush(&mut paragraph, &section, &mut paragraphs);
+  paragraphs
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+  let digest = Sha256::digest(bytes);
+  let mut encoded = String::with_capacity(digest.len() * 2);
+  for byte in digest {
+    let _ = write!(encoded, "{byte:02x}");
+  }
+  encoded
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -17,6 +173,8 @@ pub struct Requirement {
   pub description: String,
   #[serde(default = "default_true")]
   pub required: bool,
+  #[serde(rename = "sourceRefs")]
+  pub source_refs: Vec<SpecReference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -28,6 +186,7 @@ pub struct RequirementCatalog {
   pub acceptance_criteria: Vec<AcceptanceCriterion>,
   #[serde(rename = "verificationObligations")]
   pub verification_obligations: Vec<VerificationObligation>,
+  pub coverage: CatalogCoverage,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -201,6 +360,16 @@ mod tests {
         requirement_id: "REQ-002".into(),
       })
     );
+  }
+  #[test]
+  fn normative_fragments_include_fenced_content() {
+    let fragments = derive_normative_fragments(
+      "# Contract\n\nThe API must respond.\n\n```text\nstatus = 200\n```",
+    );
+
+    assert_eq!(fragments.len(), 2);
+    assert_eq!(fragments[1].text, "status = 200");
+    assert_eq!(fragments[1].section.as_deref(), Some("Contract"));
   }
 }
 

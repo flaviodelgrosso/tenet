@@ -23,6 +23,7 @@ fn requirement(id: &str) -> Requirement {
     title: format!("Requirement {id}"),
     description: "Make the observable contract work".into(),
     required: true,
+    source_refs: Vec::new(),
   }
 }
 fn app() -> Application {
@@ -49,6 +50,7 @@ fn report(passed: bool) -> VerificationReport {
         "assertion failed".into()
       },
     }],
+    executions: Vec::new(),
     warnings: Vec::new(),
   }
 }
@@ -305,6 +307,10 @@ fn requirement_projection_preserves_evidence_and_gaps() {
       mandatory: true,
     }],
     verification_obligations: Vec::new(),
+    coverage: tenet_domain::worker::CatalogCoverage {
+      normative_fragments: Vec::new(),
+      uncovered_fragment_ids: Vec::new(),
+    },
   }));
   app.apply(RunEvent::Reconcile(ReconcileResult {
     summary: "Missing R1".into(),

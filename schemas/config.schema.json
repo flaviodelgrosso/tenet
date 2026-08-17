@@ -141,13 +141,34 @@
         "env": { "type": "object", "additionalProperties": { "type": "string" } }
       }
     },
+    "verificationSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["program", "args", "workingDirectory", "environment"],
+      "properties": {
+        "program": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+        "args": { "$ref": "#/$defs/stringList", "default": [] },
+        "workingDirectory": { "type": "string", "default": ".", "minLength": 1 },
+        "environment": { "type": "object", "default": {}, "additionalProperties": { "type": "string" } }
+      }
+    },
+    "projectVerificationGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["obligation_ids", "spec", "dependency_scope"],
+      "properties": {
+        "obligation_ids": { "$ref": "#/$defs/stringList", "minItems": 1 },
+        "spec": { "$ref": "#/$defs/verificationSpec" },
+        "dependency_scope": { "$ref": "#/$defs/stringList", "minItems": 1 }
+      }
+    },
     "verificationConfig": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Deterministic commands and limits used to verify each implemented work unit.",
+      "description": "Structured, controller-trusted verification gates and execution limits.",
       "required": [
         "require_project_gate",
-        "commands",
+        "gates",
         "timeout_secs",
         "max_output_bytes"
       ],
@@ -155,13 +176,13 @@
         "require_project_gate": {
           "type": "boolean",
           "default": false,
-          "description": "Requires at least one project-specific verification command before work can pass."
+          "description": "Requires at least one explicitly obligation-bound project gate before work can pass."
         },
-        "commands": {
-          "$ref": "#/$defs/stringList",
+        "gates": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/projectVerificationGate" },
           "default": [],
-          "description": "Explicit shell commands run as project verification gates.",
-          "examples": [["cargo test", "cargo clippy --all-targets -- -D warnings"]]
+          "description": "Project-configured verification specs explicitly bound to obligation identities."
         },
         "timeout_secs": {
           "type": "integer",
@@ -185,7 +206,7 @@
           },
           "then": {
             "properties": {
-              "commands": { "minItems": 1 }
+              "gates": { "minItems": 1 }
             }
           }
         }
