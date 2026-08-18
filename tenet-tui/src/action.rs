@@ -14,7 +14,7 @@ impl Screen {
     match self {
       Self::Run => "Run",
       Self::Requirements => "Requirements",
-      Self::Checks => "Checks",
+      Self::Checks => "Advisory Checks",
       Self::Changes => "Changes",
       Self::History => "History",
     }

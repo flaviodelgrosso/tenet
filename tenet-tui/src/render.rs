@@ -13,7 +13,7 @@ use tenet_domain::{
 
 use crate::tui::{
   action::{ActivityCategory, Overlay, Screen},
-  app::{failure_preview, status_label, Activity, Application},
+  app::{status_label, Activity, Application},
   layout::{self, Density},
   theme,
 };
@@ -438,8 +438,55 @@ fn context_pane(frame: &mut Frame<'_>, app: &Application, area: Rect) {
       ),
     ]),
     Line::raw(""),
-    section_line("CHECKS"),
-    check_context_line(app),
+    section_line("VERIFICATION"),
+    Line::styled(
+      format!(
+        "Project checks       {}/{} {}",
+        state.verification_layers.project_checks_passed,
+        state.verification_layers.project_checks_total,
+        if state.verification_layers.project_passed {
+          "PASS"
+        } else {
+          "NOT PASSING"
+        }
+      ),
+      if state.verification_layers.project_passed {
+        theme::success()
+      } else {
+        theme::warning()
+      },
+    ),
+    Line::styled(
+      format!(
+        "Semantic obligations {}/{} SATISFIED · {} uncertain",
+        state.verification_layers.semantic_satisfied,
+        state.verification_layers.semantic_obligations_total,
+        state.verification_layers.semantic_uncertain
+      ),
+      if state.verification_layers.semantic_gaps == 0
+        && state.verification_layers.semantic_uncertain == 0
+      {
+        theme::success()
+      } else {
+        theme::warning()
+      },
+    ),
+    Line::styled(
+      format!(
+        "Contradictions       {} · Completion {}",
+        state.verification_layers.contradictions,
+        if state.verification_layers.completion_eligible {
+          "ELIGIBLE"
+        } else {
+          "BLOCKED"
+        }
+      ),
+      if state.verification_layers.completion_eligible {
+        theme::success()
+      } else {
+        theme::muted()
+      },
+    ),
     Line::raw(""),
     section_line("REPOSITORY"),
     Line::styled(
@@ -595,7 +642,7 @@ fn requirement_detail_pane(frame: &mut Frame<'_>, app: &Application, area: Rect)
 }
 
 fn checks_screen(frame: &mut Frame<'_>, app: &Application, area: Rect, density: Density) {
-  let mut lines = screen_heading("CHECKS", checks_subtitle(app));
+  let mut lines = screen_heading("ADVISORY CHECKS", checks_subtitle(app));
   let visible = app.visible_checks();
   if visible.is_empty() {
     lines.extend(empty_state(
@@ -843,7 +890,7 @@ fn help_lines() -> Vec<Line<'static>> {
   vec![
     Line::styled("Navigation", theme::heading()),
     Line::styled(
-      "g r  Run     g q  Requirements     g c  Checks",
+      "g r  Run     g q  Requirements     g c  Advisory Checks",
       theme::secondary(),
     ),
     Line::styled("g d  Changes g h  History", theme::secondary()),
@@ -866,7 +913,11 @@ fn palette_lines(query: &str) -> Vec<Line<'static>> {
   let commands = [
     ("Run", "Open live run activity", "g r"),
     ("Requirements", "Browse requirement gaps", "g q"),
-    ("Checks", "Review verification evidence", "g c"),
+    (
+      "Advisory Checks",
+      "Review agent-suggested candidate checks",
+      "g c",
+    ),
     ("Changes", "Inspect repository paths", "g d"),
     ("History", "Search the audit trail", "g h"),
     ("Start", "Start or resume the controller", "r"),
@@ -997,20 +1048,6 @@ fn detail_bullets(items: &[String], empty: &str, style: Style) -> Vec<Line<'stat
   }
 }
 
-fn check_context_line(app: &Application) -> Line<'static> {
-  match app.checks().last() {
-    Some(report) if report.passed => Line::from(vec![
-      Span::styled("✓ ", theme::success()),
-      Span::styled("Latest verification passed", theme::secondary()),
-    ]),
-    Some(report) => Line::from(vec![
-      Span::styled("✕ ", theme::failure()),
-      Span::styled(failure_preview(report), theme::secondary()),
-    ]),
-    None => Line::styled("No deterministic check recorded", theme::muted()),
-  }
-}
-
 fn key_hints(hints: &[(&str, &str)]) -> Vec<Span<'static>> {
   hints
     .iter()
@@ -1084,7 +1121,9 @@ fn status_style(status: &RunStatus) -> Style {
 fn status_style_requirement(status: &VerificationState) -> Style {
   match status {
     VerificationState::Verified => theme::success(),
-    VerificationState::PartiallyVerified | VerificationState::Stale => theme::warning(),
+    VerificationState::PartiallyVerified
+    | VerificationState::Uncertain
+    | VerificationState::Stale => theme::warning(),
     VerificationState::Unverified => theme::muted(),
     VerificationState::Contradicted => theme::failure(),
   }
@@ -1095,6 +1134,7 @@ fn requirement_mark(status: &VerificationState) -> &'static str {
     VerificationState::Verified => "✓",
     VerificationState::PartiallyVerified => "◐",
     VerificationState::Unverified => "○",
+    VerificationState::Uncertain => "?",
     VerificationState::Stale => "↻",
     VerificationState::Contradicted => "✕",
   }
@@ -1105,6 +1145,7 @@ fn status_text(status: &VerificationState) -> &'static str {
     VerificationState::Verified => "VERIFIED",
     VerificationState::PartiallyVerified => "PARTIAL",
     VerificationState::Unverified => "UNVERIFIED",
+    VerificationState::Uncertain => "UNCERTAIN",
     VerificationState::Stale => "STALE",
     VerificationState::Contradicted => "CONTRADICTED",
   }

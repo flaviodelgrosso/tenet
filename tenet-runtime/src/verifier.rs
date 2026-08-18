@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use tenet_domain::{
   config::Config,
+  ids::VerificationRunId,
   model::{CommandResult, VerificationReport},
   verification::{
     ProjectCheckResult, ProjectVerificationRun, VerificationExecutionRequest,
@@ -83,6 +84,7 @@ pub async fn run_project_verification_isolated(
       .iter()
       .all(|check| check.result.exit_code == Some(0) && !check.result.timed_out);
   Ok(ProjectVerificationRun {
+    run_id: VerificationRunId::new(),
     revision: revision.into(),
     suite_hash: config.verification.suite_hash()?,
     checks,

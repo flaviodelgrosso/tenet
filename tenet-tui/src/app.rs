@@ -779,6 +779,7 @@ fn verification_label(state: VerificationState) -> &'static str {
     VerificationState::Verified => "VERIFIED",
     VerificationState::PartiallyVerified => "PARTIALLY VERIFIED",
     VerificationState::Unverified => "UNVERIFIED",
+    VerificationState::Uncertain => "UNCERTAIN",
     VerificationState::Stale => "STALE",
     VerificationState::Contradicted => "CONTRADICTED",
   }

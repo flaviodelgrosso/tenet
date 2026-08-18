@@ -17,14 +17,16 @@ use uuid::Uuid;
 use tenet_domain::{
   config::{config_path, ensure_config, read_config, TENET_DIR},
   events::{EventSink, RunEvent, RunLogger},
-  evidence::{EvidenceGraphState, EvidencePolicy, ImplementationState, VerificationState},
-  ids::VerificationRunId,
+  evidence::{
+    EvidenceGraphState, EvidencePolicy, ImplementationState, ObligationAssessment,
+    SemanticAssessmentReport, VerificationState,
+  },
   model::{
     CompletedWorkUnit, Discovery, DiscoveryRecord, DiscoveryStatus, IntegrationPhase, Phase,
     ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus, State,
-    VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
+    VerificationLayers, VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
   },
-  verification::{ProjectVerificationRun, VerificationExecutionRequest},
+  verification::ProjectVerificationRun,
 };
 
 use tenet_runtime::{
@@ -266,11 +268,13 @@ impl Controller {
       store::write_evidence_graph(&self.cwd, &evidence_graph).await?;
       let current_revision = git::head(&self.cwd).await?;
       prune_deferred_candidates(&self.cwd, state, &catalog, &current_revision).await?;
+      let suite_hash = context.config.verification.suite_hash()?;
       evidence_graph::invalidate(
         &self.cwd,
         &context.events,
         &mut evidence_graph,
         &current_revision,
+        &suite_hash,
       )
       .await?;
       state.cycle = cycle;
@@ -291,7 +295,10 @@ impl Controller {
         .iter()
         .map(|record| record.discovery.clone())
         .collect();
-      let evidence_for_worker = evidence_graph::projections(&evidence_graph)?;
+      let evidence_for_worker = evidence_graph::projections(
+        &evidence_graph,
+        EvidencePolicy::new(&current_revision, &suite_hash),
+      )?;
       let backend = self.backend.clone();
       let reconciliation = self
         .validated_read_only_proposal(
@@ -347,7 +354,16 @@ impl Controller {
         };
       }
       store::write_roadmap(&self.cwd, &reconciliation).await?;
-      state.requirement_counts = requirement_counts(&catalog, &reconciliation, &evidence_graph)?;
+      state.requirement_counts = requirement_counts(
+        &catalog,
+        &evidence_graph,
+        EvidencePolicy::new(&current_revision, &suite_hash),
+      )?;
+      state.requirement_counts.missing_implementation = reconciliation
+        .requirements
+        .iter()
+        .filter(|assessment| assessment.implementation_state != ImplementationState::Present)
+        .count();
       state.last_summary.clone_from(&reconciliation.summary);
       context
         .events
@@ -631,15 +647,17 @@ impl Controller {
           verification,
           mut transaction,
         } => {
-          evidence_graph::invalidate(&self.cwd, &context.events, evidence_graph, &revision).await?;
-          evidence_graph::establish(
+          let suite_hash = context.config.verification.suite_hash()?;
+          evidence_graph::invalidate(
             &self.cwd,
             &context.events,
             evidence_graph,
             &revision,
-            &candidate.verification,
+            &suite_hash,
           )
           .await?;
+          evidence_graph::record_project_verification(&self.cwd, evidence_graph, &verification)
+            .await?;
           context
             .events
             .emit(RunEvent::ProjectVerification(verification.clone()))
@@ -694,116 +712,133 @@ impl Controller {
     evidence_graph: &mut EvidenceGraphState,
   ) -> Result<Option<State>> {
     let verified_revision = git::head(&self.cwd).await?;
+    let suite_hash = context.config.verification.suite_hash()?;
     state.phase = Phase::Verifying;
-    state.last_summary = "Running final deterministic verification".into();
+    state.last_summary = "Running controller-owned project verification".into();
     self.publish(&context.events, state).await?;
-    let report = self.verify_revision(context, &verified_revision).await?;
+    let project_report = self.verify_revision(context, &verified_revision).await?;
     store::save_evidence(
       &self.cwd,
-      &format!("project-verification-{}", Uuid::new_v4()),
-      &report,
+      &format!("project-verification-{}", project_report.run_id),
+      &project_report,
     )
     .await?;
+    evidence_graph::record_project_verification(&self.cwd, evidence_graph, &project_report).await?;
     context
       .events
-      .emit(RunEvent::ProjectVerification(report.clone()))
+      .emit(RunEvent::ProjectVerification(project_report.clone()))
       .await?;
-    if !report.passed {
+    state.verification_layers = project_layers(&project_report);
+    state.verification_layers.semantic_obligations_total = catalog
+      .verification_obligations
+      .iter()
+      .filter(|obligation| obligation.required)
+      .count();
+    self.publish(&context.events, state).await?;
+    if !project_report.passed {
       return Ok(Some(
         self
-          .block(context, state, "Final deterministic verification failed")
-          .await?,
-      ));
-    }
-    let requests = match verification::required_requests(catalog, VerificationRunId::new()) {
-      Ok(requests) => requests,
-      Err(error) => {
-        let reason = format!("Semantic verification unavailable: {error}");
-        return Ok(Some(self.block(context, state, &reason).await?));
-      }
-    };
-    let semantic_report = self
-      .verify_obligations_revision(context, &verified_revision, &requests)
-      .await?;
-    context
-      .events
-      .emit(RunEvent::Verification(semantic_report.clone()))
-      .await?;
-    evidence_graph::establish(
-      &self.cwd,
-      &context.events,
-      evidence_graph,
-      &verified_revision,
-      &semantic_report,
-    )
-    .await?;
-    if !semantic_report.passed {
-      return Ok(Some(
-        self
-          .block(context, state, "Semantic verification failed")
-          .await?,
-      ));
-    }
-    if !evidence_graph.all_required_verified(&EvidencePolicy) {
-      return Ok(Some(
-        self
-          .block(
-            context,
-            state,
-            "Final verification did not establish every mandatory verification obligation",
-          )
+          .block(context, state, "Final project verification failed")
           .await?,
       ));
     }
 
     state.phase = Phase::Assessing;
-    state.last_summary = "Independent skeptical evidence-gap assessment".into();
+    state.last_summary = "Running independent semantic verification".into();
     self.publish(&context.events, state).await?;
+    let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
     let catalog_for_worker = catalog.clone();
-    let evidence_for_worker = evidence_graph::projections(evidence_graph)?;
+    let project_for_worker = project_report.clone();
+    let evidence_for_worker = evidence_graph::projections(evidence_graph, policy)?;
     let backend = self.backend.clone();
-    let assessment = self
-      .validated_read_only_proposal(
-        context,
-        catalog,
-        "assessment",
-        move |inspection_context, feedback| {
-          let backend = backend.clone();
-          let catalog = catalog_for_worker.clone();
-          let evidence = evidence_for_worker.clone();
-          async move {
-            backend
-              .assess(
-                &inspection_context,
-                &catalog,
-                &evidence,
-                feedback.as_deref(),
-              )
-              .await
-          }
-        },
-      )
+    let semantic_report = self
+      .validated_semantic_assessment(context, catalog, move |inspection_context, feedback| {
+        let backend = backend.clone();
+        let catalog = catalog_for_worker.clone();
+        let project = project_for_worker.clone();
+        let evidence = evidence_for_worker.clone();
+        async move {
+          backend
+            .assess(
+              &inspection_context,
+              &catalog,
+              &project,
+              &evidence,
+              feedback.as_deref(),
+            )
+            .await
+        }
+      })
       .await?;
-    store::write_roadmap(&self.cwd, &assessment).await?;
-    state.requirement_counts = requirement_counts(catalog, &assessment, evidence_graph)?;
-    state.last_summary.clone_from(&assessment.summary);
     context
       .events
-      .emit(RunEvent::Reconcile(assessment.clone()))
+      .emit(RunEvent::SemanticAssessment(semantic_report.clone()))
       .await?;
-    if !assessment.work_units.is_empty() {
+    let assessment_worker_id = format!("{}-assessment", context.worker_id);
+    evidence_graph::establish_semantic_assessment(
+      &self.cwd,
+      &context.events,
+      evidence_graph,
+      &verified_revision,
+      &suite_hash,
+      &assessment_worker_id,
+      &semantic_report,
+    )
+    .await?;
+    let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
+    state.requirement_counts = requirement_counts(catalog, evidence_graph, policy)?;
+    apply_semantic_layers(&mut state.verification_layers, evidence_graph, policy);
+    state.last_summary.clone_from(&semantic_report.summary);
+
+    let gaps: Vec<_> = semantic_report
+      .assessments
+      .iter()
+      .filter_map(|assessment| match &assessment.assessment {
+        ObligationAssessment::Gap { description } => Some(WorkerDiscovery {
+          discovery: Discovery::VerificationBlocker {
+            description: format!("{}: {description}", assessment.obligation_id),
+          },
+          role: tenet_domain::model::WorkerRole::Assess,
+        }),
+        ObligationAssessment::Satisfied { .. } | ObligationAssessment::Uncertain { .. } => None,
+      })
+      .collect();
+    if !gaps.is_empty() {
+      record_discoveries(
+        state,
+        catalog,
+        &verified_revision,
+        "semantic-assessment",
+        &gaps,
+      )?;
       self.publish(&context.events, state).await?;
       return Ok(None);
     }
+    if semantic_report.assessments.iter().any(|assessment| {
+      matches!(
+        assessment.assessment,
+        ObligationAssessment::Uncertain { .. }
+      )
+    }) {
+      return Ok(Some(
+        self
+          .block(
+            context,
+            state,
+            "Independent semantic verification is uncertain; specification clarification or stronger evidence is required",
+          )
+          .await?,
+      ));
+    }
+
     let current_revision = git::head(&self.cwd).await?;
     let repository_clean = git::is_clean(&self.cwd).await?;
     let pending_journal = store::read_integration_journal(&self.cwd).await?.is_some();
     let decision = CompletionPolicy.evaluate(&CompletionContext {
       catalog,
       evidence: evidence_graph,
-      assessment: &assessment,
-      project_verification_passed: report.passed,
-      verified_revision: &verified_revision,
+      project_verification: &project_report,
+      current_suite_hash: &suite_hash,
       current_revision: &current_revision,
       repository_clean,
       has_active_leases: !state.active_leases.is_empty(),
@@ -815,8 +850,8 @@ impl Controller {
       CompletionDecision::Done => {
         state.status = RunStatus::Done;
         state.phase = Phase::Complete;
-        state.last_summary =
-          "All requirements have valid revision-bound evidence and the project verification suite passes".into();
+        state.verification_layers.completion_eligible = true;
+        state.last_summary = "Project checks pass and every required semantic obligation is independently satisfied at the current revision".into();
         Ok(Some(state.clone()))
       }
       CompletionDecision::NotReady(blockers) => {
@@ -914,44 +949,6 @@ impl Controller {
     .await
   }
 
-  async fn verify_obligations_revision(
-    &self,
-    context: &BackendContext,
-    revision: &str,
-    requests: &[VerificationExecutionRequest],
-  ) -> Result<VerificationReport> {
-    let canonical_before = git::repository_state(&self.cwd).await?;
-    let run_id = context
-      .runtime_dir
-      .file_name()
-      .and_then(|value| value.to_str())
-      .context("verification run id is unavailable")?;
-    let workspaces = WorkspaceManager::new(self.cwd.clone(), run_id);
-    let workspace = workspaces
-      .create_disposable("semantic-verification", revision)
-      .await?;
-    let result = verifier::run_execution_requests_cancelled(
-      &workspace,
-      &context.config,
-      requests,
-      &context.cancel,
-    )
-    .await;
-    let cleanup = workspaces.remove(&workspace).await;
-    if let Err(cleanup) = cleanup {
-      return match result {
-        Ok(_) => Err(cleanup).context("discard semantic verification worktree"),
-        Err(error) => Err(error).context(format!(
-          "semantic verification failed; cleanup also failed: {cleanup:#}"
-        )),
-      };
-    }
-    if git::repository_state(&self.cwd).await? != canonical_before {
-      bail!("semantic verification command modified canonical repository state");
-    }
-    result
-  }
-
   async fn validated_read_only_proposal<F, Fut>(
     &self,
     context: &BackendContext,
@@ -987,6 +984,38 @@ impl Controller {
       }
     }
     unreachable!("semantic proposal retry loop always returns")
+  }
+
+  async fn validated_semantic_assessment<F, Fut>(
+    &self,
+    context: &BackendContext,
+    catalog: &RequirementCatalog,
+    generate: F,
+  ) -> Result<SemanticAssessmentReport>
+  where
+    F: Fn(BackendContext, Option<String>) -> Fut + Clone,
+    Fut: Future<Output = Result<SemanticAssessmentReport>>,
+  {
+    let mut feedback = None;
+    for attempt in 0..=context.config.agent.completion_retries {
+      let generate = generate.clone();
+      let attempt_feedback = feedback.clone();
+      let result = self
+        .read_only_worker(context, "assessment", move |inspection_context| {
+          generate(inspection_context, attempt_feedback)
+        })
+        .await?;
+      match verification::validate_semantic_assessment(catalog, &result) {
+        Ok(()) => return Ok(result),
+        Err(error) if attempt == context.config.agent.completion_retries => return Err(error),
+        Err(error) => {
+          feedback = Some(format!(
+            "{error:#}\nReturn every required verification-obligation ID exactly once. Do not guess or normalize identifiers."
+          ));
+        }
+      }
+    }
+    unreachable!("semantic assessment retry loop always returns")
   }
 
   async fn read_only_worker<T, F, Fut>(
@@ -1338,36 +1367,50 @@ fn advance_stagnation(state: &mut State, fingerprint: String, limit: u32) -> boo
 
 fn requirement_counts(
   catalog: &RequirementCatalog,
-  result: &ReconcileResult,
   graph: &EvidenceGraphState,
+  policy: EvidencePolicy<'_>,
 ) -> Result<RequirementCounts> {
-  let implementations: BTreeMap<_, _> = result
-    .requirements
-    .iter()
-    .map(|item| (item.requirement_id.clone(), item.implementation_state))
-    .collect();
   let mut counts = RequirementCounts {
     total: catalog.requirements.len(),
     ..Default::default()
   };
   for requirement in &catalog.requirements {
-    match graph.requirement_verification_state(&requirement.id, &EvidencePolicy)? {
+    match graph.requirement_verification_state(&requirement.id, policy)? {
       VerificationState::Verified => counts.verified += 1,
       VerificationState::PartiallyVerified => counts.partially_verified += 1,
       VerificationState::Unverified => counts.unverified += 1,
+      VerificationState::Uncertain => counts.uncertain += 1,
       VerificationState::Stale => counts.stale += 1,
       VerificationState::Contradicted => counts.contradicted += 1,
     }
-    if implementations.get(&requirement.id).is_some_and(|state| {
-      matches!(
-        state,
-        ImplementationState::Partial | ImplementationState::Absent | ImplementationState::Unknown
-      )
-    }) {
-      counts.missing_implementation += 1;
-    }
   }
   Ok(counts)
+}
+
+fn project_layers(report: &ProjectVerificationRun) -> VerificationLayers {
+  VerificationLayers {
+    project_checks_total: report.checks.len(),
+    project_checks_passed: report
+      .checks
+      .iter()
+      .filter(|check| check.result.exit_code == Some(0) && !check.result.timed_out)
+      .count(),
+    project_passed: report.passed,
+    ..VerificationLayers::default()
+  }
+}
+
+fn apply_semantic_layers(
+  layers: &mut VerificationLayers,
+  graph: &EvidenceGraphState,
+  policy: EvidencePolicy<'_>,
+) {
+  let counts = graph.semantic_counts(policy);
+  layers.semantic_obligations_total = counts.total;
+  layers.semantic_satisfied = counts.satisfied;
+  layers.semantic_gaps = counts.gaps;
+  layers.semantic_uncertain = counts.uncertain;
+  layers.contradictions = counts.gaps;
 }
 fn record_candidate_discoveries(
   state: &mut State,
@@ -1467,10 +1510,9 @@ pub async fn manual_verify(cwd: &Path) -> Result<ProjectVerificationRun> {
 mod tests {
   use super::*;
   use tenet_domain::{
-    evidence::{AcceptanceCriterion, VerificationKind, VerificationObligation},
+    evidence::{AcceptanceCriterion, VerificationObligation},
     ids::{CriterionId, ObligationId, RequirementId},
     model::{ArchitectOutput, Requirement, RequirementAssessment},
-    verification::{DependencyScopeAuthority, VerificationAuthority, VerificationSpec},
     worker::{derive_normative_fragments, CatalogCoverage},
   };
 
@@ -1496,18 +1538,8 @@ mod tests {
       verification_obligations: vec![VerificationObligation {
         id: ObligationId::from("REQ-001/AC-01/VO-01"),
         criterion_id: CriterionId::from("REQ-001/AC-01"),
-        description: "Run test".into(),
-        kind: VerificationKind::AutomatedTest,
+        description: "Required behavior is observable".into(),
         required: true,
-        spec: VerificationSpec {
-          program: "cargo".into(),
-          args: vec!["test".into()],
-          working_directory: ".".into(),
-          environment: Default::default(),
-        },
-        authority: VerificationAuthority::ProjectConfigured,
-        dependency_scope: vec!["src/**".into()],
-        dependency_scope_authority: DependencyScopeAuthority::ProjectConfigured,
       }],
     }
   }
@@ -1628,10 +1660,6 @@ mod tests {
     assert!(built.requirements[0].required);
     assert!(built.acceptance_criteria[0].mandatory);
     assert!(built.verification_obligations[0].required);
-    assert_eq!(
-      built.verification_obligations[0].authority,
-      VerificationAuthority::AgentProposed
-    );
   }
 
   #[test]

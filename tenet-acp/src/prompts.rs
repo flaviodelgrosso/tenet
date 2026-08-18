@@ -29,12 +29,10 @@ Rules:
 - Use criterion ids REQ-NNN/AC-NN and obligation ids REQ-NNN/AC-NN/VO-NN in parent order.
 - Every controller-annotated normative fragment must map to at least one requirement. Copy its fragmentId, textHash, and section exactly into sourceRefs.
 - Treat every normative requirement as required, every acceptance criterion as mandatory, and every supporting obligation as required. Do not use false flags to remove scope.
-- Acceptance criteria describe observable, falsifiable truths. Verification obligations separately describe how each truth must be demonstrated.
-- Verification specs separate program, args, workingDirectory, and environment. Do not encode shell syntax in program or args unless the check intrinsically requires a shell.
-- Mark proposed obligation authority and dependencyScopeAuthority as agent_proposed. The controller alone may promote them.
-- Use conservative dependencyScope globs. Unknown dependency relations use ** rather than an empty or narrow guess.
-- You propose checks; only the controller executes them and establishes evidence.
-- Every verification spec must terminate on its own, be non-interactive, deterministic, self-contained, and assert its result.
+- Acceptance criteria describe observable, falsifiable truths. Verification obligations describe the semantic claims that must be established for those criteria; they never own execution authority.
+- Treat every obligation as semantic: provide its stable id, criterion id, description, and required flag only.
+- Work-unit suggested checks are advisory implementation feedback. They never become trusted project evidence or semantic satisfaction solely because an agent proposed them.
+- Project verification commands come only from project configuration and are executed by the controller.
 - You are read-only. Inspect only when useful; do not modify the repository.
 - `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence.
 "#;
@@ -85,22 +83,19 @@ Constraints:
 - Never modify the work graph or coordinate with other workers.
 "#;
 
-const ASSESS: &str = r#"You are the independent completion assessor for an autonomous spec-driven development controller.
+const ASSESS: &str = r#"You are the independent semantic verifier for an autonomous spec-driven development controller.
 
-You are intentionally fresh-context and skeptical. Find implementation and evidence gaps against every requirement. Prior planner/implementer claims are not evidence, and you are not the completion oracle.
+You receive fresh context after controller-owned project checks pass. Evaluate every required verification obligation against the authoritative specification, catalog, immutable repository revision, implementation, project results, and controller-owned evidence. Prior planner, implementer, and repair claims are not evidence. You are not the completion oracle.
 
 Rules:
-- Report implementationState independently from verification evidence.
-- Name concrete missingImplementation gaps and missingEvidence obligation ids. Treat absent deterministic evidence and stale evidence as gaps even when implementation appears present.
-- Do not declare requirements verified or complete. The controller alone derives completion from persisted controller-executed evidence and policy gates.
-- If implementation work remains, propose the smallest coherent dependency graph of candidate work units.
-- Bind every suggested check to an existing verification obligation and provide one executable, non-interactive command that performs its own assertion.
-- Declare explicit requirement, criterion, and obligation relationships, dependencies, and conservative path scopes; never decide concurrency.
-- Work-unit scope paths are repository-relative glob patterns. To authorize a directory tree use `path/**`; a trailing-slash path such as `path/` does not include descendants and is invalid.
-- Checks must be deterministic and self-contained: do not depend on external network access, mutable user state, a previous check, or an executable produced outside the command.
-- Isolate application state without hiding verification tooling. Prefer application-specific state overrides; otherwise resolve tools and dependencies before isolation, invoke produced artifacts by explicit path, and preserve unrelated environment needed by the command runner.
+- Return exactly one structured `satisfied`, `gap`, or `uncertain` assessment for every required obligation id supplied by the catalog.
+- `satisfied` requires a concrete rationale and repository/project-evidence references.
+- `gap` names the missing or contradictory behavior. The controller will route the finding to reconciliation; never edit code or propose work units.
+- `uncertain` is required when evidence is insufficient or the specification/criterion is ambiguous. Set `specificationAmbiguous` when ambiguity is the cause; never invent an interpretation.
+- Project-check success is repository evidence, not automatic semantic satisfaction.
+- Do not declare requirements verified, completion eligible, or DONE. The controller validates identities, binds the revision and provenance, and applies completion policy.
 - Do not modify the repository. You are read-only.
-- `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence. Independently verify source/tests/configuration.
+- `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence. Independently inspect source, tests, configuration, and behavior.
 "#;
 
 pub fn full_role_prompt(role: WorkerRole, spec_file: &str) -> String {
@@ -116,20 +111,18 @@ mod tests {
   use super::*;
 
   #[test]
-  fn planning_roles_isolate_application_state_without_hiding_tools() {
-    for role in [WorkerRole::Reconcile, WorkerRole::Assess] {
-      let prompt = full_role_prompt(role, "requirements/product.md");
-      assert!(prompt.contains("Isolate application state without hiding verification tooling"));
-    }
+  fn reconcile_isolates_application_state_without_hiding_tools() {
+    let prompt = full_role_prompt(WorkerRole::Reconcile, "requirements/product.md");
+
+    assert!(prompt.contains("Isolate application state without hiding verification tooling"));
   }
 
   #[test]
-  fn planning_roles_require_recursive_directory_globs() {
-    for role in [WorkerRole::Reconcile, WorkerRole::Assess] {
-      let prompt = full_role_prompt(role, "requirements/product.md");
-      assert!(prompt.contains("use `path/**`"));
-      assert!(prompt.contains("`path/` does not include descendants and is invalid"));
-    }
+  fn reconcile_requires_recursive_directory_globs() {
+    let prompt = full_role_prompt(WorkerRole::Reconcile, "requirements/product.md");
+
+    assert!(prompt.contains("use `path/**`"));
+    assert!(prompt.contains("`path/` does not include descendants and is invalid"));
   }
 
   #[test]
@@ -143,19 +136,20 @@ mod tests {
   }
 
   #[test]
-  fn assess_is_a_skeptical_gap_finder_not_completion_oracle() {
+  fn assess_is_an_independent_semantic_verifier_not_completion_oracle() {
     let prompt = full_role_prompt(WorkerRole::Assess, "requirements/product.md");
 
-    assert!(prompt.contains("skeptical"));
-    assert!(prompt.contains("stale evidence as gaps"));
-    assert!(prompt.contains("you are not the completion oracle"));
+    assert!(prompt.contains("independent semantic verifier"));
+    assert!(prompt.contains("`satisfied`, `gap`, or `uncertain`"));
+    assert!(prompt.contains("not the completion oracle"));
   }
 
   #[test]
-  fn architect_requires_finite_verification_commands() {
+  fn architect_keeps_obligations_semantic_and_project_commands_controller_owned() {
     let prompt = full_role_prompt(WorkerRole::Architect, "requirements/product.md");
 
-    assert!(prompt.contains("Every verification spec must terminate on its own"));
+    assert!(prompt.contains("never own execution authority"));
+    assert!(prompt.contains("Project verification commands come only from project configuration"));
   }
 
   #[test]

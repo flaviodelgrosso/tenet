@@ -4,11 +4,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tenet_domain::{
   config::Config,
-  evidence::EvidenceProjection,
+  evidence::{EvidenceProjection, SemanticAssessmentReport},
   model::{
     ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, RequirementCatalog,
     VerificationReport, WorkUnit, WorkerSummary,
   },
+  verification::ProjectVerificationRun,
 };
 use tenet_runtime::backend::{BackendContext, LaunchMetadata};
 
@@ -49,7 +50,8 @@ pub trait AgentBackend: Send + Sync {
     &self,
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
+    project_verification: &ProjectVerificationRun,
     evidence: &[EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
-  ) -> Result<ReconcileResult>;
+  ) -> Result<SemanticAssessmentReport>;
 }

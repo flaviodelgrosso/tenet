@@ -160,17 +160,24 @@ isolated Git worktree                             │
 immutable candidate commit                        │
      │                                            │
      ▼                                            │
-controller-run verification                       │
+controller-run project verification               │
      │                                            │
      ├── fail ──► bounded Repair ──► verify ──────┤
      │                                            │
      └── pass ──► controlled integration ─────────┘
                                        │
                                        ▼
-                               skeptical Assess
+                         final project checks at R
                                        │
                                        ▼
-                                     DONE?
+                    fresh independent semantic Assess
+                         (obligation by obligation)
+                                       │
+                     ┌─────────────────┼─────────────────┐
+                   GAP             UNCERTAIN         SATISFIED
+                     │                 │                 │
+                     ▼                 ▼                 ▼
+                Reconcile          BLOCKED           DONE?
 ```
 
 The repository evolves. The plan is allowed to evolve with it. The specification and controller-owned evidence remain the reference points.
@@ -194,17 +201,15 @@ valid requirement catalog
         +
 mandatory acceptance criteria
         +
-required verification obligations
+required semantic verification obligations
         +
-controller-observed passing evidence at revision R
+project-owner-configured deterministic suite passes at revision R
         +
-no blocking contradictory evidence
+every required obligation has current independent semantic satisfaction at R
+        +
+no current semantic gap, uncertainty, or contradictory evidence
         +
 no remaining work from current reconciliation
-        +
-no concrete gap from skeptical assessment
-        +
-repository-wide project verification suite passes
         +
 canonical HEAD is still R
         +

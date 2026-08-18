@@ -467,10 +467,9 @@ mod tests {
 
   fn evidence_catalog() -> RequirementCatalog {
     use tenet_domain::{
-      evidence::{AcceptanceCriterion, VerificationKind, VerificationObligation},
+      evidence::{AcceptanceCriterion, VerificationObligation},
       ids::{CriterionId, ObligationId, RequirementId},
       model::Requirement,
-      verification::{DependencyScopeAuthority, VerificationAuthority, VerificationSpec},
       worker::CatalogCoverage,
     };
 
@@ -492,18 +491,8 @@ mod tests {
       verification_obligations: vec![VerificationObligation {
         id: ObligationId::from("REQ-001/AC-01/VO-01"),
         criterion_id: CriterionId::from("REQ-001/AC-01"),
-        description: "Run check".into(),
-        kind: VerificationKind::Command,
+        description: "Required behavior is observable".into(),
         required: true,
-        spec: VerificationSpec {
-          program: "true".into(),
-          args: Vec::new(),
-          working_directory: ".".into(),
-          environment: Default::default(),
-        },
-        authority: VerificationAuthority::ProjectConfigured,
-        dependency_scope: vec!["src/**".into()],
-        dependency_scope_authority: DependencyScopeAuthority::ProjectConfigured,
       }],
       coverage: CatalogCoverage {
         normative_fragments: Vec::new(),
@@ -530,47 +519,63 @@ mod tests {
   async fn evidence_graph_persists_and_reloads_semantics() {
     use chrono::Utc;
     use tenet_domain::{
-      evidence::{EvidencePolicy, VerificationState},
+      evidence::{
+        EvidencePolicy, ObligationAssessment, ObligationAssessmentResult, SemanticAssessmentReport,
+        VerificationState,
+      },
       ids::{ObligationId, RequirementId, VerificationRunId},
-      model::CommandResult,
-      verification::{VerificationAuthority, VerificationExecutionResult, VerificationSpec},
+      verification::{CommandResult, ProjectCheckResult, ProjectVerificationRun, VerificationSpec},
     };
 
     let project = tempfile::tempdir().expect("temporary project");
     ensure_layout(project.path()).await.expect("layout");
     let catalog = evidence_catalog();
     let mut graph = graph_from_catalog(&catalog).expect("graph");
+    let now = Utc::now();
+    let project_run = ProjectVerificationRun {
+      run_id: VerificationRunId::new(),
+      revision: "abc123".into(),
+      suite_hash: "suite".into(),
+      checks: vec![ProjectCheckResult {
+        name: "quality".into(),
+        spec: VerificationSpec {
+          program: "true".into(),
+          args: Vec::new(),
+          working_directory: ".".into(),
+          environment: Default::default(),
+        },
+        timeout_secs: 10,
+        result: CommandResult {
+          command: "true".into(),
+          exit_code: Some(0),
+          timed_out: false,
+          duration_ms: 1,
+          stdout: String::new(),
+          stderr: String::new(),
+        },
+      }],
+      passed: true,
+      started_at: now,
+      finished_at: now,
+    };
+    graph.record_project_verification(&project_run);
     graph
-      .record_execution_result(
+      .record_semantic_assessment(
         "abc123",
-        Utc::now(),
-        &VerificationExecutionResult {
-          run_id: VerificationRunId::new(),
-          obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
-          spec: VerificationSpec {
-            program: "true".into(),
-            args: Vec::new(),
-            working_directory: ".".into(),
-            environment: Default::default(),
-          },
-          authority: VerificationAuthority::ProjectConfigured,
-          result: CommandResult {
-            command: VerificationSpec {
-              program: "true".into(),
-              args: Vec::new(),
-              working_directory: ".".into(),
-              environment: Default::default(),
-            }
-            .identity(),
-            exit_code: Some(0),
-            timed_out: false,
-            duration_ms: 1,
-            stdout: String::new(),
-            stderr: String::new(),
-          },
+        now,
+        "assess",
+        &SemanticAssessmentReport {
+          summary: "satisfied".into(),
+          assessments: vec![ObligationAssessmentResult {
+            obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+            assessment: ObligationAssessment::Satisfied {
+              rationale: "Observed behavior".into(),
+              evidence_refs: Vec::new(),
+            },
+          }],
         },
       )
-      .expect("evidence");
+      .expect("semantic evidence");
     write_evidence_graph(project.path(), &graph)
       .await
       .expect("write graph");
@@ -580,7 +585,10 @@ mod tests {
       .expect("reload graph");
 
     assert_eq!(
-      reloaded.requirement_verification_state(&RequirementId::from("REQ-001"), &EvidencePolicy),
+      reloaded.requirement_verification_state(
+        &RequirementId::from("REQ-001"),
+        EvidencePolicy::new("abc123", "suite")
+      ),
       Ok(VerificationState::Verified)
     );
   }

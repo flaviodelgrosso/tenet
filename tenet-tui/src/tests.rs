@@ -85,10 +85,9 @@ fn projection_builds_causal_activity_feed() {
     .activities()
     .iter()
     .any(|event| event.title == "IMPLEMENT"));
-  assert!(app
-    .activities()
-    .iter()
-    .any(|event| event.category == ActivityCategory::Error && event.title == "CHECKS FAIL"));
+  assert!(app.activities().iter().any(
+    |event| event.category == ActivityCategory::Error && event.title == "ADVISORY CHECKS FAIL"
+  ));
 }
 
 #[test]
@@ -266,7 +265,7 @@ fn verification_failure_then_repair_is_visible() {
     .collect::<Vec<_>>();
   assert!(titles
     .windows(3)
-    .any(|window| window == ["CHECKS FAIL", "REPAIR", "CHECKS PASS"]));
+    .any(|window| window == ["ADVISORY CHECKS FAIL", "REPAIR", "ADVISORY CHECKS PASS"]));
 }
 
 #[test]
@@ -506,4 +505,31 @@ fn inspector_blocked_completed_and_boundary_layouts_render_without_overlap() {
   }
   let tiny = rendered(&app, 42, 12);
   assert!(tiny.contains("/ search   Enter inspect"), "{tiny}");
+}
+
+#[test]
+fn overview_distinguishes_project_and_semantic_verification() {
+  let mut app = app();
+  let mut state = State::fresh();
+  state.verification_layers.project_checks_total = 3;
+  state.status = RunStatus::Running;
+  state.phase = Phase::Assessing;
+  state.verification_layers.project_checks_passed = 3;
+  state.verification_layers.project_passed = true;
+  state.verification_layers.semantic_obligations_total = 4;
+  state.verification_layers.semantic_satisfied = 3;
+  state.verification_layers.semantic_uncertain = 1;
+  state.verification_layers.completion_eligible = false;
+  app.apply(RunEvent::State(state));
+
+  let output = rendered(&app, 120, 36);
+
+  assert!(output.contains("Project checks       3/3 PASS"), "{output}");
+  assert!(
+    output.contains("Semantic obligations 3/4 SATISFIED"),
+    "{output}"
+  );
+  assert!(output.contains("uncertain"), "{output}");
+  assert!(output.contains("Completion"), "{output}");
+  assert!(output.contains("BLOCKED"), "{output}");
 }

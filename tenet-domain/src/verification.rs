@@ -91,6 +91,8 @@ pub struct ProjectCheckResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectVerificationRun {
+  #[serde(rename = "verificationRunId")]
+  pub run_id: VerificationRunId,
   pub revision: String,
   #[serde(rename = "suiteHash")]
   pub suite_hash: String,
@@ -189,6 +191,7 @@ mod tests {
       environment: [("CI".into(), "true".into())].into_iter().collect(),
     };
     let run = ProjectVerificationRun {
+      run_id: VerificationRunId::new(),
       revision: "abc123".into(),
       suite_hash: "suite-hash".into(),
       checks: vec![ProjectCheckResult {

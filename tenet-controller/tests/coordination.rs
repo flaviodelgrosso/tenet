@@ -25,8 +25,9 @@ use tenet_domain::{
   config::{read_config, Config, CustomAgentConfig, ProjectVerificationCheck},
   events::{EventSink, RunEvent},
   evidence::{
-    AcceptanceCriterion, EvidencePolicy, ImplementationState, VerificationKind,
-    VerificationObligation, VerificationState,
+    AcceptanceCriterion, EvidencePolicy, ImplementationState, ObligationAssessment,
+    ObligationAssessmentResult, SemanticAssessmentReport, VerificationObligation,
+    VerificationState,
   },
   ids::SpecFragmentId,
   ids::{CriterionId, ObligationId, RequirementId},
@@ -36,9 +37,7 @@ use tenet_domain::{
     RequirementAssessment, RequirementCatalog, State, VerificationReport, WorkExecution, WorkLease,
     WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
-  verification::{
-    DependencyScopeAuthority, ProjectVerificationRun, VerificationAuthority, VerificationSpec,
-  },
+  verification::ProjectVerificationRun,
   worker::{derive_normative_fragments, CatalogCoverage, SpecReference},
 };
 use tenet_runtime::{
@@ -136,17 +135,7 @@ fn obligation() -> VerificationObligation {
     id: ObligationId::from("REQ-001/AC-01/VO-01"),
     criterion_id: CriterionId::from("REQ-001/AC-01"),
     description: "Verify every diamond output".into(),
-    kind: VerificationKind::Command,
     required: true,
-    spec: VerificationSpec {
-      program: "git".into(),
-      args: vec!["diff".into(), "--check".into()],
-      working_directory: ".".into(),
-      environment: Default::default(),
-    },
-    authority: VerificationAuthority::ProjectConfigured,
-    dependency_scope: vec!["*.txt".into()],
-    dependency_scope_authority: DependencyScopeAuthority::ProjectConfigured,
   }
 }
 
@@ -231,6 +220,7 @@ enum BackendMode {
   InvalidVerificationCheck,
   NeverPassingVerification,
   IncompleteAssessment,
+  SemanticGapThenRepair,
   CleanupFailure,
   InvalidReconcileThenCorrect,
   InvalidAssessmentThenCorrect,
@@ -377,6 +367,15 @@ impl AgentBackend for FakeBackend {
       unit
         .depends_on
         .retain(|dependency| missing.contains(dependency.as_str()));
+    }
+    if matches!(self.mode, BackendMode::SemanticGapThenRepair)
+      && satisfied
+      && discoveries
+        .iter()
+        .any(|discovery| matches!(discovery, Discovery::VerificationBlocker { .. }))
+      && !ctx.cwd.join("semantic-fix.txt").exists()
+    {
+      work_units.push(unit("semantic-fix", &[]));
     }
     if matches!(
       self.mode,
@@ -556,9 +555,10 @@ impl AgentBackend for FakeBackend {
     &self,
     ctx: &BackendContext,
     _catalog: &RequirementCatalog,
+    _project_verification: &ProjectVerificationRun,
     _evidence: &[tenet_domain::evidence::EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
-  ) -> Result<ReconcileResult> {
+  ) -> Result<SemanticAssessmentReport> {
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Assess)
       .await?;
@@ -597,35 +597,40 @@ impl AgentBackend for FakeBackend {
       fs::create_dir_all(obstacle.parent().expect("integration parent")).await?;
       fs::write(obstacle, "cleanup obstacle").await?;
     }
-    if matches!(self.mode, BackendMode::IncompleteAssessment) && satisfied {
-      return Ok(ReconcileResult {
-        summary: "assessment still finds a gap".into(),
-        requirements: vec![assessment(false)],
-        work_units: vec![unit("assessment-gap", &[])],
-      });
-    }
-    if matches!(self.mode, BackendMode::InvalidAssessmentThenCorrect) && assessment_call == 0 {
-      let mut invalid = unit("assessment-invalid", &[]);
-      invalid.verification_obligation_ids = vec![ObligationId::from("REQ-999/AC-01/VO-01")];
-      return Ok(ReconcileResult {
-        summary: "malformed assessment".into(),
-        requirements: vec![assessment(satisfied)],
-        work_units: vec![invalid],
-      });
-    }
-    if matches!(self.mode, BackendMode::InvalidAssessmentScopeThenCorrect) && assessment_call == 0 {
-      let mut invalid = unit("assessment-scope", &[]);
-      invalid.scope.paths = vec!["src/".into()];
-      return Ok(ReconcileResult {
-        summary: "malformed assessment scope".into(),
-        requirements: vec![assessment(satisfied)],
-        work_units: vec![invalid],
-      });
-    }
-    Ok(ReconcileResult {
-      summary: "skeptical assessment".into(),
-      requirements: vec![assessment(satisfied)],
-      work_units: Vec::new(),
+    let invalid_first = matches!(
+      self.mode,
+      BackendMode::InvalidAssessmentThenCorrect | BackendMode::InvalidAssessmentScopeThenCorrect
+    ) && assessment_call == 0;
+    let obligation_id = if invalid_first {
+      ObligationId::from("REQ-999/AC-01/VO-01")
+    } else {
+      ObligationId::from("REQ-001/AC-01/VO-01")
+    };
+    let semantic_repair_present = ctx.cwd.join("semantic-fix.txt").exists();
+    let assessment = if matches!(self.mode, BackendMode::IncompleteAssessment)
+      || matches!(self.mode, BackendMode::SemanticGapThenRepair) && !semantic_repair_present
+      || !satisfied
+    {
+      ObligationAssessment::Gap {
+        description: "diamond implementation is incomplete".into(),
+      }
+    } else {
+      ObligationAssessment::Satisfied {
+        rationale: "A, B, C, and D exist in the immutable revision".into(),
+        evidence_refs: vec![
+          "A.txt".into(),
+          "B.txt".into(),
+          "C.txt".into(),
+          "D.txt".into(),
+        ],
+      }
+    };
+    Ok(SemanticAssessmentReport {
+      summary: "independent semantic assessment".into(),
+      assessments: vec![ObligationAssessmentResult {
+        obligation_id,
+        assessment,
+      }],
     })
   }
 }
@@ -781,14 +786,7 @@ async fn assert_read_only_role_is_isolated(role: tenet_domain::model::WorkerRole
     .await
     .expect("isolated read-only mutation cannot affect the run");
 
-  assert_eq!(
-    state.status,
-    if role == tenet_domain::model::WorkerRole::Architect {
-      tenet_domain::model::RunStatus::Blocked
-    } else {
-      tenet_domain::model::RunStatus::Done
-    }
-  );
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
   assert!(!repository.path().join("read-only-mutation.txt").exists());
   assert_ne!(
     git::head(repository.path()).await.expect("head after run"),
@@ -874,7 +872,7 @@ async fn assessment_directory_scope_is_retried_with_recursive_glob_feedback() {
   assert_eq!(feedback[0].0, WorkerRole::Assess);
   assert!(feedback[0]
     .1
-    .contains("assessment-scope scope path \"src/\" does not include descendants; use \"src/**\" or explicit files"));
+    .contains("semantic assessment must cover every required obligation exactly once"));
 }
 
 #[tokio::test]
@@ -932,7 +930,7 @@ async fn malformed_assessment_is_retried_with_feedback_and_corrected() {
   assert_eq!(feedback[0].0, WorkerRole::Assess);
   assert!(feedback[0]
     .1
-    .contains("assessment-invalid targets unknown verification obligation REQ-999/AC-01/VO-01"));
+    .contains("semantic assessment must cover every required obligation exactly once"));
 }
 
 #[tokio::test]
@@ -1022,12 +1020,15 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
   let graph = controller_evidence::load(repository.path(), &catalog)
     .await
     .expect("read evidence graph");
-  assert!(graph.all_required_verified(&EvidencePolicy));
+  let head = git::head(repository.path()).await.expect("head");
+  let config = read_config(repository.path()).await.expect("config");
+  let suite_hash = config.verification.suite_hash().expect("suite hash");
+  let policy = EvidencePolicy::new(&head, &suite_hash);
+  assert!(graph.all_required_verified(policy));
   let explanation = graph
-    .projection(&RequirementId::from("REQ-001"), &EvidencePolicy)
+    .projection(&RequirementId::from("REQ-001"), policy)
     .expect("requirement explanation");
   assert_eq!(explanation.verification_state, VerificationState::Verified);
-  let head = git::head(repository.path()).await.expect("head");
   assert!(explanation.criteria[0].obligations[0]
     .evidence
     .iter()
@@ -1448,11 +1449,7 @@ async fn specification_change_invalidates_completion_and_discovery_history() {
     .await
     .expect("changed specification starts a new catalog context");
 
-  assert_eq!(second.status, tenet_domain::model::RunStatus::Blocked);
-  assert!(second
-    .blocked_reason
-    .as_deref()
-    .is_some_and(|reason| reason.contains("Semantic verification unavailable")));
+  assert_eq!(second.status, tenet_domain::model::RunStatus::Done);
   assert!(second.completed_work_units.is_empty());
   assert!(second.discoveries.is_empty());
 }
@@ -1673,6 +1670,7 @@ fn passing_report() -> VerificationReport {
 fn passing_project_verification() -> ProjectVerificationRun {
   ProjectVerificationRun {
     revision: "revision".into(),
+    run_id: tenet_domain::ids::VerificationRunId::new(),
     suite_hash: passing_project_config()
       .verification
       .suite_hash()
@@ -2389,6 +2387,61 @@ async fn repair_attempt_count_matches_configured_bound_exactly() {
 }
 
 #[tokio::test]
+async fn semantic_gap_repair_creates_new_revision_and_requires_reverification() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::SemanticGapThenRepair));
+  let (controller, mut events) = configured_controller(&repository, backend.clone(), 2).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("semantic gap is repaired");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert!(state
+    .completed_work_units
+    .iter()
+    .any(|completed| completed.work_unit.id == "semantic-fix"));
+  assert!(backend.assessment_calls.load(Ordering::SeqCst) >= 2);
+  let semantic_reports: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+    .filter_map(|event| match event {
+      RunEvent::SemanticAssessment(report) => Some(report),
+      _ => None,
+    })
+    .collect();
+  assert!(semantic_reports.iter().any(|report| report
+    .assessments
+    .iter()
+    .any(|item| matches!(item.assessment, ObligationAssessment::Gap { .. }))));
+  assert!(semantic_reports.iter().any(|report| report
+    .assessments
+    .iter()
+    .any(|item| matches!(item.assessment, ObligationAssessment::Satisfied { .. }))));
+
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("catalog read")
+    .expect("catalog");
+  let graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("evidence graph");
+  let head = git::head(repository.path()).await.expect("head");
+  assert!(graph.evidence.values().any(|evidence| {
+    evidence.result == tenet_domain::evidence::EvidenceResult::Failed
+      && evidence.revision != head
+      && matches!(
+        evidence.validity,
+        tenet_domain::evidence::EvidenceValidity::Stale { .. }
+      )
+  }));
+  assert!(graph.evidence.values().any(|evidence| {
+    evidence.result == tenet_domain::evidence::EvidenceResult::Passed
+      && evidence.revision == head
+      && evidence.validity.is_valid()
+  }));
+}
+
+#[tokio::test]
 async fn maximum_cycle_count_blocks_on_exact_configured_cycle() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::IncompleteAssessment));
@@ -2429,7 +2482,7 @@ async fn stagnation_limit_blocks_on_exact_unchanged_transition() {
     .expect("stagnation produces blocked state");
 
   assert_eq!(state.status, tenet_domain::model::RunStatus::Blocked);
-  assert_eq!(state.cycle, 5);
+  assert_eq!(state.cycle, 6);
   assert!(state
     .blocked_reason
     .as_deref()

@@ -117,6 +117,35 @@ impl App {
       state.requirement_counts.stale,
       state.requirement_counts.contradicted
     );
+    println!(
+      "project checks: {}/{} {}",
+      state.verification_layers.project_checks_passed,
+      state.verification_layers.project_checks_total,
+      if state.verification_layers.project_passed {
+        "PASS"
+      } else {
+        "NOT PASSING"
+      }
+    );
+    println!(
+      "semantic obligations: {}/{} SATISFIED ({} gaps, {} uncertain)",
+      state.verification_layers.semantic_satisfied,
+      state.verification_layers.semantic_obligations_total,
+      state.verification_layers.semantic_gaps,
+      state.verification_layers.semantic_uncertain
+    );
+    println!(
+      "contradictions: {}",
+      state.verification_layers.contradictions
+    );
+    println!(
+      "completion: {}",
+      if state.verification_layers.completion_eligible {
+        "ELIGIBLE"
+      } else {
+        "BLOCKED"
+      }
+    );
     for lease in state.active_leases.values() {
       println!(
         "active work: {} · {} ({})",

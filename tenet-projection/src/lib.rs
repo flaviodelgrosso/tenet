@@ -5,7 +5,10 @@ use std::{
 
 use tenet_domain::{
   events::RunEvent,
-  evidence::{AcceptanceCriterion, ImplementationState, VerificationState},
+  evidence::{
+    AcceptanceCriterion, ImplementationState, ObligationAssessment, SemanticAssessmentReport,
+    VerificationState,
+  },
   model::{
     Phase, ReconcileResult, RepositoryChange, Requirement, RequirementAssessment,
     RequirementCatalog, RunStatus, State, VerificationReport, WorkExecution, WorkUnit, WorkerEvent,
@@ -69,6 +72,8 @@ pub struct RunProjection {
   activities: VecDeque<Activity>,
   workers: VecDeque<WorkerSession>,
   checks: Vec<VerificationReport>,
+  project_verifications: Vec<ProjectVerificationRun>,
+  semantic_assessments: Vec<SemanticAssessmentReport>,
   changes: Vec<RepositoryChange>,
   ready_work_units: Vec<WorkUnit>,
   candidate_queue: Vec<WorkExecution>,
@@ -97,6 +102,8 @@ impl RunProjection {
       activities: VecDeque::new(),
       workers: VecDeque::new(),
       checks: Vec::new(),
+      project_verifications: Vec::new(),
+      semantic_assessments: Vec::new(),
       changes: Vec::new(),
       ready_work_units: Vec::new(),
       candidate_queue: Vec::new(),
@@ -143,6 +150,12 @@ impl RunProjection {
   pub fn checks(&self) -> &[VerificationReport] {
     &self.checks
   }
+  pub fn project_verifications(&self) -> &[ProjectVerificationRun] {
+    &self.project_verifications
+  }
+  pub fn semantic_assessments(&self) -> &[SemanticAssessmentReport] {
+    &self.semantic_assessments
+  }
   pub fn changes(&self) -> &[RepositoryChange] {
     &self.changes
   }
@@ -181,6 +194,8 @@ impl RunProjection {
     self.activities.clear();
     self.workers.clear();
     self.checks.clear();
+    self.project_verifications.clear();
+    self.semantic_assessments.clear();
     self.changes.clear();
     self.streaming_worker = None;
     self.assessments.clear();
@@ -314,6 +329,7 @@ impl RunProjection {
       ),
       RunEvent::Verification(report) => self.apply_check(report),
       RunEvent::ProjectVerification(report) => self.apply_project_verification(report),
+      RunEvent::SemanticAssessment(report) => self.apply_semantic_assessment(report),
       RunEvent::RepositoryChanges(changes) => {
         let summary = format!("{} files changed", changes.len());
         let detail = changes
@@ -334,15 +350,15 @@ impl RunProjection {
         evidence.observed_at.to_rfc3339(),
         ActivityCategory::Check,
         "EVIDENCE ESTABLISHED",
-        format!("{} · {}", evidence.obligation_id, evidence.check_identity),
-        format!("revision {}\n{}", evidence.revision, evidence.output),
+        format!("{} · {:?}", evidence.obligation_id, evidence.source),
+        format!("revision {}\n{}", evidence.revision, evidence.rationale),
       ),
       RunEvent::EvidenceFailed(evidence) => self.push_activity(
         evidence.observed_at.to_rfc3339(),
         ActivityCategory::Error,
         "EVIDENCE FAILED",
-        format!("{} · {}", evidence.obligation_id, evidence.check_identity),
-        format!("revision {}\n{}", evidence.revision, evidence.output),
+        format!("{} · {:?}", evidence.obligation_id, evidence.source),
+        format!("revision {}\n{}", evidence.revision, evidence.rationale),
       ),
       RunEvent::EvidenceInvalidated {
         evidence_id,
@@ -484,7 +500,11 @@ impl RunProjection {
       } else {
         ActivityCategory::Error
       },
-      if passed { "CHECKS PASS" } else { "CHECKS FAIL" },
+      if passed {
+        "ADVISORY CHECKS PASS"
+      } else {
+        "ADVISORY CHECKS FAIL"
+      },
       summary,
       detail,
     );
@@ -537,6 +557,46 @@ impl RunProjection {
       ),
       detail,
     );
+    self.project_verifications.push(report);
+  }
+
+  fn apply_semantic_assessment(&mut self, report: SemanticAssessmentReport) {
+    let satisfied = report
+      .assessments
+      .iter()
+      .filter(|item| matches!(item.assessment, ObligationAssessment::Satisfied { .. }))
+      .count();
+    let gaps = report
+      .assessments
+      .iter()
+      .filter(|item| matches!(item.assessment, ObligationAssessment::Gap { .. }))
+      .count();
+    let uncertain = report
+      .assessments
+      .iter()
+      .filter(|item| matches!(item.assessment, ObligationAssessment::Uncertain { .. }))
+      .count();
+    let detail = report
+      .assessments
+      .iter()
+      .map(|item| format!("{} · {:?}", item.obligation_id, item.assessment))
+      .collect::<Vec<_>>()
+      .join("\n");
+    self.push_activity(
+      now(),
+      if gaps == 0 && uncertain == 0 {
+        ActivityCategory::Check
+      } else {
+        ActivityCategory::Error
+      },
+      "SEMANTIC VERIFICATION",
+      format!(
+        "{satisfied} of {} satisfied · {gaps} gaps · {uncertain} uncertain",
+        report.assessments.len()
+      ),
+      detail,
+    );
+    self.semantic_assessments.push(report);
   }
 
   fn apply_worker(&mut self, event: WorkerEvent) {
@@ -1004,7 +1064,7 @@ mod tests {
     assert!(projection
       .activities()
       .iter()
-      .any(|item| item.title == "CHECKS PASS"));
+      .any(|item| item.title == "ADVISORY CHECKS PASS"));
     assert_eq!(
       projection.current_worker().unwrap().role,
       WorkerRole::Implement
@@ -1021,6 +1081,7 @@ mod tests {
       environment: Default::default(),
     };
     projection.apply(RunEvent::ProjectVerification(ProjectVerificationRun {
+      run_id: tenet_domain::ids::VerificationRunId::new(),
       revision: "abc123".into(),
       suite_hash: "0123456789abcdef".into(),
       checks: vec![tenet_domain::verification::ProjectCheckResult {
@@ -1059,7 +1120,7 @@ mod tests {
       .collect::<Vec<_>>();
     assert!(titles
       .windows(3)
-      .any(|window| window == ["CHECKS FAIL", "REPAIR", "CHECKS PASS"]));
+      .any(|window| window == ["ADVISORY CHECKS FAIL", "REPAIR", "ADVISORY CHECKS PASS"]));
     assert!(failure_preview(projection.checks().first().unwrap()).contains("assertion failed"));
   }
 

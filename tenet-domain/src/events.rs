@@ -12,7 +12,7 @@ use crate::model::{
   WorkExecution, WorkLease, WorkUnit, WorkerEvent,
 };
 use crate::{
-  evidence::{Evidence, VerificationState},
+  evidence::{Evidence, SemanticAssessmentReport, VerificationState},
   ids::{CriterionId, EvidenceId, ObligationId, RequirementId},
   verification::ProjectVerificationRun,
 };
@@ -59,6 +59,7 @@ pub enum RunEvent {
   },
   Verification(VerificationReport),
   ProjectVerification(ProjectVerificationRun),
+  SemanticAssessment(SemanticAssessmentReport),
   RepositoryChanges(Vec<RepositoryChange>),
   EvidenceEstablished(Evidence),
   EvidenceFailed(Evidence),
@@ -184,6 +185,9 @@ impl RunLogger {
       RunEvent::Verification(v) => serde_json::json!({"type":"verification","value":v}),
       RunEvent::ProjectVerification(v) => {
         serde_json::json!({"type":"project_verification","value":v})
+      }
+      RunEvent::SemanticAssessment(v) => {
+        serde_json::json!({"type":"semantic_assessment","value":v})
       }
       RunEvent::RepositoryChanges(v) => {
         serde_json::json!({"type":"repository_changes","value":v})

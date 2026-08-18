@@ -99,12 +99,9 @@ impl WorkGraph {
 mod tests {
   use super::*;
   use tenet_domain::{
-    evidence::{
-      AcceptanceCriterion, ImplementationState, VerificationKind, VerificationObligation,
-    },
+    evidence::{AcceptanceCriterion, ImplementationState, VerificationObligation},
     ids::{CriterionId, ObligationId, RequirementId},
     model::{CandidateCheck, Requirement, RequirementAssessment, WorkScope},
-    verification::{DependencyScopeAuthority, VerificationAuthority, VerificationSpec},
     worker::CatalogCoverage,
   };
 
@@ -127,18 +124,8 @@ mod tests {
       verification_obligations: vec![VerificationObligation {
         id: ObligationId::from("REQ-001/AC-01/VO-01"),
         criterion_id: CriterionId::from("REQ-001/AC-01"),
-        description: "Run check".into(),
-        kind: VerificationKind::Command,
+        description: "Required behavior is observable".into(),
         required: true,
-        spec: VerificationSpec {
-          program: "cargo".into(),
-          args: vec!["test".into()],
-          working_directory: ".".into(),
-          environment: Default::default(),
-        },
-        authority: VerificationAuthority::AgentProposed,
-        dependency_scope: vec!["src/**".into()],
-        dependency_scope_authority: DependencyScopeAuthority::AgentProposed,
       }],
       coverage: CatalogCoverage {
         normative_fragments: Vec::new(),

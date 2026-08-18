@@ -103,7 +103,7 @@ impl ConsoleRenderer {
       ("CHANGES", item.summary.as_str())
     } else if item.title == "RECONCILE" {
       ("WORK", item.summary.as_str())
-    } else if item.title.starts_with("CHECKS") {
+    } else if item.title.starts_with("ADVISORY CHECKS") {
       ("VERIFY", item.summary.as_str())
     } else if item.title.ends_with("TOOL COMPLETE") {
       ("TOOL DONE", item.summary.as_str())
@@ -126,7 +126,7 @@ impl ConsoleRenderer {
       }
     }
 
-    if item.title.starts_with("CHECKS") {
+    if item.title.starts_with("ADVISORY CHECKS") {
       for line in item
         .detail
         .lines()
@@ -181,6 +181,40 @@ impl ConsoleRenderer {
 
     writeln!(
       self.stdout,
+      "  Project checks {}/{} {}",
+      state.verification_layers.project_checks_passed,
+      state.verification_layers.project_checks_total,
+      if state.verification_layers.project_passed {
+        "PASS"
+      } else {
+        "NOT PASSING"
+      }
+    )?;
+    writeln!(
+      self.stdout,
+      "  Semantic      {}/{} SATISFIED ({} gaps, {} uncertain)",
+      state.verification_layers.semantic_satisfied,
+      state.verification_layers.semantic_obligations_total,
+      state.verification_layers.semantic_gaps,
+      state.verification_layers.semantic_uncertain
+    )?;
+    writeln!(
+      self.stdout,
+      "  Contradictions {}",
+      state.verification_layers.contradictions
+    )?;
+    writeln!(
+      self.stdout,
+      "  Completion     {}",
+      if state.verification_layers.completion_eligible {
+        "ELIGIBLE"
+      } else {
+        "BLOCKED"
+      }
+    )?;
+
+    writeln!(
+      self.stdout,
       "  Work units     {} completed",
       state.completed_work_units.len()
     )?;
@@ -201,7 +235,7 @@ impl ConsoleRenderer {
     if !presentation.checks().is_empty() {
       writeln!(
         self.stdout,
-        "  Checks         {}",
+        "  Advisory checks {}",
         if presentation
           .checks()
           .last()

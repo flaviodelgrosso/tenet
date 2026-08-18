@@ -10,7 +10,6 @@ use anyhow::{bail, Context, Result};
 use tenet_domain::{
   config::Config,
   model::{ArchitectOutput, RequirementCatalog},
-  verification::{DependencyScopeAuthority, VerificationAuthority},
   worker::CatalogCoverage,
 };
 
@@ -101,8 +100,6 @@ pub fn build(
   let mut verification_obligations = output.verification_obligations;
   for obligation in &mut verification_obligations {
     obligation.required = true;
-    obligation.authority = VerificationAuthority::AgentProposed;
-    obligation.dependency_scope_authority = DependencyScopeAuthority::AgentProposed;
   }
 
   let coverage = CatalogCoverage::derive(specification, &requirements);

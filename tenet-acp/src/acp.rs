@@ -26,11 +26,12 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tenet_domain::events::EventSink;
-use tenet_domain::evidence::EvidenceProjection;
+use tenet_domain::evidence::{EvidenceProjection, SemanticAssessmentReport};
 use tenet_domain::model::{
   ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, RequirementCatalog,
   VerificationReport, WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
 };
+use tenet_domain::verification::ProjectVerificationRun;
 use tokio::sync::oneshot;
 
 use crate::registry::RegistryClient;
@@ -168,16 +169,18 @@ impl AgentBackend for AcpRuntime {
     &self,
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
+    project_verification: &ProjectVerificationRun,
     evidence: &[EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
-  ) -> Result<ReconcileResult> {
+  ) -> Result<SemanticAssessmentReport> {
     self
       .run_typed(
         ctx,
         WorkerRole::Assess,
         format!(
-          "Perform an independent skeptical gap assessment against every requirement. The controller-derived evidence projection is authoritative for verification state; identify gaps but do not declare completion.\n\nCatalog:\n{}\n\nController-derived evidence projections:\n{}{}",
+          "Independently assess every required semantic obligation against the immutable repository revision. Return exactly one Satisfied, Gap, or Uncertain result per required obligation. Do not propose edits or declare completion.\n\nCatalog:\n{}\n\nController-executed project verification:\n{}\n\nExisting controller-owned evidence:\n{}{}",
           serde_json::to_string_pretty(catalog)?,
+          serde_json::to_string_pretty(project_verification)?,
           serde_json::to_string_pretty(evidence)?,
           semantic_feedback(semantic_validation_feedback)
         ),
@@ -1258,7 +1261,7 @@ mod tests {
     let architect = json!({
       "requirements":[{"id":"REQ-001","title":"Title","description":"Description","required":true,"sourceRefs":[{"section":null,"fragmentId":"SPEC-0001-example","textHash":"hash"}]}],
       "acceptanceCriteria":[{"id":"REQ-001/AC-01","requirementId":"REQ-001","description":"Observable","mandatory":true}],
-      "verificationObligations":[{"id":"REQ-001/AC-01/VO-01","criterionId":"REQ-001/AC-01","description":"Run check","kind":"automated_test","required":true,"spec":{"program":"cargo","args":["test"],"workingDirectory":".","environment":{}},"authority":"agent_proposed","dependencyScope":["src/**"],"dependencyScopeAuthority":"agent_proposed"}]
+      "verificationObligations":[{"id":"REQ-001/AC-01/VO-01","criterionId":"REQ-001/AC-01","description":"Behavior is satisfied","required":true}]
     });
     let worker = json!({"summary":"done","changedFiles":["src/lib.rs"],"testsRun":["cargo test"],"notes":[],"discoveries":[{"type":"blocker","description":"blocked"}]});
 
@@ -1267,6 +1270,22 @@ mod tests {
       &schema_for::<ArchitectOutput>().expect("architect schema"),
     )
     .expect("valid architect output");
+    let semantic = json!({
+      "summary": "Independent assessment",
+      "assessments": [{
+        "obligationId": "REQ-001/AC-01/VO-01",
+        "assessment": {
+          "status": "satisfied",
+          "rationale": "Observed behavior",
+          "evidenceRefs": ["src/lib.rs"]
+        }
+      }]
+    });
+    validate_structured_output::<SemanticAssessmentReport>(
+      &semantic,
+      &schema_for::<SemanticAssessmentReport>().expect("semantic assessment schema"),
+    )
+    .expect("valid semantic assessment output");
     validate_structured_output::<ReconcileResult>(
       &valid_reconcile_output(),
       &schema_for::<ReconcileResult>().expect("reconcile schema"),

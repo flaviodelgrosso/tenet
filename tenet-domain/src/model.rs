@@ -42,10 +42,33 @@ pub struct RequirementCounts {
   pub partially_verified: usize,
   #[serde(alias = "missing")]
   pub unverified: usize,
+  pub uncertain: usize,
   pub stale: usize,
   pub contradicted: usize,
   #[serde(rename = "missingImplementation")]
   pub missing_implementation: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct VerificationLayers {
+  #[serde(rename = "projectChecksTotal")]
+  pub project_checks_total: usize,
+  #[serde(rename = "projectChecksPassed")]
+  pub project_checks_passed: usize,
+  #[serde(rename = "projectPassed")]
+  pub project_passed: bool,
+  #[serde(rename = "semanticObligationsTotal")]
+  pub semantic_obligations_total: usize,
+  #[serde(rename = "semanticSatisfied")]
+  pub semantic_satisfied: usize,
+  #[serde(rename = "semanticGaps")]
+  pub semantic_gaps: usize,
+  #[serde(rename = "semanticUncertain")]
+  pub semantic_uncertain: usize,
+  pub contradictions: usize,
+  #[serde(rename = "completionEligible")]
+  pub completion_eligible: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,6 +211,8 @@ pub struct State {
   pub work_statuses: std::collections::BTreeMap<String, WorkStatus>,
   #[serde(rename = "requirementCounts")]
   pub requirement_counts: RequirementCounts,
+  #[serde(default, rename = "verificationLayers")]
+  pub verification_layers: VerificationLayers,
   #[serde(rename = "completedWorkUnits")]
   pub completed_work_units: Vec<CompletedWorkUnit>,
   pub discoveries: Vec<DiscoveryRecord>,
@@ -222,6 +247,7 @@ impl State {
       deferred_candidates: Vec::new(),
       work_statuses: std::collections::BTreeMap::new(),
       requirement_counts: RequirementCounts::default(),
+      verification_layers: VerificationLayers::default(),
       completed_work_units: Vec::new(),
       stagnation_count: 0,
       progress_fingerprint: None,
