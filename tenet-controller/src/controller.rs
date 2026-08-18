@@ -686,6 +686,13 @@ impl Controller {
         outcome => {
           accepted = false;
           let reason = integration_failure(&outcome);
+          if let IntegrationOutcome::ProjectVerificationFailed { report } = &outcome {
+            state.verification_layers = project_layers(report);
+            context
+              .events
+              .emit(RunEvent::ProjectVerification(report.clone()))
+              .await?;
+          }
           state.work_statuses.insert(id.clone(), WorkStatus::Failed);
           context
             .events
@@ -1476,11 +1483,32 @@ fn integration_failure(outcome: &IntegrationOutcome) -> String {
     IntegrationOutcome::VerificationFailed { .. } => {
       "Candidate verification failed during integration".into()
     }
-    IntegrationOutcome::RegressionDetected { .. } => {
-      "Candidate introduced a deterministic verification regression".into()
+    IntegrationOutcome::ProjectVerificationFailed { report } => {
+      project_verification_failure_reason(report)
     }
     IntegrationOutcome::Accepted { .. } => "Candidate accepted".into(),
   }
+}
+
+fn project_verification_failure_reason(report: &ProjectVerificationRun) -> String {
+  let Some(check) = report
+    .checks
+    .iter()
+    .find(|check| check.result.exit_code != Some(0) || check.result.timed_out)
+  else {
+    return "Candidate failed mandatory project verification before all checks completed".into();
+  };
+  let status = if check.result.timed_out {
+    "timed out".into()
+  } else if let Some(exit_code) = check.result.exit_code {
+    format!("exited with code {exit_code}")
+  } else {
+    "terminated without an exit code".into()
+  };
+  format!(
+    "Candidate failed mandatory project verification: '{}' {status}",
+    check.name
+  )
 }
 
 pub async fn manual_verify(cwd: &Path) -> Result<ProjectVerificationRun> {
@@ -1511,8 +1539,9 @@ mod tests {
   use super::*;
   use tenet_domain::{
     evidence::{AcceptanceCriterion, VerificationObligation},
-    ids::{CriterionId, ObligationId, RequirementId},
+    ids::{CriterionId, ObligationId, RequirementId, VerificationRunId},
     model::{ArchitectOutput, Requirement, RequirementAssessment},
+    verification::{CommandResult, ProjectCheckResult, VerificationSpec},
     worker::{derive_normative_fragments, CatalogCoverage},
   };
 
@@ -1697,6 +1726,42 @@ mod tests {
     assert_eq!(
       built.coverage.uncovered_fragment_ids,
       vec![fragments[1].id.clone()]
+    );
+  }
+
+  #[test]
+  fn project_verification_failure_names_failed_check_and_exit_code() {
+    let spec = VerificationSpec {
+      program: "npm".into(),
+      args: vec!["run".into(), "build".into()],
+      working_directory: ".".into(),
+      environment: BTreeMap::new(),
+    };
+    let report = ProjectVerificationRun {
+      run_id: VerificationRunId::new(),
+      revision: "candidate".into(),
+      suite_hash: "suite".into(),
+      checks: vec![ProjectCheckResult {
+        name: "build".into(),
+        spec: spec.clone(),
+        timeout_secs: 300,
+        result: CommandResult {
+          command: spec.identity(),
+          exit_code: Some(127),
+          timed_out: false,
+          duration_ms: 1,
+          stdout: String::new(),
+          stderr: "tsc: command not found".into(),
+        },
+      }],
+      passed: false,
+      started_at: Utc::now(),
+      finished_at: Utc::now(),
+    };
+
+    assert_eq!(
+      project_verification_failure_reason(&report),
+      "Candidate failed mandatory project verification: 'build' exited with code 127"
     );
   }
 }

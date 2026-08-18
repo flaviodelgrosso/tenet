@@ -29,7 +29,7 @@ pub enum IntegrationOutcome {
   VerificationFailed {
     report: VerificationReport,
   },
-  RegressionDetected {
+  ProjectVerificationFailed {
     report: ProjectVerificationRun,
   },
 }
@@ -124,7 +124,7 @@ impl Integrator {
     .await?;
     if !regression.passed {
       git::reset_hard(&self.workspace, &self.accepted_revision).await?;
-      return Ok(IntegrationOutcome::RegressionDetected { report: regression });
+      return Ok(IntegrationOutcome::ProjectVerificationFailed { report: regression });
     }
 
     let transaction_id = Uuid::new_v4().to_string();

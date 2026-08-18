@@ -1832,7 +1832,7 @@ async fn integration_rejects_stale_candidate_base() {
 }
 
 #[tokio::test]
-async fn integration_rejects_candidate_check_and_global_regression() {
+async fn integration_rejects_candidate_and_project_verification_failures() {
   let repository = TempRepo::new();
   let base = git::head(repository.path()).await.expect("base revision");
   let checks_manager = WorkspaceManager::new(repository.path().to_path_buf(), "checks");
@@ -1866,47 +1866,47 @@ async fn integration_rejects_candidate_check_and_global_regression() {
     .await
     .expect("cleanup check integration");
 
-  let regression_manager = WorkspaceManager::new(repository.path().to_path_buf(), "regression");
-  let regression = candidate(
+  let project_manager = WorkspaceManager::new(repository.path().to_path_buf(), "project-check");
+  let project_failure = candidate(
     &repository,
-    &regression_manager,
-    "regression",
+    &project_manager,
+    "project-check",
     &base,
-    "regression",
+    "project-check",
     "present",
     Vec::new(),
   )
   .await;
   let mut config = Config::default();
   config.verification.checks = vec![ProjectVerificationCheck {
-    name: "regression".into(),
-    command: vec!["sh".into(), "-c".into(), "test ! -f regression".into()],
+    name: "project-check".into(),
+    command: vec!["sh".into(), "-c".into(), "test ! -f project-check".into()],
     working_directory: ".".into(),
     environment: Default::default(),
     timeout_secs: None,
   }];
-  let mut regression_integrator = Integrator::create(
+  let mut project_integrator = Integrator::create(
     repository.path().to_path_buf(),
-    &regression_manager,
+    &project_manager,
     base,
     config,
   )
   .await
-  .expect("create regression integrator");
+  .expect("create project verification integrator");
 
-  let outcome = regression_integrator
-    .integrate(&regression)
+  let outcome = project_integrator
+    .integrate(&project_failure)
     .await
-    .expect("run regression check");
+    .expect("run project verification");
 
   assert!(matches!(
     outcome,
-    IntegrationOutcome::RegressionDetected { .. }
+    IntegrationOutcome::ProjectVerificationFailed { .. }
   ));
-  regression_integrator
-    .cleanup(&regression_manager)
+  project_integrator
+    .cleanup(&project_manager)
     .await
-    .expect("cleanup regression integration");
+    .expect("cleanup project verification integration");
 }
 
 #[cfg(unix)]

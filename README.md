@@ -350,7 +350,7 @@ The candidate is committed first; project verification then runs against clean d
 
 ### 5 · Repair
 
-A failed verification attempt becomes structured input to a new repair attempt: candidate repository + verification command + exit code + stdout + stderr → fresh Repair worker. Repairs are bounded — Tenet prefers an explicit blocked state over infinite retry. Today, failure routing is still relatively coarse; a future controller should distinguish defects, regressions, environment failures, dependency failures, flaky verification, and specification ambiguity, since they shouldn't all lead to the same recovery action.
+A failed advisory verification attempt becomes structured input to a new Repair worker: candidate repository + verification command + exit code + stdout + stderr. Repairs are bounded — Tenet prefers an explicit blocked state over infinite retry. Mandatory project-suite failures at integration are reported as project verification failures with their structured check results; Tenet does not call them regressions without a passing baseline comparison.
 
 ### 6 · Integrate
 

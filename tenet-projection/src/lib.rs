@@ -516,7 +516,7 @@ impl RunProjection {
       .checks
       .iter()
       .map(|check| {
-        format!(
+        let mut detail = format!(
           "{} {} ({} ms)\n{}",
           if check.result.exit_code == Some(0) && !check.result.timed_out {
             "PASS"
@@ -528,7 +528,16 @@ impl RunProjection {
           check.name,
           check.result.duration_ms,
           check.result.command
-        )
+        );
+        if !check.result.stdout.is_empty() {
+          detail.push_str("\nstdout:\n");
+          detail.push_str(&check.result.stdout);
+        }
+        if !check.result.stderr.is_empty() {
+          detail.push_str("\nstderr:\n");
+          detail.push_str(&check.result.stderr);
+        }
+        detail
       })
       .collect::<Vec<_>>()
       .join("\n\n");
@@ -1105,6 +1114,44 @@ mod tests {
     let activity = projection.activities().back().expect("project activity");
     assert_eq!(activity.title, "PROJECT VERIFICATION PASS");
     assert!(activity.detail.contains("quality"));
+  }
+
+  #[test]
+  fn projects_failed_project_verification_output() {
+    let mut projection = RunProjection::new(State::fresh(), Vec::new());
+    let spec = tenet_domain::verification::VerificationSpec {
+      program: "npm".into(),
+      args: vec!["run".into(), "build".into()],
+      working_directory: ".".into(),
+      environment: Default::default(),
+    };
+    projection.apply(RunEvent::ProjectVerification(ProjectVerificationRun {
+      run_id: tenet_domain::ids::VerificationRunId::new(),
+      revision: "candidate".into(),
+      suite_hash: "0123456789abcdef".into(),
+      checks: vec![tenet_domain::verification::ProjectCheckResult {
+        name: "build".into(),
+        spec: spec.clone(),
+        timeout_secs: 300,
+        result: CommandResult {
+          command: spec.identity(),
+          exit_code: Some(127),
+          timed_out: false,
+          duration_ms: 4,
+          stdout: "build output".into(),
+          stderr: "tsc: command not found".into(),
+        },
+      }],
+      passed: false,
+      started_at: "2026-08-18T10:00:00Z".parse().expect("timestamp"),
+      finished_at: "2026-08-18T10:00:01Z".parse().expect("timestamp"),
+    }));
+
+    let activity = projection.activities().back().expect("project activity");
+    assert!(
+      activity.detail.contains("stdout:\nbuild output")
+        && activity.detail.contains("stderr:\ntsc: command not found")
+    );
   }
 
   #[test]
