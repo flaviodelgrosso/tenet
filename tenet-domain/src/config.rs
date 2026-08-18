@@ -1,9 +1,15 @@
-use std::path::{Component, Path, PathBuf};
+use std::{
+  collections::BTreeMap,
+  fmt::Write as _,
+  path::{Component, Path, PathBuf},
+};
 
-use crate::{ids::ObligationId, model::WorkerRole, verification::VerificationSpec};
 use anyhow::{Context, Result};
 use serde::{de, ser::SerializeStruct, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::fs;
+
+use crate::{model::WorkerRole, verification::VerificationSpec};
 
 pub const TENET_DIR: &str = ".tenet";
 pub const CONFIG_FILE: &str = "tenet.toml";
@@ -13,7 +19,7 @@ pub const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
 const DEFAULT_COMPLETION_RETRIES: u32 = 2;
 const DEFAULT_TURN_TIMEOUT_SECS: u64 = 900;
-const DEFAULT_VERIFICATION_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_VERIFICATION_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const DEFAULT_STAGNATION_LIMIT: u32 = 3;
 const DEFAULT_MAX_PARALLEL_WORKERS: usize = 1;
@@ -274,7 +280,7 @@ impl AgentPreferences {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VerificationConfig {
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub gates: Vec<ProjectVerificationGate>,
+  pub checks: Vec<ProjectVerificationCheck>,
   #[serde(
     default = "default_verification_timeout_secs",
     skip_serializing_if = "VerificationConfig::has_default_timeout"
@@ -289,18 +295,44 @@ pub struct VerificationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectVerificationGate {
-  #[serde(rename = "obligation_ids")]
-  pub obligation_ids: Vec<ObligationId>,
-  pub spec: VerificationSpec,
-  pub dependency_scope: Vec<String>,
+pub struct ProjectVerificationCheck {
+  pub name: String,
+  pub command: Vec<String>,
+  #[serde(
+    default = "default_working_directory",
+    skip_serializing_if = "is_default_working_directory"
+  )]
+  pub working_directory: String,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub environment: BTreeMap<String, String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub timeout_secs: Option<u64>,
+}
+
+impl ProjectVerificationCheck {
+  pub fn verification_spec(&self) -> Result<VerificationSpec> {
+    let (program, args) = self
+      .command
+      .split_first()
+      .context("project verification check command must contain an executable")?;
+    Ok(VerificationSpec {
+      program: program.clone(),
+      args: args.to_vec(),
+      working_directory: self.working_directory.clone(),
+      environment: self.environment.clone(),
+    })
+  }
+
+  pub fn effective_timeout_secs(&self, default: u64) -> u64 {
+    self.timeout_secs.unwrap_or(default)
+  }
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct VerificationConfigWire {
   #[serde(default)]
-  gates: Vec<ProjectVerificationGate>,
+  checks: Vec<ProjectVerificationCheck>,
   #[serde(default = "default_verification_timeout_secs")]
   timeout_secs: u64,
   #[serde(default = "default_max_output_bytes")]
@@ -314,7 +346,7 @@ impl<'de> Deserialize<'de> for VerificationConfig {
   {
     let wire = VerificationConfigWire::deserialize(deserializer)?;
     let config = Self {
-      gates: wire.gates,
+      checks: wire.checks,
       timeout_secs: wire.timeout_secs,
       max_output_bytes: wire.max_output_bytes,
     };
@@ -326,7 +358,7 @@ impl<'de> Deserialize<'de> for VerificationConfig {
 impl Default for VerificationConfig {
   fn default() -> Self {
     Self {
-      gates: Vec::new(),
+      checks: Vec::new(),
       timeout_secs: DEFAULT_VERIFICATION_TIMEOUT_SECS,
       max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
     }
@@ -335,23 +367,53 @@ impl Default for VerificationConfig {
 
 impl VerificationConfig {
   fn validate(&self) -> Result<()> {
-    for gate in &self.gates {
-      if gate.obligation_ids.is_empty() {
-        anyhow::bail!("verification gate must explicitly bind at least one obligation_id");
+    if self.timeout_secs == 0 {
+      anyhow::bail!("verification.timeout_secs must be at least 1");
+    }
+    for check in &self.checks {
+      if check.name.trim().is_empty() {
+        anyhow::bail!("project verification check name must not be blank");
       }
-      if gate.spec.program.trim().is_empty() {
-        anyhow::bail!("verification gate program must not be blank");
+      let Some(program) = check.command.first() else {
+        anyhow::bail!("project verification check command must contain an executable");
+      };
+      if program.trim().is_empty() {
+        anyhow::bail!("project verification check executable must not be blank");
       }
-      if gate.dependency_scope.is_empty()
-        || gate
-          .dependency_scope
-          .iter()
-          .any(|pattern| pattern.trim().is_empty())
-      {
-        anyhow::bail!("verification gate dependency_scope must not be empty");
+      if check.working_directory.trim().is_empty() {
+        anyhow::bail!("project verification check working_directory must not be blank");
+      }
+      if check.timeout_secs == Some(0) {
+        anyhow::bail!("project verification check timeout_secs must be at least 1");
       }
     }
     Ok(())
+  }
+
+  pub fn suite_hash(&self) -> Result<String> {
+    let checks = self
+      .checks
+      .iter()
+      .map(|check| {
+        (
+          &check.command,
+          &check.working_directory,
+          &check.environment,
+          check.effective_timeout_secs(self.timeout_secs),
+        )
+      })
+      .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&(
+      "tenet-project-verification-suite-v1",
+      checks,
+      self.max_output_bytes,
+    ))?;
+    let digest = Sha256::digest(bytes);
+    let mut hash = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+      write!(hash, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(hash)
   }
 
   fn is_default(&self) -> bool {
@@ -365,6 +427,14 @@ impl VerificationConfig {
   fn has_default_max_output(value: &usize) -> bool {
     *value == DEFAULT_MAX_OUTPUT_BYTES
   }
+}
+
+fn default_working_directory() -> String {
+  ".".into()
+}
+
+fn is_default_working_directory(value: &String) -> bool {
+  value == "."
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -423,7 +493,9 @@ pub async fn ensure_config(cwd: &Path) -> Result<Config> {
   if !path.exists() {
     let config = Config::default();
     let body = toml::to_string_pretty(&config)?;
-    let text = format!("#:schema {CONFIG_SCHEMA_URL}\n\n{body}");
+    let text = format!(
+      "#:schema {CONFIG_SCHEMA_URL}\n\n{body}\n# Configure at least one trusted project check before running Tenet.\n# [[verification.checks]]\n# name = \"project verification\"\n# command = [\"./verify\"]\n"
+    );
     fs::write(&path, text).await?;
     return Ok(config);
   }
@@ -579,6 +651,34 @@ mod tests {
         .collect::<std::collections::BTreeSet<_>>(),
       ["max_parallel_workers"].into_iter().collect(),
     );
+    assert_eq!(
+      schema["$defs"]["verificationConfig"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>(),
+      ["checks", "max_output_bytes", "timeout_secs"]
+        .into_iter()
+        .collect(),
+    );
+    assert_eq!(
+      schema["$defs"]["projectVerificationCheck"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>(),
+      [
+        "name",
+        "command",
+        "working_directory",
+        "environment",
+        "timeout_secs",
+      ]
+      .into_iter()
+      .collect(),
+    );
   }
 
   #[test]
@@ -622,8 +722,8 @@ mod tests {
       config.agent.turn_timeout_secs
     );
     assert_eq!(
-      schema["$defs"]["verificationConfig"]["properties"]["gates"]["default"],
-      serde_json::to_value(config.verification.gates).unwrap()
+      schema["$defs"]["verificationConfig"]["properties"]["checks"]["default"],
+      serde_json::to_value(config.verification.checks).unwrap()
     );
     assert_eq!(
       schema["$defs"]["verificationConfig"]["properties"]["timeout_secs"]["default"],
@@ -668,7 +768,6 @@ mod tests {
       "stagnation_limit",
       "completion_retries",
       "turn_timeout_secs",
-      "verification",
       "max_output_bytes",
       "max_parallel_workers",
       "integration",
@@ -679,6 +778,8 @@ mod tests {
         "generated config contains {omitted}"
       );
     }
+    assert!(generated.contains("[[verification.checks]]"));
+    assert!(generated.contains("command = [\"./verify\"]"));
     assert!(error.contains("no ACP launch source configured"));
   }
 
@@ -878,6 +979,71 @@ mod tests {
     );
     let error = toml::from_str::<Config>(&text).unwrap_err().to_string();
     assert!(error.contains("thinking"), "unexpected error: {error}");
+  }
+  #[test]
+  fn structured_project_checks_deserialize_without_catalog_ids() {
+    let text = concat!(
+      "version = 1\n",
+      "spec_file = \"spec.md\"\n",
+      "max_cycles = 25\n",
+      "max_repair_attempts = 3\n",
+      "[agent]\n",
+      "id = \"test-agent\"\n",
+      "[verification]\n",
+      "timeout_secs = 300\n",
+      "max_output_bytes = 65536\n",
+      "[[verification.checks]]\n",
+      "name = \"tests\"\n",
+      "command = [\"./test\", \"--all\"]\n",
+      "working_directory = \"project\"\n",
+      "environment = { CI = \"true\" }\n",
+      "timeout_secs = 600\n",
+    );
+
+    let config: Config = toml::from_str(text).expect("structured project check");
+    let check = &config.verification.checks[0];
+
+    assert_eq!(check.command, ["./test", "--all"]);
+    assert_eq!(check.working_directory, "project");
+    assert_eq!(check.environment["CI"], "true");
+    assert_eq!(
+      check.effective_timeout_secs(config.verification.timeout_secs),
+      600
+    );
+  }
+
+  #[test]
+  fn project_suite_hash_changes_with_effective_configuration() {
+    let mut config = super::VerificationConfig::default();
+    config.checks.push(super::ProjectVerificationCheck {
+      name: "tests".into(),
+      command: vec!["./test".into()],
+      working_directory: ".".into(),
+      environment: Default::default(),
+      timeout_secs: None,
+    });
+    let original = config.suite_hash().expect("suite hash");
+    config.checks[0]
+      .environment
+      .insert("CI".into(), "true".into());
+
+    assert_ne!(config.suite_hash().expect("changed suite hash"), original);
+  }
+
+  #[test]
+  fn project_check_name_does_not_change_suite_hash() {
+    let mut config = super::VerificationConfig::default();
+    config.checks.push(super::ProjectVerificationCheck {
+      name: "tests".into(),
+      command: vec!["./test".into()],
+      working_directory: ".".into(),
+      environment: Default::default(),
+      timeout_secs: None,
+    });
+    let original = config.suite_hash().expect("suite hash");
+    config.checks[0].name = "diagnostic rename".into();
+
+    assert_eq!(config.suite_hash().expect("renamed suite hash"), original);
   }
 
   #[test]

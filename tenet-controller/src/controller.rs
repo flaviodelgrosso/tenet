@@ -24,7 +24,7 @@ use tenet_domain::{
     ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus, State,
     VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
   },
-  verification::VerificationExecutionRequest,
+  verification::{ProjectVerificationRun, VerificationExecutionRequest},
 };
 
 use tenet_runtime::{
@@ -126,7 +126,7 @@ impl Controller {
     let config = Arc::new(ensure_config(&self.cwd).await?);
     git::head(&self.cwd).await?;
     let mut state = store::read_state(&self.cwd).await?;
-    store::recover_integration(&self.cwd, &mut state).await?;
+    store::recover_integration(&self.cwd, &mut state, &config).await?;
     if !git::is_clean(&self.cwd).await? {
       bail!("worktree execution requires a clean canonical working tree");
     }
@@ -245,6 +245,15 @@ impl Controller {
 
   async fn run_inner(&self, context: &BackendContext, state: &mut State) -> Result<State> {
     let mut catalog = self.ensure_catalog(context, state).await?;
+    if context.config.verification.checks.is_empty() {
+      return self
+        .block(
+          context,
+          state,
+          "No trusted project verification checks are configured.\n\nConfigure at least one:\n\n[[verification.checks]]\nname = \"project verification\"\ncommand = [\"./verify\"]",
+        )
+        .await;
+    }
     let mut evidence_graph = evidence_graph::load(&self.cwd, &catalog).await?;
     store::write_evidence_graph(&self.cwd, &evidence_graph).await?;
 
@@ -631,14 +640,10 @@ impl Controller {
             &candidate.verification,
           )
           .await?;
-          evidence_graph::establish(
-            &self.cwd,
-            &context.events,
-            evidence_graph,
-            &revision,
-            &verification,
-          )
-          .await?;
+          context
+            .events
+            .emit(RunEvent::ProjectVerification(verification.clone()))
+            .await?;
           state.completed_work_units.push(CompletedWorkUnit {
             work_unit: transaction.work_unit.clone(),
             completed_at: Utc::now().to_rfc3339(),
@@ -692,32 +697,50 @@ impl Controller {
     state.phase = Phase::Verifying;
     state.last_summary = "Running final deterministic verification".into();
     self.publish(&context.events, state).await?;
+    let report = self.verify_revision(context, &verified_revision).await?;
+    store::save_evidence(
+      &self.cwd,
+      &format!("project-verification-{}", Uuid::new_v4()),
+      &report,
+    )
+    .await?;
+    context
+      .events
+      .emit(RunEvent::ProjectVerification(report.clone()))
+      .await?;
+    if !report.passed {
+      return Ok(Some(
+        self
+          .block(context, state, "Final deterministic verification failed")
+          .await?,
+      ));
+    }
     let requests = match verification::required_requests(catalog, VerificationRunId::new()) {
       Ok(requests) => requests,
       Err(error) => {
-        let reason = format!("Final deterministic verification unavailable: {error}");
+        let reason = format!("Semantic verification unavailable: {error}");
         return Ok(Some(self.block(context, state, &reason).await?));
       }
     };
-    let report = self
-      .verify_revision(context, &verified_revision, &requests)
+    let semantic_report = self
+      .verify_obligations_revision(context, &verified_revision, &requests)
       .await?;
     context
       .events
-      .emit(RunEvent::Verification(report.clone()))
+      .emit(RunEvent::Verification(semantic_report.clone()))
       .await?;
     evidence_graph::establish(
       &self.cwd,
       &context.events,
       evidence_graph,
       &verified_revision,
-      &report,
+      &semantic_report,
     )
     .await?;
-    if !report.passed {
+    if !semantic_report.passed {
       return Ok(Some(
         self
-          .block(context, state, "Final deterministic verification failed")
+          .block(context, state, "Semantic verification failed")
           .await?,
       ));
     }
@@ -779,7 +802,7 @@ impl Controller {
       catalog,
       evidence: evidence_graph,
       assessment: &assessment,
-      deterministic_gate_passed: report.passed,
+      project_verification_passed: report.passed,
       verified_revision: &verified_revision,
       current_revision: &current_revision,
       repository_clean,
@@ -793,7 +816,7 @@ impl Controller {
         state.status = RunStatus::Done;
         state.phase = Phase::Complete;
         state.last_summary =
-          "All requirements have valid revision-bound evidence and deterministic gates pass".into();
+          "All requirements have valid revision-bound evidence and the project verification suite passes".into();
         Ok(Some(state.clone()))
       }
       CompletionDecision::NotReady(blockers) => {
@@ -854,7 +877,7 @@ impl Controller {
           .await
       })
       .await?;
-    let catalog = catalog::build(&spec, spec_hash, output, &context.config)?;
+    let catalog = catalog::build(&spec, spec_hash, output)?;
     catalog::validate(&catalog)?;
     catalog::validate_coverage(&catalog, &spec)?;
     store::write_catalog(&self.cwd, &catalog).await?;
@@ -873,6 +896,28 @@ impl Controller {
     &self,
     context: &BackendContext,
     revision: &str,
+  ) -> Result<ProjectVerificationRun> {
+    let run_id = context
+      .runtime_dir
+      .file_name()
+      .and_then(|value| value.to_str())
+      .context("verification run id is unavailable")?;
+    let workspaces = WorkspaceManager::new(self.cwd.clone(), run_id);
+    verifier::run_project_verification_isolated(
+      &self.cwd,
+      &workspaces,
+      revision,
+      &context.config,
+      "final-project-verification",
+      &context.cancel,
+    )
+    .await
+  }
+
+  async fn verify_obligations_revision(
+    &self,
+    context: &BackendContext,
+    revision: &str,
     requests: &[VerificationExecutionRequest],
   ) -> Result<VerificationReport> {
     let canonical_before = git::repository_state(&self.cwd).await?;
@@ -883,7 +928,7 @@ impl Controller {
       .context("verification run id is unavailable")?;
     let workspaces = WorkspaceManager::new(self.cwd.clone(), run_id);
     let workspace = workspaces
-      .create_disposable("final-verification", revision)
+      .create_disposable("semantic-verification", revision)
       .await?;
     let result = verifier::run_execution_requests_cancelled(
       &workspace,
@@ -895,14 +940,14 @@ impl Controller {
     let cleanup = workspaces.remove(&workspace).await;
     if let Err(cleanup) = cleanup {
       return match result {
-        Ok(_) => Err(cleanup).context("discard final verification worktree"),
+        Ok(_) => Err(cleanup).context("discard semantic verification worktree"),
         Err(error) => Err(error).context(format!(
-          "final verification failed; cleanup also failed: {cleanup:#}"
+          "semantic verification failed; cleanup also failed: {cleanup:#}"
         )),
       };
     }
     if git::repository_state(&self.cwd).await? != canonical_before {
-      bail!("final verification command modified canonical repository state");
+      bail!("semantic verification command modified canonical repository state");
     }
     result
   }
@@ -1395,23 +1440,26 @@ fn integration_failure(outcome: &IntegrationOutcome) -> String {
   }
 }
 
-pub async fn manual_verify(cwd: &Path) -> Result<VerificationReport> {
+pub async fn manual_verify(cwd: &Path) -> Result<ProjectVerificationRun> {
   let config = ensure_config(cwd).await?;
-  let catalog = store::read_catalog(cwd)
-    .await?
-    .context("manual verification requires an initialized requirement catalog")?;
-  catalog::validate(&catalog)?;
-  let (specification, _) = store::spec_text_and_hash(cwd, &config).await?;
-  catalog::validate_coverage(&catalog, &specification)?;
   let revision = git::head(cwd).await?;
-  let requests = verification::required_requests(&catalog, VerificationRunId::new())?;
-  let report =
-    verifier::run_execution_requests_cancelled(cwd, &config, &requests, &CancellationToken::new())
-      .await?;
-  let mut graph = evidence_graph::load(cwd, &catalog).await?;
-  evidence_graph::invalidate_for_revision(cwd, &mut graph, &revision).await?;
-  evidence_graph::record_report(&mut graph, &revision, &report)?;
-  store::write_evidence_graph(cwd, &graph).await?;
+  let run_id = format!("manual-{}", Uuid::new_v4());
+  let workspaces = WorkspaceManager::new(cwd.to_path_buf(), run_id);
+  let report = verifier::run_project_verification_isolated(
+    cwd,
+    &workspaces,
+    &revision,
+    &config,
+    "manual-project-verification",
+    &CancellationToken::new(),
+  )
+  .await?;
+  store::save_evidence(
+    cwd,
+    &format!("project-verification-{}", Uuid::new_v4()),
+    &report,
+  )
+  .await?;
   Ok(report)
 }
 
@@ -1419,7 +1467,6 @@ pub async fn manual_verify(cwd: &Path) -> Result<VerificationReport> {
 mod tests {
   use super::*;
   use tenet_domain::{
-    config::Config,
     evidence::{AcceptanceCriterion, VerificationKind, VerificationObligation},
     ids::{CriterionId, ObligationId, RequirementId},
     model::{ArchitectOutput, Requirement, RequirementAssessment},
@@ -1576,8 +1623,7 @@ mod tests {
     let mut output = architect_output(requirement);
     output.acceptance_criteria[0].mandatory = false;
     output.verification_obligations[0].required = false;
-    let built = catalog::build("Description", "spec".into(), output, &Config::default())
-      .expect("build catalog");
+    let built = catalog::build("Description", "spec".into(), output).expect("build catalog");
 
     assert!(built.requirements[0].required);
     assert!(built.acceptance_criteria[0].mandatory);
@@ -1599,13 +1645,8 @@ mod tests {
     requirement.source_refs[0].section = Some("Incorrect".into());
     requirement.source_refs[0].text_hash = fragment.text_hash[..63].into();
 
-    let built = catalog::build(
-      specification,
-      "spec".into(),
-      architect_output(requirement),
-      &Config::default(),
-    )
-    .expect("build catalog");
+    let built = catalog::build(specification, "spec".into(), architect_output(requirement))
+      .expect("build catalog");
 
     assert_eq!(
       built.requirements[0].source_refs,
@@ -1620,13 +1661,8 @@ mod tests {
     let fragments = derive_normative_fragments(specification);
     let mut requirement = catalog().requirements.remove(0);
     requirement.source_refs = vec![fragments[0].reference()];
-    let built = catalog::build(
-      specification,
-      "spec".into(),
-      architect_output(requirement),
-      &Config::default(),
-    )
-    .expect("build catalog");
+    let built = catalog::build(specification, "spec".into(), architect_output(requirement))
+      .expect("build catalog");
 
     assert!(catalog::validate(&built).is_ok());
     assert!(catalog::validate_coverage(&built, specification).is_err());

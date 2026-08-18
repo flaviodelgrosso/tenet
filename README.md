@@ -204,7 +204,7 @@ no remaining work from current reconciliation
         +
 no concrete gap from skeptical assessment
         +
-repository-wide deterministic gates pass
+repository-wide project verification suite passes
         +
 canonical HEAD is still R
         +
@@ -341,7 +341,7 @@ A worker receives bounded work and an explicit repository scope, in an isolated 
 
 ### 4 · Verify
 
-The candidate is committed first; verification then runs against an immutable checkout of that candidate revision (e.g. `cargo test`, `make ci`, `./scripts/acceptance.sh`). Configured project gates produce authoritative evidence — agent-proposed checks remain advisory unless explicitly authorized by project configuration. Passing and failing evidence are both preserved; a valid contradictory failure cannot be erased by a later optimistic model statement.
+The candidate is committed first; project verification then runs against clean disposable checkouts of that candidate revision (for example `cargo test`, `make ci`, or `./scripts/acceptance.sh`). Project-configured checks are controller-authorized and mandatory; they run in declaration order and fail fast. Agent-proposed checks remain advisory. Project-suite results are persisted with their revision and configuration fingerprint, but are not treated as evidence for generated semantic obligations.
 
 ### 5 · Repair
 
@@ -353,7 +353,7 @@ A verified candidate is integrated through the controller rather than being allo
 
 ### 7 · Assess
 
-Once deterministic evidence gates pass, a fresh skeptical worker searches for concrete implementation or evidence gaps. Assess can **veto** completion by proposing a specific gap — it cannot authorize completion. The controller remains the final authority.
+Once the project verification suite passes and requirement evidence policy is satisfied, a fresh skeptical worker searches for concrete implementation or evidence gaps. Assess can **veto** completion by proposing a specific gap — it cannot authorize completion. The controller remains the final authority.
 
 ---
 
@@ -459,23 +459,26 @@ Tenet also supports custom ACP commands through `tenet.toml`.
 
 ### 5. Configure verification
 
-This is one of the most important parts of a Tenet project:
+Declare one or more deterministic commands that the project owner trusts. Commands are structured as an executable followed by arguments; Tenet does not invoke a shell.
 
 ```toml
 [verification]
+timeout_secs = 300
+max_output_bytes = 65536
 
-[[verification.gates]]
-obligation_ids = ["REQ-001/AC-01/VO-01"]
-dependency_scope = ["src/**", "tests/**"]
-spec = {
-  program = "cargo",
-  args = ["test"],
-  workingDirectory = ".",
-  environment = {}
-}
+[[verification.checks]]
+name = "tests"
+command = ["./test"]
+
+[[verification.checks]]
+name = "quality"
+command = ["./quality"]
+working_directory = "."
+environment = { CI = "true" }
+timeout_secs = 600
 ```
 
-Project-configured gates bind executable verification to explicit verification obligations. An agent cannot promote its own successful command execution into trusted evidence merely by reporting that it passed — and no orchestration system can compensate for a verification suite that proves the wrong thing.
+Every configured check is mandatory. Tenet executes checks in declaration order with fail-fast behavior, each in a clean disposable workspace at the target revision. Names are diagnostic only. Configuration never refers to generated requirement, criterion, or obligation IDs. Complex pipelines belong behind one project-owned command.
 
 ### 6. Run
 

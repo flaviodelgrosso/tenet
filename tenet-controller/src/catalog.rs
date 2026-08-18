@@ -76,7 +76,6 @@ pub fn build(
   specification: &str,
   spec_hash: String,
   output: ArchitectOutput,
-  config: &Config,
 ) -> Result<RequirementCatalog> {
   let mut requirements = output.requirements;
   for requirement in &mut requirements {
@@ -104,27 +103,6 @@ pub fn build(
     obligation.required = true;
     obligation.authority = VerificationAuthority::AgentProposed;
     obligation.dependency_scope_authority = DependencyScopeAuthority::AgentProposed;
-  }
-
-  let mut promoted = BTreeSet::new();
-  for gate in &config.verification.gates {
-    for obligation_id in &gate.obligation_ids {
-      if !promoted.insert(obligation_id.clone()) {
-        bail!("multiple project gates target verification obligation {obligation_id}");
-      }
-      let obligation = verification_obligations
-        .iter_mut()
-        .find(|obligation| obligation.id == *obligation_id)
-        .with_context(|| {
-          format!("project gate targets unknown verification obligation {obligation_id}")
-        })?;
-      obligation.spec = gate.spec.clone();
-      obligation.authority = VerificationAuthority::ProjectConfigured;
-      obligation
-        .dependency_scope
-        .clone_from(&gate.dependency_scope);
-      obligation.dependency_scope_authority = DependencyScopeAuthority::ProjectConfigured;
-    }
   }
 
   let coverage = CatalogCoverage::derive(specification, &requirements);
@@ -211,7 +189,7 @@ pub fn validate(catalog: &RequirementCatalog) -> Result<()> {
     bail!("acceptance criterion targets an unknown requirement");
   }
 
-  let mut obligation_ids = BTreeSet::new();
+  let mut seen_obligations = BTreeSet::new();
   for criterion in &catalog.acceptance_criteria {
     let obligations: Vec<_> = catalog
       .verification_obligations
@@ -229,7 +207,7 @@ pub fn validate(catalog: &RequirementCatalog) -> Result<()> {
           obligation.id
         );
       }
-      if !obligation_ids.insert(obligation.id.clone()) {
+      if !seen_obligations.insert(obligation.id.clone()) {
         bail!("duplicate verification obligation id {}", obligation.id);
       }
     }

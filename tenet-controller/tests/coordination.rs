@@ -18,9 +18,11 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use tenet_controller::{evidence as controller_evidence, AgentBackend, Controller};
+use tenet_controller::{
+  controller::manual_verify, evidence as controller_evidence, AgentBackend, Controller,
+};
 use tenet_domain::{
-  config::{read_config, Config, CustomAgentConfig, ProjectVerificationGate},
+  config::{read_config, Config, CustomAgentConfig, ProjectVerificationCheck},
   events::{EventSink, RunEvent},
   evidence::{
     AcceptanceCriterion, EvidencePolicy, ImplementationState, VerificationKind,
@@ -34,7 +36,9 @@ use tenet_domain::{
     RequirementAssessment, RequirementCatalog, State, VerificationReport, WorkExecution, WorkLease,
     WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
-  verification::{DependencyScopeAuthority, VerificationAuthority, VerificationSpec},
+  verification::{
+    DependencyScopeAuthority, ProjectVerificationRun, VerificationAuthority, VerificationSpec,
+  },
   worker::{derive_normative_fragments, CatalogCoverage, SpecReference},
 };
 use tenet_runtime::{
@@ -639,10 +643,12 @@ async fn configured_controller(
     env: BTreeMap::new(),
   });
   config.execution.max_parallel_workers = max_parallel_workers;
-  config.verification.gates = vec![ProjectVerificationGate {
-    obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
-    spec: obligation().spec,
-    dependency_scope: vec!["*.txt".into()],
+  config.verification.checks = vec![ProjectVerificationCheck {
+    name: "project verification".into(),
+    command: vec!["git".into(), "diff".into(), "--check".into()],
+    working_directory: ".".into(),
+    environment: BTreeMap::new(),
+    timeout_secs: None,
   }];
   fs::write(
     repository.path().join("tenet.toml"),
@@ -684,6 +690,78 @@ async fn configured_controller(
   )
 }
 
+#[tokio::test]
+async fn manual_verify_runs_project_suite_without_requirement_catalog() {
+  let repository = TempRepo::new();
+  let mut config = Config::default();
+  config.agent.custom = Some(CustomAgentConfig {
+    command: "unused".into(),
+    args: Vec::new(),
+    env: BTreeMap::new(),
+  });
+  config.verification.checks = vec![ProjectVerificationCheck {
+    name: "tracked file".into(),
+    command: vec!["sh".into(), "-c".into(), "test -f README.txt".into()],
+    working_directory: ".".into(),
+    environment: BTreeMap::new(),
+    timeout_secs: None,
+  }];
+  fs::write(
+    repository.path().join("tenet.toml"),
+    toml::to_string_pretty(&config).expect("serialize config"),
+  )
+  .await
+  .expect("write config");
+  run_git(repository.path(), &["add", "tenet.toml"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "configure verification"],
+  );
+
+  let report = manual_verify(repository.path())
+    .await
+    .expect("manual project verification");
+
+  assert!(report.passed);
+  assert_eq!(report.checks[0].name, "tracked file");
+  assert!(!repository.path().join(".tenet/requirements.json").exists());
+}
+
+#[tokio::test]
+async fn missing_project_checks_block_before_reconciliation() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  let mut config = read_config(repository.path()).await.expect("read config");
+  config.verification.checks.clear();
+  fs::write(
+    repository.path().join("tenet.toml"),
+    toml::to_string_pretty(&config).expect("serialize config"),
+  )
+  .await
+  .expect("write config");
+  run_git(repository.path(), &["add", "tenet.toml"]);
+  fs::remove_file(repository.path().join(".tenet/requirements.json"))
+    .await
+    .expect("remove cached catalog");
+  run_git(
+    repository.path(),
+    &["commit", "-m", "remove project checks"],
+  );
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("missing checks produce blocked state");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Blocked);
+  assert!(state
+    .blocked_reason
+    .as_deref()
+    .is_some_and(|reason| reason.contains("[[verification.checks]]")));
+  assert_eq!(backend.reconcile_calls.load(Ordering::SeqCst), 0);
+}
+
 async fn assert_read_only_role_is_isolated(role: tenet_domain::model::WorkerRole, commit: bool) {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::ReadOnlyMutation {
@@ -703,7 +781,14 @@ async fn assert_read_only_role_is_isolated(role: tenet_domain::model::WorkerRole
     .await
     .expect("isolated read-only mutation cannot affect the run");
 
-  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert_eq!(
+    state.status,
+    if role == tenet_domain::model::WorkerRole::Architect {
+      tenet_domain::model::RunStatus::Blocked
+    } else {
+      tenet_domain::model::RunStatus::Done
+    }
+  );
   assert!(!repository.path().join("read-only-mutation.txt").exists());
   assert_ne!(
     git::head(repository.path()).await.expect("head after run"),
@@ -1363,7 +1448,11 @@ async fn specification_change_invalidates_completion_and_discovery_history() {
     .await
     .expect("changed specification starts a new catalog context");
 
-  assert_eq!(second.status, tenet_domain::model::RunStatus::Done);
+  assert_eq!(second.status, tenet_domain::model::RunStatus::Blocked);
+  assert!(second
+    .blocked_reason
+    .as_deref()
+    .is_some_and(|reason| reason.contains("Semantic verification unavailable")));
   assert!(second.completed_work_units.is_empty());
   assert!(second.discoveries.is_empty());
 }
@@ -1558,6 +1647,18 @@ async fn cancellation_after_partial_completion_cleans_all_worktrees() {
   assert_eq!(list.matches("worktree ").count(), 1);
 }
 
+fn passing_project_config() -> Config {
+  let mut config = Config::default();
+  config.verification.checks = vec![ProjectVerificationCheck {
+    name: "project verification".into(),
+    command: vec!["true".into()],
+    working_directory: ".".into(),
+    environment: Default::default(),
+    timeout_secs: None,
+  }];
+  config
+}
+
 fn passing_report() -> VerificationReport {
   VerificationReport {
     passed: true,
@@ -1566,6 +1667,20 @@ fn passing_report() -> VerificationReport {
     commands: Vec::new(),
     executions: Vec::new(),
     warnings: Vec::new(),
+  }
+}
+
+fn passing_project_verification() -> ProjectVerificationRun {
+  ProjectVerificationRun {
+    revision: "revision".into(),
+    suite_hash: passing_project_config()
+      .verification
+      .suite_hash()
+      .expect("suite hash"),
+    checks: Vec::new(),
+    passed: true,
+    started_at: "2026-08-16T10:00:00Z".parse().expect("valid timestamp"),
+    finished_at: "2026-08-16T10:00:01Z".parse().expect("valid timestamp"),
   }
 }
 
@@ -1650,7 +1765,7 @@ async fn integration_rejects_merge_conflicts_without_advancing_canonical_head() 
     repository.path().to_path_buf(),
     &manager,
     base,
-    Config::default(),
+    passing_project_config(),
   )
   .await
   .expect("create integrator");
@@ -1701,7 +1816,7 @@ async fn integration_rejects_stale_candidate_base() {
     repository.path().to_path_buf(),
     &manager,
     base,
-    Config::default(),
+    passing_project_config(),
   )
   .await
   .expect("create integrator");
@@ -1737,7 +1852,7 @@ async fn integration_rejects_candidate_check_and_global_regression() {
     repository.path().to_path_buf(),
     &checks_manager,
     base.clone(),
-    Config::default(),
+    passing_project_config(),
   )
   .await
   .expect("create check integrator");
@@ -1765,15 +1880,12 @@ async fn integration_rejects_candidate_check_and_global_regression() {
   )
   .await;
   let mut config = Config::default();
-  config.verification.gates = vec![ProjectVerificationGate {
-    obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
-    spec: VerificationSpec {
-      program: "sh".into(),
-      args: vec!["-lc".into(), "test ! -f regression".into()],
-      working_directory: ".".into(),
-      environment: Default::default(),
-    },
-    dependency_scope: vec!["**".into()],
+  config.verification.checks = vec![ProjectVerificationCheck {
+    name: "regression".into(),
+    command: vec!["sh".into(), "-c".into(), "test ! -f regression".into()],
+    working_directory: ".".into(),
+    environment: Default::default(),
+    timeout_secs: None,
   }];
   let mut regression_integrator = Integrator::create(
     repository.path().to_path_buf(),
@@ -1787,7 +1899,7 @@ async fn integration_rejects_candidate_check_and_global_regression() {
   let outcome = regression_integrator
     .integrate(&regression)
     .await
-    .expect("run regression gate");
+    .expect("run regression check");
 
   assert!(matches!(
     outcome,
@@ -1837,7 +1949,7 @@ async fn repository_after_disposable_check(command: &str) -> (TempRepo, String, 
     repository.path().to_path_buf(),
     &manager,
     base,
-    Config::default(),
+    passing_project_config(),
   )
   .await
   .expect("create integrator");
@@ -1946,7 +2058,7 @@ async fn cancellation_before_integration_leaves_canonical_head_unchanged() {
     repository.path().to_path_buf(),
     &manager,
     base.clone(),
-    Config::default(),
+    passing_project_config(),
     cancel,
   )
   .await
@@ -1990,15 +2102,12 @@ async fn assert_cancellation_during_integration_verification(global: bool) {
   .await;
   let mut config = Config::default();
   if global {
-    config.verification.gates = vec![ProjectVerificationGate {
-      obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
-      spec: VerificationSpec {
-        program: "sh".into(),
-        args: vec!["-lc".into(), command],
-        working_directory: ".".into(),
-        environment: Default::default(),
-      },
-      dependency_scope: vec!["**".into()],
+    config.verification.checks = vec![ProjectVerificationCheck {
+      name: "cancellable".into(),
+      command: vec!["sh".into(), "-c".into(), command],
+      working_directory: ".".into(),
+      environment: Default::default(),
+      timeout_secs: None,
     }];
   }
   let cancel = CancellationToken::new();
@@ -2054,7 +2163,7 @@ async fn write_recovery_transaction(
   new_head: &str,
   phase: IntegrationPhase,
 ) -> IntegrationTransaction {
-  let report = passing_report();
+  let report = passing_project_verification();
   let evidence_path = store::save_evidence(repository.path(), "recovery", &report)
     .await
     .expect("save recovery evidence");
@@ -2073,7 +2182,7 @@ async fn write_recovery_transaction(
     new_head: new_head.into(),
     phase,
     verification_evidence: evidence,
-    verification_hash: store::verification_hash(&report).expect("hash evidence"),
+    verification_hash: store::project_verification_hash(&report).expect("hash evidence"),
     created_at: "created".into(),
     updated_at: "updated".into(),
   };
@@ -2099,7 +2208,7 @@ async fn prepared_journal_with_old_head_is_abandoned_without_advancement() {
   .await;
   let mut state = State::fresh();
 
-  store::recover_integration(repository.path(), &mut state)
+  store::recover_integration(repository.path(), &mut state, &passing_project_config())
     .await
     .expect("abandon uncommitted transaction");
 
@@ -2123,7 +2232,7 @@ async fn assert_new_head_transaction_recovers(phase: IntegrationPhase) {
   write_recovery_transaction(&repository, &old_head, &new_head, phase).await;
   let mut state = State::fresh();
 
-  store::recover_integration(repository.path(), &mut state)
+  store::recover_integration(repository.path(), &mut state, &passing_project_config())
     .await
     .expect("recover committed transaction");
 
@@ -2132,6 +2241,36 @@ async fn assert_new_head_transaction_recovers(phase: IntegrationPhase) {
     .await
     .expect("read journal")
     .is_none());
+}
+
+#[tokio::test]
+async fn changed_project_suite_invalidates_recovery_evidence() {
+  let repository = TempRepo::new();
+  store::ensure_layout(repository.path())
+    .await
+    .expect("ensure layout");
+  let old_head = git::head(repository.path()).await.expect("old head");
+  std::fs::write(repository.path().join("recovered.txt"), "committed").expect("recovery file");
+  run_git(repository.path(), &["add", "recovered.txt"]);
+  run_git(repository.path(), &["commit", "-m", "already advanced"]);
+  let new_head = git::head(repository.path()).await.expect("new head");
+  write_recovery_transaction(
+    &repository,
+    &old_head,
+    &new_head,
+    IntegrationPhase::GitCommitted,
+  )
+  .await;
+  let mut changed = passing_project_config();
+  changed.verification.checks[0].command = vec!["false".into()];
+  let mut state = State::fresh();
+
+  let error = store::recover_integration(repository.path(), &mut state, &changed)
+    .await
+    .expect_err("changed suite must stale prior evidence");
+
+  assert!(error.to_string().contains("stale suite"));
+  assert!(state.completed_work_units.is_empty());
 }
 
 #[tokio::test]
@@ -2159,7 +2298,7 @@ async fn integration_recovery_rejects_unexpected_head() {
   .await;
   let mut state = State::fresh();
 
-  let error = store::recover_integration(repository.path(), &mut state)
+  let error = store::recover_integration(repository.path(), &mut state, &passing_project_config())
     .await
     .expect_err("unexpected HEAD must fail closed");
 
@@ -2331,7 +2470,7 @@ async fn cancellation_after_prepared_journal_prevents_fast_forward() {
     repository.path().to_path_buf(),
     &manager,
     base.clone(),
-    Config::default(),
+    passing_project_config(),
     cancel,
   )
   .await
@@ -2370,7 +2509,7 @@ async fn orphan_evidence_before_journal_does_not_claim_completion() {
     .expect("save orphan evidence");
   let mut state = State::fresh();
 
-  store::recover_integration(repository.path(), &mut state)
+  store::recover_integration(repository.path(), &mut state, &passing_project_config())
     .await
     .expect("no journal means no recovery action");
 

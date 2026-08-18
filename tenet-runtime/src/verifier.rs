@@ -16,21 +16,80 @@ use tokio_util::sync::CancellationToken;
 use tenet_domain::{
   config::Config,
   model::{CommandResult, VerificationReport},
-  verification::{VerificationExecutionRequest, VerificationExecutionResult, VerificationSpec},
+  verification::{
+    ProjectCheckResult, ProjectVerificationRun, VerificationExecutionRequest,
+    VerificationExecutionResult, VerificationSpec,
+  },
 };
 
-pub async fn run_verification_cancelled(
-  cwd: &Path,
+use crate::{git, workspace::WorkspaceManager};
+
+pub async fn run_project_verification_isolated(
+  repository: &Path,
+  workspaces: &WorkspaceManager,
+  revision: &str,
   config: &Config,
+  purpose: &str,
   cancel: &CancellationToken,
-) -> Result<VerificationReport> {
-  run_specs(
-    cwd,
-    config,
-    config.verification.gates.iter().map(|gate| &gate.spec),
-    cancel,
-  )
-  .await
+) -> Result<ProjectVerificationRun> {
+  if config.verification.checks.is_empty() {
+    bail!("No trusted project verification checks are configured.\n\nConfigure at least one:\n\n[[verification.checks]]\nname = \"project verification\"\ncommand = [\"./verify\"]");
+  }
+  let canonical_before = git::repository_state(repository).await?;
+  let started_at = Utc::now();
+  let mut checks = Vec::new();
+  for (index, check) in config.verification.checks.iter().enumerate() {
+    let spec = check.verification_spec()?;
+    let workspace = workspaces
+      .create_disposable(&format!("{purpose}-{index}"), revision)
+      .await?;
+    let result = run_spec(
+      &workspace,
+      &spec,
+      Duration::from_secs(check.effective_timeout_secs(config.verification.timeout_secs)),
+      config.verification.max_output_bytes,
+      cancel,
+    )
+    .await;
+    let cleanup = workspaces.remove(&workspace).await;
+    let result = match (result, cleanup) {
+      (Ok(result), Ok(())) => result,
+      (Err(error), Ok(())) => return Err(error),
+      (Ok(_), Err(cleanup)) => {
+        return Err(cleanup).context("discard project verification worktree")
+      }
+      (Err(error), Err(cleanup)) => {
+        return Err(error).context(format!(
+          "project verification failed; cleanup also failed: {cleanup:#}"
+        ))
+      }
+    };
+    let failed = result.exit_code != Some(0) || result.timed_out;
+    checks.push(ProjectCheckResult {
+      name: check.name.clone(),
+      spec,
+      timeout_secs: check.effective_timeout_secs(config.verification.timeout_secs),
+      result,
+    });
+    if failed {
+      break;
+    }
+  }
+  if git::repository_state(repository).await? != canonical_before {
+    bail!("project verification command modified canonical repository state");
+  }
+  let passed = checks.len() == config.verification.checks.len()
+    && checks
+      .iter()
+      .all(|check| check.result.exit_code == Some(0) && !check.result.timed_out);
+  Ok(ProjectVerificationRun {
+    revision: revision.into(),
+    suite_hash: config.verification.suite_hash()?,
+    checks,
+    passed,
+    started_at,
+    finished_at: Utc::now(),
+  })
 }
 
 pub async fn run_execution_requests_cancelled(
@@ -64,14 +123,9 @@ pub async fn run_execution_requests_cancelled(
       break;
     }
   }
-  let project_gates_configured = !config.verification.gates.is_empty();
   let passed = commands
     .iter()
-    .all(|result| result.exit_code == Some(0) && !result.timed_out)
-    && (!project_gates_configured
-      || requests
-        .iter()
-        .any(|request| request.authority.is_trusted()));
+    .all(|result| result.exit_code == Some(0) && !result.timed_out);
   Ok(VerificationReport {
     passed,
     started_at,
@@ -88,18 +142,11 @@ pub async fn run_verification_with_checks_cancelled<'a>(
   suggested_checks: impl IntoIterator<Item = &'a str>,
   cancel: &CancellationToken,
 ) -> Result<VerificationReport> {
-  let mut specs: Vec<_> = suggested_checks
+  let specs: Vec<_> = suggested_checks
     .into_iter()
     .filter(|command| !command.trim().is_empty())
     .map(advisory_shell_spec)
     .collect();
-  specs.extend(
-    config
-      .verification
-      .gates
-      .iter()
-      .map(|gate| gate.spec.clone()),
-  );
   run_specs(cwd, config, specs.iter(), cancel).await
 }
 
@@ -158,10 +205,7 @@ async fn run_specs<'a>(
       break;
     }
   }
-  let mut warnings = Vec::new();
-  if results.is_empty() {
-    warnings.push("No deterministic verification gates configured.".into());
-  }
+  let warnings = Vec::new();
   let passed = results
     .iter()
     .all(|result| result.exit_code == Some(0) && !result.timed_out);
@@ -311,18 +355,111 @@ fn truncate_utf8(bytes: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  fn configured_gate() -> tenet_domain::config::ProjectVerificationGate {
-    tenet_domain::config::ProjectVerificationGate {
-      obligation_ids: vec![tenet_domain::ids::ObligationId::from("REQ-001/AC-01/VO-01")],
-      spec: VerificationSpec {
-        program: "true".into(),
-        args: Vec::new(),
-        working_directory: ".".into(),
-        environment: Default::default(),
-      },
-      dependency_scope: vec!["**".into()],
+  #[cfg(unix)]
+  fn project_check(name: &str, script: &str) -> tenet_domain::config::ProjectVerificationCheck {
+    tenet_domain::config::ProjectVerificationCheck {
+      name: name.into(),
+      command: vec!["sh".into(), "-c".into(), script.into()],
+      working_directory: ".".into(),
+      environment: Default::default(),
+      timeout_secs: None,
     }
+  }
+
+  #[cfg(unix)]
+  fn git_repository() -> tempfile::TempDir {
+    use std::process::Command as StdCommand;
+
+    let repository = tempfile::tempdir().expect("repository");
+    let run = |args: &[&str]| {
+      let status = StdCommand::new("git")
+        .args([
+          "-c",
+          "user.name=Tenet Test",
+          "-c",
+          "user.email=tenet@example.com",
+        ])
+        .args(args)
+        .current_dir(repository.path())
+        .status()
+        .expect("run git");
+      assert!(status.success(), "git command failed: {args:?}");
+    };
+    run(&["init", "-q"]);
+    std::fs::write(repository.path().join("tracked"), "base\n").expect("tracked file");
+    run(&["add", "tracked"]);
+    run(&["commit", "-q", "-m", "base"]);
+    repository
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn project_checks_run_in_order_in_independent_workspaces() {
+    let repository = git_repository();
+    let revision = git::head(repository.path()).await.expect("head");
+    let workspaces = WorkspaceManager::new(repository.path().to_path_buf(), "suite-order");
+    let mut config = Config::default();
+    config.verification.checks = vec![
+      project_check("first", "test ! -e mutation && touch mutation"),
+      project_check("second", "test ! -e mutation && touch mutation"),
+    ];
+
+    let report = run_project_verification_isolated(
+      repository.path(),
+      &workspaces,
+      &revision,
+      &config,
+      "project-check",
+      &CancellationToken::new(),
+    )
+    .await
+    .expect("project verification");
+
+    assert!(report.passed);
+    assert_eq!(
+      report
+        .checks
+        .iter()
+        .map(|check| check.name.as_str())
+        .collect::<Vec<_>>(),
+      ["first", "second"]
+    );
+    assert!(!repository.path().join("mutation").exists());
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn project_checks_fail_fast_after_first_failure() {
+    let repository = git_repository();
+    let revision = git::head(repository.path()).await.expect("head");
+    let workspaces = WorkspaceManager::new(repository.path().to_path_buf(), "suite-fail-fast");
+    let mut config = Config::default();
+    config.verification.checks = vec![
+      project_check("first", "true"),
+      project_check("failure", "false"),
+      project_check("not-run", "true"),
+    ];
+
+    let report = run_project_verification_isolated(
+      repository.path(),
+      &workspaces,
+      &revision,
+      &config,
+      "project-check",
+      &CancellationToken::new(),
+    )
+    .await
+    .expect("project verification");
+
+    assert!(!report.passed);
+    assert_eq!(
+      report
+        .checks
+        .iter()
+        .map(|check| check.name.as_str())
+        .collect::<Vec<_>>(),
+      ["first", "failure"]
+    );
   }
 
   #[test]
@@ -331,34 +468,6 @@ mod tests {
     let error = resolve_working_directory(workspace.path(), "../outside")
       .expect_err("parent traversal rejected");
     assert!(error.to_string().contains("relative path"));
-  }
-
-  #[tokio::test]
-  async fn no_project_gates_preserve_advisory_only_default_behavior() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let report = run_execution_requests_cancelled(
-      workspace.path(),
-      &Config::default(),
-      &[],
-      &CancellationToken::new(),
-    )
-    .await
-    .expect("verification report");
-
-    assert!(report.passed);
-  }
-
-  #[tokio::test]
-  async fn configured_project_gates_require_trusted_execution_authority() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let mut config = Config::default();
-    config.verification.gates = vec![configured_gate()];
-    let report =
-      run_execution_requests_cancelled(workspace.path(), &config, &[], &CancellationToken::new())
-        .await
-        .expect("verification report");
-
-    assert!(!report.passed);
   }
 
   #[test]

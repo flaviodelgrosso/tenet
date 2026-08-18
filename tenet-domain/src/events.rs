@@ -14,6 +14,7 @@ use crate::model::{
 use crate::{
   evidence::{Evidence, VerificationState},
   ids::{CriterionId, EvidenceId, ObligationId, RequirementId},
+  verification::ProjectVerificationRun,
 };
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,7 @@ pub enum RunEvent {
     path: PathBuf,
   },
   Verification(VerificationReport),
+  ProjectVerification(ProjectVerificationRun),
   RepositoryChanges(Vec<RepositoryChange>),
   EvidenceEstablished(Evidence),
   EvidenceFailed(Evidence),
@@ -180,6 +182,9 @@ impl RunLogger {
         serde_json::json!({"type":"workspace_removed","leaseId":lease_id,"path":path})
       }
       RunEvent::Verification(v) => serde_json::json!({"type":"verification","value":v}),
+      RunEvent::ProjectVerification(v) => {
+        serde_json::json!({"type":"project_verification","value":v})
+      }
       RunEvent::RepositoryChanges(v) => {
         serde_json::json!({"type":"repository_changes","value":v})
       }

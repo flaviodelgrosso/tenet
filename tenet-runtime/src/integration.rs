@@ -10,6 +10,7 @@ use tenet_domain::{
   model::{
     CandidateCheck, IntegrationPhase, IntegrationTransaction, VerificationReport, WorkExecution,
   },
+  verification::ProjectVerificationRun,
 };
 
 use crate::{git, store, verifier, workspace::WorkspaceManager};
@@ -18,7 +19,7 @@ use crate::{git, store, verifier, workspace::WorkspaceManager};
 pub enum IntegrationOutcome {
   Accepted {
     revision: String,
-    verification: VerificationReport,
+    verification: ProjectVerificationRun,
     transaction: Box<IntegrationTransaction>,
   },
   StaleBase,
@@ -29,7 +30,7 @@ pub enum IntegrationOutcome {
     report: VerificationReport,
   },
   RegressionDetected {
-    report: VerificationReport,
+    report: ProjectVerificationRun,
   },
 }
 
@@ -104,11 +105,7 @@ impl Integrator {
     let revision = git::head(&self.workspace).await?;
     if !candidate.lease.work_unit.suggested_checks.is_empty() {
       let report = self
-        .verify_revision(
-          &revision,
-          &candidate.lease.work_unit.suggested_checks,
-          false,
-        )
+        .verify_revision(&revision, &candidate.lease.work_unit.suggested_checks)
         .await?;
       if !report.passed {
         git::reset_hard(&self.workspace, &self.accepted_revision).await?;
@@ -116,7 +113,15 @@ impl Integrator {
       }
     }
 
-    let regression = self.verify_revision(&revision, &[], true).await?;
+    let regression = verifier::run_project_verification_isolated(
+      &self.repository,
+      &self.workspaces,
+      &revision,
+      &self.config,
+      "integration-project-verification",
+      &self.cancel,
+    )
+    .await?;
     if !regression.passed {
       git::reset_hard(&self.workspace, &self.accepted_revision).await?;
       return Ok(IntegrationOutcome::RegressionDetected { report: regression });
@@ -145,7 +150,7 @@ impl Integrator {
       new_head: revision.clone(),
       phase: IntegrationPhase::Prepared,
       verification_evidence: evidence,
-      verification_hash: store::verification_hash(&regression)?,
+      verification_hash: store::project_verification_hash(&regression)?,
       created_at: now.clone(),
       updated_at: now,
     };
@@ -173,24 +178,19 @@ impl Integrator {
     &self,
     revision: &str,
     suggested_checks: &[CandidateCheck],
-    project_verification: bool,
   ) -> Result<VerificationReport> {
     let canonical_before = git::repository_state(&self.repository).await?;
     let workspace = self
       .workspaces
       .create_disposable("integration-verification", revision)
       .await?;
-    let result = if project_verification {
-      verifier::run_verification_cancelled(&workspace, &self.config, &self.cancel).await
-    } else {
-      verifier::run_suggested_checks_cancelled(
-        &workspace,
-        &self.config,
-        suggested_checks.iter().map(|check| check.command.as_str()),
-        &self.cancel,
-      )
-      .await
-    };
+    let result = verifier::run_suggested_checks_cancelled(
+      &workspace,
+      &self.config,
+      suggested_checks.iter().map(|check| check.command.as_str()),
+      &self.cancel,
+    )
+    .await;
     let cleanup = self.workspaces.remove(&workspace).await;
     if let Err(cleanup) = cleanup {
       return match result {

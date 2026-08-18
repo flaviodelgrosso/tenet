@@ -21,15 +21,12 @@ repair = { thought_level = "high", model = "github-copilot/gpt-5.6-luna" }
 assess = { thought_level = "high", model = "github-copilot/gpt-5.6-luna" }
 
 [verification]
-gates = [
-  { obligation_ids = [
-    "REQ-001/AC-01/VO-01",
-  ], dependency_scope = [
-    "**",
-  ], spec = { program = "make", args = [
-    "ci",
-  ], workingDirectory = ".", environment = {} } },
-]
+timeout_secs = 300
+max_output_bytes = 65536
+
+[[verification.checks]]
+name = "quality"
+command = ["make", "ci"]
 
 [execution]
 max_parallel_workers = 3

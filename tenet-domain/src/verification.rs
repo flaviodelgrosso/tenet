@@ -79,6 +79,30 @@ pub struct VerificationExecutionResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectCheckResult {
+  pub name: String,
+  pub spec: VerificationSpec,
+  #[serde(rename = "timeoutSecs")]
+  pub timeout_secs: u64,
+  pub result: CommandResult,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectVerificationRun {
+  pub revision: String,
+  #[serde(rename = "suiteHash")]
+  pub suite_hash: String,
+  pub checks: Vec<ProjectCheckResult>,
+  pub passed: bool,
+  #[serde(rename = "startedAt", with = "rfc3339")]
+  pub started_at: DateTime<Utc>,
+  #[serde(rename = "finishedAt", with = "rfc3339")]
+  pub finished_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandResult {
   pub command: String,
   #[serde(rename = "exitCode")]
@@ -154,5 +178,41 @@ mod tests {
 
     assert_eq!(decoded, report);
     assert_eq!(value["startedAt"], "2026-08-16T10:00:00+00:00");
+  }
+
+  #[test]
+  fn project_verification_run_round_trip_preserves_diagnostics() {
+    let spec = VerificationSpec {
+      program: "./verify".into(),
+      args: vec!["--all".into()],
+      working_directory: ".".into(),
+      environment: [("CI".into(), "true".into())].into_iter().collect(),
+    };
+    let run = ProjectVerificationRun {
+      revision: "abc123".into(),
+      suite_hash: "suite-hash".into(),
+      checks: vec![ProjectCheckResult {
+        name: "quality".into(),
+        spec: spec.clone(),
+        timeout_secs: 600,
+        result: CommandResult {
+          command: spec.identity(),
+          exit_code: Some(0),
+          timed_out: false,
+          duration_ms: 12,
+          stdout: "ok".into(),
+          stderr: String::new(),
+        },
+      }],
+      passed: true,
+      started_at: Utc.with_ymd_and_hms(2026, 8, 18, 10, 0, 0).unwrap(),
+      finished_at: Utc.with_ymd_and_hms(2026, 8, 18, 10, 0, 1).unwrap(),
+    };
+
+    let encoded = serde_json::to_vec(&run).expect("serialize project run");
+    let decoded: ProjectVerificationRun =
+      serde_json::from_slice(&encoded).expect("deserialize project run");
+
+    assert_eq!(decoded, run);
   }
 }

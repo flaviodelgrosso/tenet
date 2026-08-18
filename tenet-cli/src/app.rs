@@ -138,24 +138,28 @@ impl App {
     if json {
       println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-      for command in &report.commands {
-        let mark = if command.exit_code == Some(0) && !command.timed_out {
+      println!("revision: {}", report.revision);
+      println!("suite: {}", report.suite_hash);
+      for check in &report.checks {
+        let mark = if check.result.exit_code == Some(0) && !check.result.timed_out {
           "PASS"
+        } else if check.result.timed_out {
+          "TIMEOUT"
         } else {
           "FAIL"
         };
-        println!("[{mark}] {} ({} ms)", command.command, command.duration_ms);
-        if mark == "FAIL" {
-          if !command.stderr.trim().is_empty() {
-            eprintln!("{}", command.stderr.trim());
+        println!(
+          "[{mark}] {}: {} ({} ms)",
+          check.name, check.result.command, check.result.duration_ms
+        );
+        if mark != "PASS" {
+          if !check.result.stderr.trim().is_empty() {
+            eprintln!("{}", check.result.stderr.trim());
           }
-          if !command.stdout.trim().is_empty() {
-            eprintln!("{}", command.stdout.trim());
+          if !check.result.stdout.trim().is_empty() {
+            eprintln!("{}", check.result.stdout.trim());
           }
         }
-      }
-      for warning in &report.warnings {
-        eprintln!("warning: {warning}");
       }
       println!(
         "verification: {}",

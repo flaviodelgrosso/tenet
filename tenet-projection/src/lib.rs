@@ -11,6 +11,7 @@ use tenet_domain::{
     RequirementCatalog, RunStatus, State, VerificationReport, WorkExecution, WorkUnit, WorkerEvent,
     WorkerRole,
   },
+  verification::ProjectVerificationRun,
 };
 
 pub const MAX_ACTIVITY: usize = 2_000;
@@ -312,6 +313,7 @@ impl RunProjection {
         path.display().to_string(),
       ),
       RunEvent::Verification(report) => self.apply_check(report),
+      RunEvent::ProjectVerification(report) => self.apply_project_verification(report),
       RunEvent::RepositoryChanges(changes) => {
         let summary = format!("{} files changed", changes.len());
         let detail = changes
@@ -487,6 +489,54 @@ impl RunProjection {
       detail,
     );
     self.checks.push(report);
+  }
+
+  fn apply_project_verification(&mut self, report: ProjectVerificationRun) {
+    let detail = report
+      .checks
+      .iter()
+      .map(|check| {
+        format!(
+          "{} {} ({} ms)\n{}",
+          if check.result.exit_code == Some(0) && !check.result.timed_out {
+            "PASS"
+          } else if check.result.timed_out {
+            "TIMEOUT"
+          } else {
+            "FAIL"
+          },
+          check.name,
+          check.result.duration_ms,
+          check.result.command
+        )
+      })
+      .collect::<Vec<_>>()
+      .join("\n\n");
+    let suite = report.suite_hash.chars().take(12).collect::<String>();
+    self.push_activity(
+      report.finished_at.to_rfc3339(),
+      if report.passed {
+        ActivityCategory::Check
+      } else {
+        ActivityCategory::Error
+      },
+      if report.passed {
+        "PROJECT VERIFICATION PASS"
+      } else {
+        "PROJECT VERIFICATION FAIL"
+      },
+      format!(
+        "{} · {} of {} checks passed",
+        suite,
+        report
+          .checks
+          .iter()
+          .filter(|check| check.result.exit_code == Some(0) && !check.result.timed_out)
+          .count(),
+        report.checks.len()
+      ),
+      detail,
+    );
   }
 
   fn apply_worker(&mut self, event: WorkerEvent) {
@@ -959,6 +1009,41 @@ mod tests {
       projection.current_worker().unwrap().role,
       WorkerRole::Implement
     );
+  }
+
+  #[test]
+  fn projects_named_project_verification_results() {
+    let mut projection = RunProjection::new(State::fresh(), Vec::new());
+    let spec = tenet_domain::verification::VerificationSpec {
+      program: "./quality".into(),
+      args: Vec::new(),
+      working_directory: ".".into(),
+      environment: Default::default(),
+    };
+    projection.apply(RunEvent::ProjectVerification(ProjectVerificationRun {
+      revision: "abc123".into(),
+      suite_hash: "0123456789abcdef".into(),
+      checks: vec![tenet_domain::verification::ProjectCheckResult {
+        name: "quality".into(),
+        spec: spec.clone(),
+        timeout_secs: 300,
+        result: CommandResult {
+          command: spec.identity(),
+          exit_code: Some(0),
+          timed_out: false,
+          duration_ms: 4,
+          stdout: String::new(),
+          stderr: String::new(),
+        },
+      }],
+      passed: true,
+      started_at: "2026-08-18T10:00:00Z".parse().expect("timestamp"),
+      finished_at: "2026-08-18T10:00:01Z".parse().expect("timestamp"),
+    }));
+
+    let activity = projection.activities().back().expect("project activity");
+    assert_eq!(activity.title, "PROJECT VERIFICATION PASS");
+    assert!(activity.detail.contains("quality"));
   }
 
   #[test]

@@ -15,8 +15,9 @@ use tenet_domain::{
   evidence::EvidenceGraphState,
   model::{
     CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
-    RequirementCatalog, State, VerificationReport,
+    RequirementCatalog, State,
   },
+  verification::ProjectVerificationRun,
 };
 
 pub const STATE_FILE: &str = "state.json";
@@ -217,7 +218,7 @@ pub async fn remove_integration_journal(cwd: &Path) -> Result<()> {
   }
 }
 
-pub async fn recover_integration(cwd: &Path, state: &mut State) -> Result<()> {
+pub async fn recover_integration(cwd: &Path, state: &mut State, config: &Config) -> Result<()> {
   let Some(transaction) = read_integration_journal(cwd).await? else {
     return Ok(());
   };
@@ -234,7 +235,7 @@ pub async fn recover_integration(cwd: &Path, state: &mut State) -> Result<()> {
       transaction.id
     ));
   }
-  verify_transaction_evidence(cwd, &transaction).await?;
+  verify_transaction_evidence(cwd, &transaction, &config.verification.suite_hash()?).await?;
   if !state.completed_work_units.iter().any(|completed| {
     completed.work_unit == transaction.work_unit
       && completed.verification_evidence == transaction.verification_evidence
@@ -250,7 +251,7 @@ pub async fn recover_integration(cwd: &Path, state: &mut State) -> Result<()> {
   remove_integration_journal(cwd).await
 }
 
-pub fn verification_hash(report: &VerificationReport) -> Result<String> {
+pub fn project_verification_hash(report: &ProjectVerificationRun) -> Result<String> {
   let bytes = serde_json::to_vec(report)?;
   Ok(sha256_hex(&bytes))
 }
@@ -258,9 +259,18 @@ pub fn verification_hash(report: &VerificationReport) -> Result<String> {
 async fn verify_transaction_evidence(
   cwd: &Path,
   transaction: &IntegrationTransaction,
+  expected_suite_hash: &str,
 ) -> Result<()> {
-  let report: VerificationReport = read_json(cwd.join(&transaction.verification_evidence)).await?;
-  let actual = verification_hash(&report)?;
+  let report: ProjectVerificationRun =
+    read_json(cwd.join(&transaction.verification_evidence)).await?;
+  if report.suite_hash != expected_suite_hash {
+    return Err(anyhow!(
+      "integration project verification evidence uses stale suite {}; current suite is {}",
+      report.suite_hash,
+      expected_suite_hash
+    ));
+  }
+  let actual = project_verification_hash(&report)?;
   if actual != transaction.verification_hash {
     return Err(anyhow!(
       "integration evidence hash mismatch for transaction {}",

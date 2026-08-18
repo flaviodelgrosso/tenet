@@ -128,57 +128,66 @@
         }
       }
     },
-    "verificationSpec": {
+    "projectVerificationCheck": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["program", "args", "workingDirectory", "environment"],
+      "required": ["name", "command"],
       "properties": {
-        "program": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
-        "args": { "$ref": "#/$defs/stringList", "default": [] },
-        "workingDirectory": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": ".*\\S.*",
+          "description": "Diagnostic name for this check. The name has no verification semantics."
+        },
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "prefixItems": [
+            { "type": "string", "minLength": 1, "pattern": ".*\\S.*" }
+          ],
+          "items": { "type": "string" },
+          "description": "Structured command: executable followed by zero or more arguments."
+        },
+        "working_directory": {
           "type": "string",
           "default": ".",
-          "minLength": 1
+          "minLength": 1,
+          "description": "Repository-relative working directory inside the isolated verification workspace."
         },
         "environment": {
           "type": "object",
           "default": {},
           "additionalProperties": { "type": "string" }
+        },
+        "timeout_secs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional timeout override for this check."
         }
-      }
-    },
-    "projectVerificationGate": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["obligation_ids", "spec", "dependency_scope"],
-      "properties": {
-        "obligation_ids": { "$ref": "#/$defs/stringList", "minItems": 1 },
-        "spec": { "$ref": "#/$defs/verificationSpec" },
-        "dependency_scope": { "$ref": "#/$defs/stringList", "minItems": 1 }
       }
     },
     "verificationConfig": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Structured, controller-trusted verification gates and optional execution-limit overrides.",
+      "description": "Ordered, controller-trusted project checks and execution limits.",
       "properties": {
-        "gates": {
+        "checks": {
           "type": "array",
-          "items": { "$ref": "#/$defs/projectVerificationGate" },
+          "items": { "$ref": "#/$defs/projectVerificationCheck" },
           "default": [],
-          "description": "Project-configured verification specs explicitly bound to obligation identities. Configured gates participate in authoritative verification."
+          "description": "Mandatory project verification checks executed in declaration order with fail-fast behavior."
         },
         "timeout_secs": {
           "type": "integer",
-          "minimum": 0,
-          "default": 120,
-          "description": "Advanced override for the maximum duration of each verification command."
+          "minimum": 1,
+          "default": 300,
+          "description": "Default maximum duration of each project verification check."
         },
         "max_output_bytes": {
           "type": "integer",
           "minimum": 0,
           "default": 65536,
-          "description": "Advanced override for output bytes retained from each verification command."
+          "description": "Output bytes retained from each project verification check."
         }
       }
     },

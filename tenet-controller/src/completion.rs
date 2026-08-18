@@ -16,7 +16,7 @@ pub enum CompletionBlocker {
   EvidenceStale(EvidenceId),
   EvidenceContradicted(ObligationId),
   UntrustedEvidence(ObligationId),
-  DeterministicGateFailed,
+  ProjectVerificationFailed,
   AssessmentFoundImplementationGap(RequirementId),
   RepositoryChangedAfterVerification,
   RepositoryDirty,
@@ -51,7 +51,7 @@ impl std::fmt::Display for CompletionBlocker {
         formatter,
         "verification obligation {id} has only untrusted passing evidence"
       ),
-      Self::DeterministicGateFailed => formatter.write_str("deterministic verification failed"),
+      Self::ProjectVerificationFailed => formatter.write_str("project verification failed"),
       Self::AssessmentFoundImplementationGap(id) => {
         write!(formatter, "assessment found an implementation gap for {id}")
       }
@@ -75,7 +75,7 @@ pub struct CompletionContext<'a> {
   pub catalog: &'a RequirementCatalog,
   pub evidence: &'a EvidenceGraphState,
   pub assessment: &'a ReconcileResult,
-  pub deterministic_gate_passed: bool,
+  pub project_verification_passed: bool,
   pub verified_revision: &'a str,
   pub current_revision: &'a str,
   pub repository_clean: bool,
@@ -100,8 +100,8 @@ impl CompletionPolicy {
         context.catalog.coverage.uncovered_fragment_ids.clone(),
       ));
     }
-    if !context.deterministic_gate_passed {
-      blockers.insert(CompletionBlocker::DeterministicGateFailed);
+    if !context.project_verification_passed {
+      blockers.insert(CompletionBlocker::ProjectVerificationFailed);
     }
 
     let policy = EvidencePolicy;
@@ -321,7 +321,7 @@ mod tests {
       catalog,
       evidence: graph,
       assessment: &assessment(),
-      deterministic_gate_passed: true,
+      project_verification_passed: true,
       verified_revision: "abc123",
       current_revision: "abc123",
       repository_clean: true,
@@ -361,7 +361,7 @@ mod tests {
       catalog: &catalog,
       evidence: &graph,
       assessment: &assessment(),
-      deterministic_gate_passed: true,
+      project_verification_passed: true,
       verified_revision: "abc123",
       current_revision: "def456",
       repository_clean: true,
@@ -384,7 +384,7 @@ mod tests {
       catalog: &catalog,
       evidence: &graph,
       assessment: &assessment(),
-      deterministic_gate_passed: false,
+      project_verification_passed: false,
       verified_revision: "abc123",
       current_revision: "def456",
       repository_clean: false,
@@ -397,7 +397,7 @@ mod tests {
     let CompletionDecision::NotReady(blockers) = decision else {
       panic!("incomplete context authorized completion");
     };
-    assert!(blockers.contains(&CompletionBlocker::DeterministicGateFailed));
+    assert!(blockers.contains(&CompletionBlocker::ProjectVerificationFailed));
     assert!(blockers.contains(&CompletionBlocker::RepositoryChangedAfterVerification));
     assert!(blockers.contains(&CompletionBlocker::RepositoryDirty));
     assert!(blockers.contains(&CompletionBlocker::ActiveLease));
@@ -498,7 +498,7 @@ mod tests {
       catalog: &catalog,
       evidence: &graph,
       assessment: &assessment,
-      deterministic_gate_passed: true,
+      project_verification_passed: true,
       verified_revision: "abc123",
       current_revision: "abc123",
       repository_clean: true,
