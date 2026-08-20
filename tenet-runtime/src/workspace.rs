@@ -4,6 +4,8 @@ use uuid::Uuid;
 use anyhow::{Context, Result};
 use tokio::fs;
 
+use tenet_domain::config::normalize_protected_path;
+
 use crate::git;
 
 /// Creates disposable Git worktrees that isolate repository mutations.
@@ -65,6 +67,27 @@ impl WorkspaceManager {
     Ok(path)
   }
 
+  pub async fn materialize_repository_file(
+    &self,
+    workspace: &Path,
+    relative_path: &str,
+  ) -> Result<()> {
+    let relative_path = normalize_protected_path(relative_path)?;
+    let destination = workspace.join(&relative_path);
+    if destination.exists() {
+      return Ok(());
+    }
+    let source = self.repository.join(&relative_path);
+    let contents = fs::read(&source)
+      .await
+      .with_context(|| format!("read repository file {}", source.display()))?;
+    if let Some(parent) = destination.parent() {
+      fs::create_dir_all(parent).await?;
+    }
+    fs::write(&destination, contents)
+      .await
+      .with_context(|| format!("materialize repository file {}", destination.display()))
+  }
   pub async fn remove(&self, path: &Path) -> Result<()> {
     let registered = git::is_worktree_registered(&self.repository, path).await?;
     if !path.exists() && !registered {

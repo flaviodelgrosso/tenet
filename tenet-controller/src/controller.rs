@@ -1099,6 +1099,9 @@ impl Controller {
     let workspace = workspaces
       .create_disposable(name, &canonical_before.head)
       .await?;
+    workspaces
+      .materialize_repository_file(&workspace, &context.config.spec_file)
+      .await?;
     let mut inspection_context = context.clone();
     inspection_context.cwd.clone_from(&workspace);
     inspection_context.runtime_dir = context.runtime_dir.join(name);

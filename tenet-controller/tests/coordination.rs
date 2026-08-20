@@ -212,6 +212,7 @@ enum ScopeMutation {
 enum BackendMode {
   Normal,
   EmptyImplementationThenRepair,
+  RequireSpecification,
   FailB,
   WorkerTimeout,
   ProtectedMutation,
@@ -272,6 +273,16 @@ impl FakeBackend {
     self.max_active.fetch_max(active, Ordering::SeqCst);
     ActiveGuard(&self.active)
   }
+  async fn require_specification(&self, ctx: &BackendContext) -> Result<()> {
+    if matches!(self.mode, BackendMode::RequireSpecification) {
+      let specification = fs::read_to_string(ctx.cwd.join(&ctx.config.spec_file)).await?;
+      if specification != "diamond" {
+        bail!("agent workspace contains the wrong authoritative specification");
+      }
+    }
+    Ok(())
+  }
+
   async fn mutate_read_only_workspace(
     &self,
     ctx: &BackendContext,
@@ -307,6 +318,7 @@ impl Drop for ActiveGuard<'_> {
 #[async_trait]
 impl AgentBackend for FakeBackend {
   async fn architect(&self, ctx: &BackendContext, spec: &str) -> Result<ArchitectOutput> {
+    self.require_specification(ctx).await?;
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Architect)
       .await?;
@@ -332,6 +344,7 @@ impl AgentBackend for FakeBackend {
     _evidence: &[tenet_domain::evidence::EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
   ) -> Result<ReconcileResult> {
+    self.require_specification(ctx).await?;
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Reconcile)
       .await?;
@@ -451,6 +464,7 @@ impl AgentBackend for FakeBackend {
     _catalog: &RequirementCatalog,
     work_unit: &WorkUnit,
   ) -> Result<WorkerSummary> {
+    self.require_specification(ctx).await?;
     let _active = self.record_active();
     self
       .workspaces
@@ -559,6 +573,7 @@ impl AgentBackend for FakeBackend {
     _evidence: &[tenet_domain::evidence::EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
   ) -> Result<SemanticAssessmentReport> {
+    self.require_specification(ctx).await?;
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Assess)
       .await?;
@@ -826,6 +841,32 @@ async fn assess_uncommitted_mutation_is_discarded_after_final_verification() {
 async fn assess_committed_mutation_is_discarded_after_final_verification() {
   assert_read_only_role_is_isolated(tenet_domain::model::WorkerRole::Assess, true).await;
 }
+#[tokio::test]
+async fn ignored_specification_is_available_to_every_agent_workspace() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::RequireSpecification));
+  let (controller, _) = configured_controller(&repository, backend, 1).await;
+  fs::write(repository.path().join(".gitignore"), ".tenet/\nspec.md\n")
+    .await
+    .expect("ignore specification");
+  run_git(repository.path(), &["add", ".gitignore"]);
+  run_git(repository.path(), &["rm", "--cached", "spec.md"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "keep specification controller-owned"],
+  );
+  fs::remove_file(repository.path().join(".tenet/requirements.json"))
+    .await
+    .expect("force architecture worker");
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("agents can read the ignored authoritative specification");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+}
+
 #[tokio::test]
 async fn directory_scope_is_retried_with_recursive_glob_feedback() {
   let repository = TempRepo::new();

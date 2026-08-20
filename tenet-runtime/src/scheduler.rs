@@ -259,6 +259,9 @@ async fn execute_lease(
       candidate.candidate_revision.as_str()
     });
   let workspace = workspaces.create_worker(&lease.id, revision).await?;
+  workspaces
+    .materialize_repository_file(&workspace, &context.config.spec_file)
+    .await?;
   lease.workspace.clone_from(&workspace);
   context.cwd.clone_from(&workspace);
   context.runtime_dir = context.runtime_dir.join(&lease.id);
