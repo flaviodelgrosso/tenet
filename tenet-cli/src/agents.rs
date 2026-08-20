@@ -147,7 +147,7 @@ async fn select_registry_agent(cwd: &Path, id: &str) -> Result<()> {
     &path,
     format!(
       "#:schema {}\n\n{body}",
-      tenet_domain::config::CONFIG_SCHEMA_URL
+      tenet_domain::config::CONFIG_SCHEMA_DIRECTIVE
     ),
   )
   .await

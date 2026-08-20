@@ -1,4 +1,4 @@
-#:schema ./schemas/config.schema.json
+#:schema ./.tenet/config.schema.json
 
 version = 1
 spec_file = "spec.md"

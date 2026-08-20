@@ -13,8 +13,8 @@ use crate::{model::WorkerRole, verification::VerificationSpec};
 
 pub const TENET_DIR: &str = ".tenet";
 pub const CONFIG_FILE: &str = "tenet.toml";
-pub const CONFIG_SCHEMA_URL: &str =
-  "https://cdn.jsdelivr.net/gh/flaviodelgrosso/tenet@main/schemas/config.schema.json";
+pub const CONFIG_SCHEMA_FILE: &str = "config.schema.json";
+pub const CONFIG_SCHEMA_DIRECTIVE: &str = "./.tenet/config.schema.json";
 pub const SUPPORTED_CONFIG_VERSION: u32 = 1;
 
 const DEFAULT_COMPLETION_RETRIES: u32 = 2;
@@ -488,13 +488,28 @@ pub fn config_path(cwd: &Path) -> PathBuf {
   cwd.join(CONFIG_FILE)
 }
 
+pub fn config_schema_path(cwd: &Path) -> PathBuf {
+  cwd.join(TENET_DIR).join(CONFIG_SCHEMA_FILE)
+}
+
+pub async fn ensure_config_schema(cwd: &Path) -> Result<()> {
+  let path = config_schema_path(cwd);
+  if let Some(parent) = path.parent() {
+    fs::create_dir_all(parent).await?;
+  }
+  fs::write(&path, include_str!("../../schemas/config.schema.json"))
+    .await
+    .with_context(|| format!("write {}", path.display()))?;
+  Ok(())
+}
+
 pub async fn ensure_config(cwd: &Path) -> Result<Config> {
   let path = config_path(cwd);
   if !path.exists() {
     let config = Config::default();
     let body = toml::to_string_pretty(&config)?;
     let text = format!(
-      "#:schema {CONFIG_SCHEMA_URL}\n\n{body}\n# Configure at least one trusted project check before running Tenet.\n# [[verification.checks]]\n# name = \"project verification\"\n# command = [\"./verify\"]\n"
+      "#:schema {CONFIG_SCHEMA_DIRECTIVE}\n\n{body}\n# Configure at least one trusted project check before running Tenet.\n# [[verification.checks]]\n# name = \"project verification\"\n# command = [\"./verify\"]\n"
     );
     fs::write(&path, text).await?;
     return Ok(config);
@@ -561,7 +576,9 @@ pub fn normalize_protected_path(value: &str) -> Result<PathBuf> {
 mod tests {
   use tempfile::tempdir;
 
-  use super::{config_path, ensure_config, read_config, Config, CONFIG_SCHEMA_URL, TENET_DIR};
+  use super::{
+    config_path, ensure_config, read_config, Config, CONFIG_SCHEMA_DIRECTIVE, TENET_DIR,
+  };
   use crate::model::WorkerRole;
 
   const ROLES: [WorkerRole; 5] = [
@@ -761,7 +778,7 @@ mod tests {
 
     assert_eq!(path, project.path().join("tenet.toml"));
     assert!(!project.path().join(TENET_DIR).join("config.toml").exists());
-    assert!(generated.starts_with(&format!("#:schema {CONFIG_SCHEMA_URL}\n\n")));
+    assert!(generated.starts_with(&format!("#:schema {CONFIG_SCHEMA_DIRECTIVE}\n\n")));
     assert!(generated.contains("version = 1"));
     assert!(generated.contains("spec_file = \"spec.md\""));
     for omitted in [

@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://cdn.jsdelivr.net/gh/flaviodelgrosso/tenet@main/schemas/config.schema.json",
+  "$id": "config.schema.json",
   "title": "Tenet configuration",
   "description": "Configuration for autonomous Tenet runs.",
   "type": "object",

@@ -429,7 +429,7 @@ Inside the repository Tenet should operate on:
 tenet init
 ```
 
-A run requires an existing Git repository, at least one commit, and a clean canonical working tree. `tenet init` creates the project configuration and Tenet state directory.
+A run requires an existing Git repository, at least one commit, and a clean canonical working tree. `tenet init` creates the project configuration, Tenet state directory, and a local `.tenet/config.schema.json` referenced by `tenet.toml`.
 
 ### 3. Write the specification
 
