@@ -248,31 +248,30 @@ AC-003-01
 A token is accepted before expiry and rejected after expiry.
 ```
 
-And a verification obligation might bind that requirement to:
+A verification obligation is a semantic claim about that criterion:
 
 ```
 VO-003-01
+Demonstrate token expiration semantics.
+```
+
+An executable check is configured separately. For example, a project-configured check or an agent-proposed advisory check may be:
+
+```
 cargo test password_reset_expiry
 ```
 
-Tenet's authoritative evidence is **not**:
+Tenet's authoritative record of a controller-executed project check is closer to:
 
 ```
-Agent: "I ran the tests and they pass."
-```
-
-It is closer to:
-
-```
-requirement:  REQ-003
-criterion:    AC-003-01
-obligation:   VO-003-01
 revision:     abc123...
 program:      cargo
 arguments:    test password_reset_expiry
 exit_code:    0
 observed_by:  controller
 ```
+
+That result is revision-bound project-verification evidence. It is not an executable binding for `VO-003-01`, and it does not by itself establish the generated semantic obligation. Semantic obligations are assessed separately.
 
 If a later change touches the dependency scope supporting that evidence, Tenet can mark it stale and require verification again.
 
@@ -334,7 +333,7 @@ But this design has a cost: fresh workers may repeatedly rediscover stable facts
 
 ### 1 · Architect
 
-Turns the specification into a typed catalog containing requirements, acceptance criteria, verification obligations, and stable semantic IDs. An acceptance criterion describes **what must be true**; a verification obligation describes **how that truth must be demonstrated**. Architect proposes the catalog — the controller validates its structure.
+Turns the specification into a typed catalog containing requirements, acceptance criteria, verification obligations, and stable semantic IDs. An acceptance criterion describes **what must be true**; a verification obligation describes **the semantic claim that must be established** for that criterion. Architect proposes the catalog — the controller validates its structure.
 
 ### 2 · Reconcile
 
