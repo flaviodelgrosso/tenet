@@ -139,7 +139,7 @@ pub fn derive_normative_fragments(specification: &str) -> Vec<SpecFragment> {
 
   for line in specification.lines() {
     let trimmed = line.trim();
-    if trimmed.starts_with("```") {
+    if trimmed.starts_with("```") || is_markdown_thematic_break(trimmed) {
       flush(&mut paragraph, &section, &mut paragraphs);
       continue;
     }
@@ -154,6 +154,16 @@ pub fn derive_normative_fragments(specification: &str) -> Vec<SpecFragment> {
   }
   flush(&mut paragraph, &section, &mut paragraphs);
   paragraphs
+}
+
+fn is_markdown_thematic_break(line: &str) -> bool {
+  let mut characters = line.chars().filter(|character| !character.is_whitespace());
+  let Some(marker) = characters.next() else {
+    return false;
+  };
+  matches!(marker, '-' | '*' | '_')
+    && characters.clone().count() >= 2
+    && characters.all(|character| character == marker)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -413,6 +423,20 @@ mod tests {
     assert_eq!(fragments.len(), 2);
     assert_eq!(fragments[1].text, "status = 200");
     assert_eq!(fragments[1].section.as_deref(), Some("Contract"));
+  }
+  #[test]
+  fn normative_fragments_exclude_markdown_thematic_breaks() {
+    let fragments = derive_normative_fragments(
+      "# First\n\nFirst requirement.\n\n---\n\n# Second\n\nSecond requirement.",
+    );
+
+    assert_eq!(
+      fragments
+        .iter()
+        .map(|fragment| fragment.text.as_str())
+        .collect::<Vec<_>>(),
+      vec!["First requirement.", "Second requirement."]
+    );
   }
 }
 

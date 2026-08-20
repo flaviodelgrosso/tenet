@@ -90,21 +90,30 @@ fn run_git(cwd: &Path, args: &[&str]) -> String {
   String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
-fn annotated_reference(spec: &str) -> SpecReference {
-  let metadata = spec
+fn annotated_references(spec: &str) -> Vec<SpecReference> {
+  spec
     .lines()
-    .find(|line| line.starts_with("[fragmentId="))
-    .expect("annotated fragment metadata");
-  let metadata = metadata.trim_matches(['[', ']']);
-  let fields: BTreeMap<_, _> = metadata
-    .split_whitespace()
-    .filter_map(|field| field.split_once('='))
-    .collect();
-  SpecReference {
-    section: (fields["section"] != "<none>").then(|| fields["section"].to_owned()),
-    fragment_id: SpecFragmentId::from(fields["fragmentId"]),
-    text_hash: fields["textHash"].to_owned(),
-  }
+    .filter(|line| line.starts_with("[fragmentId="))
+    .map(|metadata| {
+      let metadata = metadata.trim_matches(['[', ']']);
+      let fields: BTreeMap<_, _> = metadata
+        .split_whitespace()
+        .filter_map(|field| field.split_once('='))
+        .collect();
+      SpecReference {
+        section: (fields["section"] != "<none>").then(|| fields["section"].to_owned()),
+        fragment_id: SpecFragmentId::from(fields["fragmentId"]),
+        text_hash: fields["textHash"].to_owned(),
+      }
+    })
+    .collect()
+}
+
+fn annotated_reference(spec: &str) -> SpecReference {
+  annotated_references(spec)
+    .into_iter()
+    .next()
+    .expect("annotated fragment metadata")
 }
 
 fn requirement_for(spec: &str) -> Requirement {
@@ -213,6 +222,8 @@ enum BackendMode {
   Normal,
   EmptyImplementationThenRepair,
   RequireSpecification,
+  IncompleteCatalogThenCorrect,
+  AlwaysIncompleteCatalog,
   FailB,
   WorkerTimeout,
   ProtectedMutation,
@@ -247,6 +258,7 @@ struct FakeBackend {
   discoveries_seen: AtomicUsize,
   repair_calls: AtomicUsize,
   reconcile_calls: AtomicUsize,
+  architect_calls: AtomicUsize,
   semantic_feedback: Mutex<Vec<(WorkerRole, String)>>,
   assessment_calls: AtomicUsize,
 }
@@ -263,6 +275,7 @@ impl FakeBackend {
       discoveries_seen: AtomicUsize::new(0),
       repair_calls: AtomicUsize::new(0),
       reconcile_calls: AtomicUsize::new(0),
+      architect_calls: AtomicUsize::new(0),
       semantic_feedback: Mutex::new(Vec::new()),
       assessment_calls: AtomicUsize::new(0),
     }
@@ -323,7 +336,18 @@ impl AgentBackend for FakeBackend {
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Architect)
       .await?;
     let mut requirement = requirement();
-    requirement.source_refs = vec![annotated_reference(spec)];
+    let attempt = self.architect_calls.fetch_add(1, Ordering::SeqCst);
+    requirement.source_refs =
+      if matches!(self.mode, BackendMode::IncompleteCatalogThenCorrect) && attempt > 0 {
+        self
+          .semantic_feedback
+          .lock()
+          .expect("semantic feedback lock")
+          .push((WorkerRole::Architect, spec.to_owned()));
+        annotated_references(spec)
+      } else {
+        vec![annotated_reference(spec)]
+      };
     Ok(ArchitectOutput {
       requirements: vec![requirement],
       acceptance_criteria: vec![criterion()],
@@ -865,6 +889,70 @@ async fn ignored_specification_is_available_to_every_agent_workspace() {
     .expect("agents can read the ignored authoritative specification");
 
   assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+}
+
+#[tokio::test]
+async fn incomplete_catalog_is_retried_with_coverage_feedback() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::IncompleteCatalogThenCorrect));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  fs::write(
+    repository.path().join("spec.md"),
+    "First normative statement.\n\nSecond normative statement.",
+  )
+  .await
+  .expect("write multi-fragment specification");
+  fs::remove_file(repository.path().join(".tenet/requirements.json"))
+    .await
+    .expect("force architecture worker");
+  run_git(repository.path(), &["add", "spec.md"]);
+  run_git(repository.path(), &["commit", "-m", "expand specification"]);
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("corrected catalog proceeds");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert_eq!(backend.architect_calls.load(Ordering::SeqCst), 2);
+  let feedback = backend
+    .semantic_feedback
+    .lock()
+    .expect("semantic feedback lock");
+  assert_eq!(feedback.len(), 1);
+  assert_eq!(feedback[0].0, WorkerRole::Architect);
+  assert!(feedback[0]
+    .1
+    .contains("catalog does not cover normative specification fragments"));
+}
+
+#[tokio::test]
+async fn incomplete_catalog_exhausts_configured_retries_with_precise_error() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::AlwaysIncompleteCatalog));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  let specification = "First normative statement.\n\nSecond normative statement.";
+  fs::write(repository.path().join("spec.md"), specification)
+    .await
+    .expect("write multi-fragment specification");
+  fs::remove_file(repository.path().join(".tenet/requirements.json"))
+    .await
+    .expect("force architecture worker");
+  run_git(repository.path(), &["add", "spec.md"]);
+  run_git(repository.path(), &["commit", "-m", "expand specification"]);
+  rewrite_config(&repository, |config| config.agent.completion_retries = 1).await;
+  let uncovered = derive_normative_fragments(specification)[1].id.clone();
+
+  let error = controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("incomplete catalog exhausts retries");
+
+  assert_eq!(
+    error.to_string(),
+    format!("catalog does not cover normative specification fragments: {uncovered}")
+  );
+  assert_eq!(backend.architect_calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

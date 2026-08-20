@@ -959,23 +959,41 @@ impl Controller {
       state.work_statuses.clear();
       state.discoveries.clear();
     }
-    let architect_spec = catalog::annotated_specification(&spec);
+    let annotated_spec = catalog::annotated_specification(&spec);
     state.last_summary = format!(
       "Deriving requirement catalog from {}",
       context.config.spec_file
     );
     self.publish(&context.events, state).await?;
-    let backend = self.backend.clone();
-    let output = self
-      .read_only_worker(context, "architect", move |inspection_context| async move {
-        backend
-          .architect(&inspection_context, &architect_spec)
-          .await
-      })
-      .await?;
-    let catalog = catalog::build(&spec, spec_hash, output)?;
-    catalog::validate(&catalog)?;
-    catalog::validate_coverage(&catalog, &spec)?;
+    let mut feedback = None;
+    let mut attempt = 0;
+    let catalog = loop {
+      let architect_spec = match &feedback {
+        Some(feedback) => format!(
+          "{annotated_spec}\nDeterministic catalog validation rejected the previous result:\n{feedback}\nRegenerate the entire catalog. Cover every controller-annotated fragmentId in at least one requirement sourceRefs entry."
+        ),
+        None => annotated_spec.clone(),
+      };
+      let backend = self.backend.clone();
+      let output = self
+        .read_only_worker(context, "architect", move |inspection_context| async move {
+          backend
+            .architect(&inspection_context, &architect_spec)
+            .await
+        })
+        .await?;
+      let candidate = catalog::build(&spec, spec_hash.clone(), output)?;
+      let validation =
+        catalog::validate(&candidate).and_then(|()| catalog::validate_coverage(&candidate, &spec));
+      match validation {
+        Ok(()) => break candidate,
+        Err(error) if attempt == context.config.agent.completion_retries => return Err(error),
+        Err(error) => {
+          attempt += 1;
+          feedback = Some(format!("{error:#}"));
+        }
+      }
+    };
     store::write_catalog(&self.cwd, &catalog).await?;
     context
       .events
