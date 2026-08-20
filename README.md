@@ -528,6 +528,11 @@ spec_file = "spec.md"
 max_cycles = 25
 max_repair_attempts = 3
 
+[verification]
+checks = []
+timeout_secs = 300
+max_output_bytes = 65536
+
 [agent]
 ```
 
@@ -546,7 +551,7 @@ additional_protected_paths = [
 ]
 ```
 
-Advanced controller, agent, verification, and execution settings are documented in [`schemas/config.schema.json`](schemas/config.schema.json). Stable defaults are intentionally omitted from normal project configuration.
+Advanced controller, agent, verification, and execution settings are documented in [`schemas/config.schema.json`](schemas/config.schema.json). Verification defaults are written explicitly so the empty `checks` list is visible; replace it with at least one trusted check before running Tenet.
 
 ---
 

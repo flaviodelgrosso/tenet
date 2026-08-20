@@ -173,6 +173,7 @@
       "properties": {
         "checks": {
           "type": "array",
+          "minItems": 1,
           "items": { "$ref": "#/$defs/projectVerificationCheck" },
           "default": [],
           "description": "Mandatory project verification checks executed in declaration order with fail-fast behavior."

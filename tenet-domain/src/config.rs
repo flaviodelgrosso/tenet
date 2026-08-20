@@ -37,7 +37,7 @@ pub struct Config {
   )]
   pub stagnation_limit: u32,
   pub agent: AgentConfig,
-  #[serde(default, skip_serializing_if = "VerificationConfig::is_default")]
+  #[serde(default)]
   pub verification: VerificationConfig,
   #[serde(default, skip_serializing_if = "ExecutionConfig::is_default")]
   pub execution: ExecutionConfig,
@@ -279,17 +279,10 @@ impl AgentPreferences {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VerificationConfig {
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub checks: Vec<ProjectVerificationCheck>,
-  #[serde(
-    default = "default_verification_timeout_secs",
-    skip_serializing_if = "VerificationConfig::has_default_timeout"
-  )]
+  #[serde(default = "default_verification_timeout_secs")]
   pub timeout_secs: u64,
-  #[serde(
-    default = "default_max_output_bytes",
-    skip_serializing_if = "VerificationConfig::has_default_max_output"
-  )]
+  #[serde(default = "default_max_output_bytes")]
   pub max_output_bytes: usize,
 }
 
@@ -415,18 +408,6 @@ impl VerificationConfig {
     }
     Ok(hash)
   }
-
-  fn is_default(&self) -> bool {
-    self == &Self::default()
-  }
-
-  fn has_default_timeout(value: &u64) -> bool {
-    *value == DEFAULT_VERIFICATION_TIMEOUT_SECS
-  }
-
-  fn has_default_max_output(value: &usize) -> bool {
-    *value == DEFAULT_MAX_OUTPUT_BYTES
-  }
 }
 
 fn default_working_directory() -> String {
@@ -508,9 +489,7 @@ pub async fn ensure_config(cwd: &Path) -> Result<Config> {
   if !path.exists() {
     let config = Config::default();
     let body = toml::to_string_pretty(&config)?;
-    let text = format!(
-      "#:schema {CONFIG_SCHEMA_DIRECTIVE}\n\n{body}\n# Configure at least one trusted project check before running Tenet.\n# [[verification.checks]]\n# name = \"project verification\"\n# command = [\"./verify\"]\n"
-    );
+    let text = format!("#:schema {CONFIG_SCHEMA_DIRECTIVE}\n\n{body}");
     fs::write(&path, text).await?;
     return Ok(config);
   }
@@ -740,7 +719,11 @@ mod tests {
     );
     assert_eq!(
       schema["$defs"]["verificationConfig"]["properties"]["checks"]["default"],
-      serde_json::to_value(config.verification.checks).unwrap()
+      serde_json::json!([])
+    );
+    assert_eq!(
+      schema["$defs"]["verificationConfig"]["properties"]["checks"]["minItems"],
+      1
     );
     assert_eq!(
       schema["$defs"]["verificationConfig"]["properties"]["timeout_secs"]["default"],
@@ -768,7 +751,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn generated_config_is_small_and_requires_a_launch_source() {
+  async fn generated_config_includes_an_empty_verification_gate_without_comments() {
     let project = tempdir().unwrap();
 
     ensure_config(project.path()).await.unwrap();
@@ -781,22 +764,23 @@ mod tests {
     assert!(generated.starts_with(&format!("#:schema {CONFIG_SCHEMA_DIRECTIVE}\n\n")));
     assert!(generated.contains("version = 1"));
     assert!(generated.contains("spec_file = \"spec.md\""));
+    assert!(generated
+      .contains("[verification]\nchecks = []\ntimeout_secs = 300\nmax_output_bytes = 65536"));
     for omitted in [
       "stagnation_limit",
       "completion_retries",
       "turn_timeout_secs",
-      "max_output_bytes",
       "max_parallel_workers",
       "integration",
       "protected_paths",
+      "Configure at least one trusted project check",
+      "[[verification.checks]]",
     ] {
       assert!(
         !generated.contains(omitted),
         "generated config contains {omitted}"
       );
     }
-    assert!(generated.contains("[[verification.checks]]"));
-    assert!(generated.contains("command = [\"./verify\"]"));
     assert!(error.contains("no ACP launch source configured"));
   }
 

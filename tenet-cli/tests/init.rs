@@ -46,13 +46,21 @@ fn init_writes_a_local_configuration_schema() {
     "{}",
     String::from_utf8_lossy(&output.stderr)
   );
-  assert!(std::fs::read_to_string(project.0.join("tenet.toml"))
-    .expect("read generated config")
-    .starts_with("#:schema ./.tenet/config.schema.json\n\n"));
+  let config =
+    std::fs::read_to_string(project.0.join("tenet.toml")).expect("read generated config");
+  assert!(config.starts_with("#:schema ./.tenet/config.schema.json\n\n"));
+  assert!(
+    config.contains("[verification]\nchecks = []\ntimeout_secs = 300\nmax_output_bytes = 65536")
+  );
+  assert!(!config.contains("Configure at least one trusted project check"));
   let schema: serde_json::Value = serde_json::from_str(
     &std::fs::read_to_string(project.0.join(".tenet/config.schema.json"))
       .expect("read generated schema"),
   )
   .expect("generated schema is JSON");
   assert_eq!(schema["$id"], "config.schema.json");
+  assert_eq!(
+    schema["$defs"]["verificationConfig"]["properties"]["checks"]["minItems"],
+    1
+  );
 }
