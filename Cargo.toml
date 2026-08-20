@@ -5,36 +5,29 @@ members = [
   "tenet-cli",
   "tenet-controller",
   "tenet-domain",
-  "tenet-projection",
   "tenet-runtime",
-  "tenet-tui",
 ]
 default-members = ["tenet-cli"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Autonomous spec-driven development powered by headless coding agents"
+description = "Deterministic orchestration for autonomous coding agents"
 license = "MIT"
 
 [workspace.dependencies]
 agent-client-protocol = "2"
 anyhow = "1"
 async-trait = "0.1"
-base64 = "0.23"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 colored = "3"
-crossterm = "0.29"
 globset = "0.4"
-include_dir = "0.7"
 jsonschema = "0.49"
 libc = "0.2"
-ratatui = "0.30"
 petgraph = "0.8"
 proptest = "1"
 schemars = { version = "1", features = ["chrono04"] }
-rusqlite = { version = "0.40", features = ["backup"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

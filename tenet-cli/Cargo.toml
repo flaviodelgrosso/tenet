@@ -18,8 +18,6 @@ tenet-acp = { path = "../tenet-acp" }
 tenet-controller = { path = "../tenet-controller" }
 tenet-runtime = { path = "../tenet-runtime" }
 tenet-domain = { path = "../tenet-domain" }
-tenet-projection = { path = "../tenet-projection" }
-tenet-tui = { path = "../tenet-tui" }
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::console::{ConsoleEvent, ConsolePresenter, ConsoleRenderer, InformationMode, RunHeader};
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ConsoleOptions {
+pub(crate) struct RunOptions {
   pub quiet: bool,
   pub verbose: bool,
 }
@@ -18,7 +18,7 @@ pub(crate) struct ConsoleOptions {
 pub(crate) async fn run(
   cwd: PathBuf,
   backend: Arc<dyn AgentBackend>,
-  options: ConsoleOptions,
+  options: RunOptions,
 ) -> Result<State> {
   let initial = store::read_state(&cwd).await?;
   let catalog = store::read_catalog(&cwd).await?;

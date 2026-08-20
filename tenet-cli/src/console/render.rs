@@ -428,11 +428,13 @@ impl<W: Write> ConsoleRenderer<W> {
         indent_lines(&reason, "    ")
       )?;
     }
-    if matches!(state.status, RunStatus::Blocked | RunStatus::Stopped) {
-      writeln!(
+    match state.status {
+      RunStatus::Blocked => writeln!(
         self.writer,
-        "\n  next\n    Address the blocker, then run `tenet resume --headless`."
-      )?;
+        "\n  next\n    Address the blocker, then run `tenet resume`."
+      )?,
+      RunStatus::Stopped => writeln!(self.writer, "\n  next\n    Run `tenet resume` to continue.")?,
+      RunStatus::Idle | RunStatus::Running | RunStatus::Done | RunStatus::Failed => {}
     }
     self.writer.flush()?;
     Ok(())

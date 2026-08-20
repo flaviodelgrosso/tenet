@@ -16,11 +16,65 @@ use tenet_domain::{
   },
   verification::{ProjectVerificationRun, VerificationReport},
 };
-use tenet_projection::{compact, failure_preview, sanitize_terminal_text};
 
 const MAX_CHANGE_PATHS: usize = 8;
 const MAX_DEFAULT_OUTPUT_CHARS: usize = 480;
 const MAX_VERBOSE_OUTPUT_CHARS: usize = 2_048;
+
+fn failure_preview(report: &VerificationReport) -> String {
+  report
+    .commands
+    .iter()
+    .find(|item| item.exit_code != Some(0) || item.timed_out)
+    .map(|item| {
+      let output = if item.stderr.trim().is_empty() {
+        &item.stdout
+      } else {
+        &item.stderr
+      };
+      format!(
+        "{} · {}",
+        item.command,
+        compact(&sanitize_terminal_text(output), 240)
+      )
+    })
+    .unwrap_or_else(|| "verification failed".into())
+}
+
+fn sanitize_terminal_text(text: &str) -> String {
+  let mut output = String::with_capacity(text.len());
+  let mut characters = text.chars().peekable();
+  while let Some(character) = characters.next() {
+    if character == '\u{1b}' {
+      if characters.peek() == Some(&'[') {
+        characters.next();
+        for next in characters.by_ref() {
+          if ('@'..='~').contains(&next) {
+            break;
+          }
+        }
+      } else {
+        let _ = characters.next();
+      }
+      continue;
+    }
+    if character == '\n' || character == '\t' || !character.is_control() {
+      output.push(character);
+    }
+  }
+  output
+}
+
+fn compact(text: &str, max: usize) -> String {
+  if text.len() <= max {
+    return text.into();
+  }
+  let mut end = max;
+  while !text.is_char_boundary(end) {
+    end -= 1;
+  }
+  format!("{}…", &text[..end])
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InformationMode {

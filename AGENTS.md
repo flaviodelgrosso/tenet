@@ -45,7 +45,7 @@ For new implementations and refactors:
 - internal module boundaries may change;
 - config schemas may change;
 - agent structured-output contracts may change;
-- CLI/TUI behavior may change where required by the architecture;
+- CLI behavior may change where required by the architecture;
 - old migrations or compatibility shims are not required unless explicitly requested by the task;
 - do not preserve a weak or misleading abstraction only to remain compatible with an earlier MVP implementation.
 

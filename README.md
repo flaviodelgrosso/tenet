@@ -33,7 +33,7 @@ _An evidence-driven control plane for autonomous, spec-driven software developme
 - [Security boundary](#-security-boundary)
 - [Agent-neutral by design](#-agent-neutral-by-design)
 - [Quick start](#-quick-start)
-- [Terminal UI](#-terminal-ui)
+- [Console output](#console-output)
 - [Configuration](#-configuration)
 - [Useful commands](#-useful-commands)
 - [Architecture](#-architecture)
@@ -75,7 +75,7 @@ That hypothesis still needs benchmarks. Tenet does **not** currently claim to be
 | Dependency-aware scheduling                                                   |       ✅        |
 | Transactional integration and recovery journal                                |       ✅        |
 | Persistent controller state                                                   |       ✅        |
-| TUI and headless execution                                                    |       ✅        |
+| Append-only console execution                                                 |       ✅        |
 | Comparative evaluation harness                                                |   🚧 Planned    |
 | Published single-agent / simple-loop / Tenet benchmarks                       |   ❌ Not yet    |
 | Failure-specific recovery routing                                             |   🚧 Planned    |
@@ -487,35 +487,23 @@ Every configured check is mandatory. Tenet executes checks in declaration order 
 ### 6. Run
 
 ```bash
-tenet run                              # interactive
-tenet run --headless                   # engineering progress stream
-tenet run --headless --quiet           # outcome-changing events only
-tenet run --headless --verbose         # harness and worker diagnostics
+tenet run                              # engineering progress stream
+tenet run --quiet                      # outcome-changing events only
+tenet run --verbose                    # harness and worker diagnostics
 tenet resume                           # continue from persisted state
 ```
 
 ---
 
-## 🖥️ Terminal UI
+## Console output
 
-The default terminal interface focuses on the engineering process rather than only displaying an agent transcript. Views expose the active worker, requirement progress, evidence, verification, controller transitions, and timeline.
-
-| Key                      | Action        |
-| ------------------------ | ------------- |
-| `Tab`                    | switch view   |
-| `Home` / `g`             | top           |
-| `Up` / `Down`, `j` / `k` | scroll        |
-| `End` / `G`              | follow        |
-| `PageUp` / `PageDown`    | faster scroll |
-| `q` / `Ctrl-C`           | stop / exit   |
-
-For CI, SSH, server execution, or log capture:
+The run interface is an append-only engineering progress stream organized around cycles, work-unit lifecycles, verification, semantic gaps, progress, and the controller-owned completion gate. It works unchanged in terminals, CI, SSH sessions, and redirected logs.
 
 ```bash
-tenet run --headless > tenet.log
+tenet run > tenet.log
 ```
 
-Headless output is append-only and organized around cycles, work-unit lifecycles, verification, semantic gaps, progress, and the controller-owned completion gate. Symbols preserve meaning without color; ANSI styling is disabled when stdout is redirected and when `NO_COLOR` is set. Use `status --json` and `verify --json` for machine-readable output.
+Symbols preserve meaning without color; ANSI styling is disabled when stdout is redirected and when `NO_COLOR` is set. Use `status --json` and `verify --json` for machine-readable output.
 
 ---
 
@@ -595,9 +583,7 @@ Tenet is split into Rust crates with deliberate dependency boundaries.
 | **`tenet-runtime`**    | Repository operations, workspaces, scheduling mechanisms, verification execution, integration, and persistence                                                       |
 | **`tenet-controller`** | The control loop — owns catalog trust policy, evidence trust policy, verification authorization, scheduling decisions, stopping conditions, and completion authority |
 | **`tenet-acp`**        | Adapts ACP-compatible coding-agent runtimes to the controller's agent backend interface                                                                              |
-| **`tenet-projection`** | Read-side projections of controller state and evidence                                                                                                               |
-| **`tenet-tui`**        | Interactive terminal presentation                                                                                                                                    |
-| **`tenet-cli`**        | Application composition and command-line entry point                                                                                                                 |
+| **`tenet-cli`**        | Console presentation, application composition, and command-line entry point                                                                                           |
 
 The dependency direction is deliberate: the runtime does not own completion semantics, ACP does not own controller policy, and the model adapter is replaceable.
 

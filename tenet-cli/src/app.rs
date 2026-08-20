@@ -6,12 +6,11 @@ use tenet_acp::acp::AcpRuntime;
 use tenet_controller::{controller::manual_verify, AgentBackend};
 use tenet_domain::model::RunStatus;
 use tenet_runtime::store;
-use tenet_tui::tui;
 
 use crate::{
   agents,
   cli::{Cli, Command},
-  headless::{self, ConsoleOptions},
+  run::{self, RunOptions},
 };
 
 pub(crate) struct App {
@@ -28,37 +27,19 @@ impl App {
     Ok(Self {
       cwd: cli.cwd.unwrap_or(cur_dir),
       backend: Arc::new(AcpRuntime),
-      command: cli.command,
+      command: Some(cli.command),
     })
   }
 
   pub(crate) async fn run(mut self) -> Result<ExitCode> {
     let exit_code = match self.command.take() {
-      None => {
-        let _ = tui::idle(self.cwd, self.backend).await?;
-        ExitCode::SUCCESS
-      }
+      None => unreachable!("Clap requires an explicit subcommand"),
       Some(Command::Init) => {
         self.initialize().await?;
         ExitCode::SUCCESS
       }
-      Some(
-        Command::Run {
-          headless: is_headless,
-          quiet,
-          verbose,
-        }
-        | Command::Resume {
-          headless: is_headless,
-          quiet,
-          verbose,
-        },
-      ) => {
-        let state = if is_headless {
-          headless::run(self.cwd, self.backend, ConsoleOptions { quiet, verbose }).await?
-        } else {
-          tui::run(self.cwd, self.backend).await?
-        };
+      Some(Command::Run { quiet, verbose } | Command::Resume { quiet, verbose }) => {
+        let state = run::run(self.cwd, self.backend, RunOptions { quiet, verbose }).await?;
         if matches!(
           state.status,
           RunStatus::Blocked | RunStatus::Failed | RunStatus::Stopped

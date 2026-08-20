@@ -361,7 +361,10 @@ fn stopped_run_summary_has_resume_guidance() {
   let output = render_summary(RunStatus::Stopped, Some("cancelled by user"));
 
   assert!(output.contains("! STOPPED"), "{output}");
-  assert!(output.contains("tenet resume --headless"), "{output}");
+  assert!(
+    output.contains("Run `tenet resume` to continue."),
+    "{output}"
+  );
 }
 
 #[test]

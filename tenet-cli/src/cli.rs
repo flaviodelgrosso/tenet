@@ -12,7 +12,7 @@ pub(crate) struct Cli {
   pub(crate) cwd: Option<PathBuf>,
 
   #[command(subcommand)]
-  pub(crate) command: Option<Command>,
+  pub(crate) command: Command,
 }
 
 #[derive(Subcommand)]
@@ -27,9 +27,6 @@ pub(crate) enum Command {
   },
   /// Start or continue autonomous development.
   Run {
-    /// Run without the interactive TUI and stream progress to the console.
-    #[arg(long)]
-    headless: bool,
     /// Only print outcome-changing work, verification, errors, and the final state.
     #[arg(long, short)]
     quiet: bool,
@@ -39,9 +36,6 @@ pub(crate) enum Command {
   },
   /// Alias for run; state is always resumed from .tenet/.
   Resume {
-    /// Run without the interactive TUI and stream progress to the console.
-    #[arg(long)]
-    headless: bool,
     /// Only print outcome-changing work, verification, errors, and the final state.
     #[arg(long, short)]
     quiet: bool,
@@ -91,17 +85,19 @@ mod tests {
   use super::{Cli, Command};
 
   #[test]
-  fn commandless_invocation_selects_tui_launcher() {
-    let cli = Cli::try_parse_from(["tenet"]).unwrap();
-    assert!(cli.command.is_none());
+  fn commandless_invocation_requires_an_explicit_command() {
+    assert!(Cli::try_parse_from(["tenet"]).is_err());
   }
 
   #[test]
-  fn headless_and_hidden_compatibility_alias_select_console_mode() {
-    let cli = Cli::try_parse_from(["tenet", "run", "--headless"]).unwrap();
+  fn run_uses_console_mode_without_a_mode_flag() {
+    let cli = Cli::try_parse_from(["tenet", "run"]).unwrap();
     assert!(matches!(
       cli.command,
-      Some(Command::Run { headless: true, .. })
+      Command::Run {
+        quiet: false,
+        verbose: false,
+      }
     ));
   }
 }
