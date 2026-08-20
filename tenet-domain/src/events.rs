@@ -17,6 +17,31 @@ use crate::{
   verification::ProjectVerificationRun,
 };
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionGateOutcome {
+  Satisfied,
+  Unsatisfied,
+  Unknown,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionGateItem {
+  pub label: String,
+  pub outcome: CompletionGateOutcome,
+  pub detail: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionGate {
+  pub revision: String,
+  pub earned: bool,
+  pub items: Vec<CompletionGateItem>,
+  pub blockers: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum RunEvent {
@@ -81,6 +106,7 @@ pub enum RunEvent {
     previous: VerificationState,
     current: VerificationState,
   },
+  CompletionGate(CompletionGate),
   Finished(State),
 }
 
@@ -223,6 +249,9 @@ impl RunLogger {
         current,
       } => {
         serde_json::json!({"type":"requirement_verification_changed","requirementId":requirement_id,"previous":previous,"current":current})
+      }
+      RunEvent::CompletionGate(v) => {
+        serde_json::json!({"type":"completion_gate","value":v})
       }
       RunEvent::Finished(v) => serde_json::json!({"type":"finished","value":v}),
     };

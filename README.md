@@ -488,9 +488,9 @@ Every configured check is mandatory. Tenet executes checks in declaration order 
 
 ```bash
 tenet run                              # interactive
-tenet run --headless                   # headless
-tenet run --headless --quiet           # less output
-tenet run --headless --verbose         # more diagnostics
+tenet run --headless                   # engineering progress stream
+tenet run --headless --quiet           # outcome-changing events only
+tenet run --headless --verbose         # harness and worker diagnostics
 tenet resume                           # continue from persisted state
 ```
 
@@ -514,6 +514,8 @@ For CI, SSH, server execution, or log capture:
 ```bash
 tenet run --headless > tenet.log
 ```
+
+Headless output is append-only and organized around cycles, work-unit lifecycles, verification, semantic gaps, progress, and the controller-owned completion gate. Symbols preserve meaning without color; ANSI styling is disabled when stdout is redirected and when `NO_COLOR` is set. Use `status --json` and `verify --json` for machine-readable output.
 
 ---
 

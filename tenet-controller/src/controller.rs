@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use tenet_domain::{
   config::{config_path, ensure_config, read_config, TENET_DIR},
-  events::{EventSink, RunEvent, RunLogger},
+  events::{
+    CompletionGate, CompletionGateItem, CompletionGateOutcome, EventSink, RunEvent, RunLogger,
+  },
   evidence::{
     EvidenceGraphState, EvidencePolicy, ImplementationState, ObligationAssessment,
     SemanticAssessmentReport, VerificationState,
@@ -45,7 +47,7 @@ use tenet_runtime::{
 
 use crate::{
   catalog,
-  completion::{CompletionContext, CompletionDecision, CompletionPolicy},
+  completion::{CompletionBlocker, CompletionContext, CompletionDecision, CompletionPolicy},
   evidence as evidence_graph,
   ports::agent::AgentBackend,
   verification,
@@ -743,6 +745,18 @@ impl Controller {
       .count();
     self.publish(&context.events, state).await?;
     if !project_report.passed {
+      self
+        .evaluate_and_publish_completion_gate(
+          context,
+          state,
+          catalog,
+          evidence_graph,
+          &project_report,
+          &suite_hash,
+        )
+        .await?;
+    }
+    if !project_report.passed {
       return Ok(Some(
         self
           .block(context, state, "Final project verification failed")
@@ -827,6 +841,16 @@ impl Controller {
         ObligationAssessment::Uncertain { .. }
       )
     }) {
+      self
+        .evaluate_and_publish_completion_gate(
+          context,
+          state,
+          catalog,
+          evidence_graph,
+          &project_report,
+          &suite_hash,
+        )
+        .await?;
       return Ok(Some(
         self
           .block(
@@ -838,21 +862,16 @@ impl Controller {
       ));
     }
 
-    let current_revision = git::head(&self.cwd).await?;
-    let repository_clean = git::is_clean(&self.cwd).await?;
-    let pending_journal = store::read_integration_journal(&self.cwd).await?.is_some();
-    let decision = CompletionPolicy.evaluate(&CompletionContext {
-      catalog,
-      evidence: evidence_graph,
-      project_verification: &project_report,
-      current_suite_hash: &suite_hash,
-      current_revision: &current_revision,
-      repository_clean,
-      has_active_leases: !state.active_leases.is_empty(),
-      has_pending_integrations: !state.candidate_integrations.is_empty()
-        || !state.deferred_candidates.is_empty()
-        || pending_journal,
-    });
+    let decision = self
+      .evaluate_and_publish_completion_gate(
+        context,
+        state,
+        catalog,
+        evidence_graph,
+        &project_report,
+        &suite_hash,
+      )
+      .await?;
     match decision {
       CompletionDecision::Done => {
         state.status = RunStatus::Done;
@@ -870,6 +889,41 @@ impl Controller {
         Ok(Some(self.block(context, state, &message).await?))
       }
     }
+  }
+
+  async fn evaluate_and_publish_completion_gate(
+    &self,
+    context: &BackendContext,
+    state: &State,
+    catalog: &RequirementCatalog,
+    evidence_graph: &EvidenceGraphState,
+    project_report: &ProjectVerificationRun,
+    suite_hash: &str,
+  ) -> Result<CompletionDecision> {
+    let current_revision = git::head(&self.cwd).await?;
+    let repository_clean = git::is_clean(&self.cwd).await?;
+    let pending_journal = store::read_integration_journal(&self.cwd).await?.is_some();
+    let decision = CompletionPolicy.evaluate(&CompletionContext {
+      catalog,
+      evidence: evidence_graph,
+      project_verification: project_report,
+      current_suite_hash: suite_hash,
+      current_revision: &current_revision,
+      repository_clean,
+      has_active_leases: !state.active_leases.is_empty(),
+      has_pending_integrations: !state.candidate_integrations.is_empty()
+        || !state.deferred_candidates.is_empty()
+        || pending_journal,
+    });
+    context
+      .events
+      .emit(RunEvent::CompletionGate(completion_gate(
+        &decision,
+        state,
+        current_revision,
+      )))
+      .await?;
+    Ok(decision)
   }
 
   async fn ensure_catalog(
@@ -1394,6 +1448,121 @@ fn requirement_counts(
   Ok(counts)
 }
 
+fn completion_gate(
+  decision: &CompletionDecision,
+  state: &State,
+  revision: String,
+) -> CompletionGate {
+  let blockers = match decision {
+    CompletionDecision::Done => &[][..],
+    CompletionDecision::NotReady(blockers) => blockers.as_slice(),
+  };
+  let outcome = |blocked| {
+    if blocked {
+      CompletionGateOutcome::Unsatisfied
+    } else {
+      CompletionGateOutcome::Satisfied
+    }
+  };
+  let blocked = |predicate: fn(&CompletionBlocker) -> bool| blockers.iter().any(predicate);
+  let item = |label: &str, blocked: bool, detail: String| CompletionGateItem {
+    label: label.into(),
+    outcome: outcome(blocked),
+    detail,
+  };
+  let coverage_incomplete = blocked(|blocker| {
+    matches!(
+      blocker,
+      CompletionBlocker::SpecificationCoverageIncomplete(_)
+    )
+  });
+  let items = vec![
+    item(
+      "specification coverage",
+      coverage_incomplete,
+      if coverage_incomplete {
+        "incomplete".into()
+      } else {
+        "complete".into()
+      },
+    ),
+    item(
+      "project verification",
+      blocked(|blocker| {
+        matches!(
+          blocker,
+          CompletionBlocker::ProjectVerificationFailed
+            | CompletionBlocker::ProjectVerificationStale
+        )
+      }),
+      format!(
+        "{}/{}",
+        state.verification_layers.project_checks_passed,
+        state.verification_layers.project_checks_total
+      ),
+    ),
+    item(
+      "requirements",
+      blocked(|blocker| {
+        matches!(
+          blocker,
+          CompletionBlocker::RequirementUnverified(_) | CompletionBlocker::CriterionUnverified(_)
+        )
+      }),
+      format!(
+        "{}/{} verified",
+        state.requirement_counts.verified, state.requirement_counts.total
+      ),
+    ),
+    item(
+      "semantic obligations",
+      blocked(|blocker| {
+        matches!(
+          blocker,
+          CompletionBlocker::SemanticGap(_) | CompletionBlocker::SemanticUncertain(_)
+        )
+      }),
+      format!(
+        "{}/{} satisfied",
+        state.verification_layers.semantic_satisfied,
+        state.verification_layers.semantic_obligations_total
+      ),
+    ),
+    item(
+      "repository clean",
+      blocked(|blocker| matches!(blocker, CompletionBlocker::RepositoryDirty)),
+      String::new(),
+    ),
+    item(
+      "canonical revision stable",
+      blocked(|blocker| {
+        matches!(
+          blocker,
+          CompletionBlocker::ProjectVerificationStale
+            | CompletionBlocker::RepositoryChangedAfterVerification
+        )
+      }),
+      String::new(),
+    ),
+    item(
+      "no active leases",
+      blocked(|blocker| matches!(blocker, CompletionBlocker::ActiveLease)),
+      String::new(),
+    ),
+    item(
+      "no pending integration",
+      blocked(|blocker| matches!(blocker, CompletionBlocker::PendingIntegration)),
+      String::new(),
+    ),
+  ];
+  CompletionGate {
+    revision,
+    earned: matches!(decision, CompletionDecision::Done),
+    items,
+    blockers: blockers.iter().map(ToString::to_string).collect(),
+  }
+}
+
 fn project_layers(report: &ProjectVerificationRun) -> VerificationLayers {
   VerificationLayers {
     project_checks_total: report.checks.len(),
@@ -1763,6 +1932,40 @@ mod tests {
       project_verification_failure_reason(&report),
       "Candidate failed mandatory project verification: 'build' exited with code 127"
     );
+  }
+
+  #[test]
+  fn completion_gate_projects_policy_blockers_without_redeciding_them() {
+    let mut state = State::fresh();
+    state.requirement_counts.total = 1;
+    state.verification_layers.project_checks_total = 1;
+    state.verification_layers.project_checks_passed = 1;
+    let decision = CompletionDecision::NotReady(vec![
+      CompletionBlocker::SemanticGap(ObligationId::from("REQ-001/AC-01/VO-01")),
+      CompletionBlocker::RepositoryDirty,
+    ]);
+
+    let gate = completion_gate(&decision, &state, "abc1234".into());
+
+    assert!(!gate.earned);
+    assert_eq!(gate.blockers.len(), 2);
+    assert!(gate.items.iter().any(|item| {
+      item.label == "semantic obligations" && item.outcome == CompletionGateOutcome::Unsatisfied
+    }));
+    assert!(gate.items.iter().any(|item| {
+      item.label == "repository clean" && item.outcome == CompletionGateOutcome::Unsatisfied
+    }));
+  }
+
+  #[test]
+  fn completion_gate_marks_every_condition_satisfied_only_for_done() {
+    let gate = completion_gate(&CompletionDecision::Done, &State::fresh(), "abc1234".into());
+
+    assert!(gate.earned);
+    assert!(gate
+      .items
+      .iter()
+      .all(|item| item.outcome == CompletionGateOutcome::Satisfied));
   }
 }
 

@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+colored.workspace = true
 tenet-acp = { path = "../tenet-acp" }
 tenet-controller = { path = "../tenet-controller" }
 tenet-runtime = { path = "../tenet-runtime" }

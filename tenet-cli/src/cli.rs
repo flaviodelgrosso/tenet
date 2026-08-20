@@ -30,7 +30,7 @@ pub(crate) enum Command {
     /// Run without the interactive TUI and stream progress to the console.
     #[arg(long)]
     headless: bool,
-    /// Only print controller milestones, verification, errors, and the final state.
+    /// Only print outcome-changing work, verification, errors, and the final state.
     #[arg(long, short)]
     quiet: bool,
     /// Include worker narrative and diagnostic tool details.
@@ -42,7 +42,7 @@ pub(crate) enum Command {
     /// Run without the interactive TUI and stream progress to the console.
     #[arg(long)]
     headless: bool,
-    /// Only print controller milestones, verification, errors, and the final state.
+    /// Only print outcome-changing work, verification, errors, and the final state.
     #[arg(long, short)]
     quiet: bool,
     /// Include worker narrative and diagnostic tool details.

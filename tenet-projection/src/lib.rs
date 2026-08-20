@@ -411,6 +411,21 @@ impl RunProjection {
           String::new(),
         );
       }
+      RunEvent::CompletionGate(gate) => self.push_activity(
+        now(),
+        if gate.earned {
+          ActivityCategory::Check
+        } else {
+          ActivityCategory::Error
+        },
+        "COMPLETION GATE",
+        if gate.earned {
+          format!("DONE earned at {}", gate.revision)
+        } else {
+          format!("{} blocker(s)", gate.blockers.len())
+        },
+        gate.blockers.join("\n"),
+      ),
       RunEvent::Finished(state) => {
         self.apply_state(state);
         self.running = false;
