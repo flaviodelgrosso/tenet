@@ -13,6 +13,7 @@ use tenet_domain::{
   },
   model::{
     Phase, RepositoryChange, RunStatus, State, WorkExecution, WorkLease, WorkUnit, WorkerEvent,
+    WorkerRole,
   },
   verification::{ProjectVerificationRun, VerificationReport},
 };
@@ -303,6 +304,7 @@ pub(crate) struct ConsolePresenter {
   cycle: u32,
   leases: BTreeMap<String, WorkLease>,
   work: BTreeMap<String, WorkUnit>,
+  worker_text: BTreeMap<String, String>,
   work_started: BTreeMap<String, Instant>,
   candidates: BTreeMap<String, WorkExecution>,
   current_integration: Option<String>,
@@ -321,6 +323,7 @@ impl ConsolePresenter {
       leases: BTreeMap::new(),
       work: BTreeMap::new(),
       work_started: BTreeMap::new(),
+      worker_text: BTreeMap::new(),
       candidates: BTreeMap::new(),
       current_integration: None,
       seen_work: BTreeSet::new(),
@@ -651,90 +654,164 @@ impl ConsolePresenter {
       WorkerEvent::ToolEnd {
         at,
         role,
+        worker_id,
         tool_name,
         is_error: true,
         output,
         ..
-      } => vec![ConsoleEvent::Error {
-        at: at.clone(),
-        label: "TOOL",
-        summary: format!("{} · {tool_name} failed", role.as_str()),
-        detail: output.clone(),
-      }],
+      } => {
+        let mut events = self.flush_worker_text(worker_id, *role, at);
+        events.push(ConsoleEvent::Error {
+          at: at.clone(),
+          label: "TOOL",
+          summary: format!("{} · {tool_name} failed", role.as_str()),
+          detail: output.clone(),
+        });
+        events
+      }
       WorkerEvent::End {
         at,
         role,
+        worker_id,
         ok: false,
         message,
         ..
-      } => vec![ConsoleEvent::Error {
-        at: at.clone(),
-        label: "WORKER",
-        summary: format!("{} failed", role.as_str()),
-        detail: message.clone(),
-      }],
+      } => {
+        let mut events = self.flush_worker_text(worker_id, *role, at);
+        events.push(ConsoleEvent::Error {
+          at: at.clone(),
+          label: "WORKER",
+          summary: format!("{} failed", role.as_str()),
+          detail: message.clone(),
+        });
+        events
+      }
       WorkerEvent::Start {
         at,
         role,
         worker_id,
         lease_id,
         work_unit_id,
-      } => vec![ConsoleEvent::Diagnostic {
-        at: at.clone(),
-        label: role.as_str().to_ascii_uppercase(),
-        summary: format!("worker {worker_id} started"),
-        detail: format!(
-          "lease {} · work unit {}",
-          lease_id.as_deref().unwrap_or("none"),
-          work_unit_id.as_deref().unwrap_or("none")
-        ),
-      }],
+      } => {
+        self.worker_text.remove(worker_id);
+        vec![ConsoleEvent::Diagnostic {
+          at: at.clone(),
+          label: role.as_str().to_ascii_uppercase(),
+          summary: format!("worker {worker_id} started"),
+          detail: format!(
+            "lease {} · work unit {}",
+            lease_id.as_deref().unwrap_or("none"),
+            work_unit_id.as_deref().unwrap_or("none")
+          ),
+        }]
+      }
       WorkerEvent::Text {
         at,
         role,
         worker_id,
         delta,
         ..
-      } => vec![ConsoleEvent::Diagnostic {
-        at: at.clone(),
-        label: role.as_str().to_ascii_uppercase(),
-        summary: worker_id.clone(),
-        detail: sanitize_terminal_text(delta),
-      }],
+      } => self.buffer_worker_text(worker_id, *role, at, delta),
       WorkerEvent::ToolStart {
         at,
         role,
+        worker_id,
         tool_name,
         args,
         ..
-      } => vec![ConsoleEvent::Diagnostic {
-        at: at.clone(),
-        label: "TOOL".into(),
-        summary: format!("{} · {tool_name}", role.as_str()),
-        detail: serde_json::to_string(args).unwrap_or_else(|_| "{}".into()),
-      }],
+      } => {
+        let mut events = self.flush_worker_text(worker_id, *role, at);
+        events.push(ConsoleEvent::Diagnostic {
+          at: at.clone(),
+          label: "TOOL".into(),
+          summary: format!("{} · {tool_name}", role.as_str()),
+          detail: serde_json::to_string(args).unwrap_or_else(|_| "{}".into()),
+        });
+        events
+      }
       WorkerEvent::ToolEnd {
         at,
         role,
+        worker_id,
         tool_name,
         output,
         ..
-      } => vec![ConsoleEvent::Diagnostic {
-        at: at.clone(),
-        label: "TOOL".into(),
-        summary: format!("{} · {tool_name} complete", role.as_str()),
-        detail: output.clone().unwrap_or_default(),
-      }],
+      } => {
+        let mut events = self.flush_worker_text(worker_id, *role, at);
+        events.push(ConsoleEvent::Diagnostic {
+          at: at.clone(),
+          label: "TOOL".into(),
+          summary: format!("{} · {tool_name} complete", role.as_str()),
+          detail: output.clone().unwrap_or_default(),
+        });
+        events
+      }
       WorkerEvent::End {
-        at, role, message, ..
-      } => vec![ConsoleEvent::Diagnostic {
-        at: at.clone(),
-        label: role.as_str().to_ascii_uppercase(),
-        summary: "worker complete".into(),
-        detail: message.clone().unwrap_or_default(),
-      }],
+        at,
+        role,
+        worker_id,
+        message,
+        ..
+      } => {
+        let mut events = self.flush_worker_text(worker_id, *role, at);
+        events.push(ConsoleEvent::Diagnostic {
+          at: at.clone(),
+          label: role.as_str().to_ascii_uppercase(),
+          summary: "worker complete".into(),
+          detail: message.clone().unwrap_or_default(),
+        });
+        events
+      }
     }
   }
+
+  fn buffer_worker_text(
+    &mut self,
+    worker_id: &str,
+    role: WorkerRole,
+    at: &str,
+    delta: &str,
+  ) -> Vec<ConsoleEvent> {
+    let buffer = self.worker_text.entry(worker_id.into()).or_default();
+    buffer.push_str(delta);
+    let Some(last_newline) = buffer.rfind('\n') else {
+      return Vec::new();
+    };
+    let remainder = buffer.split_off(last_newline + 1);
+    let complete = std::mem::replace(buffer, remainder);
+    worker_text_events(role, worker_id, at, complete.split_terminator('\n'))
+  }
+  fn flush_worker_text(
+    &mut self,
+    worker_id: &str,
+    role: WorkerRole,
+    at: &str,
+  ) -> Vec<ConsoleEvent> {
+    self
+      .worker_text
+      .remove(worker_id)
+      .map_or_else(Vec::new, |text| {
+        worker_text_events(role, worker_id, at, std::iter::once(text.as_str()))
+      })
+  }
+}
+
+fn worker_text_events<'a>(
+  role: WorkerRole,
+  worker_id: &str,
+  at: &str,
+  lines: impl Iterator<Item = &'a str>,
+) -> Vec<ConsoleEvent> {
+  lines
+    .map(sanitize_terminal_text)
+    .filter(|line| !line.is_empty())
+    .map(|detail| ConsoleEvent::Diagnostic {
+      at: at.into(),
+      label: role.as_str().to_ascii_uppercase(),
+      summary: worker_id.into(),
+      detail,
+    })
+    .collect()
 }
 
 mod render;

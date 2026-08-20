@@ -12,7 +12,10 @@ use tenet_domain::{
     ObligationAssessment, ObligationAssessmentResult, SemanticAssessmentReport,
   },
   ids::{CriterionId, EvidenceId, ObligationId, RequirementId, VerificationRunId},
-  model::{Phase, RepairProgress, RepositoryChange, RunStatus, State, WorkScope, WorkUnit},
+  model::{
+    Phase, RepairProgress, RepositoryChange, RunStatus, State, WorkScope, WorkUnit, WorkerEvent,
+    WorkerRole,
+  },
   verification::{
     CommandResult, ProjectCheckResult, ProjectVerificationRun, VerificationReport, VerificationSpec,
   },
@@ -167,6 +170,45 @@ fn verbose_preserves_diagnostic_detail() {
 
   assert!(output.contains("cargo test complete"), "{output}");
   assert!(output.contains("stdout detail"), "{output}");
+}
+
+#[test]
+fn streamed_worker_text_is_emitted_only_at_line_boundaries() {
+  let mut presenter = ConsolePresenter::new(3);
+  let text = |delta: &str| {
+    RunEvent::Worker(WorkerEvent::Text {
+      role: WorkerRole::Reconcile,
+      worker_id: "reconcile-1".into(),
+      lease_id: None,
+      work_unit_id: None,
+      at: "10:00:00".into(),
+      delta: delta.into(),
+    })
+  };
+
+  assert!(presenter.present(&text("todo ")).is_empty());
+  assert!(presenter.present(&text("creation")).is_empty());
+
+  let complete_line = presenter.present(&text("\nnext line"));
+  assert!(matches!(
+    complete_line.as_slice(),
+    [ConsoleEvent::Diagnostic { detail, .. }] if detail == "todo creation"
+  ));
+
+  let remainder = presenter.present(&RunEvent::Worker(WorkerEvent::End {
+    role: WorkerRole::Reconcile,
+    worker_id: "reconcile-1".into(),
+    lease_id: None,
+    work_unit_id: None,
+    at: "10:00:01".into(),
+    ok: true,
+    message: None,
+  }));
+  assert!(matches!(
+    remainder.as_slice(),
+    [ConsoleEvent::Diagnostic { detail, .. }, ConsoleEvent::Diagnostic { .. }]
+      if detail == "next line"
+  ));
 }
 
 #[test]
