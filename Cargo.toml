@@ -6,6 +6,7 @@ members = [
   "tenet-controller",
   "tenet-domain",
   "tenet-runtime",
+  "tenet-storage",
 ]
 default-members = ["tenet-cli"]
 
@@ -26,6 +27,7 @@ globset = "0.4"
 jsonschema = "0.49"
 libc = "0.2"
 petgraph = "0.8"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid", "json"] }
 proptest = "1"
 schemars = { version = "1", features = ["chrono04"] }
 serde = { version = "1", features = ["derive"] }

@@ -36,6 +36,7 @@ pub trait AgentBackend: Send + Sync {
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
     work_unit: &WorkUnit,
+    discoveries: &[Discovery],
   ) -> Result<WorkerSummary>;
 
   async fn repair(
@@ -43,6 +44,7 @@ pub trait AgentBackend: Send + Sync {
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
     work_unit: &WorkUnit,
+    discoveries: &[Discovery],
     report: &VerificationReport,
   ) -> Result<WorkerSummary>;
 

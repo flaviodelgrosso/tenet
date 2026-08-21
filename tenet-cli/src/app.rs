@@ -6,10 +6,11 @@ use tenet_acp::acp::AcpRuntime;
 use tenet_controller::{controller::manual_verify, AgentBackend};
 use tenet_domain::model::RunStatus;
 use tenet_runtime::store;
+use tenet_storage::{DatabaseHealth, Storage};
 
 use crate::{
   agents,
-  cli::{Cli, Command},
+  cli::{Cli, Command, DbCommand, DumpCommand, EvidenceCommand},
   run::{self, RunOptions},
 };
 
@@ -61,6 +62,36 @@ impl App {
         ExitCode::SUCCESS
       }
       Some(Command::Verify { json }) => self.verify(json).await?,
+      Some(Command::Db {
+        command: DbCommand::Check,
+      }) => {
+        self.check_database().await?;
+        ExitCode::SUCCESS
+      }
+      Some(Command::State {
+        command: DumpCommand::Dump { json },
+      }) => {
+        self.dump_state(json).await?;
+        ExitCode::SUCCESS
+      }
+      Some(Command::Requirements {
+        command: DumpCommand::Dump { json },
+      }) => {
+        self.dump_requirements(json).await?;
+        ExitCode::SUCCESS
+      }
+      Some(Command::Evidence {
+        command: EvidenceCommand::Dump { json, requirement },
+      }) => {
+        self.dump_evidence(json, requirement.as_deref()).await?;
+        ExitCode::SUCCESS
+      }
+      Some(Command::Roadmap {
+        command: DumpCommand::Dump { json },
+      }) => {
+        self.dump_roadmap(json).await?;
+        ExitCode::SUCCESS
+      }
     };
     Ok(exit_code)
   }
@@ -84,7 +115,10 @@ impl App {
   }
 
   async fn print_status(&self, json: bool) -> Result<()> {
-    let state = store::read_state(&self.cwd).await?;
+    let state = Storage::open_existing(&self.cwd)
+      .await?
+      .load_current_state()
+      .await?;
     if json {
       println!("{}", serde_json::to_string_pretty(&state)?);
       return Ok(());
@@ -141,6 +175,68 @@ impl App {
     if let Some(error) = state.last_error {
       println!("error: {error}");
     }
+    Ok(())
+  }
+
+  async fn check_database(&self) -> Result<()> {
+    let storage = Storage::open_existing(&self.cwd).await?;
+    let quick = storage.quick_check().await?;
+    let foreign_keys = storage.foreign_key_check().await?;
+    if quick != DatabaseHealth::Ok || foreign_keys != DatabaseHealth::Ok {
+      anyhow::bail!("database check failed: quick={quick:?}, foreign_keys={foreign_keys:?}");
+    }
+    println!("database: {}", storage.path().display());
+    println!("quick_check: ok");
+    println!("foreign_key_check: ok");
+    Ok(())
+  }
+
+  async fn dump_state(&self, _json: bool) -> Result<()> {
+    let value = Storage::open_existing(&self.cwd)
+      .await?
+      .load_current_state()
+      .await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+  }
+
+  async fn dump_requirements(&self, _json: bool) -> Result<()> {
+    let value = Storage::open_existing(&self.cwd)
+      .await?
+      .load_active_catalog()
+      .await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+  }
+
+  async fn dump_evidence(&self, _json: bool, requirement: Option<&str>) -> Result<()> {
+    let storage = Storage::open_existing(&self.cwd).await?;
+    let catalog = storage
+      .load_active_catalog()
+      .await?
+      .context("no active requirement catalog")?;
+    let graph = storage.load_evidence_graph(&catalog).await?;
+    if let Some(requirement) = requirement {
+      let evidence: Vec<_> = graph
+        .evidence
+        .values()
+        .filter(|item| item.requirement_id.as_str() == requirement)
+        .collect();
+      println!("{}", serde_json::to_string_pretty(&evidence)?);
+    } else {
+      println!("{}", serde_json::to_string_pretty(&graph)?);
+    }
+    Ok(())
+  }
+
+  async fn dump_roadmap(&self, _json: bool) -> Result<()> {
+    let storage = Storage::open_existing(&self.cwd).await?;
+    let state = storage.load_current_state().await?;
+    let value = match state.run_id {
+      Some(run_id) => storage.load_latest_reconcile_result(&run_id).await?,
+      None => None,
+    };
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
   }
 

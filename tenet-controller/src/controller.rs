@@ -70,16 +70,22 @@ impl CandidateExecutor for ScheduledAgent {
     context: &BackendContext,
     catalog: &RequirementCatalog,
     work_unit: &tenet_domain::model::WorkUnit,
+    discoveries: &[Discovery],
     previous_verification: Option<&VerificationReport>,
   ) -> Result<tenet_domain::model::WorkerSummary> {
     match previous_verification {
       Some(report) => {
         self
           .backend
-          .repair(context, catalog, work_unit, report)
+          .repair(context, catalog, work_unit, discoveries, report)
           .await
       }
-      None => self.backend.implement(context, catalog, work_unit).await,
+      None => {
+        self
+          .backend
+          .implement(context, catalog, work_unit, discoveries)
+          .await
+      }
     }
   }
 }
@@ -98,10 +104,6 @@ impl Controller {
     let config = ensure_config(&self.cwd).await?;
     store::ensure_spec(&self.cwd, &config).await?;
     store::ensure_gitignore(&self.cwd).await?;
-    let state_path = self.cwd.join(TENET_DIR).join(store::STATE_FILE);
-    if !state_path.exists() {
-      store::write_state(&self.cwd, &State::fresh()).await?;
-    }
     store::read_state(&self.cwd).await
   }
 
@@ -124,7 +126,6 @@ impl Controller {
     }
     let configured = read_config(&self.cwd).await?;
     configured.agent.validate_launch_source()?;
-    let launch = self.backend.resolve_launch(&self.cwd, &configured).await?;
     self.initialize().await?;
     let _lock = RunLock::acquire(&self.cwd)?;
     let config = Arc::new(ensure_config(&self.cwd).await?);
@@ -134,6 +135,7 @@ impl Controller {
     if !git::is_clean(&self.cwd).await? {
       bail!("worktree execution requires a clean canonical working tree");
     }
+    let launch = self.backend.resolve_launch(&self.cwd, &configured).await?;
 
     let run_id = format!(
       "{}-{}",
@@ -223,9 +225,8 @@ impl Controller {
   }
 
   async fn record_failed_attempt(&self, error: &anyhow::Error) -> Result<()> {
-    let state_path = self.cwd.join(TENET_DIR).join(store::STATE_FILE);
-    if !state_path.exists() {
-      return Ok(());
+    if store::has_unfinished_integration(&self.cwd).await? {
+      bail!("cannot replace current run state while an integration transaction requires recovery");
     }
     let mut state = store::read_state(&self.cwd).await?;
     if state.status == RunStatus::Failed {
@@ -241,6 +242,7 @@ impl Controller {
     state.active_leases.clear();
     state.candidate_integrations.clear();
     state.current_repair = None;
+    state.work_statuses.clear();
     state.last_summary = "Latest run attempt failed during preflight".into();
     state.last_error = Some(error.to_string());
     state.updated_at = Utc::now().to_rfc3339();
@@ -667,7 +669,7 @@ impl Controller {
           state.completed_work_units.push(CompletedWorkUnit {
             work_unit: transaction.work_unit.clone(),
             completed_at: Utc::now().to_rfc3339(),
-            verification_evidence: transaction.verification_evidence.clone(),
+            verification_run_id: transaction.verification_run_id,
           });
           state
             .work_statuses
@@ -726,12 +728,6 @@ impl Controller {
     state.last_summary = "Running controller-owned project verification".into();
     self.publish(&context.events, state).await?;
     let project_report = self.verify_revision(context, &verified_revision).await?;
-    store::save_evidence(
-      &self.cwd,
-      &format!("project-verification-{}", project_report.run_id),
-      &project_report,
-    )
-    .await?;
     evidence_graph::record_project_verification(&self.cwd, evidence_graph, &project_report).await?;
     context
       .events
@@ -768,7 +764,7 @@ impl Controller {
     state.last_summary = "Running independent semantic verification".into();
     self.publish(&context.events, state).await?;
     let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
-    let catalog_for_worker = catalog.clone();
+    let catalog_for_worker = assessment_catalog(catalog);
     let project_for_worker = project_report.clone();
     let evidence_for_worker = evidence_graph::projections(evidence_graph, policy)?;
     let backend = self.backend.clone();
@@ -1447,6 +1443,56 @@ fn advance_stagnation(state: &mut State, fingerprint: String, limit: u32) -> boo
   state.stagnation_count >= limit
 }
 
+fn assessment_catalog(catalog: &RequirementCatalog) -> RequirementCatalog {
+  let verification_obligations: Vec<_> = catalog
+    .verification_obligations
+    .iter()
+    .filter(|obligation| obligation.required)
+    .cloned()
+    .collect();
+  let criterion_ids: BTreeSet<_> = verification_obligations
+    .iter()
+    .map(|obligation| obligation.criterion_id.clone())
+    .collect();
+  let acceptance_criteria: Vec<_> = catalog
+    .acceptance_criteria
+    .iter()
+    .filter(|criterion| criterion_ids.contains(&criterion.id))
+    .cloned()
+    .collect();
+  let requirement_ids: BTreeSet<_> = acceptance_criteria
+    .iter()
+    .map(|criterion| criterion.requirement_id.clone())
+    .collect();
+  let requirements: Vec<_> = catalog
+    .requirements
+    .iter()
+    .filter(|requirement| requirement_ids.contains(&requirement.id))
+    .cloned()
+    .collect();
+  let fragment_ids: BTreeSet<_> = requirements
+    .iter()
+    .flat_map(|requirement| requirement.source_refs.iter())
+    .map(|reference| reference.fragment_id.clone())
+    .collect();
+  RequirementCatalog {
+    spec_hash: catalog.spec_hash.clone(),
+    requirements,
+    acceptance_criteria,
+    verification_obligations,
+    coverage: tenet_domain::worker::CatalogCoverage {
+      normative_fragments: catalog
+        .coverage
+        .normative_fragments
+        .iter()
+        .filter(|fragment| fragment_ids.contains(&fragment.id))
+        .cloned()
+        .collect(),
+      uncovered_fragment_ids: Vec::new(),
+    },
+  }
+}
+
 fn requirement_counts(
   catalog: &RequirementCatalog,
   graph: &EvidenceGraphState,
@@ -1705,7 +1751,7 @@ pub async fn manual_verify(cwd: &Path) -> Result<ProjectVerificationRun> {
   let config = ensure_config(cwd).await?;
   let revision = git::head(cwd).await?;
   let run_id = format!("manual-{}", Uuid::new_v4());
-  let workspaces = WorkspaceManager::new(cwd.to_path_buf(), run_id);
+  let workspaces = WorkspaceManager::new(cwd.to_path_buf(), run_id.clone());
   let report = verifier::run_project_verification_isolated(
     cwd,
     &workspaces,
@@ -1715,12 +1761,7 @@ pub async fn manual_verify(cwd: &Path) -> Result<ProjectVerificationRun> {
     &CancellationToken::new(),
   )
   .await?;
-  store::save_evidence(
-    cwd,
-    &format!("project-verification-{}", Uuid::new_v4()),
-    &report,
-  )
-  .await?;
+  store::record_manual_verification(cwd, &run_id, &report).await?;
   Ok(report)
 }
 

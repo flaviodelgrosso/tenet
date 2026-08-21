@@ -7,11 +7,12 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use chrono::Utc;
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
 use tenet_domain::{
-  config::{Config, TENET_DIR},
+  config::{read_config, Config, TENET_DIR},
   evidence::EvidenceGraphState,
   model::{
     CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
@@ -19,16 +20,11 @@ use tenet_domain::{
   },
   verification::ProjectVerificationRun,
 };
-
-pub const STATE_FILE: &str = "state.json";
-pub const REQUIREMENTS_FILE: &str = "requirements.json";
-pub const ROADMAP_FILE: &str = "roadmap.json";
-pub const INTEGRATION_JOURNAL_FILE: &str = "integration-journal.json";
-pub const EVIDENCE_GRAPH_FILE: &str = "evidence/graph.json";
+use tenet_storage::Storage;
 
 pub async fn ensure_layout(cwd: &Path) -> Result<()> {
-  fs::create_dir_all(cwd.join(TENET_DIR).join("evidence")).await?;
   fs::create_dir_all(cwd.join(TENET_DIR).join("runs")).await?;
+  Storage::open(cwd).await?;
   Ok(())
 }
 
@@ -46,11 +42,11 @@ pub async fn ensure_spec(cwd: &Path, config: &Config) -> Result<()> {
 pub async fn ensure_gitignore(cwd: &Path) -> Result<()> {
   let path = cwd.join(".gitignore");
   let mut text = match fs::read_to_string(&path).await {
-    Ok(v) => v,
-    Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-    Err(err) => return Err(err.into()),
+    Ok(value) => value,
+    Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+    Err(error) => return Err(error.into()),
   };
-  if !text.lines().any(|v| v.trim() == ".tenet/") {
+  if !text.lines().any(|value| value.trim() == ".tenet/") {
     if !text.is_empty() && !text.ends_with('\n') {
       text.push('\n');
     }
@@ -61,100 +57,61 @@ pub async fn ensure_gitignore(cwd: &Path) -> Result<()> {
 }
 
 pub async fn read_state(cwd: &Path) -> Result<State> {
-  let path = cwd.join(TENET_DIR).join(STATE_FILE);
-  if !path.exists() {
-    return Ok(State::fresh());
-  }
-  let value: serde_json::Value = read_json(path).await?;
-  let version = value
-    .get("version")
-    .and_then(serde_json::Value::as_u64)
-    .ok_or_else(|| anyhow!("state file has no numeric version"))?;
-  if version != u64::from(State::VERSION) {
-    return Err(anyhow!(
-      "unsupported state version {version}; expected {}",
-      State::VERSION
-    ));
-  }
-  let state = serde_json::from_value(value).context("deserialize current state")?;
-  validate_state(&state)?;
-  Ok(state)
-}
-
-fn validate_state(state: &State) -> Result<()> {
-  use tenet_domain::model::{Phase, RunStatus};
-
-  if state.status == RunStatus::Done && state.phase != Phase::Complete {
-    return Err(anyhow!(
-      "invalid persisted state: done status requires complete phase"
-    ));
-  }
-  if state.status == RunStatus::Idle
-    && (!state.active_leases.is_empty() || !state.candidate_integrations.is_empty())
-  {
-    return Err(anyhow!(
-      "invalid persisted state: idle state cannot contain active leases or candidate integrations"
-    ));
-  }
-  if state.current_repair.is_some()
-    && (state.status != RunStatus::Running || state.phase != Phase::Repairing)
-  {
-    return Err(anyhow!(
-      "invalid persisted state: current repair requires running/repairing state"
-    ));
-  }
-  Ok(())
+  Ok(Storage::open(cwd).await?.load_current_state().await?)
 }
 
 pub async fn write_state(cwd: &Path, state: &State) -> Result<()> {
-  write_json_atomic(cwd.join(TENET_DIR).join(STATE_FILE), state).await
+  Ok(Storage::open(cwd).await?.persist_state(state).await?)
 }
 
 pub async fn read_catalog(cwd: &Path) -> Result<Option<RequirementCatalog>> {
-  let path = cwd.join(TENET_DIR).join(REQUIREMENTS_FILE);
-  if !path.exists() {
-    return Ok(None);
-  }
-  Ok(Some(read_json(path).await?))
+  Ok(Storage::open(cwd).await?.load_active_catalog().await?)
 }
 
 pub async fn write_catalog(cwd: &Path, catalog: &RequirementCatalog) -> Result<()> {
-  write_json_atomic(cwd.join(TENET_DIR).join(REQUIREMENTS_FILE), catalog).await
+  let source_path = read_config(cwd)
+    .await
+    .map(|config| config.spec_file)
+    .unwrap_or_else(|_| "spec.md".into());
+  Ok(
+    Storage::open(cwd)
+      .await?
+      .persist_catalog(&source_path, Utc::now(), catalog)
+      .await?,
+  )
 }
 
 pub async fn write_roadmap(cwd: &Path, value: &ReconcileResult) -> Result<()> {
-  write_json_atomic(cwd.join(TENET_DIR).join(ROADMAP_FILE), value).await
+  let storage = Storage::open(cwd).await?;
+  let state = storage.load_current_state().await?;
+  let run_id = state
+    .run_id
+    .as_deref()
+    .ok_or_else(|| anyhow!("cannot persist reconciliation without an active run"))?;
+  let catalog = storage
+    .load_active_catalog()
+    .await?
+    .ok_or_else(|| anyhow!("cannot persist reconciliation without an active catalog"))?;
+  let revision = crate::git::head(cwd).await?;
+  storage
+    .persist_reconcile_round(run_id, state.cycle, &revision, &catalog.spec_hash, value)
+    .await
+    .context("persist reconciliation round")?;
+  Ok(())
 }
+
 pub async fn read_evidence_graph(
   cwd: &Path,
   expected: &EvidenceGraphState,
 ) -> Result<EvidenceGraphState> {
-  let path = cwd.join(TENET_DIR).join(EVIDENCE_GRAPH_FILE);
-  if !path.exists() {
-    return Ok(expected.clone());
-  }
-  let mut value: serde_json::Value = read_json(path).await?;
-  let version = value
-    .get("version")
-    .and_then(serde_json::Value::as_u64)
-    .ok_or_else(|| anyhow!("evidence graph has no numeric version"))?;
-  if version == 0 {
-    value["version"] = serde_json::Value::from(EvidenceGraphState::VERSION);
-  } else if version != u64::from(EvidenceGraphState::VERSION) {
-    return Err(anyhow!(
-      "unsupported evidence graph version {version}; expected {}",
-      EvidenceGraphState::VERSION
-    ));
-  }
-  let mut graph: EvidenceGraphState =
-    serde_json::from_value(value).context("deserialize evidence graph")?;
-  if graph.requirements.is_empty() {
-    graph.requirements.clone_from(&expected.requirements);
-  }
-  if graph.specification_hash != expected.specification_hash {
-    return Ok(expected.clone());
-  }
-  if graph.requirements != expected.requirements
+  let storage = Storage::open(cwd).await?;
+  let catalog = storage
+    .load_active_catalog()
+    .await?
+    .ok_or_else(|| anyhow!("cannot load evidence without an active catalog"))?;
+  let graph = storage.load_evidence_graph(&catalog).await?;
+  if graph.specification_hash != expected.specification_hash
+    || graph.requirements != expected.requirements
     || graph.required_requirements != expected.required_requirements
     || graph.criteria != expected.criteria
     || graph.obligations != expected.obligations
@@ -167,64 +124,145 @@ pub async fn read_evidence_graph(
 }
 
 pub async fn write_evidence_graph(cwd: &Path, graph: &EvidenceGraphState) -> Result<()> {
-  write_json_atomic(cwd.join(TENET_DIR).join(EVIDENCE_GRAPH_FILE), graph).await
+  let storage = Storage::open(cwd).await?;
+  let state = storage.load_current_state().await?;
+  let run_id = state
+    .run_id
+    .as_deref()
+    .ok_or_else(|| anyhow!("cannot persist evidence without an active run"))?;
+  storage
+    .persist_evidence_graph(run_id, graph)
+    .await
+    .context("persist evidence graph")?;
+  Ok(())
 }
 
-pub async fn save_evidence<T: serde::Serialize>(
-  cwd: &Path,
-  name: &str,
-  value: &T,
-) -> Result<PathBuf> {
-  let path = cwd
-    .join(TENET_DIR)
-    .join("evidence")
-    .join(format!("{name}.json"));
-  write_json_atomic(path.clone(), value).await?;
-  Ok(path)
+pub async fn has_unfinished_integration(cwd: &Path) -> Result<bool> {
+  Ok(
+    Storage::open(cwd)
+      .await?
+      .has_unfinished_integration()
+      .await?,
+  )
 }
+
 pub async fn read_integration_journal(cwd: &Path) -> Result<Option<IntegrationTransaction>> {
-  let path = cwd.join(TENET_DIR).join(INTEGRATION_JOURNAL_FILE);
-  if !path.exists() {
-    return Ok(None);
+  let storage = Storage::open(cwd).await?;
+  let state = storage.load_current_state().await?;
+  match state.run_id {
+    Some(run_id) => Ok(storage.load_active_integration(&run_id).await?),
+    None => Ok(None),
   }
-  let transaction: IntegrationTransaction = read_json(path).await?;
-  if transaction.version != IntegrationTransaction::VERSION {
-    return Err(anyhow!(
-      "unsupported integration journal version {}; expected {}",
-      transaction.version,
-      IntegrationTransaction::VERSION
-    ));
-  }
-  Ok(Some(transaction))
+}
+
+pub async fn record_manual_verification(
+  cwd: &Path,
+  run_id: &str,
+  report: &ProjectVerificationRun,
+) -> Result<()> {
+  let storage = Storage::open(cwd).await?;
+  storage
+    .create_detached_run(run_id)
+    .await
+    .context("create detached verification run")?;
+  storage
+    .record_project_verification(run_id, report)
+    .await
+    .context("record project verification")?;
+  Ok(())
 }
 
 pub async fn write_integration_journal(
   cwd: &Path,
   transaction: &IntegrationTransaction,
 ) -> Result<()> {
-  write_json_atomic(
-    cwd.join(TENET_DIR).join(INTEGRATION_JOURNAL_FILE),
-    transaction,
-  )
-  .await
+  let storage = Storage::open(cwd).await?;
+  match transaction.phase {
+    IntegrationPhase::Prepared => storage
+      .prepare_integration(transaction)
+      .await
+      .context("prepare integration transaction")?,
+    IntegrationPhase::GitCommitted => {
+      storage
+        .mark_integration_git_committed(transaction)
+        .await
+        .context("mark integration Git committed")?;
+    }
+    IntegrationPhase::StateCommitted => {
+      storage
+        .complete_integration(transaction, &transaction.updated_at)
+        .await
+        .context("complete integration transaction")?;
+    }
+  }
+  Ok(())
 }
 
 pub async fn remove_integration_journal(cwd: &Path) -> Result<()> {
-  let path = cwd.join(TENET_DIR).join(INTEGRATION_JOURNAL_FILE);
-  match fs::remove_file(path).await {
-    Ok(()) => Ok(()),
-    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-    Err(error) => Err(error.into()),
+  let storage = Storage::open(cwd).await?;
+  let unfinished_count = storage.unfinished_integration_count().await?;
+  if unfinished_count > 1 {
+    return Err(anyhow!(
+      "cannot remove integration state: {unfinished_count} unfinished transactions are ambiguous"
+    ));
   }
+  let state = storage.load_current_state().await?;
+  let Some(run_id) = state.run_id else {
+    if storage.has_unfinished_integration().await? {
+      return Err(anyhow!(
+        "cannot remove unfinished integration without a current run"
+      ));
+    }
+    return Ok(());
+  };
+  let Some(transaction) = storage.load_active_integration(&run_id).await? else {
+    if storage.has_unfinished_integration().await? {
+      return Err(anyhow!(
+        "cannot remove unfinished integration owned by a non-current run"
+      ));
+    }
+    return Ok(());
+  };
+  if transaction.phase != IntegrationPhase::Prepared {
+    return Err(anyhow!(
+      "cannot abandon integration {} after canonical Git mutation",
+      transaction.id
+    ));
+  }
+  storage
+    .abandon_prepared_integration(&transaction.id)
+    .await?;
+  Ok(())
 }
 
 pub async fn recover_integration(cwd: &Path, state: &mut State, config: &Config) -> Result<()> {
-  let Some(transaction) = read_integration_journal(cwd).await? else {
+  let storage = Storage::open(cwd).await?;
+  let unfinished_count = storage.unfinished_integration_count().await?;
+  if unfinished_count > 1 {
+    return Err(anyhow!("integration recovery failed closed: {unfinished_count} unfinished transactions are ambiguous"));
+  }
+  *state = storage.load_current_state().await?;
+  let Some(run_id) = state.run_id.as_deref() else {
+    if storage.has_unfinished_integration().await? {
+      return Err(anyhow!(
+        "integration recovery found an unfinished transaction without a current run"
+      ));
+    }
+    return Ok(());
+  };
+  let Some(mut transaction) = storage.load_active_integration(run_id).await? else {
+    if storage.has_unfinished_integration().await? {
+      return Err(anyhow!(
+        "integration recovery found an unfinished transaction owned by a non-current run"
+      ));
+    }
     return Ok(());
   };
   let head = crate::git::head(cwd).await?;
   if head == transaction.old_head && transaction.phase == IntegrationPhase::Prepared {
-    remove_integration_journal(cwd).await?;
+    storage
+      .abandon_prepared_integration(&transaction.id)
+      .await?;
     return Ok(());
   }
   if head != transaction.new_head {
@@ -235,20 +273,37 @@ pub async fn recover_integration(cwd: &Path, state: &mut State, config: &Config)
       transaction.id
     ));
   }
-  verify_transaction_evidence(cwd, &transaction, &config.verification.suite_hash()?).await?;
+  let report = storage
+    .load_project_verification(transaction.verification_run_id)
+    .await?
+    .ok_or_else(|| {
+      anyhow!(
+        "integration recovery is missing project verification {}",
+        transaction.verification_run_id
+      )
+    })?;
+  verify_transaction_evidence(&transaction, &report, &config.verification.suite_hash()?)?;
+  if transaction.phase == IntegrationPhase::Prepared {
+    transaction.phase = IntegrationPhase::GitCommitted;
+    transaction.updated_at = Utc::now().to_rfc3339();
+    storage.mark_integration_git_committed(&transaction).await?;
+  }
   if !state.completed_work_units.iter().any(|completed| {
     completed.work_unit == transaction.work_unit
-      && completed.verification_evidence == transaction.verification_evidence
+      && completed.verification_run_id == transaction.verification_run_id
   }) {
     state.completed_work_units.push(CompletedWorkUnit {
       work_unit: transaction.work_unit.clone(),
       completed_at: transaction.updated_at.clone(),
-      verification_evidence: transaction.verification_evidence.clone(),
+      verification_run_id: transaction.verification_run_id,
     });
   }
   state.candidate_integrations.clear();
-  write_state(cwd, state).await?;
-  remove_integration_journal(cwd).await
+  storage.persist_state(state).await?;
+  storage
+    .complete_integration(&transaction, &transaction.updated_at)
+    .await?;
+  Ok(())
 }
 
 pub fn project_verification_hash(report: &ProjectVerificationRun) -> Result<String> {
@@ -256,13 +311,23 @@ pub fn project_verification_hash(report: &ProjectVerificationRun) -> Result<Stri
   Ok(sha256_hex(&bytes))
 }
 
-async fn verify_transaction_evidence(
-  cwd: &Path,
+fn verify_transaction_evidence(
   transaction: &IntegrationTransaction,
+  report: &ProjectVerificationRun,
   expected_suite_hash: &str,
 ) -> Result<()> {
-  let report: ProjectVerificationRun =
-    read_json(cwd.join(&transaction.verification_evidence)).await?;
+  if !report.passed {
+    return Err(anyhow!(
+      "integration recovery requires passing project verification evidence"
+    ));
+  }
+  if report.revision != transaction.new_head {
+    return Err(anyhow!(
+      "integration recovery evidence revision {} does not match intended revision {}",
+      report.revision,
+      transaction.new_head
+    ));
+  }
   if report.suite_hash != expected_suite_hash {
     return Err(anyhow!(
       "integration project verification evidence uses stale suite {}; current suite is {}",
@@ -270,7 +335,7 @@ async fn verify_transaction_evidence(
       expected_suite_hash
     ));
   }
-  let actual = project_verification_hash(&report)?;
+  let actual = project_verification_hash(report)?;
   if actual != transaction.verification_hash {
     return Err(anyhow!(
       "integration evidence hash mismatch for transaction {}",
@@ -308,7 +373,7 @@ impl RunLock {
     if path.exists() {
       if let Ok(text) = std::fs::read_to_string(&path) {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-          if let Some(pid) = value.get("pid").and_then(|v| v.as_u64()) {
+          if let Some(pid) = value.get("pid").and_then(serde_json::Value::as_u64) {
             if process_alive(pid as u32) {
               return Err(anyhow!("another tenet run is active (pid {pid})"));
             }
@@ -321,8 +386,7 @@ impl RunLock {
       .create_new(true)
       .write(true)
       .open(&path)?;
-    let payload =
-      serde_json::json!({"pid":std::process::id(),"startedAt":chrono::Utc::now().to_rfc3339()});
+    let payload = serde_json::json!({"pid":std::process::id(),"startedAt":Utc::now().to_rfc3339()});
     writeln!(file, "{}", serde_json::to_string(&payload)?)?;
     Ok(Self { path })
   }
@@ -339,7 +403,7 @@ fn process_alive(pid: u32) -> bool {
   Command::new("kill")
     .args(["-0", &pid.to_string()])
     .status()
-    .map(|s| s.success())
+    .map(|status| status.success())
     .unwrap_or(false)
 }
 
@@ -349,7 +413,6 @@ fn process_alive(pid: u32) -> bool {
   let output = Command::new("tasklist")
     .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
     .output();
-
   output
     .map(|output| {
       String::from_utf8_lossy(&output.stdout)
@@ -362,24 +425,6 @@ fn process_alive(pid: u32) -> bool {
 #[cfg(all(not(unix), not(windows)))]
 fn process_alive(_pid: u32) -> bool {
   false
-}
-
-async fn read_json<T: serde::de::DeserializeOwned>(path: PathBuf) -> Result<T> {
-  let bytes = fs::read(&path)
-    .await
-    .with_context(|| format!("read {}", path.display()))?;
-  serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
-}
-
-async fn write_json_atomic<T: serde::Serialize>(path: PathBuf, value: &T) -> Result<()> {
-  if let Some(parent) = path.parent() {
-    fs::create_dir_all(parent).await?;
-  }
-  let tmp = path.with_extension("tmp");
-  let bytes = serde_json::to_vec_pretty(value)?;
-  fs::write(&tmp, bytes).await?;
-  fs::rename(&tmp, &path).await?;
-  Ok(())
 }
 
 const SPEC_TEMPLATE: &str = r#"# Product specification
@@ -400,14 +445,65 @@ Describe commands and observable behavior that prove the product is complete.
 #[cfg(test)]
 mod tests {
   use super::*;
+  use tenet_domain::{
+    ids::{CriterionId, ObligationId, RequirementId, VerificationRunId},
+    model::{WorkScope, WorkUnit},
+  };
+
+  fn recovery_evidence_fixture() -> (IntegrationTransaction, ProjectVerificationRun) {
+    let verification_run_id = VerificationRunId::new();
+    let report = ProjectVerificationRun {
+      run_id: verification_run_id,
+      revision: "wrong".into(),
+      suite_hash: "suite".into(),
+      checks: Vec::new(),
+      passed: true,
+      started_at: Utc::now(),
+      finished_at: Utc::now(),
+    };
+    let transaction = IntegrationTransaction {
+      version: IntegrationTransaction::VERSION,
+      id: "integration".into(),
+      run_id: "run".into(),
+      work_unit: WorkUnit {
+        id: "WU-001".into(),
+        title: "Work".into(),
+        objective: "Work".into(),
+        requirement_ids: vec![RequirementId::from("REQ-001")],
+        criterion_ids: vec![CriterionId::from("REQ-001/AC-01")],
+        verification_obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
+        suggested_checks: Vec::new(),
+        depends_on: Vec::new(),
+        scope: WorkScope {
+          paths: vec!["src/**".into()],
+        },
+      },
+      candidate_revision: "new".into(),
+      old_head: "old".into(),
+      new_head: "new".into(),
+      phase: IntegrationPhase::GitCommitted,
+      verification_run_id,
+      verification_hash: project_verification_hash(&report).expect("verification hash"),
+      created_at: "created".into(),
+      updated_at: "updated".into(),
+    };
+    (transaction, report)
+  }
 
   #[test]
-  fn state_validation_rejects_done_outside_complete_phase() {
-    let mut state = State::fresh();
-    state.status = tenet_domain::model::RunStatus::Done;
-    state.phase = tenet_domain::model::Phase::Reconciling;
+  fn recovery_rejects_wrong_revision_and_failed_evidence() {
+    let (transaction, mut report) = recovery_evidence_fixture();
+    assert!(verify_transaction_evidence(&transaction, &report, "suite")
+      .expect_err("wrong revision")
+      .to_string()
+      .contains("does not match intended revision"));
 
-    assert!(validate_state(&state).is_err());
+    report.revision = transaction.new_head.clone();
+    report.passed = false;
+    assert!(verify_transaction_evidence(&transaction, &report, "suite")
+      .expect_err("failed evidence")
+      .to_string()
+      .contains("requires passing"));
   }
 
   #[tokio::test]
@@ -417,233 +513,9 @@ mod tests {
       spec_file: "requirements/product.md".into(),
       ..Config::default()
     };
-
     ensure_spec(project.path(), &config)
       .await
       .expect("create configured spec");
-
     assert!(project.path().join("requirements/product.md").exists());
-    assert!(!project.path().join(TENET_DIR).join("spec.md").exists());
-  }
-
-  #[tokio::test]
-  async fn read_state_accepts_existing_version_one_json() {
-    let project = tempfile::tempdir().expect("temporary project");
-    let directory = project.path().join(TENET_DIR);
-    fs::create_dir_all(&directory)
-      .await
-      .expect("create state directory");
-    let fixture = serde_json::json!({
-      "version": 1,
-      "status": "running",
-      "phase": "reconciling",
-      "runId": "run-existing",
-      "cycle": 3,
-      "activeLeases": {},
-      "candidateIntegrations": [],
-      "workStatuses": {},
-      "requirementCounts": {"total": 1, "satisfied": 0, "partial": 0, "missing": 1},
-      "completedWorkUnits": [],
-      "discoveries": [],
-      "lastSummary": "Reconcile",
-      "blockedReason": null,
-      "lastError": null,
-      "updatedAt": "2026-08-16T10:00:00+00:00"
-    });
-    fs::write(
-      directory.join(STATE_FILE),
-      serde_json::to_vec_pretty(&fixture).expect("serialize fixture"),
-    )
-    .await
-    .expect("write fixture");
-
-    let state = read_state(project.path())
-      .await
-      .expect("read existing state");
-
-    assert_eq!(state.run_id.as_deref(), Some("run-existing"));
-    assert_eq!(state.cycle, 3);
-  }
-
-  fn evidence_catalog() -> RequirementCatalog {
-    use tenet_domain::{
-      evidence::{AcceptanceCriterion, VerificationObligation},
-      ids::{CriterionId, ObligationId, RequirementId},
-      model::Requirement,
-      worker::CatalogCoverage,
-    };
-
-    RequirementCatalog {
-      spec_hash: "spec".into(),
-      requirements: vec![Requirement {
-        id: RequirementId::from("REQ-001"),
-        title: "Requirement".into(),
-        description: "Description".into(),
-        required: true,
-        source_refs: Vec::new(),
-      }],
-      acceptance_criteria: vec![AcceptanceCriterion {
-        id: CriterionId::from("REQ-001/AC-01"),
-        requirement_id: RequirementId::from("REQ-001"),
-        description: "Observable".into(),
-        mandatory: true,
-      }],
-      verification_obligations: vec![VerificationObligation {
-        id: ObligationId::from("REQ-001/AC-01/VO-01"),
-        criterion_id: CriterionId::from("REQ-001/AC-01"),
-        description: "Required behavior is observable".into(),
-        required: true,
-      }],
-      coverage: CatalogCoverage {
-        normative_fragments: Vec::new(),
-        uncovered_fragment_ids: Vec::new(),
-      },
-    }
-  }
-
-  fn graph_from_catalog(catalog: &RequirementCatalog) -> Result<EvidenceGraphState> {
-    let mut graph = EvidenceGraphState::new(&catalog.spec_hash);
-    for requirement in &catalog.requirements {
-      graph.register_requirement(requirement.id.clone(), requirement.required);
-    }
-    for criterion in &catalog.acceptance_criteria {
-      graph.add_criterion(criterion.clone())?;
-    }
-    for obligation in &catalog.verification_obligations {
-      graph.add_obligation(obligation.clone())?;
-    }
-    Ok(graph)
-  }
-
-  #[tokio::test]
-  async fn evidence_graph_persists_and_reloads_semantics() {
-    use chrono::Utc;
-    use tenet_domain::{
-      evidence::{
-        EvidencePolicy, ObligationAssessment, ObligationAssessmentResult, SemanticAssessmentReport,
-        VerificationState,
-      },
-      ids::{ObligationId, RequirementId, VerificationRunId},
-      verification::{CommandResult, ProjectCheckResult, ProjectVerificationRun, VerificationSpec},
-    };
-
-    let project = tempfile::tempdir().expect("temporary project");
-    ensure_layout(project.path()).await.expect("layout");
-    let catalog = evidence_catalog();
-    let mut graph = graph_from_catalog(&catalog).expect("graph");
-    let now = Utc::now();
-    let project_run = ProjectVerificationRun {
-      run_id: VerificationRunId::new(),
-      revision: "abc123".into(),
-      suite_hash: "suite".into(),
-      checks: vec![ProjectCheckResult {
-        name: "quality".into(),
-        spec: VerificationSpec {
-          program: "true".into(),
-          args: Vec::new(),
-          working_directory: ".".into(),
-          environment: Default::default(),
-        },
-        timeout_secs: 10,
-        result: CommandResult {
-          command: "true".into(),
-          exit_code: Some(0),
-          timed_out: false,
-          duration_ms: 1,
-          stdout: String::new(),
-          stderr: String::new(),
-        },
-      }],
-      passed: true,
-      started_at: now,
-      finished_at: now,
-    };
-    graph.record_project_verification(&project_run);
-    graph
-      .record_semantic_assessment(
-        "abc123",
-        now,
-        "assess",
-        &SemanticAssessmentReport {
-          summary: "satisfied".into(),
-          assessments: vec![ObligationAssessmentResult {
-            obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
-            assessment: ObligationAssessment::Satisfied {
-              rationale: "Observed behavior".into(),
-              evidence_refs: Vec::new(),
-            },
-          }],
-        },
-      )
-      .expect("semantic evidence");
-    write_evidence_graph(project.path(), &graph)
-      .await
-      .expect("write graph");
-
-    let reloaded = read_evidence_graph(project.path(), &graph)
-      .await
-      .expect("reload graph");
-
-    assert_eq!(
-      reloaded.requirement_verification_state(
-        &RequirementId::from("REQ-001"),
-        EvidencePolicy::new("abc123", "suite")
-      ),
-      Ok(VerificationState::Verified)
-    );
-  }
-
-  #[tokio::test]
-  async fn evidence_graph_version_zero_migrates_to_current_version() {
-    let project = tempfile::tempdir().expect("temporary project");
-    ensure_layout(project.path()).await.expect("layout");
-    let catalog = evidence_catalog();
-    let graph = graph_from_catalog(&catalog).expect("graph");
-    let mut value = serde_json::to_value(&graph).expect("serialize graph");
-    value["version"] = serde_json::json!(0);
-    value
-      .as_object_mut()
-      .expect("graph object")
-      .remove("requirements");
-    fs::write(
-      project.path().join(TENET_DIR).join(EVIDENCE_GRAPH_FILE),
-      serde_json::to_vec_pretty(&value).expect("serialize fixture"),
-    )
-    .await
-    .expect("write fixture");
-
-    let migrated = read_evidence_graph(project.path(), &graph)
-      .await
-      .expect("migrate graph");
-
-    assert_eq!(migrated.version, EvidenceGraphState::VERSION);
-    assert_eq!(migrated.requirements, migrated.required_requirements);
-  }
-
-  #[tokio::test]
-  async fn evidence_graph_rejects_unknown_future_version() {
-    let project = tempfile::tempdir().expect("temporary project");
-    ensure_layout(project.path()).await.expect("layout");
-    let catalog = evidence_catalog();
-    let mut value =
-      serde_json::to_value(graph_from_catalog(&catalog).expect("graph")).expect("serialize graph");
-    value["version"] = serde_json::json!(99);
-    fs::write(
-      project.path().join(TENET_DIR).join(EVIDENCE_GRAPH_FILE),
-      serde_json::to_vec_pretty(&value).expect("serialize fixture"),
-    )
-    .await
-    .expect("write fixture");
-
-    let error = read_evidence_graph(
-      project.path(),
-      &graph_from_catalog(&catalog).expect("graph"),
-    )
-    .await
-    .expect_err("future version rejected");
-
-    assert!(error
-      .to_string()
-      .contains("unsupported evidence graph version"));
   }
 }

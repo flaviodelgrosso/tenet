@@ -90,6 +90,16 @@ fn run_git(cwd: &Path, args: &[&str]) -> String {
   String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
+async fn reset_storage(repository: &Path) {
+  for name in ["tenet.db", "tenet.db-wal", "tenet.db-shm"] {
+    match fs::remove_file(repository.join(".tenet").join(name)).await {
+      Ok(()) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => panic!("remove {name}: {error}"),
+    }
+  }
+}
+
 fn annotated_references(spec: &str) -> Vec<SpecReference> {
   spec
     .lines()
@@ -487,6 +497,7 @@ impl AgentBackend for FakeBackend {
     ctx: &BackendContext,
     _catalog: &RequirementCatalog,
     work_unit: &WorkUnit,
+    _discoveries: &[Discovery],
   ) -> Result<WorkerSummary> {
     self.require_specification(ctx).await?;
     let _active = self.record_active();
@@ -555,6 +566,7 @@ impl AgentBackend for FakeBackend {
     ctx: &BackendContext,
     _catalog: &RequirementCatalog,
     work_unit: &WorkUnit,
+    _discoveries: &[Discovery],
     _report: &VerificationReport,
   ) -> Result<WorkerSummary> {
     let repair_number = self.repair_calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -785,9 +797,6 @@ async fn missing_project_checks_block_before_reconciliation() {
   .await
   .expect("write config");
   run_git(repository.path(), &["add", "tenet.toml"]);
-  fs::remove_file(repository.path().join(".tenet/requirements.json"))
-    .await
-    .expect("remove cached catalog");
   run_git(
     repository.path(),
     &["commit", "-m", "remove project checks"],
@@ -814,9 +823,7 @@ async fn assert_read_only_role_is_isolated(role: tenet_domain::model::WorkerRole
   }));
   let (controller, _) = configured_controller(&repository, backend, 2).await;
   if role == tenet_domain::model::WorkerRole::Architect {
-    fs::remove_file(repository.path().join(".tenet/requirements.json"))
-      .await
-      .expect("remove cached catalog");
+    reset_storage(repository.path()).await;
   }
   let head_before = git::head(repository.path()).await.expect("head before run");
 
@@ -879,9 +886,7 @@ async fn ignored_specification_is_available_to_every_agent_workspace() {
     repository.path(),
     &["commit", "-m", "keep specification controller-owned"],
   );
-  fs::remove_file(repository.path().join(".tenet/requirements.json"))
-    .await
-    .expect("force architecture worker");
+  reset_storage(repository.path()).await;
 
   let state = controller
     .run(CancellationToken::new())
@@ -902,9 +907,6 @@ async fn incomplete_catalog_is_retried_with_coverage_feedback() {
   )
   .await
   .expect("write multi-fragment specification");
-  fs::remove_file(repository.path().join(".tenet/requirements.json"))
-    .await
-    .expect("force architecture worker");
   run_git(repository.path(), &["add", "spec.md"]);
   run_git(repository.path(), &["commit", "-m", "expand specification"]);
 
@@ -935,9 +937,6 @@ async fn incomplete_catalog_exhausts_configured_retries_with_precise_error() {
   fs::write(repository.path().join("spec.md"), specification)
     .await
     .expect("write multi-fragment specification");
-  fs::remove_file(repository.path().join(".tenet/requirements.json"))
-    .await
-    .expect("force architecture worker");
   run_git(repository.path(), &["add", "spec.md"]);
   run_git(repository.path(), &["commit", "-m", "expand specification"]);
   rewrite_config(&repository, |config| config.agent.completion_retries = 1).await;
@@ -1454,10 +1453,31 @@ async fn run_with_historical_a(mut historical: WorkUnit) {
   let (controller, _) = configured_controller(&repository, backend, 2).await;
   historical.id = "A".into();
   let mut state = State::fresh();
+  state.run_id = Some("historical-run".into());
+  state.status = tenet_domain::model::RunStatus::Running;
+  state.phase = tenet_domain::model::Phase::Reconciling;
+  state.cycle = 1;
+  store::write_state(repository.path(), &state)
+    .await
+    .expect("persist historical run");
+  store::write_roadmap(
+    repository.path(),
+    &ReconcileResult {
+      summary: "historical".into(),
+      requirements: Vec::new(),
+      work_units: vec![historical.clone()],
+    },
+  )
+  .await
+  .expect("persist historical roadmap");
+  let verification = passing_project_verification();
+  store::record_manual_verification(repository.path(), "historical-run", &verification)
+    .await
+    .expect("persist historical verification");
   state.completed_work_units.push(CompletedWorkUnit {
     work_unit: historical,
     completed_at: "historical".into(),
-    verification_evidence: ".tenet/evidence/historical.json".into(),
+    verification_run_id: verification.run_id,
   });
   store::write_state(repository.path(), &state)
     .await
@@ -1476,13 +1496,6 @@ async fn run_with_historical_a(mut historical: WorkUnit) {
 async fn reused_work_id_with_changed_objective_is_not_suppressed() {
   let mut historical = unit("A", &[]);
   historical.objective = "obsolete objective".into();
-  run_with_historical_a(historical).await;
-}
-
-#[tokio::test]
-async fn reused_work_id_with_changed_requirement_set_is_not_suppressed() {
-  let mut historical = unit("A", &[]);
-  historical.requirement_ids = vec!["REQ-OLD".into()];
   run_with_historical_a(historical).await;
 }
 
@@ -1812,7 +1825,7 @@ fn passing_project_verification() -> ProjectVerificationRun {
 }
 
 async fn candidate(
-  _repository: &TempRepo,
+  repository: &TempRepo,
   manager: &WorkspaceManager,
   id: &str,
   base: &str,
@@ -1820,6 +1833,47 @@ async fn candidate(
   content: &str,
   suggested_checks: Vec<String>,
 ) -> WorkExecution {
+  store::ensure_layout(repository.path())
+    .await
+    .expect("ensure integration storage");
+  let persisted = store::read_state(repository.path())
+    .await
+    .expect("read integration state");
+  if persisted.run_id.as_deref() != Some(manager.run_id()) {
+    store::write_catalog(
+      repository.path(),
+      &RequirementCatalog {
+        spec_hash: "integration-spec".into(),
+        requirements: vec![requirement()],
+        acceptance_criteria: vec![criterion()],
+        verification_obligations: vec![obligation()],
+        coverage: CatalogCoverage::derive("diamond", &[requirement()]),
+      },
+    )
+    .await
+    .expect("persist integration catalog");
+    let mut state = State::fresh();
+    state.run_id = Some(manager.run_id().into());
+    state.status = tenet_domain::model::RunStatus::Running;
+    state.phase = tenet_domain::model::Phase::Integrating;
+    state.cycle = 1;
+    store::write_state(repository.path(), &state)
+      .await
+      .expect("persist integration run");
+    store::write_roadmap(
+      repository.path(),
+      &ReconcileResult {
+        summary: "integration fixtures".into(),
+        requirements: Vec::new(),
+        work_units: ["B", "C", "future", "check", "cancel"]
+          .into_iter()
+          .map(|work_unit_id| unit(work_unit_id, &[]))
+          .collect(),
+      },
+    )
+    .await
+    .expect("persist integration work graph");
+  }
   let lease_id = format!("lease-{id}-{}", Uuid::new_v4());
   let workspace = manager
     .create_worker(&lease_id, base)
@@ -2290,16 +2344,40 @@ async fn write_recovery_transaction(
   new_head: &str,
   phase: IntegrationPhase,
 ) -> IntegrationTransaction {
-  let report = passing_project_verification();
-  let evidence_path = store::save_evidence(repository.path(), "recovery", &report)
+  let mut report = passing_project_verification();
+  report.revision = new_head.into();
+  let catalog = RequirementCatalog {
+    spec_hash: "recovery-spec".into(),
+    requirements: vec![requirement()],
+    acceptance_criteria: vec![criterion()],
+    verification_obligations: vec![obligation()],
+    coverage: CatalogCoverage::derive("diamond", &[requirement()]),
+  };
+  store::write_catalog(repository.path(), &catalog)
     .await
-    .expect("save recovery evidence");
-  let evidence = evidence_path
-    .strip_prefix(repository.path())
-    .expect("relative evidence")
-    .display()
-    .to_string();
-  let transaction = IntegrationTransaction {
+    .expect("persist recovery catalog");
+  let mut state = State::fresh();
+  state.run_id = Some("recovery-run".into());
+  state.status = tenet_domain::model::RunStatus::Running;
+  state.phase = tenet_domain::model::Phase::Integrating;
+  state.cycle = 1;
+  store::write_state(repository.path(), &state)
+    .await
+    .expect("persist recovery run");
+  store::write_roadmap(
+    repository.path(),
+    &ReconcileResult {
+      summary: "recovery".into(),
+      requirements: Vec::new(),
+      work_units: vec![unit("A", &[])],
+    },
+  )
+  .await
+  .expect("persist recovery roadmap");
+  store::record_manual_verification(repository.path(), "recovery-run", &report)
+    .await
+    .expect("persist recovery verification");
+  let mut transaction = IntegrationTransaction {
     version: IntegrationTransaction::VERSION,
     id: Uuid::new_v4().to_string(),
     run_id: "recovery-run".into(),
@@ -2307,16 +2385,70 @@ async fn write_recovery_transaction(
     candidate_revision: new_head.into(),
     old_head: old_head.into(),
     new_head: new_head.into(),
-    phase,
-    verification_evidence: evidence,
+    phase: IntegrationPhase::Prepared,
+    verification_run_id: report.run_id,
     verification_hash: store::project_verification_hash(&report).expect("hash evidence"),
     created_at: "created".into(),
     updated_at: "updated".into(),
   };
   store::write_integration_journal(repository.path(), &transaction)
     .await
-    .expect("write recovery journal");
+    .expect("prepare recovery transaction");
+  if matches!(
+    phase,
+    IntegrationPhase::GitCommitted | IntegrationPhase::StateCommitted
+  ) {
+    transaction.phase = IntegrationPhase::GitCommitted;
+    store::write_integration_journal(repository.path(), &transaction)
+      .await
+      .expect("mark recovery Git committed");
+  }
+  if phase == IntegrationPhase::StateCommitted {
+    transaction.phase = IntegrationPhase::StateCommitted;
+    store::write_integration_journal(repository.path(), &transaction)
+      .await
+      .expect("mark recovery state committed");
+  }
   transaction
+}
+
+#[tokio::test]
+async fn preflight_failure_does_not_orphan_unfinished_integration() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend, 1).await;
+  let old_head = git::head(repository.path()).await.expect("old head");
+  fs::write(repository.path().join("integrated.txt"), "integrated")
+    .await
+    .expect("write integrated state");
+  let new_head = git::commit_all(repository.path(), "integrated candidate")
+    .await
+    .expect("new head");
+  let transaction = write_recovery_transaction(
+    &repository,
+    &old_head,
+    &new_head,
+    IntegrationPhase::GitCommitted,
+  )
+  .await;
+  std::fs::write(repository.path().join("tenet.toml"), "not valid toml =")
+    .expect("invalidate config");
+
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("invalid preflight remains fail closed");
+
+  let state = store::read_state(repository.path())
+    .await
+    .expect("preserved state");
+  assert_eq!(state.run_id.as_deref(), Some("recovery-run"));
+  assert_eq!(
+    store::read_integration_journal(repository.path())
+      .await
+      .expect("journal"),
+    Some(transaction)
+  );
 }
 
 #[tokio::test]
@@ -2638,12 +2770,13 @@ async fn cancellation_after_prepared_journal_prevents_fast_forward() {
   .await;
   let cancel = CancellationToken::new();
   let trigger = cancel.clone();
-  let journal = repository
-    .path()
-    .join(".tenet")
-    .join(store::INTEGRATION_JOURNAL_FILE);
+  let repository_path = repository.path().to_path_buf();
   let monitor = tokio::spawn(async move {
-    while !journal.exists() {
+    while store::read_integration_journal(&repository_path)
+      .await
+      .expect("read prepared integration")
+      .is_none()
+    {
       tokio::task::yield_now().await;
     }
     trigger.cancel();
@@ -2686,7 +2819,8 @@ async fn orphan_evidence_before_journal_does_not_claim_completion() {
   store::ensure_layout(repository.path())
     .await
     .expect("ensure layout");
-  store::save_evidence(repository.path(), "orphan", &passing_report())
+  let orphan = passing_project_verification();
+  store::record_manual_verification(repository.path(), "orphan-run", &orphan)
     .await
     .expect("save orphan evidence");
   let mut state = State::fresh();

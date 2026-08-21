@@ -6,6 +6,19 @@ pub use crate::worker::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::ids::VerificationRunId;
+
+/// Exact controller-state payload supplied to Implement and Repair workers.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MutationWorkerContext<'a> {
+  pub work_unit: &'a WorkUnit,
+  pub catalog: &'a RequirementCatalog,
+  pub discoveries: &'a [Discovery],
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub previous_verification: Option<&'a VerificationReport>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -77,8 +90,8 @@ pub struct CompletedWorkUnit {
   pub work_unit: WorkUnit,
   #[serde(rename = "completedAt")]
   pub completed_at: String,
-  #[serde(rename = "verificationEvidence")]
-  pub verification_evidence: String,
+  #[serde(rename = "verificationRunId")]
+  pub verification_run_id: VerificationRunId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,8 +183,8 @@ pub struct IntegrationTransaction {
   #[serde(rename = "newHead")]
   pub new_head: String,
   pub phase: IntegrationPhase,
-  #[serde(rename = "verificationEvidence")]
-  pub verification_evidence: String,
+  #[serde(rename = "verificationRunId")]
+  pub verification_run_id: VerificationRunId,
   #[serde(rename = "verificationHash")]
   pub verification_hash: String,
   #[serde(rename = "createdAt")]

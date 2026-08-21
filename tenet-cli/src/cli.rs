@@ -53,6 +53,57 @@ pub(crate) enum Command {
     #[arg(long)]
     json: bool,
   },
+  /// Check the authoritative SQLite database.
+  Db {
+    #[command(subcommand)]
+    command: DbCommand,
+  },
+  /// Export the current run-state projection.
+  State {
+    #[command(subcommand)]
+    command: DumpCommand,
+  },
+  /// Export the active requirement catalog.
+  Requirements {
+    #[command(subcommand)]
+    command: DumpCommand,
+  },
+  /// Export semantic and project evidence.
+  Evidence {
+    #[command(subcommand)]
+    command: EvidenceCommand,
+  },
+  /// Export the latest reconciliation roadmap.
+  Roadmap {
+    #[command(subcommand)]
+    command: DumpCommand,
+  },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DbCommand {
+  /// Run quick, foreign-key, and migration diagnostics.
+  Check,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DumpCommand {
+  /// Emit deterministic JSON to stdout.
+  Dump {
+    #[arg(long)]
+    json: bool,
+  },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum EvidenceCommand {
+  /// Emit deterministic JSON evidence to stdout.
+  Dump {
+    #[arg(long)]
+    json: bool,
+    #[arg(long)]
+    requirement: Option<String>,
+  },
 }
 
 #[derive(Subcommand)]
@@ -97,6 +148,39 @@ mod tests {
       Command::Run {
         quiet: false,
         verbose: false,
+      }
+    ));
+  }
+
+  #[test]
+  fn database_check_command_parses() {
+    let cli = Cli::try_parse_from(["tenet", "db", "check"]).expect("parse db check");
+    assert!(matches!(
+      cli.command,
+      Command::Db {
+        command: super::DbCommand::Check
+      }
+    ));
+  }
+
+  #[test]
+  fn evidence_dump_accepts_requirement_filter() {
+    let cli = Cli::try_parse_from([
+      "tenet",
+      "evidence",
+      "dump",
+      "--json",
+      "--requirement",
+      "REQ-001",
+    ])
+    .expect("parse evidence dump");
+    assert!(matches!(
+      cli.command,
+      Command::Evidence {
+        command: super::EvidenceCommand::Dump {
+          json: true,
+          requirement: Some(_)
+        }
       }
     ));
   }

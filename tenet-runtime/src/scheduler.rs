@@ -18,10 +18,12 @@ use tenet_domain::{
   config::Config,
   events::RunEvent,
   model::{
-    CommandResult, DeferredCandidate, RequirementCatalog, VerificationReport, WorkExecution,
-    WorkLease, WorkUnit, WorkerDiscovery, WorkerRole, WorkerSummary,
+    CommandResult, DeferredCandidate, Discovery, DiscoveryRecord, RequirementCatalog,
+    VerificationReport, WorkExecution, WorkLease, WorkUnit, WorkerDiscovery, WorkerRole,
+    WorkerSummary,
   },
 };
+use tenet_storage::Storage;
 
 use crate::{backend::BackendContext, git, protection, verifier, workspace::WorkspaceManager};
 
@@ -83,6 +85,7 @@ pub trait CandidateExecutor: Send + Sync {
     context: &BackendContext,
     catalog: &RequirementCatalog,
     work_unit: &WorkUnit,
+    discoveries: &[Discovery],
     previous_verification: Option<&VerificationReport>,
   ) -> Result<WorkerSummary>;
 }
@@ -312,6 +315,17 @@ async fn execute_lease(
   }
 }
 
+fn discovery_prompt_context(
+  persisted: &[DiscoveryRecord],
+  current: &[WorkerDiscovery],
+) -> Vec<Discovery> {
+  persisted
+    .iter()
+    .map(|record| record.discovery.clone())
+    .chain(current.iter().map(|record| record.discovery.clone()))
+    .collect()
+}
+
 async fn execute_and_commit(
   repository: &Path,
   executor: &Arc<dyn CandidateExecutor>,
@@ -323,6 +337,11 @@ async fn execute_and_commit(
 ) -> Result<LeaseOutcome> {
   let protected_paths = protected_paths(&context.config);
   let protected = protection::snapshot(&lease.workspace, &protected_paths).await?;
+  let worker_context = Storage::open(repository)
+    .await?
+    .load_current_work_unit_context(&lease.work_unit.id)
+    .await?;
+  let initial_discoveries = discovery_prompt_context(&worker_context.discoveries, &[]);
   let (worker_summary, mut discoveries, mut candidate_revision, mut changed_paths) =
     if let Some(deferred) = deferred {
       validate_deferred_candidate(repository, catalog, lease, deferred).await?;
@@ -347,7 +366,13 @@ async fn execute_and_commit(
         work_unit_id: lease.work_unit.id.clone(),
       });
       let worker_summary = executor
-        .execute(context, catalog, &lease.work_unit, None)
+        .execute(
+          context,
+          &worker_context.catalog,
+          &lease.work_unit,
+          &initial_discoveries,
+          None,
+        )
         .await
         .context("implementation worker")?;
       let mut discoveries: Vec<WorkerDiscovery> = worker_summary
@@ -369,8 +394,15 @@ async fn execute_and_commit(
           attempt,
         });
         let report = no_repository_changes_report();
+        let repair_context = discovery_prompt_context(&worker_context.discoveries, &discoveries);
         let repair_summary = executor
-          .execute(context, catalog, &lease.work_unit, Some(&report))
+          .execute(
+            context,
+            &worker_context.catalog,
+            &lease.work_unit,
+            &repair_context,
+            Some(&report),
+          )
           .await
           .context("repair worker after empty implementation")?;
         discoveries.extend(repair_summary.discoveries.into_iter().map(|discovery| {
@@ -432,8 +464,15 @@ async fn execute_and_commit(
       work_unit_id: lease.work_unit.id.clone(),
       attempt,
     });
+    let repair_context = discovery_prompt_context(&worker_context.discoveries, &discoveries);
     let repair_summary = executor
-      .execute(context, catalog, &lease.work_unit, Some(&verification))
+      .execute(
+        context,
+        &worker_context.catalog,
+        &lease.work_unit,
+        &repair_context,
+        Some(&verification),
+      )
       .await
       .context("repair worker")?;
     let repair_discoveries: Vec<_> = repair_summary
@@ -867,6 +906,37 @@ mod tests {
         paths: paths.iter().map(|path| (*path).into()).collect(),
       },
     }
+  }
+
+  #[test]
+  fn repair_prompt_context_includes_persisted_and_current_discoveries() {
+    let persisted_discovery = Discovery::Blocker {
+      description: "persisted".into(),
+    };
+    let current_discovery = Discovery::Dependency {
+      work_unit_id: "A".into(),
+      depends_on: "B".into(),
+      reason: "current".into(),
+    };
+    let persisted = vec![DiscoveryRecord {
+      fingerprint: "persisted".into(),
+      discovery: persisted_discovery.clone(),
+      catalog_hash: "catalog".into(),
+      repository_revision: "revision".into(),
+      work_unit_id: "A".into(),
+      role: WorkerRole::Implement,
+      cycle: 1,
+      status: tenet_domain::model::DiscoveryStatus::Active,
+    }];
+    let current = vec![WorkerDiscovery {
+      discovery: current_discovery.clone(),
+      role: WorkerRole::Repair,
+    }];
+
+    assert_eq!(
+      discovery_prompt_context(&persisted, &current),
+      vec![persisted_discovery, current_discovery]
+    );
   }
 
   #[test]

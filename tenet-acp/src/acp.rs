@@ -28,8 +28,8 @@ use serde_json::{json, Value};
 use tenet_domain::events::EventSink;
 use tenet_domain::evidence::{EvidenceProjection, SemanticAssessmentReport};
 use tenet_domain::model::{
-  ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, RequirementCatalog,
-  VerificationReport, WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
+  ArchitectOutput, CompletedWorkUnit, Discovery, MutationWorkerContext, ReconcileResult,
+  RequirementCatalog, VerificationReport, WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
 };
 use tenet_domain::verification::ProjectVerificationRun;
 use tokio::sync::oneshot;
@@ -141,15 +141,21 @@ impl AgentBackend for AcpRuntime {
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
     unit: &WorkUnit,
+    discoveries: &[Discovery],
   ) -> Result<WorkerSummary> {
+    let prompt_context = MutationWorkerContext {
+      work_unit: unit,
+      catalog,
+      discoveries,
+      previous_verification: None,
+    };
     self
       .run_typed(
         ctx,
         WorkerRole::Implement,
         format!(
-          "Implement this work unit now.\n\nWork unit:\n{}\n\nCatalog:\n{}",
-          serde_json::to_string_pretty(unit)?,
-          serde_json::to_string_pretty(catalog)?
+          "Implement this work unit now.\n\nController context:\n{}",
+          serde_json::to_string_pretty(&prompt_context)?
         ),
       )
       .await
@@ -160,9 +166,16 @@ impl AgentBackend for AcpRuntime {
     ctx: &BackendContext,
     catalog: &RequirementCatalog,
     unit: &WorkUnit,
+    discoveries: &[Discovery],
     report: &VerificationReport,
   ) -> Result<WorkerSummary> {
-    self.run_typed(ctx, WorkerRole::Repair, format!("Repair the assigned work unit from this deterministic verification report.\n\nWork unit:\n{}\n\nReport:\n{}\n\nCatalog:\n{}", serde_json::to_string_pretty(unit)?, serde_json::to_string_pretty(report)?, serde_json::to_string_pretty(catalog)?)).await
+    let prompt_context = MutationWorkerContext {
+      work_unit: unit,
+      catalog,
+      discoveries,
+      previous_verification: Some(report),
+    };
+    self.run_typed(ctx, WorkerRole::Repair, format!("Repair the assigned work unit from this deterministic controller context.\n\nController context:\n{}", serde_json::to_string_pretty(&prompt_context)?)).await
   }
 
   async fn assess(

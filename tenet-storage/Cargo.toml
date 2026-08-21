@@ -1,0 +1,23 @@
+[package]
+name = "tenet-storage"
+version.workspace = true
+edition.workspace = true
+description = "Transactional SQLite persistence for Tenet controller state"
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tenet-domain = { path = "../tenet-domain" }
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bench]]
+name = "storage"
+harness = false

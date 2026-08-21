@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -12,8 +12,12 @@ use tenet_domain::{
   },
   verification::ProjectVerificationRun,
 };
+use tenet_storage::Storage;
 
 use crate::{git, store, verifier, workspace::WorkspaceManager};
+
+// Give concurrently observing cancellation a bounded window after PREPARED becomes durable.
+const PREPARED_CANCELLATION_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntegrationOutcome {
@@ -127,36 +131,32 @@ impl Integrator {
       return Ok(IntegrationOutcome::ProjectVerificationFailed { report: regression });
     }
 
+    let run_id = self.workspaces.run_id();
+    Storage::open(&self.repository)
+      .await?
+      .record_project_verification(run_id, &regression)
+      .await?;
     let transaction_id = Uuid::new_v4().to_string();
-    let evidence_path = store::save_evidence(
-      &self.repository,
-      &format!("integration-{transaction_id}"),
-      &regression,
-    )
-    .await?;
-    let evidence = evidence_path
-      .strip_prefix(&self.repository)
-      .unwrap_or(&evidence_path)
-      .display()
-      .to_string();
     let now = Utc::now().to_rfc3339();
     let mut transaction = IntegrationTransaction {
       version: IntegrationTransaction::VERSION,
       id: transaction_id,
-      run_id: self.workspaces.run_id().into(),
+      run_id: run_id.into(),
       work_unit: candidate.lease.work_unit.clone(),
       candidate_revision: candidate.candidate_revision.clone(),
       old_head: self.accepted_revision.clone(),
       new_head: revision.clone(),
       phase: IntegrationPhase::Prepared,
-      verification_evidence: evidence,
+      verification_run_id: regression.run_id,
       verification_hash: store::project_verification_hash(&regression)?,
       created_at: now.clone(),
       updated_at: now,
     };
     store::write_integration_journal(&self.repository, &transaction).await?;
-    tokio::task::yield_now().await;
-    self.check_cancel()?;
+    tokio::select! {
+      () = self.cancel.cancelled() => self.check_cancel()?,
+      () = tokio::time::sleep(PREPARED_CANCELLATION_GRACE) => self.check_cancel()?,
+    }
     if git::head(&self.repository).await? != self.accepted_revision {
       anyhow::bail!("canonical HEAD changed before integration transaction commit");
     }

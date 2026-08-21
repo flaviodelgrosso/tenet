@@ -562,6 +562,16 @@ tenet status --json
 tenet verify
 tenet verify --json
 
+# Check SQLite integrity and foreign keys
+tenet db check
+
+# Export deterministic JSON projections (exports are never authoritative)
+tenet state dump --json
+tenet requirements dump --json
+tenet evidence dump --json
+tenet evidence dump --json --requirement REQ-001
+tenet roadmap dump --json
+
 # Manage ACP agents
 tenet agents list
 tenet agents search <query>
@@ -570,6 +580,12 @@ tenet agents setup
 tenet agents doctor
 tenet agents login
 ```
+
+### Controller-state storage and backup
+
+Controller-generated durable state lives in `.tenet/tenet.db`. SQLite WAL mode may also create `.tenet/tenet.db-wal` and `.tenet/tenet.db-shm` while Tenet is running; all three belong to controller state. The specification and `tenet.toml` remain ordinary authoritative files.
+
+Do not copy a live `tenet.db` file while the controller is writing. Stop Tenet first, run `tenet db check`, then copy the database with no live `-wal` file, or capture deterministic JSON projections with the dump commands above. Dump output is for inspection and recovery tooling; normal execution never reads it back.
 
 ---
 
@@ -580,7 +596,8 @@ Tenet is split into Rust crates with deliberate dependency boundaries.
 | Crate                  | Responsibility                                                                                                                                                       |
 | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`tenet-domain`**     | Semantic state, IDs, evidence types, worker contracts, configuration, and pure invariants                                                                            |
-| **`tenet-runtime`**    | Repository operations, workspaces, scheduling mechanisms, verification execution, integration, and persistence                                                       |
+| **`tenet-storage`**    | SQLite connection policy, embedded migrations, relational persistence, targeted projections, and integrity diagnostics                                                 |
+| **`tenet-runtime`**    | Repository operations, workspaces, scheduling mechanisms, verification execution, and integration                                                                          |
 | **`tenet-controller`** | The control loop — owns catalog trust policy, evidence trust policy, verification authorization, scheduling decisions, stopping conditions, and completion authority |
 | **`tenet-acp`**        | Adapts ACP-compatible coding-agent runtimes to the controller's agent backend interface                                                                              |
 | **`tenet-cli`**        | Console presentation, application composition, and command-line entry point                                                                                           |
