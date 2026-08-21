@@ -98,7 +98,6 @@ impl App {
 
   async fn initialize(&self) -> Result<()> {
     store::ensure_layout(&self.cwd).await?;
-    tenet_domain::config::ensure_config_schema(&self.cwd).await?;
     let config = tenet_domain::config::ensure_config(&self.cwd).await?;
     store::ensure_spec(&self.cwd, &config).await?;
     self.print_initialization();

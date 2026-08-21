@@ -473,7 +473,7 @@ pub fn config_schema_path(cwd: &Path) -> PathBuf {
   cwd.join(TENET_DIR).join(CONFIG_SCHEMA_FILE)
 }
 
-pub async fn ensure_config_schema(cwd: &Path) -> Result<()> {
+async fn ensure_config_schema(cwd: &Path) -> Result<()> {
   let path = config_schema_path(cwd);
   if let Some(parent) = path.parent() {
     fs::create_dir_all(parent).await?;
@@ -485,6 +485,7 @@ pub async fn ensure_config_schema(cwd: &Path) -> Result<()> {
 }
 
 pub async fn ensure_config(cwd: &Path) -> Result<Config> {
+  ensure_config_schema(cwd).await?;
   let path = config_path(cwd);
   if !path.exists() {
     let config = Config::default();
@@ -556,7 +557,8 @@ mod tests {
   use tempfile::tempdir;
 
   use super::{
-    config_path, ensure_config, read_config, Config, CONFIG_SCHEMA_DIRECTIVE, TENET_DIR,
+    config_path, config_schema_path, ensure_config, read_config, Config, CONFIG_SCHEMA_DIRECTIVE,
+    CONFIG_SCHEMA_FILE, TENET_DIR,
   };
   use crate::model::WorkerRole;
 
@@ -751,17 +753,24 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn generated_config_includes_an_empty_verification_gate_without_comments() {
+  async fn generated_config_creates_its_referenced_local_schema() {
     let project = tempdir().unwrap();
 
     ensure_config(project.path()).await.unwrap();
     let path = config_path(project.path());
     let generated = tokio::fs::read_to_string(&path).await.unwrap();
+    let schema: serde_json::Value = serde_json::from_str(
+      &tokio::fs::read_to_string(config_schema_path(project.path()))
+        .await
+        .unwrap(),
+    )
+    .unwrap();
     let error = read_config(project.path()).await.unwrap_err().to_string();
 
     assert_eq!(path, project.path().join("tenet.toml"));
     assert!(!project.path().join(TENET_DIR).join("config.toml").exists());
     assert!(generated.starts_with(&format!("#:schema {CONFIG_SCHEMA_DIRECTIVE}\n\n")));
+    assert_eq!(schema["$id"], CONFIG_SCHEMA_FILE);
     assert!(generated.contains("version = 1"));
     assert!(generated.contains("spec_file = \"spec.md\""));
     assert!(generated
