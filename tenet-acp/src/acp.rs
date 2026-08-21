@@ -1272,7 +1272,7 @@ mod tests {
   #[test]
   fn generated_contracts_deserialize_valid_architect_reconcile_and_worker_output() {
     let architect = json!({
-      "requirements":[{"id":"REQ-001","title":"Title","description":"Description","required":true,"sourceRefs":[{"section":null,"fragmentId":"SPEC-0001-example","textHash":"hash"}]}],
+      "requirements":[{"id":"REQ-001","title":"Title","description":"Description","required":true,"sourceRefs":["B0001-F01"]}],
       "acceptanceCriteria":[{"id":"REQ-001/AC-01","requirementId":"REQ-001","description":"Observable","mandatory":true}],
       "verificationObligations":[{"id":"REQ-001/AC-01/VO-01","criterionId":"REQ-001/AC-01","description":"Behavior is satisfied","required":true}]
     });

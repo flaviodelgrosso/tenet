@@ -25,9 +25,9 @@ Translate the authoritative product spec into a stable, exhaustive catalog of in
 Rules:
 - Never invent product scope not implied by the spec.
 - Requirements are product/quality requirements, not implementation micro-tasks.
-- Use stable sequential ids REQ-001, REQ-002, ... in spec order.
-- Use criterion ids REQ-NNN/AC-NN and obligation ids REQ-NNN/AC-NN/VO-NN in parent order.
-- Every controller-annotated normative fragment must map to at least one requirement. Copy its fragmentId, textHash, and section exactly into sourceRefs.
+- IDs are batch-local. In every assigned batch, restart requirement ids at REQ-001 and number them sequentially in that batch's spec order.
+- Use criterion ids REQ-NNN/AC-NN and obligation ids REQ-NNN/AC-NN/VO-NN in batch-local parent order. The controller renumbers all ids after merging batches.
+- Every controller-annotated sourceRef token in the assigned batch must map to at least one requirement. Copy only the exact short sourceRef tokens into sourceRefs; never emit SPEC fragment IDs, hashes, sections, or reference objects.
 - Treat every normative requirement as required, every acceptance criterion as mandatory, and every supporting obligation as required. Do not use false flags to remove scope.
 - Acceptance criteria describe observable, falsifiable truths. Verification obligations describe the semantic claims that must be established for those criteria; they never own execution authority.
 - Treat every obligation as semantic: provide its stable id, criterion id, description, and required flag only.
@@ -150,6 +150,14 @@ mod tests {
 
     assert!(prompt.contains("never own execution authority"));
     assert!(prompt.contains("Project verification commands come only from project configuration"));
+  }
+
+  #[test]
+  fn architect_restarts_ids_for_each_controller_assigned_batch() {
+    let prompt = full_role_prompt(WorkerRole::Architect, "requirements/product.md");
+
+    assert!(prompt.contains("In every assigned batch, restart requirement ids at REQ-001"));
+    assert!(prompt.contains("controller renumbers all ids after merging batches"));
   }
 
   #[test]

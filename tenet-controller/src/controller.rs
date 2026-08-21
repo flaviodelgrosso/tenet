@@ -955,41 +955,55 @@ impl Controller {
       state.work_statuses.clear();
       state.discoveries.clear();
     }
-    let annotated_spec = catalog::annotated_specification(&spec);
+    let catalog_authority = catalog::CatalogAuthority::derive(&spec);
+    let architect_batches = catalog_authority.architect_batches();
     state.last_summary = format!(
-      "Deriving requirement catalog from {}",
-      context.config.spec_file
+      "Deriving requirement catalog from {} in {} deterministic architect batch(es)",
+      context.config.spec_file,
+      architect_batches.len()
     );
     self.publish(&context.events, state).await?;
-    let mut feedback = None;
-    let mut attempt = 0;
-    let catalog = loop {
-      let architect_spec = match &feedback {
-        Some(feedback) => format!(
-          "{annotated_spec}\nDeterministic catalog validation rejected the previous result:\n{feedback}\nRegenerate the entire catalog. Cover every controller-annotated fragmentId in at least one requirement sourceRefs entry."
-        ),
-        None => annotated_spec.clone(),
-      };
-      let backend = self.backend.clone();
-      let output = self
-        .read_only_worker(context, "architect", move |inspection_context| async move {
-          backend
-            .architect(&inspection_context, &architect_spec)
-            .await
-        })
-        .await?;
-      let candidate = catalog::build(&spec, spec_hash.clone(), output)?;
-      let validation =
-        catalog::validate(&candidate).and_then(|()| catalog::validate_coverage(&candidate, &spec));
-      match validation {
-        Ok(()) => break candidate,
-        Err(error) if attempt == context.config.agent.completion_retries => return Err(error),
-        Err(error) => {
-          attempt += 1;
-          feedback = Some(format!("{error:#}"));
+    let mut catalog_batches = Vec::with_capacity(architect_batches.len());
+    for batch in architect_batches {
+      let mut feedback = None;
+      let mut attempt = 0;
+      let candidate = loop {
+        let architect_spec = match &feedback {
+          Some(feedback) => format!(
+            "{}\nDeterministic catalog validation rejected the previous result for this batch:\n{feedback}\nRegenerate this batch catalog and cover every assigned sourceRef token in at least one requirement sourceRefs entry.",
+            batch.annotated_specification
+          ),
+          None => batch.annotated_specification.clone(),
+        };
+        let backend = self.backend.clone();
+        let output = self
+          .read_only_worker(context, "architect", move |inspection_context| async move {
+            backend
+              .architect(&inspection_context, &architect_spec)
+              .await
+          })
+          .await?;
+        let candidate = catalog_authority
+          .build_batch(&batch, spec_hash.clone(), output)
+          .and_then(|candidate| {
+            catalog::validate(&candidate)?;
+            catalog::validate_batch_coverage(&candidate, &batch.fragment_ids)?;
+            Ok(candidate)
+          });
+        match candidate {
+          Ok(candidate) => break candidate,
+          Err(error) if attempt == context.config.agent.completion_retries => return Err(error),
+          Err(error) => {
+            attempt += 1;
+            feedback = Some(format!("{error:#}"));
+          }
         }
-      }
-    };
+      };
+      catalog_batches.push(candidate);
+    }
+    let catalog = catalog_authority.merge_batches(spec_hash, catalog_batches)?;
+    catalog::validate(&catalog)?;
+    catalog::validate_derived_coverage(&catalog)?;
     store::write_catalog(&self.cwd, &catalog).await?;
     context
       .events
@@ -1770,8 +1784,8 @@ mod tests {
   use super::*;
   use tenet_domain::{
     evidence::{AcceptanceCriterion, VerificationObligation},
-    ids::{CriterionId, ObligationId, RequirementId, VerificationRunId},
-    model::{ArchitectOutput, Requirement, RequirementAssessment},
+    ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId, VerificationRunId},
+    model::{ArchitectOutput, ArchitectRequirement, Requirement, RequirementAssessment},
     verification::{CommandResult, ProjectCheckResult, VerificationSpec},
     worker::{derive_normative_fragments, CatalogCoverage},
   };
@@ -1902,7 +1916,18 @@ mod tests {
   }
   fn architect_output(requirement: Requirement) -> ArchitectOutput {
     ArchitectOutput {
-      requirements: vec![requirement],
+      requirements: vec![ArchitectRequirement {
+        id: requirement.id,
+        title: requirement.title,
+        description: requirement.description,
+        required: requirement.required,
+        source_refs: requirement
+          .source_refs
+          .into_iter()
+          .enumerate()
+          .map(|(index, _)| ArchitectSourceRef::from(format!("B0001-F{:02}", index + 1)))
+          .collect(),
+      }],
       acceptance_criteria: catalog().acceptance_criteria,
       verification_obligations: catalog().verification_obligations,
     }
@@ -1923,15 +1948,13 @@ mod tests {
   }
 
   #[test]
-  fn architect_fragment_metadata_is_controller_normalized() {
+  fn architect_source_token_is_expanded_from_controller_metadata() {
     let specification = "Description";
     let fragment = derive_normative_fragments(specification)
       .into_iter()
       .next()
       .expect("normative fragment");
-    let mut requirement = catalog().requirements.remove(0);
-    requirement.source_refs[0].section = Some("Incorrect".into());
-    requirement.source_refs[0].text_hash = fragment.text_hash[..63].into();
+    let requirement = catalog().requirements.remove(0);
 
     let built = catalog::build(specification, "spec".into(), architect_output(requirement))
       .expect("build catalog");
@@ -1941,6 +1964,20 @@ mod tests {
       vec![fragment.reference()]
     );
     assert!(catalog::validate_coverage(&built, specification).is_ok());
+  }
+
+  #[test]
+  fn architect_unknown_source_token_is_rejected() {
+    let requirement = catalog().requirements.remove(0);
+    let mut output = architect_output(requirement);
+    output.requirements[0].source_refs = vec![ArchitectSourceRef::from("B9999-F01")];
+
+    let error = catalog::build("Description", "spec".into(), output)
+      .expect_err("unknown source token must fail closed");
+
+    assert!(error
+      .to_string()
+      .contains("references unknown architect source token B9999-F01"));
   }
 
   #[test]

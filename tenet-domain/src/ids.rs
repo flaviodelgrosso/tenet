@@ -67,6 +67,10 @@ semantic_id!(
   "Stable identity for one normative specification fragment."
 );
 semantic_id!(
+  ArchitectSourceRef,
+  "Controller-issued batch-bound architect source reference."
+);
+semantic_id!(
   WorkUnitId,
   "Stable work-unit identity used in serialized domain relationships."
 );

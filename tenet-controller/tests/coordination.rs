@@ -1,5 +1,5 @@
 use std::{
-  collections::BTreeMap,
+  collections::{BTreeMap, BTreeSet},
   path::{Path, PathBuf},
   process::Command,
   sync::{
@@ -29,16 +29,15 @@ use tenet_domain::{
     ObligationAssessmentResult, SemanticAssessmentReport, VerificationObligation,
     VerificationState,
   },
-  ids::SpecFragmentId,
-  ids::{CriterionId, ObligationId, RequirementId},
+  ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId},
   model::{
-    ArchitectOutput, CandidateCheck, CompletedWorkUnit, Discovery, DiscoveryRecord,
-    DiscoveryStatus, IntegrationPhase, IntegrationTransaction, ReconcileResult, Requirement,
-    RequirementAssessment, RequirementCatalog, State, VerificationReport, WorkExecution, WorkLease,
-    WorkScope, WorkUnit, WorkerRole, WorkerSummary,
+    ArchitectOutput, ArchitectRequirement, CandidateCheck, CompletedWorkUnit, Discovery,
+    DiscoveryRecord, DiscoveryStatus, IntegrationPhase, IntegrationTransaction, ReconcileResult,
+    Requirement, RequirementAssessment, RequirementCatalog, State, VerificationReport,
+    WorkExecution, WorkLease, WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
   verification::ProjectVerificationRun,
-  worker::{derive_normative_fragments, CatalogCoverage, SpecReference},
+  worker::{derive_normative_fragments, CatalogCoverage},
 };
 use tenet_runtime::{
   backend::{BackendContext, LaunchMetadata},
@@ -100,30 +99,20 @@ async fn reset_storage(repository: &Path) {
   }
 }
 
-fn annotated_references(spec: &str) -> Vec<SpecReference> {
+fn annotated_references(spec: &str) -> Vec<ArchitectSourceRef> {
   spec
     .lines()
-    .filter(|line| line.starts_with("[fragmentId="))
-    .map(|metadata| {
-      let metadata = metadata.trim_matches(['[', ']']);
-      let fields: BTreeMap<_, _> = metadata
-        .split_whitespace()
-        .filter_map(|field| field.split_once('='))
-        .collect();
-      SpecReference {
-        section: (fields["section"] != "<none>").then(|| fields["section"].to_owned()),
-        fragment_id: SpecFragmentId::from(fields["fragmentId"]),
-        text_hash: fields["textHash"].to_owned(),
-      }
-    })
+    .filter_map(|line| line.strip_prefix("[sourceRef="))
+    .filter_map(|metadata| metadata.split([' ', ']']).next())
+    .map(ArchitectSourceRef::from)
     .collect()
 }
 
-fn annotated_reference(spec: &str) -> SpecReference {
+fn annotated_reference(spec: &str) -> ArchitectSourceRef {
   annotated_references(spec)
     .into_iter()
     .next()
-    .expect("annotated fragment metadata")
+    .expect("annotated source token")
 }
 
 fn requirement_for(spec: &str) -> Requirement {
@@ -138,6 +127,22 @@ fn requirement_for(spec: &str) -> Requirement {
 
 fn requirement() -> Requirement {
   requirement_for("diamond")
+}
+
+fn architect_requirement() -> ArchitectRequirement {
+  let requirement = requirement();
+  ArchitectRequirement {
+    id: requirement.id,
+    title: requirement.title,
+    description: requirement.description,
+    required: requirement.required,
+    source_refs: requirement
+      .source_refs
+      .into_iter()
+      .enumerate()
+      .map(|(index, _)| ArchitectSourceRef::from(format!("B0001-F{:02}", index + 1)))
+      .collect(),
+  }
 }
 
 fn criterion() -> AcceptanceCriterion {
@@ -230,6 +235,7 @@ enum ScopeMutation {
 #[derive(Clone, Copy)]
 enum BackendMode {
   Normal,
+  LargeCatalog,
   EmptyImplementationThenRepair,
   RequireSpecification,
   IncompleteCatalogThenCorrect,
@@ -345,19 +351,22 @@ impl AgentBackend for FakeBackend {
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Architect)
       .await?;
-    let mut requirement = requirement();
+    let mut requirement = architect_requirement();
     let attempt = self.architect_calls.fetch_add(1, Ordering::SeqCst);
-    requirement.source_refs =
-      if matches!(self.mode, BackendMode::IncompleteCatalogThenCorrect) && attempt > 0 {
+    requirement.source_refs = if matches!(self.mode, BackendMode::LargeCatalog)
+      || matches!(self.mode, BackendMode::IncompleteCatalogThenCorrect) && attempt > 0
+    {
+      if matches!(self.mode, BackendMode::IncompleteCatalogThenCorrect) {
         self
           .semantic_feedback
           .lock()
           .expect("semantic feedback lock")
           .push((WorkerRole::Architect, spec.to_owned()));
-        annotated_references(spec)
-      } else {
-        vec![annotated_reference(spec)]
-      };
+      }
+      annotated_references(spec)
+    } else {
+      vec![annotated_reference(spec)]
+    };
     Ok(ArchitectOutput {
       requirements: vec![requirement],
       acceptance_criteria: vec![criterion()],
@@ -372,7 +381,7 @@ impl AgentBackend for FakeBackend {
   async fn reconcile(
     &self,
     ctx: &BackendContext,
-    _catalog: &RequirementCatalog,
+    catalog: &RequirementCatalog,
     _recent: &[CompletedWorkUnit],
     discoveries: &[Discovery],
     _evidence: &[tenet_domain::evidence::EvidenceProjection],
@@ -401,6 +410,37 @@ impl AgentBackend for FakeBackend {
     self
       .discoveries_seen
       .fetch_add(discoveries.len(), Ordering::SeqCst);
+    if matches!(self.mode, BackendMode::LargeCatalog) {
+      let requirements = catalog
+        .requirements
+        .iter()
+        .map(|requirement| {
+          let criterion_ids: BTreeSet<_> = catalog
+            .acceptance_criteria
+            .iter()
+            .filter(|criterion| criterion.requirement_id == requirement.id)
+            .map(|criterion| criterion.id.clone())
+            .collect();
+          RequirementAssessment {
+            requirement_id: requirement.id.clone(),
+            implementation_state: ImplementationState::Present,
+            observations: vec!["large specification behavior is present".into()],
+            missing_implementation: Vec::new(),
+            missing_evidence: catalog
+              .verification_obligations
+              .iter()
+              .filter(|obligation| criterion_ids.contains(&obligation.criterion_id))
+              .map(|obligation| obligation.id.clone())
+              .collect(),
+          }
+        })
+        .collect();
+      return Ok(ReconcileResult {
+        summary: "large catalog implementation present; evidence pending".into(),
+        requirements,
+        work_units: Vec::new(),
+      });
+    }
     let missing: std::collections::BTreeSet<_> = ["A", "B", "C", "D"]
       .into_iter()
       .filter(|id| !ctx.cwd.join(format!("{id}.txt")).exists())
@@ -604,7 +644,7 @@ impl AgentBackend for FakeBackend {
   async fn assess(
     &self,
     ctx: &BackendContext,
-    _catalog: &RequirementCatalog,
+    catalog: &RequirementCatalog,
     _project_verification: &ProjectVerificationRun,
     _evidence: &[tenet_domain::evidence::EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
@@ -628,6 +668,22 @@ impl AgentBackend for FakeBackend {
       } else if marker.exists() {
         bail!("assessment retry reused a dirty inspection workspace");
       }
+    }
+    if matches!(self.mode, BackendMode::LargeCatalog) {
+      return Ok(SemanticAssessmentReport {
+        summary: "large catalog independently assessed".into(),
+        assessments: catalog
+          .verification_obligations
+          .iter()
+          .map(|obligation| ObligationAssessmentResult {
+            obligation_id: obligation.id.clone(),
+            assessment: ObligationAssessment::Satisfied {
+              rationale: "the immutable revision satisfies the batch requirement".into(),
+              evidence_refs: vec!["README.txt".into()],
+            },
+          })
+          .collect(),
+      });
     }
     let satisfied = ["A", "B", "C", "D"]
       .iter()
@@ -840,7 +896,48 @@ async fn assert_read_only_role_is_isolated(role: tenet_domain::model::WorkerRole
     "normal candidate integrations should still advance HEAD"
   );
   let history = run_git(repository.path(), &["log", "--format=%s"]);
+
   assert!(!history.contains("malicious read-only mutation"));
+}
+#[tokio::test]
+async fn large_specification_is_architected_in_bounded_complete_batches() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::LargeCatalog));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  let specification = (1..=200)
+    .map(|index| format!("Normative requirement {index}."))
+    .collect::<Vec<_>>()
+    .join("\n\n");
+  fs::write(repository.path().join("spec.md"), &specification)
+    .await
+    .expect("write large specification");
+  run_git(repository.path(), &["add", "spec.md"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "add large specification"],
+  );
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("large catalog proceeds through the controller");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("read catalog")
+    .expect("persisted catalog");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert_eq!(backend.architect_calls.load(Ordering::SeqCst), 4);
+  assert_eq!(catalog.coverage.normative_fragments.len(), 200);
+  assert!(catalog.coverage.is_complete());
+  assert_eq!(
+    catalog
+      .requirements
+      .iter()
+      .flat_map(|requirement| &requirement.source_refs)
+      .count(),
+    200
+  );
 }
 
 #[tokio::test]

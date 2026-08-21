@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use crate::{
   error::DomainValidationError,
   evidence::{AcceptanceCriterion, ImplementationState, VerificationObligation},
-  ids::{CriterionId, ObligationId, RequirementId, SpecFragmentId, WorkUnitId},
+  ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId, SpecFragmentId, WorkUnitId},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -187,6 +187,18 @@ pub struct Requirement {
   pub source_refs: Vec<SpecReference>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ArchitectRequirement {
+  pub id: RequirementId,
+  pub title: String,
+  pub description: String,
+  #[serde(default = "default_true")]
+  pub required: bool,
+  #[serde(rename = "sourceRefs")]
+  pub source_refs: Vec<ArchitectSourceRef>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequirementCatalog {
   #[serde(rename = "specHash")]
@@ -202,7 +214,7 @@ pub struct RequirementCatalog {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ArchitectOutput {
-  pub requirements: Vec<Requirement>,
+  pub requirements: Vec<ArchitectRequirement>,
   #[serde(rename = "acceptanceCriteria")]
   pub acceptance_criteria: Vec<AcceptanceCriterion>,
   #[serde(rename = "verificationObligations")]

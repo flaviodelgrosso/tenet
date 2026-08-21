@@ -1,8 +1,8 @@
 pub use crate::verification::{CommandResult, RepositoryChange, VerificationReport};
 pub use crate::worker::{
-  ArchitectOutput, CandidateCheck, Discovery, DiscoveryRecord, DiscoveryStatus, ReconcileResult,
-  Requirement, RequirementAssessment, RequirementCatalog, WorkScope, WorkUnit, WorkerDiscovery,
-  WorkerEvent, WorkerRole, WorkerSummary,
+  ArchitectOutput, ArchitectRequirement, CandidateCheck, Discovery, DiscoveryRecord,
+  DiscoveryStatus, ReconcileResult, Requirement, RequirementAssessment, RequirementCatalog,
+  WorkScope, WorkUnit, WorkerDiscovery, WorkerEvent, WorkerRole, WorkerSummary,
 };
 use serde::{Deserialize, Serialize};
 
