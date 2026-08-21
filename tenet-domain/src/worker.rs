@@ -226,9 +226,11 @@ pub struct ArchitectOutput {
 pub struct RequirementAssessment {
   #[serde(rename = "requirementId")]
   pub requirement_id: RequirementId,
+  /// Implementation completeness only. Independent from verification and evidence state.
   #[serde(rename = "implementationState")]
   pub implementation_state: ImplementationState,
   pub observations: Vec<String>,
+  /// Concrete implementation gaps. Must be empty when implementationState is present and non-empty otherwise.
   #[serde(rename = "missingImplementation")]
   pub missing_implementation: Vec<String>,
   #[serde(rename = "missingEvidence")]

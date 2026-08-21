@@ -91,7 +91,7 @@ pub struct AcpReadiness {
 
 fn semantic_feedback(feedback: Option<&str>) -> String {
   feedback
-    .map(|feedback| format!("\n\nDeterministic semantic validation rejected your previous structured result:\n{feedback}\nRegenerate the entire result and correct the reported relationships."))
+    .map(|feedback| format!("\n\nDeterministic semantic validation rejected your previous structured result:\n{feedback}\nRegenerate the entire result."))
     .unwrap_or_default()
 }
 
@@ -1226,6 +1226,16 @@ mod tests {
   }
 
   #[test]
+  fn semantic_feedback_preserves_validation_specific_guidance() {
+    let feedback = semantic_feedback(Some(
+      "REQ-025 is internally inconsistent. Regenerate the complete reconciliation result.",
+    ));
+
+    assert!(feedback.contains("REQ-025 is internally inconsistent"));
+    assert!(!feedback.contains("correct the reported relationships"));
+  }
+
+  #[test]
   fn model_options_are_requested_when_initial_options_only_contain_other_categories() {
     let options = vec![SessionConfigOption::select(
       "thinking",
@@ -1267,6 +1277,19 @@ mod tests {
 
     assert!(properties.contains_key("workUnits"));
     assert!(!properties.contains_key("work_units"));
+  }
+
+  #[test]
+  fn generated_reconcile_schema_describes_implementation_state_semantics() {
+    let schema = schema_for::<ReconcileResult>().expect("generate reconcile schema");
+    let schema = serde_json::to_string(&schema).expect("serialize reconcile schema");
+
+    assert!(schema.contains("All required implementation for the requirement exists"));
+    assert!(schema.contains("Some required implementation exists"));
+    assert!(schema.contains("The required implementation does not exist"));
+    assert!(schema.contains("Repository inspection cannot determine"));
+    assert!(schema.contains("Independent from verification and evidence state"));
+    assert!(schema.contains("Must be empty when implementationState is present"));
   }
 
   #[test]

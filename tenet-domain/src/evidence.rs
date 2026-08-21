@@ -10,12 +10,17 @@ use crate::{
   verification::{ProjectCheckResult, ProjectVerificationRun},
 };
 
+/// Implementation completeness observed in the repository, independent from verification and evidence state.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ImplementationState {
+  /// All required implementation for the requirement exists.
   Present,
+  /// Some required implementation exists, but required behavior is missing or incomplete.
   Partial,
+  /// The required implementation does not exist.
   Absent,
+  /// Repository inspection cannot determine whether the required implementation exists.
   Unknown,
 }
 

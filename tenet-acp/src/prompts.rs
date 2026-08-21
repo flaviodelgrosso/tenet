@@ -42,8 +42,14 @@ const RECONCILE: &str = r#"You are the reconciliation layer of an autonomous spe
 Compare the repository implementation against the authoritative requirement catalog. Inspect actual code, tests, configuration, and docs; prior completion claims are not evidence.
 
 Rules:
-- Report implementationState independently from verification. observations are advisory repository observations, never authoritative evidence.
-- Identify concrete missingImplementation gaps and missingEvidence by verification obligation id.
+- Report implementationState independently from verification and evidence state; it concerns implementation completeness only. observations are advisory repository observations, never authoritative evidence.
+- implementationState semantics:
+  - present: All required implementation for this requirement exists. missingImplementation MUST be empty.
+  - partial: Some required implementation exists, but one or more required behaviors are missing or incomplete. missingImplementation MUST contain at least one concrete gap.
+  - absent: The required implementation does not exist. missingImplementation MUST contain at least one concrete gap.
+  - unknown: Repository inspection cannot determine whether the required implementation exists. missingImplementation MUST contain a concrete explanation of what could not be established.
+- If missingImplementation is non-empty, implementationState MUST NOT be present.
+- Identify missingEvidence independently by verification obligation id.
 - Do not declare requirements verified or complete. The controller derives verification from executed, revision-bound evidence.
 - If implementation work remains, propose the smallest coherent dependency graph of candidate work units.
 - Bind every proposed check to an existing verification obligation. Each command must be executable, non-interactive, deterministic, self-contained, and perform its own assertion.
@@ -133,6 +139,19 @@ mod tests {
     assert!(prompt.contains("missingEvidence"));
     assert!(prompt.contains("Do not declare requirements verified or complete"));
     assert!(prompt.contains("controller-derived discoveries"));
+  }
+
+  #[test]
+  fn reconcile_defines_every_implementation_state_and_gap_invariant() {
+    let prompt = full_role_prompt(WorkerRole::Reconcile, "requirements/product.md");
+
+    assert!(prompt.contains("present: All required implementation for this requirement exists"));
+    assert!(prompt.contains("partial: Some required implementation exists"));
+    assert!(prompt.contains("absent: The required implementation does not exist"));
+    assert!(prompt.contains("unknown: Repository inspection cannot determine"));
+    assert!(prompt.contains("missingImplementation MUST be empty"));
+    assert!(prompt.contains("missingImplementation MUST contain at least one concrete gap"));
+    assert!(prompt.contains("implementation completeness only"));
   }
 
   #[test]

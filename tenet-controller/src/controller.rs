@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use tenet_domain::{
   config::{config_path, ensure_config, read_config, TENET_DIR},
+  error::DomainValidationError,
   events::{
     CompletionGate, CompletionGateItem, CompletionGateOutcome, EventSink, RunEvent, RunLogger,
   },
@@ -23,6 +24,7 @@ use tenet_domain::{
     EvidenceGraphState, EvidencePolicy, ImplementationState, ObligationAssessment,
     SemanticAssessmentReport, VerificationState,
   },
+  ids::RequirementId,
   model::{
     CompletedWorkUnit, Discovery, DiscoveryRecord, DiscoveryStatus, IntegrationPhase, Phase,
     ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus, State,
@@ -1066,9 +1068,7 @@ impl Controller {
         Ok(()) => return Ok(result),
         Err(error) if attempt == context.config.agent.completion_retries => return Err(error),
         Err(error) => {
-          feedback = Some(format!(
-            "{error:#}\nUse requirement, criterion, and verification-obligation IDs exactly as supplied by the authoritative catalog. Do not guess, repair, or normalize identifiers."
-          ));
+          feedback = Some(reconciliation_retry_feedback(&error));
         }
       }
     }
@@ -1250,11 +1250,9 @@ fn normalize_reconcile_relationships(
       criterion_ids.insert(
         obligation_criteria
           .get(obligation_id)
-          .with_context(|| {
-            format!(
-              "{} targets unknown verification obligation {obligation_id}",
-              work.id
-            )
+          .ok_or_else(|| DomainValidationError::UnknownObligation {
+            work_unit_id: work.id.clone(),
+            obligation_id: obligation_id.to_string(),
           })?
           .clone(),
       );
@@ -1264,11 +1262,9 @@ fn normalize_reconcile_relationships(
       requirement_ids.insert(
         criterion_requirements
           .get(criterion_id)
-          .with_context(|| {
-            format!(
-              "{} targets unknown acceptance criterion {criterion_id}",
-              work.id
-            )
+          .ok_or_else(|| DomainValidationError::UnknownCriterion {
+            work_unit_id: work.id.clone(),
+            criterion_id: criterion_id.to_string(),
           })?
           .clone(),
       );
@@ -1278,6 +1274,83 @@ fn normalize_reconcile_relationships(
     work.requirement_ids = requirement_ids.into_iter().collect();
   }
   Ok(())
+}
+
+#[derive(Debug)]
+enum ReconcileValidationError {
+  PresentWithGaps(RequirementId),
+  IncompleteWithoutGap {
+    requirement_id: RequirementId,
+    state: ImplementationState,
+  },
+}
+
+impl std::fmt::Display for ReconcileValidationError {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::PresentWithGaps(requirement_id) => write!(
+        formatter,
+        "present implementation {requirement_id} cannot report implementation gaps"
+      ),
+      Self::IncompleteWithoutGap { requirement_id, .. } => {
+        write!(
+          formatter,
+          "incomplete implementation {requirement_id} requires a concrete gap"
+        )
+      }
+    }
+  }
+}
+
+impl std::error::Error for ReconcileValidationError {}
+
+fn reconciliation_retry_feedback(error: &anyhow::Error) -> String {
+  if let Some(validation) = error.downcast_ref::<ReconcileValidationError>() {
+    return match validation {
+      ReconcileValidationError::PresentWithGaps(requirement_id) => format!(
+        "{requirement_id} is internally inconsistent.\n\nimplementationState=\"present\" means all required implementation exists and missingImplementation must therefore be empty.\n\nIf the reported implementation gaps are real, choose \"partial\", \"absent\", or \"unknown\".\n\nIf no implementation gap actually remains, keep \"present\" and return an empty missingImplementation list.\n\nRegenerate the complete reconciliation result."
+      ),
+      ReconcileValidationError::IncompleteWithoutGap {
+        requirement_id,
+        state,
+      } => format!(
+        "{requirement_id} is internally inconsistent.\n\nimplementationState=\"{}\" means required implementation is missing, incomplete, or could not be established. missingImplementation must contain at least one concrete gap or explanation.\n\nIf all required implementation exists, choose \"present\" and return an empty missingImplementation list.\n\nRegenerate the complete reconciliation result.",
+        implementation_state_name(*state)
+      ),
+    };
+  }
+
+  let message = format!("{error:#}");
+  if matches!(
+    error.downcast_ref::<DomainValidationError>(),
+    Some(
+      DomainValidationError::UnknownRequirement { .. }
+        | DomainValidationError::UnknownCriterion { .. }
+        | DomainValidationError::UnknownObligation { .. }
+    )
+  ) || message.contains("IDs do not match")
+    || message.contains("unknown missing evidence obligation")
+    || message.contains("missing evidence owned by another requirement")
+    || message.contains("relationships do not match")
+    || message.contains("outside its verification obligations")
+  {
+    return format!(
+      "{message}\nUse requirement, criterion, and verification-obligation IDs exactly as supplied by the authoritative catalog. Do not guess, repair, or normalize identifiers.\nRegenerate the complete reconciliation result."
+    );
+  }
+
+  format!(
+    "{message}\nRegenerate the complete reconciliation result and correct this validation failure."
+  )
+}
+
+fn implementation_state_name(state: ImplementationState) -> &'static str {
+  match state {
+    ImplementationState::Present => "present",
+    ImplementationState::Partial => "partial",
+    ImplementationState::Absent => "absent",
+    ImplementationState::Unknown => "unknown",
+  }
 }
 
 fn validate_reconcile(catalog: &RequirementCatalog, result: &ReconcileResult) -> Result<()> {
@@ -1319,17 +1392,19 @@ fn validate_reconcile(catalog: &RequirementCatalog, result: &ReconcileResult) ->
     }
     match assessment.implementation_state {
       ImplementationState::Present if !assessment.missing_implementation.is_empty() => {
-        bail!(
-          "present implementation {} cannot report implementation gaps",
-          assessment.requirement_id
-        )
+        return Err(
+          ReconcileValidationError::PresentWithGaps(assessment.requirement_id.clone()).into(),
+        );
       }
       ImplementationState::Partial | ImplementationState::Absent | ImplementationState::Unknown => {
         implementation_gap = true;
         if assessment.missing_implementation.is_empty() {
-          bail!(
-            "incomplete implementation {} requires a concrete gap",
-            assessment.requirement_id
+          return Err(
+            ReconcileValidationError::IncompleteWithoutGap {
+              requirement_id: assessment.requirement_id.clone(),
+              state: assessment.implementation_state,
+            }
+            .into(),
           );
         }
       }
@@ -1855,6 +1930,55 @@ mod tests {
       &result(ImplementationState::Present, Vec::new(), false)
     )
     .is_ok());
+  }
+
+  #[test]
+  fn present_implementation_with_gaps_is_rejected() {
+    let error = validate_reconcile(
+      &catalog(),
+      &result(ImplementationState::Present, vec!["missing behavior"], true),
+    )
+    .expect_err("present implementation with gaps rejected");
+
+    assert!(error
+      .to_string()
+      .contains("present implementation REQ-001 cannot report implementation gaps"));
+  }
+
+  #[test]
+  fn partial_implementation_with_a_concrete_gap_is_valid() {
+    assert!(validate_reconcile(
+      &catalog(),
+      &result(ImplementationState::Partial, vec!["missing behavior"], true,)
+    )
+    .is_ok());
+  }
+
+  #[test]
+  fn partial_implementation_without_a_gap_is_rejected() {
+    assert!(validate_reconcile(
+      &catalog(),
+      &result(ImplementationState::Partial, Vec::new(), true)
+    )
+    .is_err());
+  }
+
+  #[test]
+  fn absent_implementation_without_a_gap_is_rejected() {
+    assert!(validate_reconcile(
+      &catalog(),
+      &result(ImplementationState::Absent, Vec::new(), true)
+    )
+    .is_err());
+  }
+
+  #[test]
+  fn unknown_implementation_without_an_explanatory_gap_is_rejected() {
+    assert!(validate_reconcile(
+      &catalog(),
+      &result(ImplementationState::Unknown, Vec::new(), true)
+    )
+    .is_err());
   }
 
   #[test]

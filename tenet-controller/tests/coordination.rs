@@ -253,6 +253,8 @@ enum BackendMode {
   InvalidReconcileThenCorrect,
   InvalidAssessmentThenCorrect,
   AlwaysInvalidReconcile,
+  ContradictoryReconcileThenCorrect,
+  AlwaysContradictoryReconcile,
   InvalidScopeThenCorrect,
   InvalidAssessmentScopeThenCorrect,
   RepairScopeMutation,
@@ -521,13 +523,21 @@ impl AgentBackend for FakeBackend {
     if matches!(self.mode, BackendMode::InvalidScopeThenCorrect) && reconcile_call == 0 {
       work_units[0].scope.paths = vec!["src/".into()];
     }
+    let mut requirement_assessment = assessment(satisfied);
+    if matches!(self.mode, BackendMode::AlwaysContradictoryReconcile)
+      || matches!(self.mode, BackendMode::ContradictoryReconcileThenCorrect) && reconcile_call == 0
+    {
+      requirement_assessment.implementation_state = ImplementationState::Present;
+      requirement_assessment.missing_implementation =
+        vec!["required behavior is still missing".into()];
+    }
     Ok(ReconcileResult {
       summary: if satisfied {
         "implementation present; evidence pending".into()
       } else {
         "work remains".into()
       },
-      requirements: vec![assessment(satisfied)],
+      requirements: vec![requirement_assessment],
       work_units,
     })
   }
@@ -1072,6 +1082,10 @@ async fn directory_scope_is_retried_with_recursive_glob_feedback() {
   assert!(feedback[0].1.contains(
     "A scope path \"src/\" does not include descendants; use \"src/**\" or explicit files"
   ));
+  assert!(!feedback[0]
+    .1
+    .contains("Do not guess, repair, or normalize identifiers"));
+  assert!(!feedback[0].1.contains("correct the reported relationships"));
 }
 
 #[tokio::test]
@@ -1131,6 +1145,38 @@ async fn malformed_reconciliation_is_retried_with_feedback_and_corrected() {
 }
 
 #[tokio::test]
+async fn contradictory_reconciliation_is_retried_with_targeted_feedback_and_corrected() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(
+    BackendMode::ContradictoryReconcileThenCorrect,
+  ));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("corrected reconciliation proceeds");
+
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  let feedback = backend
+    .semantic_feedback
+    .lock()
+    .expect("semantic feedback lock");
+  assert_eq!(feedback.len(), 1);
+  assert_eq!(feedback[0].0, WorkerRole::Reconcile);
+  assert!(feedback[0].1.contains("REQ-001 is internally inconsistent"));
+  assert!(feedback[0]
+    .1
+    .contains("implementationState=\"present\" means all required implementation exists"));
+  assert!(feedback[0]
+    .1
+    .contains("choose \"partial\", \"absent\", or \"unknown\""));
+  assert!(!feedback[0]
+    .1
+    .contains("Do not guess, repair, or normalize identifiers"));
+}
+
+#[tokio::test]
 async fn malformed_assessment_is_retried_with_feedback_and_corrected() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::InvalidAssessmentThenCorrect));
@@ -1183,6 +1229,31 @@ async fn exhausted_semantic_retries_return_precise_validation_error() {
   assert!(feedback.iter().all(
     |(role, message)| *role == WorkerRole::Reconcile && message.contains("REQ-999/AC-01/VO-01")
   ));
+}
+
+#[tokio::test]
+async fn contradictory_reconciliation_fails_after_retry_exhaustion() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::AlwaysContradictoryReconcile));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  rewrite_config(&repository, |config| config.agent.completion_retries = 1).await;
+
+  let error = controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("contradictory reconciliation exhausts retries");
+
+  assert_eq!(
+    error.to_string(),
+    "present implementation REQ-001 cannot report implementation gaps"
+  );
+  assert_eq!(backend.reconcile_calls.load(Ordering::SeqCst), 2);
+  let feedback = backend
+    .semantic_feedback
+    .lock()
+    .expect("semantic feedback lock");
+  assert_eq!(feedback.len(), 1);
+  assert!(feedback[0].1.contains("REQ-001 is internally inconsistent"));
 }
 
 #[tokio::test]
