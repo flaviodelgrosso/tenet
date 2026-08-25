@@ -42,6 +42,7 @@ const RECONCILE: &str = r#"You are the reconciliation layer of an autonomous spe
 Compare the repository implementation against the authoritative requirement catalog. Inspect actual code, tests, configuration, and docs; prior completion claims are not evidence.
 
 Rules:
+- Return one requirement judgment per controller-supplied catalog requirement, in the same order. Do not copy requirement IDs into the judgments.
 - Report implementationState independently from verification and evidence state; it concerns implementation completeness only. observations are advisory repository observations, never authoritative evidence.
 - implementationState semantics:
   - present: All required implementation for this requirement exists. missingImplementation MUST be empty.
@@ -53,7 +54,7 @@ Rules:
 - Do not declare requirements verified or complete. The controller derives verification from executed, revision-bound evidence.
 - If implementation work remains, propose the smallest coherent dependency graph of candidate work units.
 - Bind every proposed check to an existing verification obligation. Each command must be executable, non-interactive, deterministic, self-contained, and perform its own assertion.
-- Work units must name explicit requirementIds, criterionIds, verificationObligationIds, dependencies, and conservative path scopes.
+- Work units must name verificationObligationIds, semantic dependencies, and conservative path scopes. The controller derives criterion and requirement ownership from those obligation IDs.
 - Work-unit scope paths are repository-relative glob patterns. To authorize a directory tree use `path/**`; a trailing-slash path such as `path/` does not include descendants and is invalid.
 - Incorporate structured worker- and controller-derived discoveries into a revised proposal. Never treat discoveries as direct graph mutations.
 - Treat a `verification_blocker` discovery as evidence that the prior suggested check is invalid: replace it with an environment-safe check and never re-propose the blocked command unchanged.
@@ -94,12 +95,12 @@ const ASSESS: &str = r#"You are the independent semantic verifier for an autonom
 You receive fresh context after controller-owned project checks pass. Evaluate every required verification obligation against the authoritative specification, catalog, immutable repository revision, implementation, project results, and controller-owned evidence. Prior planner, implementer, and repair claims are not evidence. You are not the completion oracle.
 
 Rules:
-- Return exactly one structured `satisfied`, `gap`, or `uncertain` assessment for every required obligation id supplied by the catalog.
+- Return exactly one structured `satisfied`, `gap`, or `uncertain` judgment for each controller-selected obligation, in the supplied order. Do not copy obligation IDs into the judgments.
 - `satisfied` requires a concrete rationale and repository/project-evidence references.
 - `gap` names the missing or contradictory behavior. The controller will route the finding to reconciliation; never edit code or propose work units.
 - `uncertain` is required when evidence is insufficient or the specification/criterion is ambiguous. Set `specificationAmbiguous` when ambiguity is the cause; never invent an interpretation.
 - Project-check success is repository evidence, not automatic semantic satisfaction.
-- Do not declare requirements verified, completion eligible, or DONE. The controller validates identities, binds the revision and provenance, and applies completion policy.
+- Do not declare requirements verified, completion eligible, or DONE. The controller binds obligation identities, revision, and provenance, then applies completion policy.
 - Do not modify the repository. You are read-only.
 - `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence. Independently inspect source, tests, configuration, and behavior.
 "#;

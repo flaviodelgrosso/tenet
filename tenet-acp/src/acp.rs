@@ -26,10 +26,11 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tenet_domain::events::EventSink;
-use tenet_domain::evidence::{EvidenceProjection, SemanticAssessmentReport};
+use tenet_domain::evidence::{EvidenceProjection, SemanticAssessmentProposal};
 use tenet_domain::model::{
-  ArchitectOutput, CompletedWorkUnit, Discovery, MutationWorkerContext, ReconcileResult,
-  RequirementCatalog, VerificationReport, WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
+  AgentReconciliationProposal, ArchitectOutput, CompletedWorkUnit, Discovery,
+  MutationWorkerContext, RequirementCatalog, VerificationReport, WorkUnit, WorkerEvent, WorkerRole,
+  WorkerSummary,
 };
 use tenet_domain::verification::ProjectVerificationRun;
 use tokio::sync::oneshot;
@@ -132,8 +133,8 @@ impl AgentBackend for AcpRuntime {
     discoveries: &[Discovery],
     evidence: &[EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
-  ) -> Result<ReconcileResult> {
-    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository implementation against this catalog. Inspect it directly. Identify implementation gaps and missing evidence; propose a dependency graph of candidate work units when implementation work remains. The controller alone decides verification and concurrency.\n\nCatalog:\n{}\n\nController-derived evidence projections:\n{}\n\nRecent completed work:\n{}\n\nWorker- and controller-derived discoveries requiring reconsideration:\n{}{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(evidence)?, serde_json::to_string_pretty(recent)?, serde_json::to_string_pretty(discoveries)?, semantic_feedback(semantic_validation_feedback))).await
+  ) -> Result<AgentReconciliationProposal> {
+    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository implementation against this controller-ordered catalog. Inspect it directly. Return one requirement judgment per catalog requirement in the same order. Identify implementation gaps and missing evidence. Propose work units by targeting verification-obligation IDs; do not reproduce requirement or criterion relationships because the controller derives them. Semantic work dependencies remain your responsibility. The controller alone decides verification and concurrency.\n\nController-ordered catalog:\n{}\n\nController-derived evidence projections:\n{}\n\nRecent completed work:\n{}\n\nWorker- and controller-derived discoveries requiring reconsideration:\n{}{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(evidence)?, serde_json::to_string_pretty(recent)?, serde_json::to_string_pretty(discoveries)?, semantic_feedback(semantic_validation_feedback))).await
   }
 
   async fn implement(
@@ -185,13 +186,13 @@ impl AgentBackend for AcpRuntime {
     project_verification: &ProjectVerificationRun,
     evidence: &[EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
-  ) -> Result<SemanticAssessmentReport> {
+  ) -> Result<SemanticAssessmentProposal> {
     self
       .run_typed(
         ctx,
         WorkerRole::Assess,
         format!(
-          "Independently assess every required semantic obligation against the immutable repository revision. Return exactly one Satisfied, Gap, or Uncertain result per required obligation. Do not propose edits or declare completion.\n\nCatalog:\n{}\n\nController-executed project verification:\n{}\n\nExisting controller-owned evidence:\n{}{}",
+          "Independently assess every controller-selected semantic obligation against the immutable repository revision. The catalog obligations are in authoritative order. Return exactly one Satisfied, Gap, or Uncertain judgment per obligation in that same order; do not copy obligation IDs. Do not propose edits or declare completion.\n\nController-selected catalog:\n{}\n\nController-executed project verification:\n{}\n\nExisting controller-owned evidence:\n{}{}",
           serde_json::to_string_pretty(catalog)?,
           serde_json::to_string_pretty(project_verification)?,
           serde_json::to_string_pretty(evidence)?,
@@ -1202,7 +1203,6 @@ mod tests {
     json!({
       "summary": "One requirement remains",
       "requirements": [{
-        "requirementId": "REQ-001",
         "implementationState": "absent",
         "observations": [],
         "missingImplementation": ["Current output is static"],
@@ -1212,8 +1212,6 @@ mod tests {
         "id": "WU-001",
         "title": "Print current datetime",
         "objective": "Replace the static greeting",
-        "requirementIds": ["REQ-001"],
-        "criterionIds": ["REQ-001/AC-01"],
         "verificationObligationIds": ["REQ-001/AC-01/VO-01"],
         "suggestedChecks": [{
           "obligationId": "REQ-001/AC-01/VO-01",
@@ -1272,7 +1270,7 @@ mod tests {
 
   #[test]
   fn generated_reconcile_schema_preserves_wire_field_names() {
-    let schema = schema_for::<ReconcileResult>().expect("generate reconcile schema");
+    let schema = schema_for::<AgentReconciliationProposal>().expect("generate reconcile schema");
     let properties = schema["properties"].as_object().expect("root properties");
 
     assert!(properties.contains_key("workUnits"));
@@ -1280,8 +1278,24 @@ mod tests {
   }
 
   #[test]
+  fn generated_agent_schemas_exclude_controller_owned_relationships() {
+    let reconciliation = serde_json::to_string(
+      &schema_for::<AgentReconciliationProposal>().expect("reconciliation schema"),
+    )
+    .expect("serialize reconciliation schema");
+    let assessment = serde_json::to_string(
+      &schema_for::<SemanticAssessmentProposal>().expect("assessment schema"),
+    )
+    .expect("serialize assessment schema");
+
+    assert!(!reconciliation.contains("requirementIds"));
+    assert!(!reconciliation.contains("criterionIds"));
+    assert!(!assessment.contains("obligationId"));
+  }
+
+  #[test]
   fn generated_reconcile_schema_describes_implementation_state_semantics() {
-    let schema = schema_for::<ReconcileResult>().expect("generate reconcile schema");
+    let schema = schema_for::<AgentReconciliationProposal>().expect("generate reconcile schema");
     let schema = serde_json::to_string(&schema).expect("serialize reconcile schema");
 
     assert!(schema.contains("All required implementation for the requirement exists"));
@@ -1309,22 +1323,19 @@ mod tests {
     let semantic = json!({
       "summary": "Independent assessment",
       "assessments": [{
-        "obligationId": "REQ-001/AC-01/VO-01",
-        "assessment": {
-          "status": "satisfied",
-          "rationale": "Observed behavior",
-          "evidenceRefs": ["src/lib.rs"]
-        }
+        "status": "satisfied",
+        "rationale": "Observed behavior",
+        "evidenceRefs": ["src/lib.rs"]
       }]
     });
-    validate_structured_output::<SemanticAssessmentReport>(
+    validate_structured_output::<SemanticAssessmentProposal>(
       &semantic,
-      &schema_for::<SemanticAssessmentReport>().expect("semantic assessment schema"),
+      &schema_for::<SemanticAssessmentProposal>().expect("semantic assessment schema"),
     )
     .expect("valid semantic assessment output");
-    validate_structured_output::<ReconcileResult>(
+    validate_structured_output::<AgentReconciliationProposal>(
       &valid_reconcile_output(),
-      &schema_for::<ReconcileResult>().expect("reconcile schema"),
+      &schema_for::<AgentReconciliationProposal>().expect("reconcile schema"),
     )
     .expect("valid reconcile output");
     validate_structured_output::<WorkerSummary>(
@@ -1339,9 +1350,9 @@ mod tests {
     let mut output = valid_reconcile_output();
     output.as_object_mut().expect("object").remove("summary");
 
-    assert!(validate_structured_output::<ReconcileResult>(
+    assert!(validate_structured_output::<AgentReconciliationProposal>(
       &output,
-      &schema_for::<ReconcileResult>().expect("schema")
+      &schema_for::<AgentReconciliationProposal>().expect("schema")
     )
     .is_err());
   }
@@ -1351,9 +1362,9 @@ mod tests {
     let mut output = valid_reconcile_output();
     output["workUnits"][0]["description"] = Value::String("not part of WorkUnit".into());
 
-    assert!(validate_structured_output::<ReconcileResult>(
+    assert!(validate_structured_output::<AgentReconciliationProposal>(
       &output,
-      &schema_for::<ReconcileResult>().expect("schema")
+      &schema_for::<AgentReconciliationProposal>().expect("schema")
     )
     .is_err());
   }
@@ -1363,9 +1374,9 @@ mod tests {
     let mut output = valid_reconcile_output();
     output["requirements"][0]["implementationState"] = Value::String("unknown_variant".into());
 
-    assert!(validate_structured_output::<ReconcileResult>(
+    assert!(validate_structured_output::<AgentReconciliationProposal>(
       &output,
-      &schema_for::<ReconcileResult>().expect("schema")
+      &schema_for::<AgentReconciliationProposal>().expect("schema")
     )
     .is_err());
   }
@@ -1382,9 +1393,9 @@ mod tests {
 
   #[test]
   fn tenet_yield_rejects_invalid_structured_output() {
-    let schema = schema_for::<ReconcileResult>().expect("schema");
+    let schema = schema_for::<AgentReconciliationProposal>().expect("schema");
     let validator: WorkerOutputValidator = Arc::new(move |value| {
-      validate_structured_output::<ReconcileResult>(value, &schema)
+      validate_structured_output::<AgentReconciliationProposal>(value, &schema)
         .map(|_| ())
         .map_err(anyhow::Error::new)
     });

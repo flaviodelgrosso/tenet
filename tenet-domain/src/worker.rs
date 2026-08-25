@@ -270,6 +270,47 @@ pub struct WorkUnit {
   pub scope: WorkScope,
 }
 
+/// Ordered semantic judgment for one controller-supplied requirement.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRequirementAssessment {
+  /// Implementation completeness only. Independent from verification and evidence state.
+  #[serde(rename = "implementationState")]
+  pub implementation_state: ImplementationState,
+  pub observations: Vec<String>,
+  /// Concrete implementation gaps. Must be empty when implementationState is present.
+  #[serde(rename = "missingImplementation")]
+  pub missing_implementation: Vec<String>,
+  #[serde(rename = "missingEvidence")]
+  pub missing_evidence: Vec<ObligationId>,
+}
+
+/// Agent-proposed work semantics. Catalog ownership relationships are controller-derived.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWorkUnit {
+  pub id: String,
+  pub title: String,
+  pub objective: String,
+  #[serde(rename = "verificationObligationIds")]
+  pub verification_obligation_ids: Vec<ObligationId>,
+  #[serde(rename = "suggestedChecks")]
+  pub suggested_checks: Vec<CandidateCheck>,
+  #[serde(rename = "dependsOn")]
+  pub depends_on: Vec<String>,
+  pub scope: WorkScope,
+}
+
+/// Agent-facing reconciliation proposal in controller-defined requirement order.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentReconciliationProposal {
+  pub summary: String,
+  pub requirements: Vec<AgentRequirementAssessment>,
+  #[serde(rename = "workUnits")]
+  pub work_units: Vec<AgentWorkUnit>,
+}
+
 impl WorkUnit {
   pub fn validate(
     &self,

@@ -81,20 +81,17 @@ pub async fn write_catalog(cwd: &Path, catalog: &RequirementCatalog) -> Result<(
   )
 }
 
-pub async fn write_roadmap(cwd: &Path, value: &ReconcileResult) -> Result<()> {
-  let storage = Storage::open(cwd).await?;
-  let state = storage.load_current_state().await?;
-  let run_id = state
-    .run_id
-    .as_deref()
-    .ok_or_else(|| anyhow!("cannot persist reconciliation without an active run"))?;
-  let catalog = storage
-    .load_active_catalog()
+pub async fn write_roadmap(
+  cwd: &Path,
+  run_id: &str,
+  cycle: u32,
+  repository_revision: &str,
+  catalog_hash: &str,
+  value: &ReconcileResult,
+) -> Result<()> {
+  Storage::open(cwd)
     .await?
-    .ok_or_else(|| anyhow!("cannot persist reconciliation without an active catalog"))?;
-  let revision = crate::git::head(cwd).await?;
-  storage
-    .persist_reconcile_round(run_id, state.cycle, &revision, &catalog.spec_hash, value)
+    .persist_reconcile_round(run_id, cycle, repository_revision, catalog_hash, value)
     .await
     .context("persist reconciliation round")?;
   Ok(())

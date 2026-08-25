@@ -1,6 +1,5 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
-  fmt::Write as _,
   future::Future,
   path::{Path, PathBuf},
   sync::Arc,
@@ -9,26 +8,23 @@ use std::{
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
-use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use tenet_domain::{
   config::{config_path, ensure_config, read_config, TENET_DIR},
-  error::DomainValidationError,
   events::{
     CompletionGate, CompletionGateItem, CompletionGateOutcome, EventSink, RunEvent, RunLogger,
   },
   evidence::{
     EvidenceGraphState, EvidencePolicy, ImplementationState, ObligationAssessment,
-    SemanticAssessmentReport, VerificationState,
+    SemanticAssessmentProposal, SemanticAssessmentReport, VerificationState,
   },
-  ids::RequirementId,
   model::{
-    CompletedWorkUnit, Discovery, DiscoveryRecord, DiscoveryStatus, IntegrationPhase, Phase,
-    ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus, State,
-    VerificationLayers, VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
+    AgentReconciliationProposal, CompletedWorkUnit, Discovery, DiscoveryStatus, IntegrationPhase,
+    Phase, ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus,
+    State, VerificationLayers, VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
   },
   verification::ProjectVerificationRun,
 };
@@ -37,11 +33,8 @@ use tenet_runtime::{
   backend::BackendContext,
   git,
   graph::WorkGraph,
-  integration::{deterministic_order, IntegrationOutcome, Integrator},
-  scheduler::{
-    deferred_candidate_authorized, deferred_candidate_targets_unit, CandidateExecutor,
-    ExecutionUpdate, Scheduler,
-  },
+  integration::{IntegrationOutcome, Integrator},
+  scheduler::{CandidateExecutor, ExecutionUpdate, Scheduler},
   store::{self, RunLock},
   verifier,
   workspace::WorkspaceManager,
@@ -50,7 +43,7 @@ use tenet_runtime::{
 use crate::{
   catalog,
   completion::{CompletionBlocker, CompletionContext, CompletionDecision, CompletionPolicy},
-  evidence as evidence_graph,
+  decision, evidence as evidence_graph,
   ports::agent::AgentBackend,
   verification,
 };
@@ -294,7 +287,7 @@ impl Controller {
       state.discoveries.retain(|record| {
         record.status == DiscoveryStatus::Active && record.catalog_hash == catalog.spec_hash
       });
-      let catalog_for_worker = catalog.clone();
+      let catalog_for_worker = decision::reconciliation_catalog(&catalog);
       let completed_for_worker = state.completed_work_units.clone();
       let discoveries_for_worker: Vec<_> = state
         .discoveries
@@ -310,6 +303,7 @@ impl Controller {
         .validated_read_only_proposal(
           context,
           &catalog,
+          &current_revision,
           "reconciliation",
           move |inspection_context, feedback| {
             let backend = backend.clone();
@@ -333,18 +327,46 @@ impl Controller {
         )
         .await?;
       let graph = WorkGraph::from_reconcile(&catalog, &reconciliation)?;
-      let fingerprint = progress_fingerprint(&self.cwd, &catalog, &reconciliation, state).await?;
-      if advance_stagnation(state, fingerprint, context.config.stagnation_limit) {
-        return self
-          .block(
-            context,
-            state,
-            &format!(
-              "Stagnation limit ({}) reached without meaningful repository progress",
-              context.config.stagnation_limit
-            ),
-          )
-          .await;
+      let active_discoveries: Vec<_> = state
+        .discoveries
+        .iter()
+        .filter(|record| record.status == DiscoveryStatus::Active)
+        .map(|record| record.fingerprint.clone())
+        .collect();
+      let fingerprint = decision::progress_fingerprint(
+        &current_revision,
+        &catalog.spec_hash,
+        &reconciliation,
+        &active_discoveries,
+      )?;
+      let stagnation = decision::advance_stagnation(
+        state.progress_fingerprint.as_deref(),
+        state.stagnation_count,
+        fingerprint,
+        context.config.stagnation_limit,
+      );
+      state.progress_fingerprint = Some(stagnation.fingerprint);
+      state.stagnation_count = stagnation.count;
+      // Historical execution records are reconciler context, never current scheduling authority.
+      let completed = BTreeSet::new();
+      let active: BTreeSet<_> = state
+        .active_leases
+        .values()
+        .map(|lease| lease.work_unit.id.clone())
+        .collect();
+      let frontier = graph.ready_frontier(&completed, &active);
+      let next = decision::decide_reconciliation(
+        state.status.clone(),
+        !reconciliation.work_units.is_empty(),
+        frontier,
+        stagnation
+          .blocked
+          .then_some(context.config.stagnation_limit),
+      );
+      match &next {
+        decision::NextAction::Block(reason) => return self.block(context, state, reason).await,
+        decision::NextAction::Finish => return Ok(state.clone()),
+        _ => {}
       }
       for record in &mut state.discoveries {
         let deferred = state.deferred_candidates.iter().any(|candidate| {
@@ -359,7 +381,15 @@ impl Controller {
           DiscoveryStatus::Consumed
         };
       }
-      store::write_roadmap(&self.cwd, &reconciliation).await?;
+      store::write_roadmap(
+        &self.cwd,
+        state.run_id.as_deref().context("run id missing")?,
+        state.cycle,
+        &current_revision,
+        &catalog.spec_hash,
+        &reconciliation,
+      )
+      .await?;
       state.requirement_counts = requirement_counts(
         &catalog,
         &evidence_graph,
@@ -377,34 +407,24 @@ impl Controller {
         .await?;
       self.publish(&context.events, state).await?;
 
-      if reconciliation.work_units.is_empty() {
-        if let Some(final_state) = self
-          .finalize(context, state, &catalog, &mut evidence_graph)
-          .await?
-        {
-          return Ok(final_state);
+      let frontier = match next {
+        decision::NextAction::VerifyProject => {
+          if let Some(final_state) = self
+            .finalize(context, state, &catalog, &mut evidence_graph)
+            .await?
+          {
+            return Ok(final_state);
+          }
+          continue;
         }
-        continue;
-      }
-
-      // Current reconciliation describes remaining work. Historical execution records are context
-      // for the reconciler, never scheduling authority over the current repository.
-      let completed = BTreeSet::new();
-      let active: BTreeSet<_> = state
-        .active_leases
-        .values()
-        .map(|lease| lease.work_unit.id.clone())
-        .collect();
-      let frontier = graph.ready_frontier(&completed, &active);
-      if frontier.is_empty() {
-        return self
-          .block(
-            context,
-            state,
-            "Reconciliation found gaps but the validated work graph has no ready work units",
-          )
-          .await;
-      }
+        decision::NextAction::ExecuteFrontier(frontier) => frontier,
+        decision::NextAction::Block(_)
+        | decision::NextAction::Finish
+        | decision::NextAction::IntegrateCandidates(_)
+        | decision::NextAction::BeginNextCycle => {
+          bail!("reconciliation policy returned an action invalid for this driver step")
+        }
+      };
       context
         .events
         .emit(RunEvent::ReadyFrontier(frontier.clone()))
@@ -425,8 +445,8 @@ impl Controller {
           .insert(unit.id.clone(), WorkStatus::Ready);
       }
 
-      let base_revision = git::head(&self.cwd).await?;
-      if !git::is_clean(&self.cwd).await? {
+      let scheduling_repository = git::repository_state(&self.cwd).await?;
+      if !scheduling_repository.status.is_empty() {
         return self
           .block(
             context,
@@ -435,6 +455,13 @@ impl Controller {
           )
           .await;
       }
+      if scheduling_repository.head != current_revision {
+        state.last_summary =
+          "Canonical revision changed after reconciliation; beginning a new cycle".into();
+        self.publish(&context.events, state).await?;
+        continue;
+      }
+      let base_revision = current_revision.clone();
       let run_id = state.run_id.clone().context("run id missing")?;
       let (updates, mut update_receiver) = mpsc::unbounded_channel();
       let scheduler = Scheduler::new(
@@ -447,37 +474,14 @@ impl Controller {
         Arc::new(catalog.clone()),
         updates,
       );
-      let mut scheduled_frontier = Vec::new();
-      let mut selected_candidates = Vec::new();
-      for unit in frontier {
-        let mut target = None;
-        for candidate in &state.deferred_candidates {
-          if candidate.base_revision == base_revision
-            && candidate.catalog_hash == catalog.spec_hash
-            && deferred_candidate_targets_unit(candidate, &unit)?
-          {
-            target = Some(candidate.clone());
-            if deferred_candidate_authorized(candidate, &unit)? {
-              break;
-            }
-          }
-        }
-        match target {
-          Some(candidate) if deferred_candidate_authorized(&candidate, &unit)? => {
-            scheduled_frontier.push(unit);
-            selected_candidates.push(Some(candidate));
-          }
-          Some(_) => {
-            state
-              .work_statuses
-              .insert(unit.id.clone(), WorkStatus::Pending);
-          }
-          None => {
-            scheduled_frontier.push(unit);
-            selected_candidates.push(None);
-          }
-        }
-      }
+      let authorization = decision::authorize_frontier(
+        frontier,
+        &state.deferred_candidates,
+        &catalog.spec_hash,
+        &base_revision,
+      )?;
+      let scheduled_frontier = authorization.work_units;
+      let selected_candidates = authorization.deferred_candidates;
       if scheduled_frontier.is_empty() {
         self.publish(&context.events, state).await?;
         continue;
@@ -544,16 +548,20 @@ impl Controller {
           return Err(error.context(format!("scheduler cleanup also failed: {cleanup:#}")))
         }
       };
-      let mut candidates = outcome.executions;
-      deterministic_order(&mut candidates);
+      let next = decision::decide_execution(state.status.clone(), outcome.executions);
+      let candidates = match &next {
+        decision::NextAction::IntegrateCandidates(candidates) => candidates.clone(),
+        decision::NextAction::BeginNextCycle | decision::NextAction::Finish => Vec::new(),
+        _ => bail!("execution policy returned an action invalid for this driver step"),
+      };
       state.candidate_integrations = candidates.clone();
       for blocked in outcome.blocked {
         state
           .work_statuses
           .insert(blocked.lease.work_unit.id.clone(), WorkStatus::Pending);
-        record_discoveries(
+        decision::record_discoveries(
           state,
-          &catalog,
+          &catalog.spec_hash,
           &blocked.lease.base_revision,
           &blocked.lease.work_unit.id,
           &blocked.discoveries,
@@ -569,28 +577,39 @@ impl Controller {
         state
           .work_statuses
           .insert(candidate.lease.work_unit.id.clone(), WorkStatus::Candidate);
-        record_candidate_discoveries(state, &catalog, candidate)?;
+        decision::record_discoveries(
+          state,
+          &catalog.spec_hash,
+          &candidate.candidate_revision,
+          &candidate.lease.work_unit.id,
+          &candidate.discoveries,
+        )?;
       }
       self.publish(&context.events, state).await?;
 
-      if candidates.is_empty() {
-        retire_deferred_candidates(&self.cwd, state, &selected_refs).await?;
-        self.publish(&context.events, state).await?;
-        continue;
-      }
-
-      let integrated = self
-        .integrate_candidates(
-          context,
-          state,
-          &run_id,
-          base_revision,
-          candidates,
-          &mut evidence_graph,
-        )
-        .await?;
-      if !integrated {
-        return Ok(state.clone());
+      match next {
+        decision::NextAction::BeginNextCycle => {
+          retire_deferred_candidates(&self.cwd, state, &selected_refs).await?;
+          self.publish(&context.events, state).await?;
+          continue;
+        }
+        decision::NextAction::Finish => return Ok(state.clone()),
+        decision::NextAction::IntegrateCandidates(candidates) => {
+          let integrated = self
+            .integrate_candidates(
+              context,
+              state,
+              &run_id,
+              base_revision,
+              candidates,
+              &mut evidence_graph,
+            )
+            .await?;
+          if !integrated {
+            return Ok(state.clone());
+          }
+        }
+        _ => bail!("execution policy returned an action invalid for integration"),
       }
       retire_deferred_candidates(&self.cwd, state, &selected_refs).await?;
       state.candidate_integrations.clear();
@@ -766,28 +785,33 @@ impl Controller {
     state.last_summary = "Running independent semantic verification".into();
     self.publish(&context.events, state).await?;
     let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
-    let catalog_for_worker = assessment_catalog(catalog);
+    let catalog_for_worker = decision::semantic_assessment_catalog(catalog);
     let project_for_worker = project_report.clone();
     let evidence_for_worker = evidence_graph::projections(evidence_graph, policy)?;
     let backend = self.backend.clone();
     let semantic_report = self
-      .validated_semantic_assessment(context, catalog, move |inspection_context, feedback| {
-        let backend = backend.clone();
-        let catalog = catalog_for_worker.clone();
-        let project = project_for_worker.clone();
-        let evidence = evidence_for_worker.clone();
-        async move {
-          backend
-            .assess(
-              &inspection_context,
-              &catalog,
-              &project,
-              &evidence,
-              feedback.as_deref(),
-            )
-            .await
-        }
-      })
+      .validated_semantic_assessment(
+        context,
+        catalog,
+        &verified_revision,
+        move |inspection_context, feedback| {
+          let backend = backend.clone();
+          let catalog = catalog_for_worker.clone();
+          let project = project_for_worker.clone();
+          let evidence = evidence_for_worker.clone();
+          async move {
+            backend
+              .assess(
+                &inspection_context,
+                &catalog,
+                &project,
+                &evidence,
+                feedback.as_deref(),
+              )
+              .await
+          }
+        },
+      )
       .await?;
     context
       .events
@@ -823,9 +847,9 @@ impl Controller {
       })
       .collect();
     if !gaps.is_empty() {
-      record_discoveries(
+      decision::record_discoveries(
         state,
-        catalog,
+        &catalog.spec_hash,
         &verified_revision,
         "semantic-assessment",
         &gaps,
@@ -870,22 +894,10 @@ impl Controller {
         &suite_hash,
       )
       .await?;
-    match decision {
-      CompletionDecision::Done => {
-        state.status = RunStatus::Done;
-        state.phase = Phase::Complete;
-        state.verification_layers.completion_eligible = true;
-        state.last_summary = "Project checks pass and every required semantic obligation is independently satisfied at the current revision".into();
-        Ok(Some(state.clone()))
-      }
-      CompletionDecision::NotReady(blockers) => {
-        let message = blockers
-          .iter()
-          .map(ToString::to_string)
-          .collect::<Vec<_>>()
-          .join("; ");
-        Ok(Some(self.block(context, state, &message).await?))
-      }
+    match decision::apply_completion_decision(state, &decision) {
+      decision::NextAction::Finish => Ok(Some(state.clone())),
+      decision::NextAction::Block(reason) => Ok(Some(self.block(context, state, &reason).await?)),
+      _ => bail!("completion policy returned an action invalid for this driver step"),
     }
   }
 
@@ -947,15 +959,9 @@ impl Controller {
       || !state.discoveries.is_empty()
       || !state.deferred_candidates.is_empty()
     {
-      let references: Vec<_> = state
-        .deferred_candidates
-        .iter()
-        .map(|candidate| candidate.git_ref.clone())
-        .collect();
+      let references = decision::plan_spec_invalidation(state)?;
       retire_deferred_candidates(&self.cwd, state, &references).await?;
-      state.completed_work_units.clear();
-      state.work_statuses.clear();
-      state.discoveries.clear();
+      decision::apply_spec_invalidation(state);
     }
     let catalog_authority = catalog::CatalogAuthority::derive(&spec);
     let architect_batches = catalog_authority.architect_batches();
@@ -979,11 +985,16 @@ impl Controller {
         };
         let backend = self.backend.clone();
         let output = self
-          .read_only_worker(context, "architect", move |inspection_context| async move {
-            backend
-              .architect(&inspection_context, &architect_spec)
-              .await
-          })
+          .read_only_worker(
+            context,
+            "architect",
+            None,
+            move |inspection_context| async move {
+              backend
+                .architect(&inspection_context, &architect_spec)
+                .await
+            },
+          )
           .await?;
         let candidate = catalog_authority
           .build_batch(&batch, spec_hash.clone(), output)
@@ -1044,31 +1055,36 @@ impl Controller {
     &self,
     context: &BackendContext,
     catalog: &RequirementCatalog,
+    expected_revision: &str,
     name: &str,
     generate: F,
   ) -> Result<ReconcileResult>
   where
     F: Fn(BackendContext, Option<String>) -> Fut + Clone,
-    Fut: Future<Output = Result<ReconcileResult>>,
+    Fut: Future<Output = Result<AgentReconciliationProposal>>,
   {
     let mut feedback = None;
     for attempt in 0..=context.config.agent.completion_retries {
       let generate = generate.clone();
       let attempt_feedback = feedback.clone();
-      let mut result = self
-        .read_only_worker(context, name, move |inspection_context| {
-          generate(inspection_context, attempt_feedback)
-        })
+      let proposal = self
+        .read_only_worker(
+          context,
+          name,
+          Some(expected_revision),
+          move |inspection_context| generate(inspection_context, attempt_feedback),
+        )
         .await?;
-      let validation = normalize_reconcile_relationships(catalog, &mut result);
-      let validation = validation
-        .and_then(|()| validate_reconcile(catalog, &result))
-        .and_then(|()| WorkGraph::from_reconcile(catalog, &result).map(|_| ()));
-      match validation {
-        Ok(()) => return Ok(result),
+      let result = decision::materialize_reconciliation(catalog, proposal).and_then(|result| {
+        decision::validate_reconciliation(&result)?;
+        WorkGraph::from_reconcile(catalog, &result)?;
+        Ok(result)
+      });
+      match result {
+        Ok(result) => return Ok(result),
         Err(error) if attempt == context.config.agent.completion_retries => return Err(error),
         Err(error) => {
-          feedback = Some(reconciliation_retry_feedback(&error));
+          feedback = Some(decision::reconciliation_retry_feedback(&error));
         }
       }
     }
@@ -1079,27 +1095,36 @@ impl Controller {
     &self,
     context: &BackendContext,
     catalog: &RequirementCatalog,
+    expected_revision: &str,
     generate: F,
   ) -> Result<SemanticAssessmentReport>
   where
     F: Fn(BackendContext, Option<String>) -> Fut + Clone,
-    Fut: Future<Output = Result<SemanticAssessmentReport>>,
+    Fut: Future<Output = Result<SemanticAssessmentProposal>>,
   {
     let mut feedback = None;
     for attempt in 0..=context.config.agent.completion_retries {
       let generate = generate.clone();
       let attempt_feedback = feedback.clone();
-      let result = self
-        .read_only_worker(context, "assessment", move |inspection_context| {
-          generate(inspection_context, attempt_feedback)
-        })
+      let proposal = self
+        .read_only_worker(
+          context,
+          "assessment",
+          Some(expected_revision),
+          move |inspection_context| generate(inspection_context, attempt_feedback),
+        )
         .await?;
-      match verification::validate_semantic_assessment(catalog, &result) {
-        Ok(()) => return Ok(result),
+      let result =
+        decision::materialize_semantic_assessment(catalog, proposal).and_then(|result| {
+          verification::validate_semantic_assessment(catalog, &result)?;
+          Ok(result)
+        });
+      match result {
+        Ok(result) => return Ok(result),
         Err(error) if attempt == context.config.agent.completion_retries => return Err(error),
         Err(error) => {
           feedback = Some(format!(
-            "{error:#}\nReturn every required verification-obligation ID exactly once. Do not guess or normalize identifiers."
+            "{error:#}\nReturn exactly one semantic judgment for every controller-selected obligation, in the supplied order."
           ));
         }
       }
@@ -1111,6 +1136,7 @@ impl Controller {
     &self,
     context: &BackendContext,
     name: &str,
+    expected_revision: Option<&str>,
     call: F,
   ) -> Result<T>
   where
@@ -1118,6 +1144,14 @@ impl Controller {
     Fut: Future<Output = Result<T>>,
   {
     let canonical_before = git::repository_state(&self.cwd).await?;
+    if let Some(expected_revision) = expected_revision {
+      if canonical_before.head != expected_revision {
+        bail!(
+          "{name} inspection revision changed before workspace creation (expected {expected_revision}, observed {})",
+          canonical_before.head
+        );
+      }
+    }
     let run_id = context
       .runtime_dir
       .file_name()
@@ -1167,17 +1201,9 @@ impl Controller {
     if !catalog::specification_changed(&self.cwd, &context.config, &catalog).await? {
       return Ok(catalog);
     }
-    state.completed_work_units.clear();
-    for status in state.work_statuses.values_mut() {
-      *status = WorkStatus::Invalidated;
-    }
-    state.discoveries.clear();
-    let references: Vec<_> = state
-      .deferred_candidates
-      .iter()
-      .map(|candidate| candidate.git_ref.clone())
-      .collect();
+    let references = decision::plan_spec_invalidation(state)?;
     retire_deferred_candidates(&self.cwd, state, &references).await?;
+    decision::apply_spec_invalidation(state);
     self.ensure_catalog(context, state).await
   }
 
@@ -1218,271 +1244,27 @@ impl Controller {
   }
 }
 
-fn normalize_reconcile_relationships(
-  catalog: &RequirementCatalog,
-  result: &mut ReconcileResult,
-) -> Result<()> {
-  let criterion_requirements: BTreeMap<_, _> = catalog
-    .acceptance_criteria
-    .iter()
-    .map(|criterion| (criterion.id.clone(), criterion.requirement_id.clone()))
-    .collect();
-  let obligation_criteria: BTreeMap<_, _> = catalog
-    .verification_obligations
-    .iter()
-    .map(|obligation| (obligation.id.clone(), obligation.criterion_id.clone()))
-    .collect();
-
-  for work in &mut result.work_units {
-    let obligation_ids: BTreeSet<_> = work
-      .verification_obligation_ids
-      .iter()
-      .cloned()
-      .chain(
-        work
-          .suggested_checks
-          .iter()
-          .map(|check| check.obligation_id.clone()),
-      )
-      .collect();
-    let mut criterion_ids: BTreeSet<_> = work.criterion_ids.iter().cloned().collect();
-    for obligation_id in &obligation_ids {
-      criterion_ids.insert(
-        obligation_criteria
-          .get(obligation_id)
-          .ok_or_else(|| DomainValidationError::UnknownObligation {
-            work_unit_id: work.id.clone(),
-            obligation_id: obligation_id.to_string(),
-          })?
-          .clone(),
-      );
-    }
-    let mut requirement_ids: BTreeSet<_> = work.requirement_ids.iter().cloned().collect();
-    for criterion_id in &criterion_ids {
-      requirement_ids.insert(
-        criterion_requirements
-          .get(criterion_id)
-          .ok_or_else(|| DomainValidationError::UnknownCriterion {
-            work_unit_id: work.id.clone(),
-            criterion_id: criterion_id.to_string(),
-          })?
-          .clone(),
-      );
-    }
-    work.verification_obligation_ids = obligation_ids.into_iter().collect();
-    work.criterion_ids = criterion_ids.into_iter().collect();
-    work.requirement_ids = requirement_ids.into_iter().collect();
-  }
-  Ok(())
-}
-
-#[derive(Debug)]
-enum ReconcileValidationError {
-  PresentWithGaps(RequirementId),
-  IncompleteWithoutGap {
-    requirement_id: RequirementId,
-    state: ImplementationState,
-  },
-}
-
-impl std::fmt::Display for ReconcileValidationError {
-  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      Self::PresentWithGaps(requirement_id) => write!(
-        formatter,
-        "present implementation {requirement_id} cannot report implementation gaps"
-      ),
-      Self::IncompleteWithoutGap { requirement_id, .. } => {
-        write!(
-          formatter,
-          "incomplete implementation {requirement_id} requires a concrete gap"
-        )
-      }
-    }
-  }
-}
-
-impl std::error::Error for ReconcileValidationError {}
-
-fn reconciliation_retry_feedback(error: &anyhow::Error) -> String {
-  if let Some(validation) = error.downcast_ref::<ReconcileValidationError>() {
-    return match validation {
-      ReconcileValidationError::PresentWithGaps(requirement_id) => format!(
-        "{requirement_id} is internally inconsistent.\n\nimplementationState=\"present\" means all required implementation exists and missingImplementation must therefore be empty.\n\nIf the reported implementation gaps are real, choose \"partial\", \"absent\", or \"unknown\".\n\nIf no implementation gap actually remains, keep \"present\" and return an empty missingImplementation list.\n\nRegenerate the complete reconciliation result."
-      ),
-      ReconcileValidationError::IncompleteWithoutGap {
-        requirement_id,
-        state,
-      } => format!(
-        "{requirement_id} is internally inconsistent.\n\nimplementationState=\"{}\" means required implementation is missing, incomplete, or could not be established. missingImplementation must contain at least one concrete gap or explanation.\n\nIf all required implementation exists, choose \"present\" and return an empty missingImplementation list.\n\nRegenerate the complete reconciliation result.",
-        implementation_state_name(*state)
-      ),
-    };
-  }
-
-  let message = format!("{error:#}");
-  if matches!(
-    error.downcast_ref::<DomainValidationError>(),
-    Some(
-      DomainValidationError::UnknownRequirement { .. }
-        | DomainValidationError::UnknownCriterion { .. }
-        | DomainValidationError::UnknownObligation { .. }
-    )
-  ) || message.contains("IDs do not match")
-    || message.contains("unknown missing evidence obligation")
-    || message.contains("missing evidence owned by another requirement")
-    || message.contains("relationships do not match")
-    || message.contains("outside its verification obligations")
-  {
-    return format!(
-      "{message}\nUse requirement, criterion, and verification-obligation IDs exactly as supplied by the authoritative catalog. Do not guess, repair, or normalize identifiers.\nRegenerate the complete reconciliation result."
-    );
-  }
-
-  format!(
-    "{message}\nRegenerate the complete reconciliation result and correct this validation failure."
-  )
-}
-
-fn implementation_state_name(state: ImplementationState) -> &'static str {
-  match state {
-    ImplementationState::Present => "present",
-    ImplementationState::Partial => "partial",
-    ImplementationState::Absent => "absent",
-    ImplementationState::Unknown => "unknown",
-  }
-}
-
-fn validate_reconcile(catalog: &RequirementCatalog, result: &ReconcileResult) -> Result<()> {
-  let expected: BTreeSet<_> = catalog
-    .requirements
-    .iter()
-    .map(|item| item.id.clone())
-    .collect();
-  let actual: BTreeSet<_> = result
-    .requirements
-    .iter()
-    .map(|item| item.requirement_id.clone())
-    .collect();
-  if expected != actual || actual.len() != result.requirements.len() {
-    bail!("reconciliation assessment IDs do not match the requirement catalog");
-  }
-  let criterion_requirements: BTreeMap<_, _> = catalog
-    .acceptance_criteria
-    .iter()
-    .map(|criterion| (criterion.id.clone(), criterion.requirement_id.clone()))
-    .collect();
-  let obligation_criteria: BTreeMap<_, _> = catalog
-    .verification_obligations
-    .iter()
-    .map(|obligation| (obligation.id.clone(), obligation.criterion_id.clone()))
-    .collect();
-  let mut implementation_gap = false;
-  for assessment in &result.requirements {
-    if assessment
-      .observations
-      .iter()
-      .chain(&assessment.missing_implementation)
-      .any(|value| value.trim().is_empty())
-    {
-      bail!(
-        "{} contains a blank implementation observation",
-        assessment.requirement_id
-      );
-    }
-    match assessment.implementation_state {
-      ImplementationState::Present if !assessment.missing_implementation.is_empty() => {
-        return Err(
-          ReconcileValidationError::PresentWithGaps(assessment.requirement_id.clone()).into(),
-        );
-      }
-      ImplementationState::Partial | ImplementationState::Absent | ImplementationState::Unknown => {
-        implementation_gap = true;
-        if assessment.missing_implementation.is_empty() {
-          return Err(
-            ReconcileValidationError::IncompleteWithoutGap {
-              requirement_id: assessment.requirement_id.clone(),
-              state: assessment.implementation_state,
-            }
-            .into(),
-          );
-        }
-      }
-      ImplementationState::Present => {}
-    }
-    for obligation_id in &assessment.missing_evidence {
-      let Some(criterion_id) = obligation_criteria.get(obligation_id) else {
-        bail!(
-          "{} reports an unknown missing evidence obligation",
-          assessment.requirement_id
-        );
-      };
-      if criterion_requirements.get(criterion_id) != Some(&assessment.requirement_id) {
-        bail!(
-          "{} reports missing evidence owned by another requirement",
-          assessment.requirement_id
-        );
-      }
-    }
-  }
-  for work in &result.work_units {
-    for criterion_id in &work.criterion_ids {
-      let requirement_id = criterion_requirements
-        .get(criterion_id)
-        .context("work unit targets an unknown acceptance criterion")?;
-      if !work.requirement_ids.contains(requirement_id) {
-        bail!(
-          "{} criterion relationships do not match its requirements",
-          work.id
-        );
-      }
-    }
-    for obligation_id in &work.verification_obligation_ids {
-      let criterion_id = obligation_criteria
-        .get(obligation_id)
-        .context("work unit targets an unknown verification obligation")?;
-      if !work.criterion_ids.contains(criterion_id) {
-        bail!(
-          "{} obligation relationships do not match its criteria",
-          work.id
-        );
-      }
-    }
-    if work.suggested_checks.iter().any(|check| {
-      !work
-        .verification_obligation_ids
-        .contains(&check.obligation_id)
-    }) {
-      bail!(
-        "{} binds a check outside its verification obligations",
-        work.id
-      );
-    }
-  }
-  if implementation_gap && result.work_units.is_empty() {
-    bail!("implementation gaps require at least one proposed work unit");
-  }
-  Ok(())
-}
 async fn prune_deferred_candidates(
   cwd: &Path,
   state: &mut State,
   catalog: &RequirementCatalog,
   revision: &str,
 ) -> Result<()> {
-  let mut retained = Vec::with_capacity(state.deferred_candidates.len());
-  for candidate in std::mem::take(&mut state.deferred_candidates) {
-    if candidate.catalog_hash == catalog.spec_hash && candidate.base_revision == revision {
-      let resolved = git::resolve_ref(cwd, &candidate.git_ref).await?;
-      if resolved != candidate.candidate_revision {
-        bail!("deferred candidate Git ref does not match persisted revision");
-      }
-      retained.push(candidate);
-    } else {
-      git::delete_ref(cwd, &candidate.git_ref).await?;
+  let classification = decision::classify_deferred_candidates(
+    std::mem::take(&mut state.deferred_candidates),
+    &catalog.spec_hash,
+    revision,
+  );
+  for candidate in &classification.retained {
+    let resolved = git::resolve_ref(cwd, &candidate.git_ref).await?;
+    if resolved != candidate.candidate_revision {
+      bail!("deferred candidate Git ref does not match persisted revision");
     }
   }
-  state.deferred_candidates = retained;
+  for reference in &classification.stale_refs {
+    git::delete_ref(cwd, reference).await?;
+  }
+  state.deferred_candidates = classification.retained;
   Ok(())
 }
 
@@ -1498,88 +1280,6 @@ async fn retire_deferred_candidates(
     .deferred_candidates
     .retain(|candidate| !references.contains(&candidate.git_ref));
   Ok(())
-}
-
-async fn progress_fingerprint(
-  cwd: &Path,
-  catalog: &RequirementCatalog,
-  reconciliation: &ReconcileResult,
-  state: &State,
-) -> Result<String> {
-  let head = git::head(cwd).await?;
-  let active_discoveries: Vec<_> = state
-    .discoveries
-    .iter()
-    .filter(|record| record.status == DiscoveryStatus::Active)
-    .map(|record| record.fingerprint.as_str())
-    .collect();
-  let bytes = serde_json::to_vec(&(head, &catalog.spec_hash, reconciliation, active_discoveries))?;
-  let digest = Sha256::digest(bytes);
-  let mut fingerprint = String::with_capacity(digest.len() * 2);
-  for byte in digest {
-    write!(fingerprint, "{byte:02x}")?;
-  }
-  Ok(fingerprint)
-}
-
-fn advance_stagnation(state: &mut State, fingerprint: String, limit: u32) -> bool {
-  if state.progress_fingerprint.as_deref() == Some(&fingerprint) {
-    state.stagnation_count = state.stagnation_count.saturating_add(1);
-  } else {
-    state.progress_fingerprint = Some(fingerprint);
-    state.stagnation_count = 0;
-  }
-  state.stagnation_count >= limit
-}
-
-fn assessment_catalog(catalog: &RequirementCatalog) -> RequirementCatalog {
-  let verification_obligations: Vec<_> = catalog
-    .verification_obligations
-    .iter()
-    .filter(|obligation| obligation.required)
-    .cloned()
-    .collect();
-  let criterion_ids: BTreeSet<_> = verification_obligations
-    .iter()
-    .map(|obligation| obligation.criterion_id.clone())
-    .collect();
-  let acceptance_criteria: Vec<_> = catalog
-    .acceptance_criteria
-    .iter()
-    .filter(|criterion| criterion_ids.contains(&criterion.id))
-    .cloned()
-    .collect();
-  let requirement_ids: BTreeSet<_> = acceptance_criteria
-    .iter()
-    .map(|criterion| criterion.requirement_id.clone())
-    .collect();
-  let requirements: Vec<_> = catalog
-    .requirements
-    .iter()
-    .filter(|requirement| requirement_ids.contains(&requirement.id))
-    .cloned()
-    .collect();
-  let fragment_ids: BTreeSet<_> = requirements
-    .iter()
-    .flat_map(|requirement| requirement.source_refs.iter())
-    .map(|reference| reference.fragment_id.clone())
-    .collect();
-  RequirementCatalog {
-    spec_hash: catalog.spec_hash.clone(),
-    requirements,
-    acceptance_criteria,
-    verification_obligations,
-    coverage: tenet_domain::worker::CatalogCoverage {
-      normative_fragments: catalog
-        .coverage
-        .normative_fragments
-        .iter()
-        .filter(|fragment| fragment_ids.contains(&fragment.id))
-        .cloned()
-        .collect(),
-      uncovered_fragment_ids: Vec::new(),
-    },
-  }
 }
 
 fn requirement_counts(
@@ -1744,60 +1444,6 @@ fn apply_semantic_layers(
   layers.semantic_uncertain = counts.uncertain;
   layers.contradictions = counts.gaps;
 }
-fn record_candidate_discoveries(
-  state: &mut State,
-  catalog: &RequirementCatalog,
-  candidate: &WorkExecution,
-) -> Result<()> {
-  record_discoveries(
-    state,
-    catalog,
-    &candidate.candidate_revision,
-    &candidate.lease.work_unit.id,
-    &candidate.discoveries,
-  )
-}
-
-fn record_discoveries(
-  state: &mut State,
-  catalog: &RequirementCatalog,
-  repository_revision: &str,
-  work_unit_id: &str,
-  discoveries: &[WorkerDiscovery],
-) -> Result<()> {
-  for discovered in discoveries {
-    let identity = serde_json::to_vec(&(
-      &catalog.spec_hash,
-      repository_revision,
-      work_unit_id,
-      discovered.role,
-      &discovered.discovery,
-    ))?;
-    let digest = Sha256::digest(identity);
-    let mut fingerprint = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-      write!(fingerprint, "{byte:02x}")?;
-    }
-    if state
-      .discoveries
-      .iter()
-      .any(|record| record.fingerprint == fingerprint && record.status == DiscoveryStatus::Active)
-    {
-      continue;
-    }
-    state.discoveries.push(DiscoveryRecord {
-      fingerprint,
-      discovery: discovered.discovery.clone(),
-      catalog_hash: catalog.spec_hash.clone(),
-      repository_revision: repository_revision.into(),
-      work_unit_id: work_unit_id.into(),
-      role: discovered.role,
-      cycle: state.cycle,
-      status: DiscoveryStatus::Active,
-    });
-  }
-  Ok(())
-}
 
 fn integration_failure(outcome: &IntegrationOutcome) -> String {
   match outcome {
@@ -1923,6 +1569,10 @@ mod tests {
     }
   }
 
+  fn validate_reconcile(_catalog: &RequirementCatalog, result: &ReconcileResult) -> Result<()> {
+    decision::validate_reconciliation(result)
+  }
+
   #[test]
   fn present_implementation_with_missing_evidence_is_a_valid_proposal() {
     assert!(validate_reconcile(
@@ -1979,28 +1629,6 @@ mod tests {
       &result(ImplementationState::Unknown, Vec::new(), true)
     )
     .is_err());
-  }
-
-  #[test]
-  fn work_relationships_are_closed_from_verification_obligations() {
-    let catalog = catalog();
-    let mut reconciliation = result(ImplementationState::Partial, vec!["missing behavior"], true);
-    let work = &mut reconciliation.work_units[0];
-    work.requirement_ids.clear();
-    work.criterion_ids.clear();
-
-    normalize_reconcile_relationships(&catalog, &mut reconciliation)
-      .expect("normalize relationships");
-
-    assert_eq!(
-      reconciliation.work_units[0].requirement_ids,
-      [RequirementId::from("REQ-001")]
-    );
-    assert_eq!(
-      reconciliation.work_units[0].criterion_ids,
-      [CriterionId::from("REQ-001/AC-01")]
-    );
-    assert!(validate_reconcile(&catalog, &reconciliation).is_ok());
   }
 
   #[test]
@@ -2189,30 +1817,5 @@ mod tests {
       .items
       .iter()
       .all(|item| item.outcome == CompletionGateOutcome::Satisfied));
-  }
-}
-
-#[cfg(test)]
-mod stagnation_tests {
-  use super::*;
-
-  #[test]
-  fn stagnation_blocks_exactly_after_configured_unchanged_transitions() {
-    let mut state = State::fresh();
-
-    assert!(!advance_stagnation(&mut state, "same".into(), 2));
-    assert!(!advance_stagnation(&mut state, "same".into(), 2));
-    assert!(advance_stagnation(&mut state, "same".into(), 2));
-    assert_eq!(state.stagnation_count, 2);
-  }
-
-  #[test]
-  fn meaningful_progress_resets_stagnation_counter() {
-    let mut state = State::fresh();
-    advance_stagnation(&mut state, "old".into(), 3);
-    advance_stagnation(&mut state, "old".into(), 3);
-
-    assert!(!advance_stagnation(&mut state, "new".into(), 3));
-    assert_eq!(state.stagnation_count, 0);
   }
 }

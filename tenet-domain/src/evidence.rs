@@ -211,6 +211,14 @@ impl ObligationAssessment {
   }
 }
 
+/// Agent-facing judgments in controller-selected obligation order.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticAssessmentProposal {
+  pub summary: String,
+  pub assessments: Vec<ObligationAssessment>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ObligationAssessmentResult {

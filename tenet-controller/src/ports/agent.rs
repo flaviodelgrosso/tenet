@@ -4,9 +4,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tenet_domain::{
   config::Config,
-  evidence::{EvidenceProjection, SemanticAssessmentReport},
+  evidence::{EvidenceProjection, SemanticAssessmentProposal},
   model::{
-    ArchitectOutput, CompletedWorkUnit, Discovery, ReconcileResult, RequirementCatalog,
+    AgentReconciliationProposal, ArchitectOutput, CompletedWorkUnit, Discovery, RequirementCatalog,
     VerificationReport, WorkUnit, WorkerSummary,
   },
   verification::ProjectVerificationRun,
@@ -29,7 +29,7 @@ pub trait AgentBackend: Send + Sync {
     discoveries: &[Discovery],
     evidence: &[EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
-  ) -> Result<ReconcileResult>;
+  ) -> Result<AgentReconciliationProposal>;
 
   async fn implement(
     &self,
@@ -55,5 +55,5 @@ pub trait AgentBackend: Send + Sync {
     project_verification: &ProjectVerificationRun,
     evidence: &[EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
-  ) -> Result<SemanticAssessmentReport>;
+  ) -> Result<SemanticAssessmentProposal>;
 }

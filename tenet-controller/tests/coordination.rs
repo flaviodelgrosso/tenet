@@ -26,15 +26,15 @@ use tenet_domain::{
   events::{EventSink, RunEvent},
   evidence::{
     AcceptanceCriterion, EvidencePolicy, ImplementationState, ObligationAssessment,
-    ObligationAssessmentResult, SemanticAssessmentReport, VerificationObligation,
-    VerificationState,
+    SemanticAssessmentProposal, VerificationObligation, VerificationState,
   },
   ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId},
   model::{
-    ArchitectOutput, ArchitectRequirement, CandidateCheck, CompletedWorkUnit, Discovery,
-    DiscoveryRecord, DiscoveryStatus, IntegrationPhase, IntegrationTransaction, ReconcileResult,
-    Requirement, RequirementAssessment, RequirementCatalog, State, VerificationReport,
-    WorkExecution, WorkLease, WorkScope, WorkUnit, WorkerRole, WorkerSummary,
+    AgentReconciliationProposal, AgentRequirementAssessment, AgentWorkUnit, ArchitectOutput,
+    ArchitectRequirement, CandidateCheck, CompletedWorkUnit, Discovery, DiscoveryRecord,
+    DiscoveryStatus, IntegrationPhase, IntegrationTransaction, ReconcileResult, Requirement,
+    RequirementCatalog, State, VerificationReport, WorkExecution, WorkLease, WorkScope, WorkUnit,
+    WorkerRole, WorkerSummary,
   },
   verification::ProjectVerificationRun,
   worker::{derive_normative_fragments, CatalogCoverage},
@@ -182,18 +182,30 @@ fn unit(id: &str, dependencies: &[&str]) -> WorkUnit {
   }
 }
 
-fn graph_units() -> Vec<WorkUnit> {
+fn proposed_unit(id: &str, dependencies: &[&str]) -> AgentWorkUnit {
+  let unit = unit(id, dependencies);
+  AgentWorkUnit {
+    id: unit.id,
+    title: unit.title,
+    objective: unit.objective,
+    verification_obligation_ids: unit.verification_obligation_ids,
+    suggested_checks: unit.suggested_checks,
+    depends_on: unit.depends_on,
+    scope: unit.scope,
+  }
+}
+
+fn graph_units() -> Vec<AgentWorkUnit> {
   vec![
-    unit("A", &[]),
-    unit("B", &["A"]),
-    unit("C", &["A"]),
-    unit("D", &["B", "C"]),
+    proposed_unit("A", &[]),
+    proposed_unit("B", &["A"]),
+    proposed_unit("C", &["A"]),
+    proposed_unit("D", &["B", "C"]),
   ]
 }
 
-fn assessment(satisfied: bool) -> RequirementAssessment {
-  RequirementAssessment {
-    requirement_id: RequirementId::from("REQ-001"),
+fn assessment(satisfied: bool) -> AgentRequirementAssessment {
+  AgentRequirementAssessment {
     implementation_state: if satisfied {
       ImplementationState::Present
     } else {
@@ -388,7 +400,7 @@ impl AgentBackend for FakeBackend {
     discoveries: &[Discovery],
     _evidence: &[tenet_domain::evidence::EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
-  ) -> Result<ReconcileResult> {
+  ) -> Result<AgentReconciliationProposal> {
     self.require_specification(ctx).await?;
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Reconcile)
@@ -423,8 +435,7 @@ impl AgentBackend for FakeBackend {
             .filter(|criterion| criterion.requirement_id == requirement.id)
             .map(|criterion| criterion.id.clone())
             .collect();
-          RequirementAssessment {
-            requirement_id: requirement.id.clone(),
+          AgentRequirementAssessment {
             implementation_state: ImplementationState::Present,
             observations: vec!["large specification behavior is present".into()],
             missing_implementation: Vec::new(),
@@ -437,7 +448,7 @@ impl AgentBackend for FakeBackend {
           }
         })
         .collect();
-      return Ok(ReconcileResult {
+      return Ok(AgentReconciliationProposal {
         summary: "large catalog implementation present; evidence pending".into(),
         requirements,
         work_units: Vec::new(),
@@ -464,7 +475,7 @@ impl AgentBackend for FakeBackend {
         .any(|discovery| matches!(discovery, Discovery::VerificationBlocker { .. }))
       && !ctx.cwd.join("semantic-fix.txt").exists()
     {
-      work_units.push(unit("semantic-fix", &[]));
+      work_units.push(proposed_unit("semantic-fix", &[]));
     }
     if matches!(
       self.mode,
@@ -531,7 +542,7 @@ impl AgentBackend for FakeBackend {
       requirement_assessment.missing_implementation =
         vec!["required behavior is still missing".into()];
     }
-    Ok(ReconcileResult {
+    Ok(AgentReconciliationProposal {
       summary: if satisfied {
         "implementation present; evidence pending".into()
       } else {
@@ -658,7 +669,7 @@ impl AgentBackend for FakeBackend {
     _project_verification: &ProjectVerificationRun,
     _evidence: &[tenet_domain::evidence::EvidenceProjection],
     semantic_validation_feedback: Option<&str>,
-  ) -> Result<SemanticAssessmentReport> {
+  ) -> Result<SemanticAssessmentProposal> {
     self.require_specification(ctx).await?;
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Assess)
@@ -680,17 +691,14 @@ impl AgentBackend for FakeBackend {
       }
     }
     if matches!(self.mode, BackendMode::LargeCatalog) {
-      return Ok(SemanticAssessmentReport {
+      return Ok(SemanticAssessmentProposal {
         summary: "large catalog independently assessed".into(),
         assessments: catalog
           .verification_obligations
           .iter()
-          .map(|obligation| ObligationAssessmentResult {
-            obligation_id: obligation.id.clone(),
-            assessment: ObligationAssessment::Satisfied {
-              rationale: "the immutable revision satisfies the batch requirement".into(),
-              evidence_refs: vec!["README.txt".into()],
-            },
+          .map(|_| ObligationAssessment::Satisfied {
+            rationale: "the immutable revision satisfies the batch requirement".into(),
+            evidence_refs: vec!["README.txt".into()],
           })
           .collect(),
       });
@@ -718,11 +726,12 @@ impl AgentBackend for FakeBackend {
       self.mode,
       BackendMode::InvalidAssessmentThenCorrect | BackendMode::InvalidAssessmentScopeThenCorrect
     ) && assessment_call == 0;
-    let obligation_id = if invalid_first {
-      ObligationId::from("REQ-999/AC-01/VO-01")
-    } else {
-      ObligationId::from("REQ-001/AC-01/VO-01")
-    };
+    if invalid_first {
+      return Ok(SemanticAssessmentProposal {
+        summary: "incomplete semantic assessment".into(),
+        assessments: Vec::new(),
+      });
+    }
     let semantic_repair_present = ctx.cwd.join("semantic-fix.txt").exists();
     let assessment = if matches!(self.mode, BackendMode::IncompleteAssessment)
       || matches!(self.mode, BackendMode::SemanticGapThenRepair) && !semantic_repair_present
@@ -742,12 +751,9 @@ impl AgentBackend for FakeBackend {
         ],
       }
     };
-    Ok(SemanticAssessmentReport {
+    Ok(SemanticAssessmentProposal {
       summary: "independent semantic assessment".into(),
-      assessments: vec![ObligationAssessmentResult {
-        obligation_id,
-        assessment,
-      }],
+      assessments: vec![assessment],
     })
   }
 }
@@ -1141,7 +1147,8 @@ async fn malformed_reconciliation_is_retried_with_feedback_and_corrected() {
     .contains("A targets unknown verification obligation REQ-999/AC-01/VO-01"));
   assert!(feedback[0]
     .1
-    .contains("Do not guess, repair, or normalize identifiers"));
+    .contains("correct this semantic validation failure"));
+  assert!(!feedback[0].1.contains("criterion relationships"));
 }
 
 #[tokio::test]
@@ -1628,8 +1635,17 @@ async fn run_with_historical_a(mut historical: WorkUnit) {
   store::write_state(repository.path(), &state)
     .await
     .expect("persist historical run");
+  let revision = git::head(repository.path()).await.expect("historical head");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("read historical catalog")
+    .expect("historical catalog");
   store::write_roadmap(
     repository.path(),
+    "historical-run",
+    1,
+    &revision,
+    &catalog.spec_hash,
     &ReconcileResult {
       summary: "historical".into(),
       requirements: Vec::new(),
@@ -2030,6 +2046,10 @@ async fn candidate(
       .expect("persist integration run");
     store::write_roadmap(
       repository.path(),
+      manager.run_id(),
+      1,
+      base,
+      "integration-spec",
       &ReconcileResult {
         summary: "integration fixtures".into(),
         requirements: Vec::new(),
@@ -2534,6 +2554,10 @@ async fn write_recovery_transaction(
     .expect("persist recovery run");
   store::write_roadmap(
     repository.path(),
+    "recovery-run",
+    1,
+    old_head,
+    "recovery-spec",
     &ReconcileResult {
       summary: "recovery".into(),
       requirements: Vec::new(),

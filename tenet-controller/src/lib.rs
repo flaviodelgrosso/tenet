@@ -8,6 +8,7 @@
 pub mod catalog;
 pub mod completion;
 pub mod controller;
+mod decision;
 pub mod evidence;
 pub mod ports;
 pub mod verification;
