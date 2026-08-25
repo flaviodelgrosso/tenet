@@ -18,6 +18,7 @@ use tenet_domain::{
     AgentReconciliationProposal, ReconcileResult, RequirementAssessment, RequirementCatalog,
     RunStatus, WorkUnit,
   },
+  worker::normalize_scope_pattern,
 };
 
 /// Authoritative domain action requested by deterministic controller policy.
@@ -187,7 +188,7 @@ fn canonical_criteria(
 fn canonical_scope_paths(paths: &[String]) -> Vec<String> {
   let mut paths: Vec<_> = paths
     .iter()
-    .map(|path| tenet_runtime::scheduler::normalize_scope_pattern(path))
+    .map(|path| normalize_scope_pattern(path))
     .collect();
   paths.sort();
   paths.dedup();
@@ -1128,6 +1129,23 @@ mod tests {
     duplicate.id = "WU-duplicate".into();
     right.work_units.push(duplicate);
     right.work_units.reverse();
+
+    assert_eq!(
+      progress_fingerprint("catalog", &left).expect("left fingerprint"),
+      progress_fingerprint("catalog", &right).expect("right fingerprint")
+    );
+  }
+
+  #[test]
+  fn progress_fingerprint_is_deterministic_for_canonical_scope_patterns() {
+    let mut left = materialize_reconciliation(&catalog(), proposal()).expect("materialize left");
+    left.work_units[0].scope.paths = vec!["tests/**".into(), "src/auth/**".into()];
+    let mut right = left.clone();
+    right.work_units[0].scope.paths = vec![
+      "src/auth/**".into(),
+      "tests/**".into(),
+      "src/auth/**".into(),
+    ];
 
     assert_eq!(
       progress_fingerprint("catalog", &left).expect("left fingerprint"),

@@ -77,7 +77,7 @@
           "type": "integer",
           "minimum": 0,
           "default": 2,
-          "description": "Maximum additional model completions for one logical Architect, Reconcile, or Assess operation, shared across structured-output and semantic-validation failures. Implement and Repair use the same retry count within each individual worker invocation."
+          "description": "Maximum additional model completions per Architect batch, Reconcile operation, or Assess operation—not across the entire multi-batch Architect phase. Structured-output and semantic-validation failures share that per-operation budget. Implement and Repair use the same retry count within each individual worker invocation."
         },
         "preferences": {
           "$ref": "#/$defs/agentPreferences",

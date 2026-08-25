@@ -544,7 +544,7 @@ additional_protected_paths = [
 
 Advanced controller, agent, verification, and execution settings are documented in [`schemas/config.schema.json`](schemas/config.schema.json). Verification defaults are written explicitly so the empty `checks` list is visible; replace it with at least one trusted check before running Tenet.
 
-`agent.completion_retries = N` permits at most `N + 1` model completions for one logical Architect, Reconcile, or Assess operation. Structured-output correction and controller semantic-validation retries consume that same budget. `max_repair_attempts = N` permits at most `N` total Repair worker invocations for a work unit across both empty-implementation recovery and candidate-verification recovery.
+`agent.completion_retries = N` permits at most `N + 1` model completions per Architect batch, Reconcile operation, or Assess operation—not across the entire multi-batch Architect phase. Structured-output correction and controller semantic-validation retries consume that same per-operation budget. `max_repair_attempts = N` permits at most `N` total Repair worker invocations for a work unit across both empty-implementation recovery and candidate-verification recovery.
 
 ---
 

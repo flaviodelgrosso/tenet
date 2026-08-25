@@ -14,6 +14,12 @@ pub enum DomainValidationError {
   WorkUnitWithoutVerificationObligations(String),
   #[error("{0} has an empty declared scope")]
   EmptyWorkScope(String),
+  #[error("{work_unit_id} scope path {path:?} is not canonical; use {canonical:?}")]
+  NonCanonicalWorkScope {
+    work_unit_id: String,
+    path: String,
+    canonical: String,
+  },
   #[error("{work_unit_id} scope path {path:?} does not include descendants; use {recursive:?} or explicit files")]
   NonRecursiveDirectoryScope {
     work_unit_id: String,

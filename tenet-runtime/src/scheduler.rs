@@ -22,6 +22,7 @@ use tenet_domain::{
     VerificationReport, WorkExecution, WorkLease, WorkUnit, WorkerDiscovery, WorkerRole,
     WorkerSummary,
   },
+  worker::normalize_scope_pattern,
 };
 use tenet_storage::Storage;
 
@@ -888,20 +889,9 @@ pub fn scopes_conflict(left: &WorkUnit, right: &WorkUnit) -> Result<bool> {
 fn compile_scope(patterns: &[String]) -> Result<GlobSet> {
   let mut builder = GlobSetBuilder::new();
   for pattern in patterns {
-    let normalized = normalize_scope_pattern(pattern);
-    builder.add(Glob::new(&normalized).with_context(|| format!("invalid scope glob {pattern}"))?);
+    builder.add(Glob::new(pattern).with_context(|| format!("invalid scope glob {pattern}"))?);
   }
   builder.build().context("build scope matcher")
-}
-
-/// Returns the canonical representation used for both matching and progress identity.
-pub fn normalize_scope_pattern(pattern: &str) -> String {
-  pattern
-    .trim()
-    .split('/')
-    .filter(|component| !component.is_empty() && *component != ".")
-    .collect::<Vec<_>>()
-    .join("/")
 }
 
 fn patterns_provably_disjoint(left: &str, right: &str) -> bool {
@@ -1114,8 +1104,15 @@ mod tests {
   }
 
   #[test]
-  fn scope_matcher_uses_canonical_path_form() {
-    let scope = compile_scope(&[" ./src//** ".into()]).expect("valid normalized glob");
+  fn scope_matcher_does_not_normalize_authority() {
+    let scope = compile_scope(&["/src/auth/**".into()]).expect("valid literal glob");
+
+    assert!(!scope.is_match("src/auth/login.rs"));
+  }
+
+  #[test]
+  fn scope_matcher_authorizes_canonical_scope_exactly() {
+    let scope = compile_scope(&["src/auth/**".into()]).expect("valid canonical glob");
 
     assert!(scope.is_match("src/auth/login.rs"));
   }

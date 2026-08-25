@@ -282,6 +282,16 @@ pub struct WorkScope {
   pub paths: Vec<String>,
 }
 
+/// Returns the canonical representation used for scope identity and conservative comparison.
+pub fn normalize_scope_pattern(pattern: &str) -> String {
+  pattern
+    .trim()
+    .split('/')
+    .filter(|component| !component.is_empty() && *component != ".")
+    .collect::<Vec<_>>()
+    .join("/")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateCheck {
@@ -387,18 +397,25 @@ impl WorkUnit {
     if self.scope.paths.is_empty() || self.scope.paths.iter().any(|path| path.trim().is_empty()) {
       return Err(DomainValidationError::EmptyWorkScope(self.id.clone()));
     }
-    if let Some(path) = self
-      .scope
-      .paths
-      .iter()
-      .map(|path| path.trim())
-      .find(|path| path.ends_with('/'))
-    {
-      return Err(DomainValidationError::NonRecursiveDirectoryScope {
-        work_unit_id: self.id.clone(),
-        path: path.into(),
-        recursive: format!("{path}**"),
-      });
+    for path in &self.scope.paths {
+      let canonical = normalize_scope_pattern(path);
+      if canonical.is_empty() {
+        return Err(DomainValidationError::EmptyWorkScope(self.id.clone()));
+      }
+      if path != &canonical {
+        if path.trim() == path && path.ends_with('/') {
+          return Err(DomainValidationError::NonRecursiveDirectoryScope {
+            work_unit_id: self.id.clone(),
+            path: path.clone(),
+            recursive: format!("{canonical}/**"),
+          });
+        }
+        return Err(DomainValidationError::NonCanonicalWorkScope {
+          work_unit_id: self.id.clone(),
+          path: path.clone(),
+          canonical,
+        });
+      }
     }
     for check in &self.suggested_checks {
       if check.command.trim().is_empty() || check.command.contains(['\r', '\n', '`']) {
@@ -453,6 +470,27 @@ impl WorkUnit {
 mod tests {
   use super::*;
 
+  fn validate_scope(path: &str) -> Result<(), DomainValidationError> {
+    WorkUnit {
+      id: "WU-001".into(),
+      title: "Implement requirement".into(),
+      objective: "Make behavior observable".into(),
+      requirement_ids: vec![RequirementId::from("REQ-001")],
+      criterion_ids: vec![CriterionId::from("REQ-001/AC-01")],
+      verification_obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
+      suggested_checks: Vec::new(),
+      depends_on: Vec::new(),
+      scope: WorkScope {
+        paths: vec![path.into()],
+      },
+    }
+    .validate(
+      &BTreeSet::from([RequirementId::from("REQ-001")]),
+      &BTreeSet::from([CriterionId::from("REQ-001/AC-01")]),
+      &BTreeSet::from([ObligationId::from("REQ-001/AC-01/VO-01")]),
+    )
+  }
+
   #[test]
   fn work_unit_validation_returns_typed_unknown_requirement_error() {
     let unit = WorkUnit {
@@ -482,27 +520,66 @@ mod tests {
   }
 
   #[test]
-  fn work_unit_validation_rejects_directory_scope_without_recursive_glob() {
-    let unit = WorkUnit {
-      id: "WU-001".into(),
-      title: "Implement requirement".into(),
-      objective: "Make behavior observable".into(),
-      requirement_ids: vec![RequirementId::from("REQ-001")],
-      criterion_ids: vec![CriterionId::from("REQ-001/AC-01")],
-      verification_obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
-      suggested_checks: Vec::new(),
-      depends_on: Vec::new(),
-      scope: WorkScope {
-        paths: vec!["src/".into()],
-      },
-    };
-
+  fn work_unit_validation_rejects_leading_slash_in_scope() {
     assert_eq!(
-      unit.validate(
-        &BTreeSet::from([RequirementId::from("REQ-001")]),
-        &BTreeSet::from([CriterionId::from("REQ-001/AC-01")]),
-        &BTreeSet::from([ObligationId::from("REQ-001/AC-01/VO-01")]),
-      ),
+      validate_scope("/src/auth/**"),
+      Err(DomainValidationError::NonCanonicalWorkScope {
+        work_unit_id: "WU-001".into(),
+        path: "/src/auth/**".into(),
+        canonical: "src/auth/**".into(),
+      })
+    );
+  }
+
+  #[test]
+  fn work_unit_validation_rejects_root_scope_without_invalid_guidance() {
+    assert_eq!(
+      validate_scope("/"),
+      Err(DomainValidationError::EmptyWorkScope("WU-001".into()))
+    );
+  }
+
+  #[test]
+  fn work_unit_validation_rejects_leading_scope_whitespace() {
+    assert!(matches!(
+      validate_scope(" src/auth/**"),
+      Err(DomainValidationError::NonCanonicalWorkScope { .. })
+    ));
+  }
+
+  #[test]
+  fn work_unit_validation_rejects_trailing_scope_whitespace() {
+    assert!(matches!(
+      validate_scope("src/auth/** "),
+      Err(DomainValidationError::NonCanonicalWorkScope { .. })
+    ));
+  }
+
+  #[test]
+  fn work_unit_validation_rejects_redundant_current_directory_component() {
+    assert!(matches!(
+      validate_scope("./src/auth/**"),
+      Err(DomainValidationError::NonCanonicalWorkScope { .. })
+    ));
+  }
+
+  #[test]
+  fn work_unit_validation_rejects_redundant_path_separator() {
+    assert!(matches!(
+      validate_scope("src//auth/**"),
+      Err(DomainValidationError::NonCanonicalWorkScope { .. })
+    ));
+  }
+
+  #[test]
+  fn work_unit_validation_accepts_canonical_scope() {
+    assert_eq!(validate_scope("src/auth/**"), Ok(()));
+  }
+
+  #[test]
+  fn work_unit_validation_guides_directory_scope_to_recursive_glob() {
+    assert_eq!(
+      validate_scope("src/"),
       Err(DomainValidationError::NonRecursiveDirectoryScope {
         work_unit_id: "WU-001".into(),
         path: "src/".into(),
