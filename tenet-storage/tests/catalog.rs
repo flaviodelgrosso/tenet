@@ -2,7 +2,7 @@ use chrono::{TimeZone, Utc};
 use tenet_domain::{
   evidence::{AcceptanceCriterion, VerificationObligation},
   ids::{CriterionId, ObligationId, RequirementId, SpecFragmentId},
-  model::{Requirement, RequirementCatalog},
+  model::{CatalogApproval, Requirement, RequirementCatalog},
   worker::{CatalogCoverage, SpecFragment, SpecReference},
 };
 use tenet_storage::Storage;
@@ -106,4 +106,98 @@ async fn active_catalog_is_explicit_not_most_recent_by_timestamp() {
     storage.load_active_catalog().await.expect("active catalog"),
     Some(expected)
   );
+}
+
+#[tokio::test]
+async fn exact_catalog_approval_survives_reload() {
+  let project = tempfile::tempdir().expect("temporary project");
+  let storage = Storage::open(project.path()).await.expect("open storage");
+  let catalog = catalog();
+  storage
+    .persist_catalog("spec.md", Utc::now(), &catalog)
+    .await
+    .expect("persist catalog");
+  let approval = CatalogApproval {
+    spec_hash: catalog.spec_hash.clone(),
+    catalog_hash: catalog.catalog_hash().expect("hash catalog"),
+    approved_at: Utc.with_ymd_and_hms(2026, 8, 25, 10, 0, 0).unwrap(),
+  };
+  storage
+    .persist_catalog_approval(&approval)
+    .await
+    .expect("approve catalog");
+  drop(storage);
+
+  let reloaded = Storage::open_existing(project.path())
+    .await
+    .expect("reopen storage");
+
+  assert!(reloaded
+    .catalog_is_approved(&catalog)
+    .await
+    .expect("check approval"));
+}
+
+#[tokio::test]
+async fn replacing_catalog_under_same_spec_hash_invalidates_approval() {
+  let project = tempfile::tempdir().expect("temporary project");
+  let storage = Storage::open(project.path()).await.expect("open storage");
+  let original = catalog();
+  storage
+    .persist_catalog("spec.md", Utc::now(), &original)
+    .await
+    .expect("persist catalog");
+  storage
+    .persist_catalog_approval(&CatalogApproval {
+      spec_hash: original.spec_hash.clone(),
+      catalog_hash: original.catalog_hash().expect("hash catalog"),
+      approved_at: Utc::now(),
+    })
+    .await
+    .expect("approve catalog");
+  let mut replacement = original.clone();
+  replacement.requirements[0].description = "Different architect interpretation".into();
+
+  storage
+    .persist_catalog("spec.md", Utc::now(), &replacement)
+    .await
+    .expect("replace catalog");
+
+  assert!(!storage
+    .catalog_is_approved(&replacement)
+    .await
+    .expect("check approval"));
+}
+
+#[tokio::test]
+async fn stale_approval_cannot_be_written_for_replaced_catalog() {
+  let project = tempfile::tempdir().expect("temporary project");
+  let storage = Storage::open(project.path()).await.expect("open storage");
+  let original = catalog();
+  storage
+    .persist_catalog("spec.md", Utc::now(), &original)
+    .await
+    .expect("persist catalog");
+  let stale = CatalogApproval {
+    spec_hash: original.spec_hash.clone(),
+    catalog_hash: original.catalog_hash().expect("hash original"),
+    approved_at: Utc::now(),
+  };
+  let mut replacement = original;
+  replacement.requirements[0].description = "Replacement interpretation".into();
+  storage
+    .persist_catalog("spec.md", Utc::now(), &replacement)
+    .await
+    .expect("replace catalog");
+
+  storage
+    .persist_catalog_approval(&stale)
+    .await
+    .expect_err("stale approval must fail closed");
+
+  assert!(storage
+    .load_catalog_approval()
+    .await
+    .expect("load approval")
+    .is_none());
 }

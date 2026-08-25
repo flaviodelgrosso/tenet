@@ -1,9 +1,9 @@
 pub use crate::verification::{CommandResult, RepositoryChange, VerificationReport};
 pub use crate::worker::{
   AgentReconciliationProposal, AgentRequirementAssessment, AgentWorkUnit, ArchitectOutput,
-  ArchitectRequirement, CandidateCheck, Discovery, DiscoveryRecord, DiscoveryStatus,
-  ReconcileResult, Requirement, RequirementAssessment, RequirementCatalog, WorkScope, WorkUnit,
-  WorkerDiscovery, WorkerEvent, WorkerRole, WorkerSummary,
+  ArchitectRequirement, CandidateCheck, CatalogApproval, Discovery, DiscoveryRecord,
+  DiscoveryStatus, ReconcileResult, Requirement, RequirementAssessment, RequirementCatalog,
+  WorkScope, WorkUnit, WorkerDiscovery, WorkerEvent, WorkerRole, WorkerSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,7 @@ pub struct MutationWorkerContext<'a> {
 pub enum RunStatus {
   Idle,
   Running,
+  ReviewRequired,
   Done,
   Blocked,
   Failed,
@@ -36,6 +37,7 @@ pub enum RunStatus {
 pub enum Phase {
   Initialized,
   Architecting,
+  ReviewingRequirements,
   Reconciling,
   Scheduling,
   Implementing,

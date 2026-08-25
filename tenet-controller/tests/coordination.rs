@@ -11,6 +11,7 @@ use std::{
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use chrono::Utc;
 use tokio::{
   fs,
   sync::{mpsc, Notify},
@@ -32,10 +33,10 @@ use tenet_domain::{
   ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId},
   model::{
     AgentReconciliationProposal, AgentRequirementAssessment, AgentWorkUnit, ArchitectOutput,
-    ArchitectRequirement, CandidateCheck, CompletedWorkUnit, Discovery, DiscoveryRecord,
-    DiscoveryStatus, IntegrationPhase, IntegrationTransaction, ReconcileResult, Requirement,
-    RequirementCatalog, State, VerificationReport, WorkExecution, WorkLease, WorkScope, WorkUnit,
-    WorkerRole, WorkerSummary,
+    ArchitectRequirement, CandidateCheck, CatalogApproval, CompletedWorkUnit, Discovery,
+    DiscoveryRecord, DiscoveryStatus, IntegrationPhase, IntegrationTransaction, Phase,
+    ReconcileResult, Requirement, RequirementCatalog, RunStatus, State, VerificationReport,
+    WorkExecution, WorkLease, WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
   verification::ProjectVerificationRun,
   worker::{derive_normative_fragments, CatalogCoverage},
@@ -776,8 +777,25 @@ impl AgentBackend for FakeBackend {
   }
 }
 
+async fn approve_active_catalog(repository: &Path) -> CatalogApproval {
+  let catalog = store::read_catalog(repository)
+    .await
+    .expect("load catalog")
+    .expect("active catalog");
+  let approval = CatalogApproval {
+    spec_hash: catalog.spec_hash.clone(),
+    catalog_hash: catalog.catalog_hash().expect("hash catalog"),
+    approved_at: Utc::now(),
+  };
+  store::write_catalog_approval(repository, &approval)
+    .await
+    .expect("approve catalog");
+  approval
+}
+
 async fn configured_controller(
   repository: &TempRepo,
+
   backend: Arc<FakeBackend>,
   max_parallel_workers: usize,
 ) -> (Controller, mpsc::UnboundedReceiver<RunEvent>) {
@@ -825,6 +843,7 @@ async fn configured_controller(
   )
   .await
   .expect("write catalog");
+  approve_active_catalog(repository.path()).await;
   let (sender, receiver) = mpsc::unbounded_channel();
   (
     Controller::new(
@@ -834,6 +853,17 @@ async fn configured_controller(
     ),
     receiver,
   )
+}
+async fn run_after_approval_if_required(
+  controller: &Controller,
+  repository: &Path,
+) -> Result<State> {
+  let state = controller.run(CancellationToken::new()).await?;
+  if state.status != RunStatus::ReviewRequired {
+    return Ok(state);
+  }
+  approve_active_catalog(repository).await;
+  controller.run(CancellationToken::new()).await
 }
 
 #[tokio::test]
@@ -871,6 +901,124 @@ async fn manual_verify_runs_project_suite_without_requirement_catalog() {
   assert!(report.passed);
   assert_eq!(report.checks[0].name, "tracked file");
   assert!(!repository.path().join(".tenet/requirements.json").exists());
+}
+#[tokio::test]
+async fn newly_generated_catalog_requires_review_before_reconciliation() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, mut events) = configured_controller(&repository, backend.clone(), 1).await;
+  reset_storage(repository.path()).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("catalog generation stops for review");
+
+  assert_eq!(state.status, RunStatus::ReviewRequired);
+  assert_eq!(state.phase, Phase::ReviewingRequirements);
+  assert!(state.blocked_reason.is_none());
+  assert_eq!(backend.reconcile_calls.load(Ordering::SeqCst), 0);
+  let messages = std::iter::from_fn(|| events.try_recv().ok())
+    .filter_map(|event| match event {
+      RunEvent::Message(message) => Some(message),
+      _ => None,
+    })
+    .collect::<Vec<_>>();
+  assert!(messages.iter().any(|message| {
+    message.contains("Human approval is required")
+      && message.contains("tenet requirements dump")
+      && message.contains("tenet requirements approve")
+  }));
+}
+
+#[tokio::test]
+async fn unapproved_cached_catalog_does_not_invoke_architect_again() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  reset_storage(repository.path()).await;
+  let first = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("first run requires review");
+  let architect_calls = backend.architect_calls.load(Ordering::SeqCst);
+
+  let second = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("cached catalog still requires review");
+
+  assert_eq!(first.status, RunStatus::ReviewRequired);
+  assert_eq!(second.status, RunStatus::ReviewRequired);
+  assert_eq!(
+    backend.architect_calls.load(Ordering::SeqCst),
+    architect_calls
+  );
+  assert_eq!(backend.reconcile_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn exact_catalog_approval_allows_later_run_to_reconcile() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
+  reset_storage(repository.path()).await;
+  let first = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("first run requires review");
+  assert_eq!(first.status, RunStatus::ReviewRequired);
+  approve_active_catalog(repository.path()).await;
+
+  let second = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("approved run succeeds");
+
+  assert_eq!(second.status, RunStatus::Done);
+  assert!(backend.reconcile_calls.load(Ordering::SeqCst) > 0);
+}
+
+#[tokio::test]
+async fn changed_specification_invalidates_approval_and_stops_before_reconciliation() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  fs::write(repository.path().join("spec.md"), "changed requirement")
+    .await
+    .expect("change specification");
+  run_git(repository.path(), &["add", "spec.md"]);
+  run_git(repository.path(), &["commit", "-m", "change specification"]);
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("changed catalog requires review");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("load catalog")
+    .expect("active catalog");
+
+  assert_eq!(state.status, RunStatus::ReviewRequired);
+  assert_eq!(backend.reconcile_calls.load(Ordering::SeqCst), 0);
+  assert!(!store::catalog_is_approved(repository.path(), &catalog)
+    .await
+    .expect("check approval"));
+}
+
+#[tokio::test]
+async fn approved_unchanged_catalog_continues_without_human_interruption() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("approved catalog proceeds");
+
+  assert_eq!(state.status, RunStatus::Done);
+  assert_eq!(backend.architect_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -917,8 +1065,7 @@ async fn assert_read_only_role_is_isolated(role: tenet_domain::model::WorkerRole
   }
   let head_before = git::head(repository.path()).await.expect("head before run");
 
-  let state = controller
-    .run(CancellationToken::new())
+  let state = run_after_approval_if_required(&controller, repository.path())
     .await
     .expect("isolated read-only mutation cannot affect the run");
 
@@ -951,8 +1098,7 @@ async fn large_specification_is_architected_in_bounded_complete_batches() {
     &["commit", "-m", "add large specification"],
   );
 
-  let state = controller
-    .run(CancellationToken::new())
+  let state = run_after_approval_if_required(&controller, repository.path())
     .await
     .expect("large catalog proceeds through the controller");
   let catalog = store::read_catalog(repository.path())
@@ -1019,8 +1165,7 @@ async fn ignored_specification_is_available_to_every_agent_workspace() {
   );
   reset_storage(repository.path()).await;
 
-  let state = controller
-    .run(CancellationToken::new())
+  let state = run_after_approval_if_required(&controller, repository.path())
     .await
     .expect("agents can read the ignored authoritative specification");
 
@@ -1041,8 +1186,7 @@ async fn incomplete_catalog_is_retried_with_coverage_feedback() {
   run_git(repository.path(), &["add", "spec.md"]);
   run_git(repository.path(), &["commit", "-m", "expand specification"]);
 
-  let state = controller
-    .run(CancellationToken::new())
+  let state = run_after_approval_if_required(&controller, repository.path())
     .await
     .expect("corrected catalog proceeds");
 
@@ -1788,8 +1932,7 @@ async fn specification_change_invalidates_completion_and_discovery_history() {
   run_git(repository.path(), &["add", "spec.md"]);
   run_git(repository.path(), &["commit", "-m", "change specification"]);
 
-  let second = controller
-    .run(CancellationToken::new())
+  let second = run_after_approval_if_required(&controller, repository.path())
     .await
     .expect("changed specification starts a new catalog context");
 

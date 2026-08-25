@@ -4,7 +4,7 @@ use sqlx::{Row, Sqlite, Transaction};
 use tenet_domain::{
   evidence::{AcceptanceCriterion, VerificationObligation},
   ids::{CriterionId, ObligationId, RequirementId, SpecFragmentId},
-  model::{Requirement, RequirementCatalog},
+  model::{CatalogApproval, Requirement, RequirementCatalog},
   worker::{CatalogCoverage, SpecFragment, SpecReference},
 };
 
@@ -18,6 +18,9 @@ impl Storage {
     observed_at: DateTime<Utc>,
     catalog: &RequirementCatalog,
   ) -> Result<(), StorageError> {
+    let catalog_hash = catalog
+      .catalog_hash()
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
     let mut transaction = self.pool.begin().await.map_err(StorageError::from_sqlx)?;
     clear_active_catalog(&mut transaction).await?;
     sqlx::query(
@@ -98,6 +101,11 @@ impl Storage {
     }
     sqlx::query("INSERT INTO storage_metadata(key, value) VALUES ('active_spec_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
       .bind(&catalog.spec_hash)
+      .execute(&mut *transaction)
+      .await
+      .map_err(StorageError::from_sqlx)?;
+    sqlx::query("INSERT INTO storage_metadata(key, value) VALUES ('active_catalog_hash', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .bind(catalog_hash)
       .execute(&mut *transaction)
       .await
       .map_err(StorageError::from_sqlx)?;
@@ -229,12 +237,73 @@ impl Storage {
       None => Ok(None),
     }
   }
+
+  /// Persists human approval only when it matches the exact active catalog identity.
+  pub async fn persist_catalog_approval(
+    &self,
+    approval: &CatalogApproval,
+  ) -> Result<(), StorageError> {
+    let mut transaction = self.pool.begin().await.map_err(StorageError::from_sqlx)?;
+    let result = sqlx::query(
+      "INSERT INTO catalog_approvals(singleton, spec_hash, catalog_hash, approved_at) SELECT 1, ?, ?, ? WHERE EXISTS (SELECT 1 FROM storage_metadata AS spec, storage_metadata AS catalog WHERE spec.key = 'active_spec_hash' AND spec.value = ? AND catalog.key = 'active_catalog_hash' AND catalog.value = ?) ON CONFLICT(singleton) DO UPDATE SET spec_hash = excluded.spec_hash, catalog_hash = excluded.catalog_hash, approved_at = excluded.approved_at",
+    )
+    .bind(&approval.spec_hash)
+    .bind(&approval.catalog_hash)
+    .bind(approval.approved_at.to_rfc3339())
+    .bind(&approval.spec_hash)
+    .bind(&approval.catalog_hash)
+    .execute(&mut *transaction)
+    .await
+    .map_err(StorageError::from_sqlx)?;
+    if result.rows_affected() != 1 {
+      return Err(StorageError::IntegrityViolation(
+        "catalog approval does not match the exact active catalog".into(),
+      ));
+    }
+    transaction.commit().await.map_err(StorageError::from_sqlx)
+  }
+
+  /// Loads the approval associated with the active catalog, if one exists.
+  pub async fn load_catalog_approval(&self) -> Result<Option<CatalogApproval>, StorageError> {
+    let row = sqlx::query(
+      "SELECT spec_hash, catalog_hash, approved_at FROM catalog_approvals WHERE singleton = 1",
+    )
+    .fetch_optional(&self.pool)
+    .await
+    .map_err(StorageError::from_sqlx)?;
+    row
+      .map(|row| {
+        let approved_at = row.get::<String, _>("approved_at");
+        Ok(CatalogApproval {
+          spec_hash: row.get("spec_hash"),
+          catalog_hash: row.get("catalog_hash"),
+          approved_at: DateTime::parse_from_rfc3339(&approved_at)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?,
+        })
+      })
+      .transpose()
+  }
+
+  /// Returns whether human approval matches the exact active catalog.
+  pub async fn catalog_is_approved(
+    &self,
+    catalog: &RequirementCatalog,
+  ) -> Result<bool, StorageError> {
+    let catalog_hash = catalog
+      .catalog_hash()
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    Ok(self.load_catalog_approval().await?.is_some_and(|approval| {
+      approval.spec_hash == catalog.spec_hash && approval.catalog_hash == catalog_hash
+    }))
+  }
 }
 
 async fn clear_active_catalog(
   transaction: &mut Transaction<'_, Sqlite>,
 ) -> Result<(), StorageError> {
   for statement in [
+    "DELETE FROM catalog_approvals",
     "DELETE FROM integration_transactions",
     "DELETE FROM completed_work_units",
     "DELETE FROM candidates",
@@ -246,7 +315,7 @@ async fn clear_active_catalog(
     "DELETE FROM uncovered_spec_fragments",
     "DELETE FROM requirements",
     "DELETE FROM specification_snapshots",
-    "DELETE FROM storage_metadata WHERE key = 'active_spec_hash'",
+    "DELETE FROM storage_metadata WHERE key IN ('active_spec_hash', 'active_catalog_hash')",
   ] {
     sqlx::query(statement)
       .execute(&mut **transaction)

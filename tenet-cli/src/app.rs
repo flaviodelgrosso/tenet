@@ -1,16 +1,17 @@
 use std::{io::IsTerminal, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::Parser;
 use tenet_acp::acp::AcpRuntime;
-use tenet_controller::{controller::manual_verify, AgentBackend};
-use tenet_domain::model::RunStatus;
+use tenet_controller::{catalog, controller::manual_verify, AgentBackend};
+use tenet_domain::model::{CatalogApproval, RunStatus};
 use tenet_runtime::store;
 use tenet_storage::{DatabaseHealth, Storage};
 
 use crate::{
   agents,
-  cli::{Cli, Command, DbCommand, DumpCommand, EvidenceCommand},
+  cli::{Cli, Command, DbCommand, DumpCommand, EvidenceCommand, RequirementsCommand},
   run::{self, RunOptions},
 };
 
@@ -75,9 +76,15 @@ impl App {
         ExitCode::SUCCESS
       }
       Some(Command::Requirements {
-        command: DumpCommand::Dump { json },
+        command: RequirementsCommand::Dump { json },
       }) => {
         self.dump_requirements(json).await?;
+        ExitCode::SUCCESS
+      }
+      Some(Command::Requirements {
+        command: RequirementsCommand::Approve,
+      }) => {
+        self.approve_requirements().await?;
         ExitCode::SUCCESS
       }
       Some(Command::Evidence {
@@ -205,6 +212,27 @@ impl App {
       .load_active_catalog()
       .await?;
     println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+  }
+
+  async fn approve_requirements(&self) -> Result<()> {
+    let storage = Storage::open(&self.cwd).await?;
+    let catalog = storage
+      .load_active_catalog()
+      .await?
+      .context("no active requirement catalog to approve")?;
+    catalog::validate(&catalog).context("active requirement catalog is structurally invalid")?;
+    let catalog_hash = catalog.catalog_hash()?;
+    let approval = CatalogApproval {
+      spec_hash: catalog.spec_hash.clone(),
+      catalog_hash: catalog_hash.clone(),
+      approved_at: Utc::now(),
+    };
+    storage.persist_catalog_approval(&approval).await?;
+    println!("Approved requirement catalog.");
+    println!("specification: {}", approval.spec_hash);
+    println!("catalog: {catalog_hash}");
+    println!("requirements: {}", catalog.requirements.len());
     Ok(())
   }
 

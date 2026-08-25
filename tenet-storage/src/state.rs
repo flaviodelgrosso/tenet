@@ -651,6 +651,18 @@ fn validate_state(state: &State) -> Result<(), StorageError> {
       "done status requires complete phase".into(),
     ));
   }
+  if (state.status == RunStatus::ReviewRequired) != (state.phase == Phase::ReviewingRequirements) {
+    return Err(StorageError::IntegrityViolation(
+      "review-required status and reviewing-requirements phase must occur together".into(),
+    ));
+  }
+  if state.status == RunStatus::ReviewRequired
+    && (!state.active_leases.is_empty() || !state.candidate_integrations.is_empty())
+  {
+    return Err(StorageError::IntegrityViolation(
+      "review-required state cannot contain active work".into(),
+    ));
+  }
   if state.status == RunStatus::Idle
     && (!state.active_leases.is_empty() || !state.candidate_integrations.is_empty())
   {
@@ -680,6 +692,7 @@ fn run_status_name(value: &RunStatus) -> &'static str {
   match value {
     RunStatus::Idle => "idle",
     RunStatus::Running => "running",
+    RunStatus::ReviewRequired => "review_required",
     RunStatus::Done => "done",
     RunStatus::Blocked => "blocked",
     RunStatus::Failed => "failed",
@@ -690,6 +703,7 @@ fn parse_run_status(value: &str) -> Result<RunStatus, StorageError> {
   match value {
     "idle" => Ok(RunStatus::Idle),
     "running" => Ok(RunStatus::Running),
+    "review_required" => Ok(RunStatus::ReviewRequired),
     "done" => Ok(RunStatus::Done),
     "blocked" => Ok(RunStatus::Blocked),
     "failed" => Ok(RunStatus::Failed),
@@ -703,6 +717,7 @@ fn phase_name(value: &Phase) -> &'static str {
   match value {
     Phase::Initialized => "initialized",
     Phase::Architecting => "architecting",
+    Phase::ReviewingRequirements => "reviewing_requirements",
     Phase::Reconciling => "reconciling",
     Phase::Scheduling => "scheduling",
     Phase::Implementing => "implementing",
@@ -717,6 +732,7 @@ fn parse_phase(value: &str) -> Result<Phase, StorageError> {
   match value {
     "initialized" => Ok(Phase::Initialized),
     "architecting" => Ok(Phase::Architecting),
+    "reviewing_requirements" => Ok(Phase::ReviewingRequirements),
     "reconciling" => Ok(Phase::Reconciling),
     "scheduling" => Ok(Phase::Scheduling),
     "implementing" => Ok(Phase::Implementing),

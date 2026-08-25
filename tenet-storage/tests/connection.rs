@@ -1,6 +1,10 @@
-use std::time::Duration;
+use std::{str::FromStr, time::Duration};
 
-use sqlx::Row;
+use sqlx::{
+  sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+  Row,
+};
+use tenet_domain::model::{Phase, RunStatus, State};
 use tenet_storage::{DatabaseHealth, Storage};
 
 #[tokio::test]
@@ -35,6 +39,75 @@ async fn open_creates_database_with_durable_pragmas_and_migrations() {
     .expect("read-only inspection");
   assert_eq!(
     inspection.quick_check().await.expect("inspection check"),
+    DatabaseHealth::Ok
+  );
+}
+
+#[tokio::test]
+async fn existing_database_migrates_to_review_required_lifecycle() {
+  let project = tempfile::tempdir().expect("temporary project");
+  let state_directory = project.path().join(".tenet");
+  tokio::fs::create_dir(&state_directory)
+    .await
+    .expect("state directory");
+  let database_path = state_directory.join("tenet.db");
+  let pool = SqlitePoolOptions::new()
+    .connect_with(
+      SqliteConnectOptions::from_str("sqlite::memory:")
+        .expect("sqlite options")
+        .filename(&database_path)
+        .in_memory(false)
+        .create_if_missing(true)
+        .foreign_keys(true),
+    )
+    .await
+    .expect("open legacy database");
+  let legacy_migrations = tempfile::tempdir().expect("migration directory");
+  tokio::fs::write(
+    legacy_migrations.path().join("20260820000000_initial.sql"),
+    include_str!("../migrations/20260820000000_initial.sql"),
+  )
+  .await
+  .expect("write legacy migration");
+  sqlx::migrate::Migrator::new(legacy_migrations.path())
+    .await
+    .expect("load legacy migration")
+    .run(&pool)
+    .await
+    .expect("apply legacy migration");
+  sqlx::query("INSERT INTO runs(id, status, phase, cycle, stagnation_count, last_summary, updated_at) VALUES ('legacy-run', 'running', 'architecting', 0, 0, 'legacy', '2026-08-20T10:00:00Z')")
+    .execute(&pool)
+    .await
+    .expect("insert legacy run");
+  sqlx::query("INSERT INTO current_run(singleton, run_id) VALUES (1, 'legacy-run')")
+    .execute(&pool)
+    .await
+    .expect("select legacy run");
+  drop(pool);
+
+  let storage = Storage::open(project.path())
+    .await
+    .expect("migrate existing database");
+  let mut state = State::fresh();
+  state.run_id = Some("legacy-run".into());
+  state.status = RunStatus::ReviewRequired;
+  state.phase = Phase::ReviewingRequirements;
+  state.last_summary = "review".into();
+  storage
+    .persist_state(&state)
+    .await
+    .expect("persist review state");
+
+  assert_eq!(
+    storage
+      .load_current_state()
+      .await
+      .expect("reload state")
+      .status,
+    RunStatus::ReviewRequired
+  );
+  assert_eq!(
+    storage.foreign_key_check().await.expect("foreign keys"),
     DatabaseHealth::Ok
   );
 }

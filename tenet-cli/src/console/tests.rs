@@ -410,6 +410,16 @@ fn stopped_run_summary_has_resume_guidance() {
 }
 
 #[test]
+fn review_required_summary_is_non_failure_with_manual_commands() {
+  let output = render_summary(RunStatus::ReviewRequired, None);
+
+  assert!(output.contains("! REVIEW REQUIRED"), "{output}");
+  assert!(output.contains("tenet requirements dump"), "{output}");
+  assert!(output.contains("tenet requirements approve"), "{output}");
+  assert!(!output.contains("blocker"), "{output}");
+}
+
+#[test]
 fn default_mode_hides_routine_diagnostics() {
   let output = render(
     InformationMode::Default,

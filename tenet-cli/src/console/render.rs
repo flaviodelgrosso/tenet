@@ -346,6 +346,11 @@ impl<W: Write> ConsoleRenderer<W> {
   pub(crate) fn summary(&mut self, state: &State, elapsed_seconds: u64) -> Result<()> {
     let (tone, label, explanation) = match state.status {
       RunStatus::Done => (Tone::Success, "DONE", "Repository earned completion"),
+      RunStatus::ReviewRequired => (
+        Tone::Warning,
+        "REVIEW REQUIRED",
+        "Requirements are structurally complete but need human approval",
+      ),
       RunStatus::Blocked => (
         Tone::Failure,
         "BLOCKED",
@@ -429,6 +434,10 @@ impl<W: Write> ConsoleRenderer<W> {
       )?;
     }
     match state.status {
+      RunStatus::ReviewRequired => writeln!(
+        self.writer,
+        "\n  review\n    tenet requirements dump\n\n  approve\n    tenet requirements approve"
+      )?,
       RunStatus::Blocked => writeln!(
         self.writer,
         "\n  next\n    Address the blocker, then run `tenet resume`."

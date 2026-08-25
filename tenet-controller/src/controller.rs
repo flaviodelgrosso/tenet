@@ -246,6 +246,9 @@ impl Controller {
 
   async fn run_inner(&self, context: &BackendContext, state: &mut State) -> Result<State> {
     let mut catalog = self.ensure_catalog(context, state).await?;
+    if !store::catalog_is_approved(&self.cwd, &catalog).await? {
+      return self.review_required(context, state, &catalog).await;
+    }
     if context.config.verification.checks.is_empty() {
       return self
         .block(
@@ -263,6 +266,9 @@ impl Controller {
       catalog = self
         .refresh_catalog_if_spec_changed(context, state, catalog)
         .await?;
+      if !store::catalog_is_approved(&self.cwd, &catalog).await? {
+        return self.review_required(context, state, &catalog).await;
+      }
       evidence_graph = evidence_graph::load(&self.cwd, &catalog).await?;
       store::write_evidence_graph(&self.cwd, &evidence_graph).await?;
       let current_revision = git::head(&self.cwd).await?;
@@ -1215,6 +1221,39 @@ impl Controller {
     retire_deferred_candidates(&self.cwd, state, &references).await?;
     decision::apply_spec_invalidation(state);
     self.ensure_catalog(context, state).await
+  }
+
+  async fn review_required(
+    &self,
+    context: &BackendContext,
+    state: &mut State,
+    catalog: &RequirementCatalog,
+  ) -> Result<State> {
+    state.status = RunStatus::ReviewRequired;
+    state.phase = Phase::ReviewingRequirements;
+    state.active_leases.clear();
+    state.candidate_integrations.clear();
+    state.current_repair = None;
+    state.blocked_reason = None;
+    state.last_error = None;
+    state.requirement_counts = RequirementCounts {
+      total: catalog.requirements.len(),
+      ..Default::default()
+    };
+    state.last_summary =
+      "Requirement catalog requires human approval before autonomous execution".into();
+    self.publish(&context.events, state).await?;
+    context.events.emit(RunEvent::Message(format!(
+      "Requirement catalog generated.\n\n{} requirements\n{} acceptance criteria\n{} verification obligations\nSpecification coverage: complete\n\nHuman approval is required before autonomous execution.\n\nReview:\n  tenet requirements dump\n\nApprove:\n  tenet requirements approve",
+      catalog.requirements.len(),
+      catalog.acceptance_criteria.len(),
+      catalog.verification_obligations.len(),
+    ))).await?;
+    context
+      .events
+      .emit(RunEvent::Finished(state.clone()))
+      .await?;
+    Ok(state.clone())
   }
 
   async fn block(

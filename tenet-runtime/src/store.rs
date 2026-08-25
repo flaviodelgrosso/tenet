@@ -15,7 +15,7 @@ use tenet_domain::{
   config::{read_config, Config, TENET_DIR},
   evidence::EvidenceGraphState,
   model::{
-    CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
+    CatalogApproval, CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
     RequirementCatalog, State,
   },
   verification::ProjectVerificationRun,
@@ -66,6 +66,24 @@ pub async fn write_state(cwd: &Path, state: &State) -> Result<()> {
 
 pub async fn read_catalog(cwd: &Path) -> Result<Option<RequirementCatalog>> {
   Ok(Storage::open(cwd).await?.load_active_catalog().await?)
+}
+
+pub async fn catalog_is_approved(cwd: &Path, catalog: &RequirementCatalog) -> Result<bool> {
+  Ok(
+    Storage::open(cwd)
+      .await?
+      .catalog_is_approved(catalog)
+      .await?,
+  )
+}
+
+pub async fn write_catalog_approval(cwd: &Path, approval: &CatalogApproval) -> Result<()> {
+  Ok(
+    Storage::open(cwd)
+      .await?
+      .persist_catalog_approval(approval)
+      .await?,
+  )
 }
 
 pub async fn write_catalog(cwd: &Path, catalog: &RequirementCatalog) -> Result<()> {

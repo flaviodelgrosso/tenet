@@ -199,6 +199,24 @@ async fn state_transition_rolls_back_when_work_status_references_unknown_unit() 
 }
 
 #[tokio::test]
+async fn review_required_state_round_trips_without_blocker() {
+  let project = tempfile::tempdir().expect("temporary project");
+  let storage = Storage::open(project.path()).await.expect("open storage");
+  let mut state = State::fresh();
+  state.run_id = Some("review-run".into());
+  state.status = RunStatus::ReviewRequired;
+  state.phase = Phase::ReviewingRequirements;
+  state.last_summary = "Requirement catalog requires human approval".into();
+
+  storage.persist_state(&state).await.expect("persist state");
+  let reloaded = storage.load_current_state().await.expect("reload state");
+
+  assert_eq!(reloaded.status, RunStatus::ReviewRequired);
+  assert_eq!(reloaded.phase, Phase::ReviewingRequirements);
+  assert!(reloaded.blocked_reason.is_none());
+}
+
+#[tokio::test]
 async fn empty_database_loads_fresh_state_without_creating_json() {
   let project = tempfile::tempdir().expect("temporary project");
   let storage = Storage::open(project.path()).await.expect("open storage");

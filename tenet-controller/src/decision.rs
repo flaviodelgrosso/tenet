@@ -34,7 +34,11 @@ pub enum NextAction {
 fn is_terminal(status: &RunStatus) -> bool {
   matches!(
     status,
-    RunStatus::Done | RunStatus::Blocked | RunStatus::Failed | RunStatus::Stopped
+    RunStatus::ReviewRequired
+      | RunStatus::Done
+      | RunStatus::Blocked
+      | RunStatus::Failed
+      | RunStatus::Stopped
   )
 }
 
@@ -1217,6 +1221,7 @@ mod tests {
   #[test]
   fn terminal_runs_never_authorize_reconciliation_work() {
     for status in [
+      RunStatus::ReviewRequired,
       RunStatus::Done,
       RunStatus::Blocked,
       RunStatus::Failed,

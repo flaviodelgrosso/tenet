@@ -556,6 +556,10 @@ tenet init
 tenet run
 tenet resume
 
+# Review and approve a generated requirement catalog before execution
+tenet requirements dump
+tenet requirements approve
+
 # Inspect persisted state
 tenet status
 tenet status --json

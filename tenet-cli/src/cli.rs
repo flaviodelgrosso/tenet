@@ -63,10 +63,10 @@ pub(crate) enum Command {
     #[command(subcommand)]
     command: DumpCommand,
   },
-  /// Export the active requirement catalog.
+  /// Review or approve the active requirement catalog.
   Requirements {
     #[command(subcommand)]
-    command: DumpCommand,
+    command: RequirementsCommand,
   },
   /// Export semantic and project evidence.
   Evidence {
@@ -93,6 +93,17 @@ pub(crate) enum DumpCommand {
     #[arg(long)]
     json: bool,
   },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RequirementsCommand {
+  /// Emit deterministic JSON to stdout for human review.
+  Dump {
+    #[arg(long)]
+    json: bool,
+  },
+  /// Approve the exact active catalog without invoking an agent.
+  Approve,
 }
 
 #[derive(Subcommand)]
@@ -181,6 +192,19 @@ mod tests {
           json: true,
           requirement: Some(_)
         }
+      }
+    ));
+  }
+
+  #[test]
+  fn requirements_approve_command_parses() {
+    let cli = Cli::try_parse_from(["tenet", "requirements", "approve"])
+      .expect("parse requirements approve");
+
+    assert!(matches!(
+      cli.command,
+      Command::Requirements {
+        command: super::RequirementsCommand::Approve
       }
     ));
   }

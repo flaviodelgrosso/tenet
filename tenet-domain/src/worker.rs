@@ -211,6 +211,45 @@ pub struct RequirementCatalog {
   pub coverage: CatalogCoverage,
 }
 
+impl RequirementCatalog {
+  /// Computes the deterministic identity of this normalized authoritative catalog.
+  pub fn catalog_hash(&self) -> Result<String, serde_json::Error> {
+    let mut normalized = self.clone();
+    normalized
+      .requirements
+      .sort_by(|left, right| left.id.cmp(&right.id));
+    for requirement in &mut normalized.requirements {
+      requirement
+        .source_refs
+        .sort_by(|left, right| left.fragment_id.cmp(&right.fragment_id));
+    }
+    normalized
+      .acceptance_criteria
+      .sort_by(|left, right| left.id.cmp(&right.id));
+    normalized
+      .verification_obligations
+      .sort_by(|left, right| left.id.cmp(&right.id));
+    normalized
+      .coverage
+      .normative_fragments
+      .sort_by(|left, right| left.id.cmp(&right.id));
+    normalized.coverage.uncovered_fragment_ids.sort();
+    let bytes = serde_json::to_vec(&("tenet-requirement-catalog-v1", normalized))?;
+    Ok(sha256_hex(&bytes))
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogApproval {
+  #[serde(rename = "specHash")]
+  pub spec_hash: String,
+  #[serde(rename = "catalogHash")]
+  pub catalog_hash: String,
+  #[serde(rename = "approvedAt")]
+  pub approved_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ArchitectOutput {
@@ -493,6 +532,69 @@ mod tests {
         .map(|fragment| fragment.text.as_str())
         .collect::<Vec<_>>(),
       vec!["First requirement.", "Second requirement."]
+    );
+  }
+
+  #[test]
+  fn catalog_hash_normalizes_collection_order() {
+    let fragments = derive_normative_fragments("First requirement.\n\nSecond requirement.");
+    let requirements = fragments
+      .iter()
+      .enumerate()
+      .map(|(index, fragment)| Requirement {
+        id: RequirementId::from(format!("REQ-{:03}", index + 1)),
+        title: fragment.text.clone(),
+        description: fragment.text.clone(),
+        required: true,
+        source_refs: vec![fragment.reference()],
+      })
+      .collect::<Vec<_>>();
+    let mut first = RequirementCatalog {
+      spec_hash: "spec-hash".into(),
+      coverage: CatalogCoverage {
+        normative_fragments: fragments,
+        uncovered_fragment_ids: Vec::new(),
+      },
+      requirements,
+      acceptance_criteria: Vec::new(),
+      verification_obligations: Vec::new(),
+    };
+    let expected = first.catalog_hash().expect("hash catalog");
+    first.requirements.reverse();
+    first.coverage.normative_fragments.reverse();
+
+    assert_eq!(
+      first.catalog_hash().expect("hash reordered catalog"),
+      expected
+    );
+  }
+
+  #[test]
+  fn catalog_hash_changes_with_authoritative_content() {
+    let fragment = derive_normative_fragments("Required behavior.").remove(0);
+    let requirement = Requirement {
+      id: RequirementId::from("REQ-001"),
+      title: "Required behavior".into(),
+      description: "Original interpretation".into(),
+      required: true,
+      source_refs: vec![fragment.reference()],
+    };
+    let mut catalog = RequirementCatalog {
+      spec_hash: "same-spec-hash".into(),
+      requirements: vec![requirement],
+      acceptance_criteria: Vec::new(),
+      verification_obligations: Vec::new(),
+      coverage: CatalogCoverage {
+        normative_fragments: vec![fragment],
+        uncovered_fragment_ids: Vec::new(),
+      },
+    };
+    let original = catalog.catalog_hash().expect("hash catalog");
+    catalog.requirements[0].description = "Different interpretation".into();
+
+    assert_ne!(
+      catalog.catalog_hash().expect("hash changed catalog"),
+      original
     );
   }
 }
