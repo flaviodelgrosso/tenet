@@ -44,7 +44,7 @@ use crate::{
   catalog,
   completion::{CompletionBlocker, CompletionContext, CompletionDecision, CompletionPolicy},
   decision, evidence as evidence_graph,
-  ports::agent::AgentBackend,
+  ports::agent::{AgentBackend, ReconciliationRequest, SemanticAssessmentRequest},
   verification,
 };
 
@@ -288,6 +288,7 @@ impl Controller {
         record.status == DiscoveryStatus::Active && record.catalog_hash == catalog.spec_hash
       });
       let catalog_for_worker = decision::reconciliation_catalog(&catalog);
+      let requirement_handles_for_worker = decision::reconciliation_handles(&catalog);
       let completed_for_worker = state.completed_work_units.clone();
       let discoveries_for_worker: Vec<_> = state
         .discoveries
@@ -309,16 +310,20 @@ impl Controller {
             let backend = backend.clone();
             let catalog = catalog_for_worker.clone();
             let completed = completed_for_worker.clone();
+            let requirement_handles = requirement_handles_for_worker.clone();
             let discoveries = discoveries_for_worker.clone();
             let evidence = evidence_for_worker.clone();
             async move {
               backend
                 .reconcile(
                   &inspection_context,
-                  &catalog,
-                  &completed,
-                  &discoveries,
-                  &evidence,
+                  ReconciliationRequest {
+                    catalog: &catalog,
+                    requirement_handles: &requirement_handles,
+                    recent_completed: &completed,
+                    discoveries: &discoveries,
+                    evidence: &evidence,
+                  },
                   feedback.as_deref(),
                 )
                 .await
@@ -787,6 +792,7 @@ impl Controller {
     let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
     let catalog_for_worker = decision::semantic_assessment_catalog(catalog);
     let project_for_worker = project_report.clone();
+    let obligation_handles_for_worker = decision::semantic_assessment_handles(catalog);
     let evidence_for_worker = evidence_graph::projections(evidence_graph, policy)?;
     let backend = self.backend.clone();
     let semantic_report = self
@@ -799,13 +805,17 @@ impl Controller {
           let catalog = catalog_for_worker.clone();
           let project = project_for_worker.clone();
           let evidence = evidence_for_worker.clone();
+          let obligation_handles = obligation_handles_for_worker.clone();
           async move {
             backend
               .assess(
                 &inspection_context,
-                &catalog,
-                &project,
-                &evidence,
+                SemanticAssessmentRequest {
+                  catalog: &catalog,
+                  obligation_handles: &obligation_handles,
+                  project_verification: &project,
+                  evidence: &evidence,
+                },
                 feedback.as_deref(),
               )
               .await
@@ -1124,7 +1134,7 @@ impl Controller {
         Err(error) if attempt == context.config.agent.completion_retries => return Err(error),
         Err(error) => {
           feedback = Some(format!(
-            "{error:#}\nReturn exactly one semantic judgment for every controller-selected obligation, in the supplied order."
+            "{error:#}\nReturn exactly one semantic judgment for every controller-selected obligation with its supplied obligationHandle."
           ));
         }
       }

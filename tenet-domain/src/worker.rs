@@ -270,10 +270,12 @@ pub struct WorkUnit {
   pub scope: WorkScope,
 }
 
-/// Ordered semantic judgment for one controller-supplied requirement.
+/// Reconciliation judgment keyed by a controller-generated requirement handle.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentRequirementAssessment {
+  #[serde(rename = "requirementHandle")]
+  pub requirement_handle: String,
   /// Implementation completeness only. Independent from verification and evidence state.
   #[serde(rename = "implementationState")]
   pub implementation_state: ImplementationState,
@@ -301,7 +303,7 @@ pub struct AgentWorkUnit {
   pub scope: WorkScope,
 }
 
-/// Agent-facing reconciliation proposal in controller-defined requirement order.
+/// Agent-facing reconciliation proposal keyed by controller-generated requirement handles.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentReconciliationProposal {

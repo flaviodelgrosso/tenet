@@ -26,18 +26,18 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use tenet_domain::events::EventSink;
-use tenet_domain::evidence::{EvidenceProjection, SemanticAssessmentProposal};
+use tenet_domain::evidence::SemanticAssessmentProposal;
 use tenet_domain::model::{
-  AgentReconciliationProposal, ArchitectOutput, CompletedWorkUnit, Discovery,
-  MutationWorkerContext, RequirementCatalog, VerificationReport, WorkUnit, WorkerEvent, WorkerRole,
-  WorkerSummary,
+  AgentReconciliationProposal, ArchitectOutput, Discovery, MutationWorkerContext,
+  RequirementCatalog, VerificationReport, WorkUnit, WorkerEvent, WorkerRole, WorkerSummary,
 };
-use tenet_domain::verification::ProjectVerificationRun;
 use tokio::sync::oneshot;
 
 use crate::registry::RegistryClient;
 use crate::schemas::{schema_for, validate_structured_output};
-use tenet_controller::ports::agent::AgentBackend;
+use tenet_controller::ports::agent::{
+  AgentBackend, ReconciliationRequest, SemanticAssessmentRequest,
+};
 use tenet_runtime::backend::{
   AgentRuntime, BackendContext, LaunchMetadata, WorkerOutputValidator, WorkerRequest, WorkerResult,
 };
@@ -128,13 +128,10 @@ impl AgentBackend for AcpRuntime {
   async fn reconcile(
     &self,
     ctx: &BackendContext,
-    catalog: &RequirementCatalog,
-    recent: &[CompletedWorkUnit],
-    discoveries: &[Discovery],
-    evidence: &[EvidenceProjection],
+    request: ReconciliationRequest<'_>,
     semantic_validation_feedback: Option<&str>,
   ) -> Result<AgentReconciliationProposal> {
-    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository implementation against this controller-ordered catalog. Inspect it directly. Return one requirement judgment per catalog requirement in the same order. Identify implementation gaps and missing evidence. Propose work units by targeting verification-obligation IDs; do not reproduce requirement or criterion relationships because the controller derives them. Semantic work dependencies remain your responsibility. The controller alone decides verification and concurrency.\n\nController-ordered catalog:\n{}\n\nController-derived evidence projections:\n{}\n\nRecent completed work:\n{}\n\nWorker- and controller-derived discoveries requiring reconsideration:\n{}{}", serde_json::to_string_pretty(catalog)?, serde_json::to_string_pretty(evidence)?, serde_json::to_string_pretty(recent)?, serde_json::to_string_pretty(discoveries)?, semantic_feedback(semantic_validation_feedback))).await
+    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository implementation against this controller-selected catalog. Inspect it directly. Return exactly one requirement judgment for every supplied requirementHandle; output order is irrelevant. Identify implementation gaps and missing evidence. Propose work units by targeting verification-obligation IDs; do not reproduce requirement or criterion relationships because the controller derives them. Semantic work dependencies remain your responsibility. The controller alone decides verification and concurrency.\n\nController-assigned requirement handles:\n{}\n\nController-selected catalog:\n{}\n\nController-derived evidence projections:\n{}\n\nRecent completed work:\n{}\n\nWorker- and controller-derived discoveries requiring reconsideration:\n{}{}", serde_json::to_string_pretty(request.requirement_handles)?, serde_json::to_string_pretty(request.catalog)?, serde_json::to_string_pretty(request.recent_completed)?, serde_json::to_string_pretty(request.discoveries)?, serde_json::to_string_pretty(request.evidence)?, semantic_feedback(semantic_validation_feedback))).await
   }
 
   async fn implement(
@@ -182,9 +179,7 @@ impl AgentBackend for AcpRuntime {
   async fn assess(
     &self,
     ctx: &BackendContext,
-    catalog: &RequirementCatalog,
-    project_verification: &ProjectVerificationRun,
-    evidence: &[EvidenceProjection],
+    request: SemanticAssessmentRequest<'_>,
     semantic_validation_feedback: Option<&str>,
   ) -> Result<SemanticAssessmentProposal> {
     self
@@ -192,10 +187,11 @@ impl AgentBackend for AcpRuntime {
         ctx,
         WorkerRole::Assess,
         format!(
-          "Independently assess every controller-selected semantic obligation against the immutable repository revision. The catalog obligations are in authoritative order. Return exactly one Satisfied, Gap, or Uncertain judgment per obligation in that same order; do not copy obligation IDs. Do not propose edits or declare completion.\n\nController-selected catalog:\n{}\n\nController-executed project verification:\n{}\n\nExisting controller-owned evidence:\n{}{}",
-          serde_json::to_string_pretty(catalog)?,
-          serde_json::to_string_pretty(project_verification)?,
-          serde_json::to_string_pretty(evidence)?,
+          "Independently assess every controller-selected semantic obligation against the immutable repository revision. Return exactly one Satisfied, Gap, or Uncertain judgment for every supplied obligationHandle; output order is irrelevant. Do not copy obligation IDs. Do not propose edits or declare completion.\n\nController-assigned obligation handles:\n{}\n\nController-selected catalog:\n{}\n\nController-executed project verification:\n{}\n\nExisting controller-owned evidence:\n{}{}",
+          serde_json::to_string_pretty(request.obligation_handles)?,
+          serde_json::to_string_pretty(request.catalog)?,
+          serde_json::to_string_pretty(request.project_verification)?,
+          serde_json::to_string_pretty(request.evidence)?,
           semantic_feedback(semantic_validation_feedback)
         ),
       )
@@ -1203,6 +1199,7 @@ mod tests {
     json!({
       "summary": "One requirement remains",
       "requirements": [{
+        "requirementHandle": "R001",
         "implementationState": "absent",
         "observations": [],
         "missingImplementation": ["Current output is static"],
@@ -1290,7 +1287,9 @@ mod tests {
 
     assert!(!reconciliation.contains("requirementIds"));
     assert!(!reconciliation.contains("criterionIds"));
+    assert!(reconciliation.contains("requirementHandle"));
     assert!(!assessment.contains("obligationId"));
+    assert!(assessment.contains("obligationHandle"));
   }
 
   #[test]
@@ -1323,9 +1322,12 @@ mod tests {
     let semantic = json!({
       "summary": "Independent assessment",
       "assessments": [{
-        "status": "satisfied",
-        "rationale": "Observed behavior",
-        "evidenceRefs": ["src/lib.rs"]
+        "obligationHandle": "O001",
+        "judgment": {
+          "status": "satisfied",
+          "rationale": "Observed behavior",
+          "evidenceRefs": ["src/lib.rs"]
+        }
       }]
     });
     validate_structured_output::<SemanticAssessmentProposal>(

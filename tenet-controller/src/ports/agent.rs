@@ -1,10 +1,11 @@
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use tenet_domain::{
   config::Config,
   evidence::{EvidenceProjection, SemanticAssessmentProposal},
+  ids::{ObligationId, RequirementId},
   model::{
     AgentReconciliationProposal, ArchitectOutput, CompletedWorkUnit, Discovery, RequirementCatalog,
     VerificationReport, WorkUnit, WorkerSummary,
@@ -12,6 +13,23 @@ use tenet_domain::{
   verification::ProjectVerificationRun,
 };
 use tenet_runtime::backend::{BackendContext, LaunchMetadata};
+
+/// Controller-selected reconciliation inputs supplied to a read-only agent.
+pub struct ReconciliationRequest<'a> {
+  pub catalog: &'a RequirementCatalog,
+  pub requirement_handles: &'a BTreeMap<RequirementId, String>,
+  pub recent_completed: &'a [CompletedWorkUnit],
+  pub discoveries: &'a [Discovery],
+  pub evidence: &'a [EvidenceProjection],
+}
+
+/// Controller-selected semantic assessment inputs supplied to a read-only agent.
+pub struct SemanticAssessmentRequest<'a> {
+  pub catalog: &'a RequirementCatalog,
+  pub obligation_handles: &'a BTreeMap<ObligationId, String>,
+  pub project_verification: &'a ProjectVerificationRun,
+  pub evidence: &'a [EvidenceProjection],
+}
 
 /// Role-oriented coding-agent port used by the Tenet control plane.
 #[async_trait]
@@ -24,10 +42,7 @@ pub trait AgentBackend: Send + Sync {
   async fn reconcile(
     &self,
     ctx: &BackendContext,
-    catalog: &RequirementCatalog,
-    recent_completed: &[CompletedWorkUnit],
-    discoveries: &[Discovery],
-    evidence: &[EvidenceProjection],
+    request: ReconciliationRequest<'_>,
     semantic_validation_feedback: Option<&str>,
   ) -> Result<AgentReconciliationProposal>;
 
@@ -51,9 +66,7 @@ pub trait AgentBackend: Send + Sync {
   async fn assess(
     &self,
     ctx: &BackendContext,
-    catalog: &RequirementCatalog,
-    project_verification: &ProjectVerificationRun,
-    evidence: &[EvidenceProjection],
+    request: SemanticAssessmentRequest<'_>,
     semantic_validation_feedback: Option<&str>,
   ) -> Result<SemanticAssessmentProposal>;
 }

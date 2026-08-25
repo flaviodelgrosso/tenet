@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use tenet_domain::{
@@ -63,23 +64,92 @@ pub fn advance_stagnation(
   }
 }
 
-/// Hashes explicit authoritative progress facts without observing external state.
+/// Hashes only canonical controller-relevant reconciliation facts.
 pub fn progress_fingerprint(
   revision: &str,
   catalog_hash: &str,
   reconciliation: &ReconcileResult,
   active_discoveries: &[String],
 ) -> Result<String> {
-  let mut active_discoveries = active_discoveries.to_vec();
-  active_discoveries.sort();
-  active_discoveries.dedup();
-  let bytes = serde_json::to_vec(&(revision, catalog_hash, reconciliation, active_discoveries))?;
+  let projection = ProgressProjection::from_reconciliation(
+    revision,
+    catalog_hash,
+    reconciliation,
+    active_discoveries,
+  );
+  let bytes = serde_json::to_vec(&projection)?;
   let digest = Sha256::digest(bytes);
   let mut fingerprint = String::with_capacity(digest.len() * 2);
   for byte in digest {
     write!(fingerprint, "{byte:02x}")?;
   }
   Ok(fingerprint)
+}
+
+#[derive(Serialize)]
+struct ProgressProjection<'a> {
+  revision: &'a str,
+  catalog_hash: &'a str,
+  requirements: Vec<RequirementProgress>,
+  work_units: Vec<WorkUnitProgress>,
+  active_discoveries: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RequirementProgress {
+  requirement_id: RequirementId,
+  implementation_state: ImplementationState,
+  missing_evidence: Vec<ObligationId>,
+}
+
+#[derive(Serialize)]
+struct WorkUnitProgress {
+  id: String,
+  verification_obligation_ids: Vec<ObligationId>,
+  depends_on: Vec<String>,
+  scope_paths: Vec<String>,
+}
+
+impl<'a> ProgressProjection<'a> {
+  fn from_reconciliation(
+    revision: &'a str,
+    catalog_hash: &'a str,
+    reconciliation: &ReconcileResult,
+    active_discoveries: &[String],
+  ) -> Self {
+    let mut requirements: Vec<_> = reconciliation
+      .requirements
+      .iter()
+      .map(|assessment| RequirementProgress {
+        requirement_id: assessment.requirement_id.clone(),
+        implementation_state: assessment.implementation_state,
+        missing_evidence: canonical_obligations(assessment.missing_evidence.clone()),
+      })
+      .collect();
+    requirements.sort_by(|left, right| left.requirement_id.cmp(&right.requirement_id));
+
+    let mut work_units: Vec<_> = reconciliation
+      .work_units
+      .iter()
+      .map(|unit| WorkUnitProgress {
+        id: unit.id.clone(),
+        verification_obligation_ids: canonical_obligations(
+          unit.verification_obligation_ids.clone(),
+        ),
+        depends_on: canonical_strings(unit.depends_on.clone()),
+        scope_paths: canonical_strings(unit.scope.paths.clone()),
+      })
+      .collect();
+    work_units.sort_by(|left, right| left.id.cmp(&right.id));
+
+    Self {
+      revision,
+      catalog_hash,
+      requirements,
+      work_units,
+      active_discoveries: canonical_strings(active_discoveries.to_vec()),
+    }
+  }
 }
 
 /// Admits canonical, deduplicated discoveries from explicit worker observations.
@@ -369,19 +439,43 @@ pub fn semantic_assessment_catalog(catalog: &RequirementCatalog) -> RequirementC
   }
 }
 
+/// Returns stable, controller-generated handles for reconciliation judgments.
+pub fn reconciliation_handles(catalog: &RequirementCatalog) -> BTreeMap<RequirementId, String> {
+  reconciliation_catalog(catalog)
+    .requirements
+    .into_iter()
+    .enumerate()
+    .map(|(index, requirement)| (requirement.id, format!("R{:03}", index + 1)))
+    .collect()
+}
+
+/// Returns stable, controller-generated handles for required semantic judgments.
+pub fn semantic_assessment_handles(catalog: &RequirementCatalog) -> BTreeMap<ObligationId, String> {
+  semantic_assessment_catalog(catalog)
+    .verification_obligations
+    .into_iter()
+    .enumerate()
+    .map(|(index, obligation)| (obligation.id, format!("O{:03}", index + 1)))
+    .collect()
+}
+
 /// Binds an agent proposal to controller-owned catalog identities and relationships.
 pub fn materialize_reconciliation(
   catalog: &RequirementCatalog,
   proposal: AgentReconciliationProposal,
 ) -> Result<ReconcileResult> {
   let ordered = reconciliation_catalog(catalog);
-  if proposal.requirements.len() != ordered.requirements.len() {
-    bail!(
-      "reconciliation returned {} requirement judgments for {} controller-selected requirements",
-      proposal.requirements.len(),
-      ordered.requirements.len()
-    );
-  }
+  let handles = reconciliation_handles(&ordered);
+  let expected: BTreeMap<_, _> = handles
+    .iter()
+    .map(|(requirement_id, handle)| (handle.clone(), requirement_id.clone()))
+    .collect();
+  let assessments = bind_judgments(
+    proposal.requirements,
+    &expected,
+    |assessment| &assessment.requirement_handle,
+    "reconciliation requirement",
+  )?;
 
   let criterion_requirements: BTreeMap<_, _> = ordered
     .acceptance_criteria
@@ -397,8 +491,14 @@ pub fn materialize_reconciliation(
   let requirements = ordered
     .requirements
     .iter()
-    .zip(proposal.requirements)
-    .map(|(requirement, assessment)| {
+    .map(|requirement| {
+      let handle = handles
+        .get(&requirement.id)
+        .expect("every controller-selected requirement has a handle");
+      let assessment = assessments
+        .get(handle)
+        .expect("every controller-generated handle is bound")
+        .clone();
       for obligation_id in &assessment.missing_evidence {
         let criterion_id = obligation_criteria
           .get(obligation_id)
@@ -597,37 +697,69 @@ fn implementation_state_name(state: ImplementationState) -> &'static str {
   }
 }
 
-/// Binds ordered agent judgments to the controller-selected required obligations.
+/// Binds agent semantic judgments to controller-selected required obligations by handle.
 pub fn materialize_semantic_assessment(
   catalog: &RequirementCatalog,
   proposal: SemanticAssessmentProposal,
 ) -> Result<SemanticAssessmentReport> {
-  let mut obligation_ids: Vec<_> = catalog
-    .verification_obligations
+  let handles = semantic_assessment_handles(catalog);
+  let expected: BTreeMap<_, _> = handles
     .iter()
-    .filter(|obligation| obligation.required)
-    .map(|obligation| obligation.id.clone())
+    .map(|(obligation_id, handle)| (handle.clone(), obligation_id.clone()))
     .collect();
-  obligation_ids.sort();
-  if proposal.assessments.len() != obligation_ids.len() {
-    bail!(
-      "semantic assessment must cover every required obligation exactly once (received {} judgments for {} controller-selected obligations)",
-      proposal.assessments.len(),
-      obligation_ids.len()
-    );
-  }
+  let assessments = bind_judgments(
+    proposal.assessments,
+    &expected,
+    |assessment| &assessment.obligation_handle,
+    "semantic obligation",
+  )?;
 
   Ok(SemanticAssessmentReport {
     summary: proposal.summary,
-    assessments: obligation_ids
+    assessments: expected
       .into_iter()
-      .zip(proposal.assessments)
-      .map(|(obligation_id, assessment)| ObligationAssessmentResult {
+      .map(|(handle, obligation_id)| ObligationAssessmentResult {
         obligation_id,
-        assessment,
+        assessment: assessments
+          .get(&handle)
+          .expect("every controller-generated handle is bound")
+          .judgment
+          .clone(),
       })
       .collect(),
   })
+}
+
+fn bind_judgments<T, Handle>(
+  judgments: Vec<T>,
+  expected: &BTreeMap<String, Handle>,
+  handle: impl Fn(&T) -> &str,
+  kind: &str,
+) -> Result<BTreeMap<String, T>> {
+  let mut bound = BTreeMap::new();
+  for judgment in judgments {
+    let handle = handle(&judgment).to_owned();
+    if bound.insert(handle.clone(), judgment).is_some() {
+      bail!("duplicate {kind} handle {handle}");
+    }
+    if !expected.contains_key(&handle) {
+      bail!("unknown {kind} handle {handle}");
+    }
+  }
+  for handle in expected.keys() {
+    if !bound.contains_key(handle) {
+      bail!("missing {kind} handle {handle}");
+    }
+  }
+  Ok(bound)
+}
+
+fn canonical_strings(values: Vec<String>) -> Vec<String> {
+  values
+    .into_iter()
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect()
 }
 
 fn canonical_obligations(values: Vec<ObligationId>) -> Vec<ObligationId> {
@@ -643,8 +775,8 @@ mod tests {
   use chrono::{TimeZone, Utc};
   use tenet_domain::{
     evidence::{
-      AcceptanceCriterion, ImplementationState, ObligationAssessment, SemanticAssessmentProposal,
-      VerificationObligation,
+      AcceptanceCriterion, AgentObligationAssessment, ImplementationState, ObligationAssessment,
+      SemanticAssessmentProposal, VerificationObligation,
     },
     ids::{CriterionId, ObligationId, RequirementId},
     model::{
@@ -659,7 +791,7 @@ mod tests {
     advance_stagnation, apply_completion_decision, apply_spec_invalidation, authorize_frontier,
     classify_deferred_candidates, decide_execution, decide_reconciliation,
     materialize_reconciliation, materialize_semantic_assessment, plan_spec_invalidation,
-    NextAction,
+    progress_fingerprint, NextAction,
   };
 
   fn catalog() -> RequirementCatalog {
@@ -691,10 +823,37 @@ mod tests {
     }
   }
 
+  fn two_requirement_catalog() -> RequirementCatalog {
+    let mut catalog = catalog();
+    catalog.requirements.push(Requirement {
+      id: RequirementId::from("REQ-002"),
+      title: "Second requirement".into(),
+      description: "Second required behavior".into(),
+      required: true,
+      source_refs: Vec::new(),
+    });
+    catalog.acceptance_criteria.push(AcceptanceCriterion {
+      id: CriterionId::from("REQ-002/AC-01"),
+      requirement_id: RequirementId::from("REQ-002"),
+      description: "Second observable behavior".into(),
+      mandatory: true,
+    });
+    catalog
+      .verification_obligations
+      .push(VerificationObligation {
+        id: ObligationId::from("REQ-002/AC-01/VO-01"),
+        criterion_id: CriterionId::from("REQ-002/AC-01"),
+        description: "Verify second behavior".into(),
+        required: true,
+      });
+    catalog
+  }
+
   fn proposal() -> AgentReconciliationProposal {
     AgentReconciliationProposal {
       summary: "Work remains".into(),
       requirements: vec![AgentRequirementAssessment {
+        requirement_handle: "R001".into(),
         implementation_state: ImplementationState::Partial,
         observations: vec!["Existing implementation is incomplete".into()],
         missing_implementation: vec!["Required branch is absent".into()],
@@ -746,9 +905,12 @@ mod tests {
       &catalog(),
       SemanticAssessmentProposal {
         summary: "Satisfied".into(),
-        assessments: vec![ObligationAssessment::Satisfied {
-          rationale: "Verified by inspection".into(),
-          evidence_refs: vec!["src/lib.rs:1".into()],
+        assessments: vec![AgentObligationAssessment {
+          obligation_handle: "O001".into(),
+          judgment: ObligationAssessment::Satisfied {
+            rationale: "Verified by inspection".into(),
+            evidence_refs: vec!["src/lib.rs:1".into()],
+          },
         }],
       },
     )
@@ -758,6 +920,181 @@ mod tests {
       report.assessments[0].obligation_id,
       ObligationId::from("REQ-001/AC-01/VO-01")
     );
+  }
+
+  #[test]
+  fn reordered_judgments_bind_to_their_controller_handles() {
+    let catalog = two_requirement_catalog();
+    let mut reconciliation = proposal();
+    reconciliation
+      .requirements
+      .push(AgentRequirementAssessment {
+        requirement_handle: "R002".into(),
+        implementation_state: ImplementationState::Present,
+        observations: vec!["Second implementation is present".into()],
+        missing_implementation: Vec::new(),
+        missing_evidence: vec![ObligationId::from("REQ-002/AC-01/VO-01")],
+      });
+    reconciliation.requirements.reverse();
+
+    let result = materialize_reconciliation(&catalog, reconciliation).expect("rebind by handle");
+
+    assert_eq!(
+      result.requirements[0].requirement_id,
+      RequirementId::from("REQ-001")
+    );
+    assert_eq!(
+      result.requirements[0].implementation_state,
+      ImplementationState::Partial
+    );
+    assert_eq!(
+      result.requirements[1].requirement_id,
+      RequirementId::from("REQ-002")
+    );
+    assert_eq!(
+      result.requirements[1].implementation_state,
+      ImplementationState::Present
+    );
+
+    let report = materialize_semantic_assessment(
+      &catalog,
+      SemanticAssessmentProposal {
+        summary: "Judgments are deliberately reversed".into(),
+        assessments: vec![
+          AgentObligationAssessment {
+            obligation_handle: "O002".into(),
+            judgment: ObligationAssessment::Gap {
+              description: "Second obligation has a gap".into(),
+            },
+          },
+          AgentObligationAssessment {
+            obligation_handle: "O001".into(),
+            judgment: ObligationAssessment::Satisfied {
+              rationale: "First obligation satisfied".into(),
+              evidence_refs: Vec::new(),
+            },
+          },
+        ],
+      },
+    )
+    .expect("rebind semantic judgments by handle");
+
+    assert_eq!(
+      report.assessments[0].obligation_id,
+      ObligationId::from("REQ-001/AC-01/VO-01")
+    );
+    assert_eq!(
+      report.assessments[1].obligation_id,
+      ObligationId::from("REQ-002/AC-01/VO-01")
+    );
+    assert!(matches!(
+      report.assessments[0].assessment,
+      ObligationAssessment::Satisfied { .. }
+    ));
+    assert!(matches!(
+      report.assessments[1].assessment,
+      ObligationAssessment::Gap { .. }
+    ));
+  }
+
+  #[test]
+  fn judgment_handles_reject_missing_duplicate_and_unknown_values() {
+    let mut missing = proposal();
+    missing.requirements.clear();
+    assert!(materialize_reconciliation(&catalog(), missing)
+      .expect_err("missing handle rejected")
+      .to_string()
+      .contains("missing reconciliation requirement handle R001"));
+
+    let mut duplicate = proposal();
+    duplicate
+      .requirements
+      .push(duplicate.requirements[0].clone());
+    assert!(materialize_reconciliation(&catalog(), duplicate)
+      .expect_err("duplicate handle rejected")
+      .to_string()
+      .contains("duplicate reconciliation requirement handle R001"));
+
+    let mut unknown = proposal();
+    unknown.requirements[0].requirement_handle = "R999".into();
+    assert!(materialize_reconciliation(&catalog(), unknown)
+      .expect_err("unknown handle rejected")
+      .to_string()
+      .contains("unknown reconciliation requirement handle R999"));
+
+    let unknown = materialize_semantic_assessment(
+      &catalog(),
+      SemanticAssessmentProposal {
+        summary: "Unknown handle".into(),
+        assessments: vec![AgentObligationAssessment {
+          obligation_handle: "O999".into(),
+          judgment: ObligationAssessment::Gap {
+            description: "Cannot establish obligation".into(),
+          },
+        }],
+      },
+    )
+    .expect_err("unknown semantic handle rejected");
+    assert!(unknown
+      .to_string()
+      .contains("unknown semantic obligation handle O999"));
+
+    let missing = materialize_semantic_assessment(
+      &catalog(),
+      SemanticAssessmentProposal {
+        summary: "Missing handle".into(),
+        assessments: Vec::new(),
+      },
+    )
+    .expect_err("missing semantic handle rejected");
+    assert!(missing
+      .to_string()
+      .contains("missing semantic obligation handle O001"));
+
+    let duplicate = AgentObligationAssessment {
+      obligation_handle: "O001".into(),
+      judgment: ObligationAssessment::Gap {
+        description: "Cannot establish obligation".into(),
+      },
+    };
+    let duplicate = materialize_semantic_assessment(
+      &catalog(),
+      SemanticAssessmentProposal {
+        summary: "Duplicate handle".into(),
+        assessments: vec![duplicate.clone(), duplicate],
+      },
+    )
+    .expect_err("duplicate semantic handle rejected");
+    assert!(duplicate
+      .to_string()
+      .contains("duplicate semantic obligation handle O001"));
+  }
+
+  #[test]
+  fn progress_fingerprint_ignores_agent_prose_and_ordering() {
+    let left = materialize_reconciliation(&catalog(), proposal()).expect("materialize left");
+    let mut right = left.clone();
+    right.summary = "Different model summary".into();
+    right.requirements[0].observations = vec!["Different observation prose".into()];
+    right.requirements[0].missing_implementation = vec!["Different gap prose".into()];
+    right.work_units[0].title = "Different work title".into();
+    right.work_units[0].objective = "Different work objective".into();
+    right.work_units[0].suggested_checks[0].command = "different advisory command".into();
+
+    let mut second = right.work_units[0].clone();
+    second.id = "WU-002".into();
+    right.work_units.push(second.clone());
+    let mut left = left;
+    left.work_units.push(second);
+    left.work_units.reverse();
+    right.work_units.reverse();
+
+    let left = progress_fingerprint("revision", "catalog", &left, &["B".into(), "A".into()])
+      .expect("left fingerprint");
+    let right = progress_fingerprint("revision", "catalog", &right, &["A".into(), "B".into()])
+      .expect("right fingerprint");
+
+    assert_eq!(left, right);
   }
 
   fn deferred_candidate(catalog_hash: &str) -> DeferredCandidate {

@@ -18,6 +18,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use tenet_controller::ports::agent::{ReconciliationRequest, SemanticAssessmentRequest};
 use tenet_controller::{
   controller::manual_verify, evidence as controller_evidence, AgentBackend, Controller,
 };
@@ -25,8 +26,8 @@ use tenet_domain::{
   config::{read_config, Config, CustomAgentConfig, ProjectVerificationCheck},
   events::{EventSink, RunEvent},
   evidence::{
-    AcceptanceCriterion, EvidencePolicy, ImplementationState, ObligationAssessment,
-    SemanticAssessmentProposal, VerificationObligation, VerificationState,
+    AcceptanceCriterion, AgentObligationAssessment, EvidencePolicy, ImplementationState,
+    ObligationAssessment, SemanticAssessmentProposal, VerificationObligation, VerificationState,
   },
   ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId},
   model::{
@@ -206,6 +207,7 @@ fn graph_units() -> Vec<AgentWorkUnit> {
 
 fn assessment(satisfied: bool) -> AgentRequirementAssessment {
   AgentRequirementAssessment {
+    requirement_handle: "R001".into(),
     implementation_state: if satisfied {
       ImplementationState::Present
     } else {
@@ -395,12 +397,12 @@ impl AgentBackend for FakeBackend {
   async fn reconcile(
     &self,
     ctx: &BackendContext,
-    catalog: &RequirementCatalog,
-    _recent: &[CompletedWorkUnit],
-    discoveries: &[Discovery],
-    _evidence: &[tenet_domain::evidence::EvidenceProjection],
+    request: ReconciliationRequest<'_>,
     semantic_validation_feedback: Option<&str>,
   ) -> Result<AgentReconciliationProposal> {
+    let catalog = request.catalog;
+    let requirement_handles = request.requirement_handles;
+    let discoveries = request.discoveries;
     self.require_specification(ctx).await?;
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Reconcile)
@@ -436,6 +438,10 @@ impl AgentBackend for FakeBackend {
             .map(|criterion| criterion.id.clone())
             .collect();
           AgentRequirementAssessment {
+            requirement_handle: requirement_handles
+              .get(&requirement.id)
+              .expect("controller supplies a handle for every requirement")
+              .clone(),
             implementation_state: ImplementationState::Present,
             observations: vec!["large specification behavior is present".into()],
             missing_implementation: Vec::new(),
@@ -665,11 +671,11 @@ impl AgentBackend for FakeBackend {
   async fn assess(
     &self,
     ctx: &BackendContext,
-    catalog: &RequirementCatalog,
-    _project_verification: &ProjectVerificationRun,
-    _evidence: &[tenet_domain::evidence::EvidenceProjection],
+    request: SemanticAssessmentRequest<'_>,
     semantic_validation_feedback: Option<&str>,
   ) -> Result<SemanticAssessmentProposal> {
+    let catalog = request.catalog;
+    let obligation_handles = request.obligation_handles;
     self.require_specification(ctx).await?;
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Assess)
@@ -696,9 +702,15 @@ impl AgentBackend for FakeBackend {
         assessments: catalog
           .verification_obligations
           .iter()
-          .map(|_| ObligationAssessment::Satisfied {
-            rationale: "the immutable revision satisfies the batch requirement".into(),
-            evidence_refs: vec!["README.txt".into()],
+          .map(|obligation| AgentObligationAssessment {
+            obligation_handle: obligation_handles
+              .get(&obligation.id)
+              .expect("controller supplies a handle for every obligation")
+              .clone(),
+            judgment: ObligationAssessment::Satisfied {
+              rationale: "the immutable revision satisfies the batch requirement".into(),
+              evidence_refs: vec!["README.txt".into()],
+            },
           })
           .collect(),
       });
@@ -753,7 +765,13 @@ impl AgentBackend for FakeBackend {
     };
     Ok(SemanticAssessmentProposal {
       summary: "independent semantic assessment".into(),
-      assessments: vec![assessment],
+      assessments: vec![AgentObligationAssessment {
+        obligation_handle: obligation_handles
+          .get(&ObligationId::from("REQ-001/AC-01/VO-01"))
+          .expect("controller supplies the obligation handle")
+          .clone(),
+        judgment: assessment,
+      }],
     })
   }
 }
@@ -1117,7 +1135,7 @@ async fn assessment_directory_scope_is_retried_with_recursive_glob_feedback() {
   assert_eq!(feedback[0].0, WorkerRole::Assess);
   assert!(feedback[0]
     .1
-    .contains("semantic assessment must cover every required obligation exactly once"));
+    .contains("missing semantic obligation handle O001"));
 }
 
 #[tokio::test]
@@ -1208,7 +1226,7 @@ async fn malformed_assessment_is_retried_with_feedback_and_corrected() {
   assert_eq!(feedback[0].0, WorkerRole::Assess);
   assert!(feedback[0]
     .1
-    .contains("semantic assessment must cover every required obligation exactly once"));
+    .contains("missing semantic obligation handle O001"));
 }
 
 #[tokio::test]

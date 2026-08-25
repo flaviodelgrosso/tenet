@@ -211,12 +211,21 @@ impl ObligationAssessment {
   }
 }
 
-/// Agent-facing judgments in controller-selected obligation order.
+/// Agent-facing semantic judgment keyed by a controller-generated obligation handle.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentObligationAssessment {
+  #[serde(rename = "obligationHandle")]
+  pub obligation_handle: String,
+  pub judgment: ObligationAssessment,
+}
+
+/// Agent-facing semantic judgments keyed by controller-selected obligation handles.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticAssessmentProposal {
   pub summary: String,
-  pub assessments: Vec<ObligationAssessment>,
+  pub assessments: Vec<AgentObligationAssessment>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
