@@ -29,7 +29,7 @@
       "type": "integer",
       "minimum": 0,
       "default": 3,
-      "description": "Maximum repair attempts for a work unit whose verification fails."
+      "description": "Maximum total repair-worker invocations for one work unit across empty implementation and verification-failure recovery."
     },
     "stagnation_limit": {
       "type": "integer",
@@ -73,7 +73,12 @@
           "description": "Canonical ACP Registry identity."
         },
         "custom": { "$ref": "#/$defs/customAgentConfig" },
-        "completion_retries": { "type": "integer", "minimum": 0, "default": 2 },
+        "completion_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 2,
+          "description": "Maximum additional model completions for one logical Architect, Reconcile, or Assess operation, shared across structured-output and semantic-validation failures. Implement and Repair use the same retry count within each individual worker invocation."
+        },
         "preferences": {
           "$ref": "#/$defs/agentPreferences",
           "default": {

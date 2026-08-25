@@ -160,6 +160,8 @@ pub struct DeferredCandidate {
   pub catalog_hash: String,
   #[serde(rename = "gitRef")]
   pub git_ref: String,
+  #[serde(default, rename = "repairAttempts")]
+  pub repair_attempts: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

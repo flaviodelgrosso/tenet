@@ -39,7 +39,8 @@ use tenet_controller::ports::agent::{
   AgentBackend, ReconciliationRequest, SemanticAssessmentRequest,
 };
 use tenet_runtime::backend::{
-  AgentRuntime, BackendContext, LaunchMetadata, WorkerOutputValidator, WorkerRequest, WorkerResult,
+  AgentRuntime, BackendContext, CompletionBudget, LaunchMetadata, WorkerOutputValidator,
+  WorkerRequest, WorkerResult,
 };
 
 use crate::prompts::full_role_prompt;
@@ -325,6 +326,7 @@ impl AcpRuntime {
       launch: ctx.launch.clone(),
       custom: ctx.config.agent.custom.clone(),
       completion_retries: ctx.config.agent.completion_retries,
+      completion_budget: ctx.completion_budget.clone(),
     };
     ctx
       .events
@@ -598,6 +600,7 @@ impl AcpRuntime {
     let role = request.role;
     let preferences = request.preferences;
     let retries = request.completion_retries;
+    let completion_budget = request.completion_budget;
     let schema = request.schema;
     let validate_output = request.validate_output;
 
@@ -632,6 +635,7 @@ impl AcpRuntime {
         let validate_output = validate_output.clone();
         let events = events.clone();
         let identity = identity.clone();
+        let completion_budget = completion_budget.clone();
         async move {
           let initialize = connection
             .send_request(initialize_request())
@@ -654,6 +658,7 @@ impl AcpRuntime {
             let mcp_validate_output = validate_output.clone();
             let mcp_events = events.clone();
             let mcp_identity = identity.clone();
+            let mcp_completion_budget = completion_budget.clone();
             match connection.build_session(&cwd).with_mcp_server(server) {
               Ok(builder) => {
                 builder
@@ -667,6 +672,7 @@ impl AcpRuntime {
                         preferences: mcp_preferences,
                         validate_output: mcp_validate_output,
                         retries,
+                        completion_budget: mcp_completion_budget,
                         events: mcp_events,
                         identity: mcp_identity,
                         yielded: Some((yield_receiver, yield_completion_receiver)),
@@ -689,6 +695,7 @@ impl AcpRuntime {
                         preferences,
                         validate_output,
                         retries,
+                        completion_budget,
                         events,
                         identity,
                         yielded: None,
@@ -712,6 +719,7 @@ impl AcpRuntime {
                     preferences,
                     validate_output,
                     retries,
+                    completion_budget,
                     events,
                     identity,
                     yielded: None,
@@ -741,6 +749,7 @@ struct WorkerSessionInput {
   preferences: tenet_domain::config::RolePreference,
   validate_output: WorkerOutputValidator,
   retries: u32,
+  completion_budget: Option<CompletionBudget>,
   events: Option<EventSink>,
   identity: WorkerIdentity,
   yielded: Option<(oneshot::Receiver<Value>, oneshot::Receiver<()>)>,
@@ -759,6 +768,7 @@ where
     preferences,
     validate_output,
     retries,
+    completion_budget,
     events,
     identity,
     mut yielded,
@@ -812,7 +822,12 @@ where
     let structured_output = match serde_json::from_str::<Value>(&text) {
       Ok(structured_output) => structured_output,
       Err(error) => {
-        let retry = structured_completion_retry_prompt(&error, &mut attempts, retries)?;
+        let retry = structured_completion_retry_prompt(
+          &error,
+          &mut attempts,
+          retries,
+          completion_budget.as_ref(),
+        )?;
         text.clear();
         session.send_prompt(retry)?;
         read_response(
@@ -832,7 +847,12 @@ where
     };
 
     if let Err(error) = validate_output(&structured_output) {
-      let retry = structured_completion_retry_prompt(&error, &mut attempts, retries)?;
+      let retry = structured_completion_retry_prompt(
+        &error,
+        &mut attempts,
+        retries,
+        completion_budget.as_ref(),
+      )?;
       text.clear();
       session.send_prompt(retry)?;
       read_response(
@@ -858,13 +878,20 @@ fn structured_completion_retry_prompt(
   error: &dyn std::fmt::Display,
   attempts: &mut u32,
   retries: u32,
+  completion_budget: Option<&CompletionBudget>,
 ) -> std::result::Result<String, agent_client_protocol::Error> {
-  if *attempts >= retries {
-    return Err(agent_client_protocol::Error::internal_error().data(format!(
-      "invalid structured completion after {attempts} retries: {error}"
-    )));
+  if let Some(completion_budget) = completion_budget {
+    completion_budget.reserve().map_err(|budget_error| {
+      agent_client_protocol::Error::internal_error().data(budget_error.to_string())
+    })?;
+  } else {
+    if *attempts >= retries {
+      return Err(agent_client_protocol::Error::internal_error().data(format!(
+        "invalid structured completion after {attempts} retries: {error}"
+      )));
+    }
+    *attempts += 1;
   }
-  *attempts += 1;
   Ok(format!("The previous response did not match the requested structured contract ({error}). Reply with only one schema-valid JSON value matching the requested role type; no markdown or prose."))
 }
 
@@ -1548,10 +1575,31 @@ mod tests {
     let error = anyhow!("invalid output");
     let mut attempts = 0;
 
-    assert!(structured_completion_retry_prompt(&error, &mut attempts, 2).is_ok());
-    assert!(structured_completion_retry_prompt(&error, &mut attempts, 2).is_ok());
-    assert!(structured_completion_retry_prompt(&error, &mut attempts, 2).is_err());
+    assert!(structured_completion_retry_prompt(&error, &mut attempts, 2, None).is_ok());
+    assert!(structured_completion_retry_prompt(&error, &mut attempts, 2, None).is_ok());
+    assert!(structured_completion_retry_prompt(&error, &mut attempts, 2, None).is_err());
     assert_eq!(attempts, 2);
+  }
+
+  #[test]
+  fn structured_and_semantic_retries_share_one_completion_budget() {
+    let error = anyhow!("invalid output");
+    let budget = CompletionBudget::from_retries(1);
+    let mut structural_attempts = 0;
+    budget.reserve().expect("initial completion");
+
+    assert!(structured_completion_retry_prompt(
+      &error,
+      &mut structural_attempts,
+      10,
+      Some(&budget),
+    )
+    .is_ok());
+    assert!(
+      budget.reserve().is_err(),
+      "semantic retry must not multiply the budget"
+    );
+    assert_eq!(budget.used(), 2);
   }
 
   #[test]

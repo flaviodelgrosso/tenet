@@ -397,7 +397,7 @@ impl Storage {
     _run_id: &str,
     leases: &BTreeMap<String, (WorkLease, bool)>,
   ) -> Result<(Vec<WorkExecution>, Vec<DeferredCandidate>), StorageError> {
-    let rows = sqlx::query("SELECT id, lease_id, base_revision, candidate_revision, catalog_hash, git_ref, state, worker_summary_json, verification_report_json FROM candidates ORDER BY created_at, id")
+    let rows = sqlx::query("SELECT id, lease_id, base_revision, candidate_revision, catalog_hash, git_ref, repair_attempts, state, worker_summary_json, verification_report_json FROM candidates ORDER BY created_at, id")
       .fetch_all(&self.pool)
       .await
       .map_err(StorageError::from_sqlx)?;
@@ -464,6 +464,14 @@ impl Storage {
           git_ref: row.get::<Option<String>, _>("git_ref").ok_or_else(|| {
             StorageError::IntegrityViolation("deferred candidate has no git ref".into())
           })?,
+          repair_attempts: row
+            .get::<i64, _>("repair_attempts")
+            .try_into()
+            .map_err(|_| {
+              StorageError::IntegrityViolation(
+                "deferred candidate has invalid repair attempts".into(),
+              )
+            })?,
         }),
         state => {
           return Err(StorageError::IntegrityViolation(format!(
@@ -601,9 +609,9 @@ async fn insert_deferred_candidate(
   candidate: &DeferredCandidate,
 ) -> Result<(), StorageError> {
   let id = candidate.candidate_revision.clone();
-  sqlx::query("INSERT INTO candidates(id, run_id, lease_id, base_revision, candidate_revision, catalog_hash, git_ref, state, worker_summary_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'deferred', ?, ?)")
+  sqlx::query("INSERT INTO candidates(id, run_id, lease_id, base_revision, candidate_revision, catalog_hash, git_ref, repair_attempts, state, worker_summary_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'deferred', ?, ?)")
     .bind(&id).bind(run_id).bind(&candidate.lease.id).bind(&candidate.base_revision).bind(&candidate.candidate_revision)
-    .bind(&candidate.catalog_hash).bind(&candidate.git_ref).bind(serde_json::to_string(&candidate.worker_summary).map_err(serialization_error)?)
+    .bind(&candidate.catalog_hash).bind(&candidate.git_ref).bind(i64::from(candidate.repair_attempts)).bind(serde_json::to_string(&candidate.worker_summary).map_err(serialization_error)?)
     .bind(&candidate.lease.issued_at).execute(&mut **transaction).await.map_err(|error| StorageError::IntegrityViolation(format!("persist deferred candidate {id}: {error}")))?;
   insert_candidate_children(
     transaction,

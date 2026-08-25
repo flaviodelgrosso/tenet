@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use tokio::{
-  sync::{mpsc, Semaphore},
+  sync::{mpsc, oneshot, Semaphore},
   task::JoinSet,
 };
 use uuid::Uuid;
@@ -27,10 +27,17 @@ use tenet_storage::Storage;
 
 use crate::{backend::BackendContext, git, protection, verifier, workspace::WorkspaceManager};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ExecutionUpdate {
-  Implementing { work_unit_id: String },
-  Repairing { work_unit_id: String, attempt: u32 },
+  Implementing {
+    work_unit_id: String,
+  },
+  Repairing {
+    work_unit_id: String,
+    attempt: u32,
+    deferred_git_ref: Option<String>,
+    persisted: oneshot::Sender<()>,
+  },
 }
 
 #[derive(Debug)]
@@ -75,6 +82,7 @@ struct CandidateDeferral<'a> {
   candidate_revision: &'a str,
   changed_paths: &'a [String],
   discoveries: &'a [WorkerDiscovery],
+  repair_attempts: u32,
 }
 
 /// Supplies candidate mutations while the scheduler owns execution mechanics.
@@ -342,6 +350,7 @@ async fn execute_and_commit(
     .load_current_work_unit_context(&lease.work_unit.id)
     .await?;
   let initial_discoveries = discovery_prompt_context(&worker_context.discoveries, &[]);
+  let mut repair_attempts = deferred.map_or(0, |candidate| candidate.repair_attempts);
   let (worker_summary, mut discoveries, mut candidate_revision, mut changed_paths) =
     if let Some(deferred) = deferred {
       validate_deferred_candidate(repository, catalog, lease, deferred).await?;
@@ -385,14 +394,11 @@ async fn execute_and_commit(
         })
         .collect();
       reject_protected_changes(&lease.workspace, &protected, "worker").await?;
-      for attempt in 1..=context.config.max_repair_attempts {
-        if !git::is_clean(&lease.workspace).await? {
-          break;
-        }
-        let _ = updates.send(ExecutionUpdate::Repairing {
-          work_unit_id: lease.work_unit.id.clone(),
-          attempt,
-        });
+      while git::is_clean(&lease.workspace).await?
+        && repair_attempts < context.config.max_repair_attempts
+      {
+        repair_attempts += 1;
+        announce_repair(updates, lease, deferred, repair_attempts).await?;
         let report = no_repository_changes_report();
         let repair_context = discovery_prompt_context(&worker_context.discoveries, &discoveries);
         let repair_summary = executor
@@ -441,6 +447,7 @@ async fn execute_and_commit(
       candidate_revision: &candidate_revision,
       changed_paths: &changed_paths,
       discoveries: &discoveries,
+      repair_attempts,
     })
     .await?;
     return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
@@ -452,18 +459,13 @@ async fn execute_and_commit(
   let mut verification =
     verify_candidate(repository, context, &candidate_revision, &lease.work_unit).await?;
 
-  for attempt in 1..=context.config.max_repair_attempts {
-    if verification.passed {
-      break;
-    }
+  while !verification.passed && repair_attempts < context.config.max_repair_attempts {
     if context.cancel.is_cancelled() {
       bail!("run cancelled");
     }
+    repair_attempts += 1;
     git::reset_soft(&lease.workspace, &lease.base_revision).await?;
-    let _ = updates.send(ExecutionUpdate::Repairing {
-      work_unit_id: lease.work_unit.id.clone(),
-      attempt,
-    });
+    announce_repair(updates, lease, deferred, repair_attempts).await?;
     let repair_context = discovery_prompt_context(&worker_context.discoveries, &discoveries);
     let repair_summary = executor
       .execute(
@@ -505,6 +507,7 @@ async fn execute_and_commit(
         candidate_revision: &candidate_revision,
         changed_paths: &changed_paths,
         discoveries: &discoveries,
+        repair_attempts,
       })
       .await?;
       return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
@@ -529,6 +532,7 @@ async fn execute_and_commit(
         candidate_revision: &candidate_revision,
         changed_paths: &changed_paths,
         discoveries: &discoveries,
+        repair_attempts,
       })
       .await?;
       return Ok(LeaseOutcome::Blocked(Box::new(BlockedExecution {
@@ -573,6 +577,26 @@ async fn execute_and_commit(
   Ok(LeaseOutcome::Verified(Box::new(execution)))
 }
 
+async fn announce_repair(
+  updates: &mpsc::UnboundedSender<ExecutionUpdate>,
+  lease: &WorkLease,
+  deferred: Option<&DeferredCandidate>,
+  attempt: u32,
+) -> Result<()> {
+  let (persisted, confirmation) = oneshot::channel();
+  updates
+    .send(ExecutionUpdate::Repairing {
+      work_unit_id: lease.work_unit.id.clone(),
+      attempt,
+      deferred_git_ref: deferred.map(|candidate| candidate.git_ref.clone()),
+      persisted,
+    })
+    .map_err(|_| anyhow!("controller stopped before repair attempt {attempt} was persisted"))?;
+  confirmation
+    .await
+    .context("persist repair attempt before worker invocation")
+}
+
 fn no_repository_changes_report() -> VerificationReport {
   let now = Utc::now();
   VerificationReport {
@@ -603,6 +627,7 @@ async fn defer_candidate(input: CandidateDeferral<'_>) -> Result<DeferredCandida
     candidate_revision,
     changed_paths,
     discoveries,
+    repair_attempts,
   } = input;
   let safe_id = lease.id.replace(['/', '\\'], "-");
   let git_ref = format!("refs/tenet/candidates/{safe_id}");
@@ -618,6 +643,7 @@ async fn defer_candidate(input: CandidateDeferral<'_>) -> Result<DeferredCandida
     discoveries: discoveries.to_vec(),
     catalog_hash: catalog.spec_hash.clone(),
     git_ref,
+    repair_attempts,
   })
 }
 
@@ -848,40 +874,61 @@ fn select_non_conflicting_batch(
 }
 
 pub fn scopes_conflict(left: &WorkUnit, right: &WorkUnit) -> Result<bool> {
-  let left_set = compile_scope(&left.scope.paths)?;
-  let right_set = compile_scope(&right.scope.paths)?;
-  let left_samples = scope_samples(&left.scope.paths);
-  let right_samples = scope_samples(&right.scope.paths);
-  Ok(
-    left_samples.iter().any(|path| right_set.is_match(path))
-      || right_samples.iter().any(|path| left_set.is_match(path)),
-  )
+  compile_scope(&left.scope.paths)?;
+  compile_scope(&right.scope.paths)?;
+  Ok(left.scope.paths.iter().any(|left| {
+    right
+      .scope
+      .paths
+      .iter()
+      .any(|right| !patterns_provably_disjoint(left, right))
+  }))
 }
 
 fn compile_scope(patterns: &[String]) -> Result<GlobSet> {
   let mut builder = GlobSetBuilder::new();
   for pattern in patterns {
-    builder.add(Glob::new(pattern).with_context(|| format!("invalid scope glob {pattern}"))?);
+    let normalized = normalize_scope_pattern(pattern);
+    builder.add(Glob::new(&normalized).with_context(|| format!("invalid scope glob {pattern}"))?);
   }
   builder.build().context("build scope matcher")
 }
 
-fn scope_samples(patterns: &[String]) -> Vec<String> {
-  patterns
-    .iter()
-    .flat_map(|pattern| {
-      let prefix = pattern
-        .split(['*', '?', '[', '{'])
-        .next()
-        .unwrap_or_default()
-        .trim_end_matches('/');
-      [
-        pattern.clone(),
-        prefix.to_owned(),
-        format!("{prefix}/__tenet_scope_probe__"),
-      ]
-    })
-    .collect()
+/// Returns the canonical representation used for both matching and progress identity.
+pub fn normalize_scope_pattern(pattern: &str) -> String {
+  pattern
+    .trim()
+    .split('/')
+    .filter(|component| !component.is_empty() && *component != ".")
+    .collect::<Vec<_>>()
+    .join("/")
+}
+
+fn patterns_provably_disjoint(left: &str, right: &str) -> bool {
+  let left = normalize_scope_pattern(left);
+  let right = normalize_scope_pattern(right);
+  if left.contains('\\') || right.contains('\\') {
+    return false;
+  }
+  if is_exact_scope(&left) && is_exact_scope(&right) {
+    return left != right;
+  }
+
+  let disjoint = literal_prefix(&left)
+    .zip(literal_prefix(&right))
+    .any(|(left, right)| left != right);
+  disjoint
+}
+
+fn is_exact_scope(pattern: &str) -> bool {
+  !pattern.contains(['*', '?', '[', '{'])
+}
+
+fn literal_prefix(pattern: &str) -> impl Iterator<Item = &str> {
+  pattern
+    .split('/')
+    .filter(|component| !component.is_empty() && *component != ".")
+    .take_while(|component| is_exact_scope(component))
 }
 
 #[cfg(test)]
@@ -1029,12 +1076,56 @@ mod tests {
   }
 
   #[test]
+  fn scopes_conflict_when_wildcard_intersection_is_possible() {
+    let result = scopes_conflict(
+      &unit("A", &["src/*/foo.rs"]),
+      &unit("B", &["src/auth/*.rs"]),
+    )
+    .expect("valid globs");
+
+    assert!(result);
+  }
+
+  #[test]
+  fn scopes_with_escape_sequences_fail_conservative() {
+    let result = scopes_conflict(&unit("A", &["src\\foo/**"]), &unit("B", &["srcfoo/**"]))
+      .expect("valid globs");
+
+    assert!(result);
+  }
+
+  #[test]
+  fn malformed_scope_glob_is_fatal_during_conflict_analysis() {
+    let error = scopes_conflict(&unit("A", &["["]), &unit("B", &["src/auth/**"]))
+      .expect_err("malformed glob must fail scheduling");
+
+    assert!(error.to_string().contains("invalid scope glob ["));
+  }
+
+  #[test]
   fn scopes_do_not_conflict_for_separate_trees() {
     let result = scopes_conflict(
       &unit("A", &["src/auth/**"]),
       &unit("B", &["src/payments/**"]),
     )
     .expect("valid globs");
+
+    assert!(!result);
+  }
+
+  #[test]
+  fn scope_matcher_uses_canonical_path_form() {
+    let scope = compile_scope(&[" ./src//** ".into()]).expect("valid normalized glob");
+
+    assert!(scope.is_match("src/auth/login.rs"));
+  }
+  #[test]
+  fn scopes_do_not_conflict_for_distinct_exact_files() {
+    let result = scopes_conflict(
+      &unit("A", &["src/auth/login.rs"]),
+      &unit("B", &["src/auth/logout.rs"]),
+    )
+    .expect("valid exact paths");
 
     assert!(!result);
   }

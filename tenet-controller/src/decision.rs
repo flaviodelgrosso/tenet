@@ -68,19 +68,12 @@ pub fn advance_stagnation(
   }
 }
 
-/// Hashes only canonical controller-relevant reconciliation facts.
+/// Hashes only canonical controller-relevant semantic reconciliation facts.
 pub fn progress_fingerprint(
-  revision: &str,
   catalog_hash: &str,
   reconciliation: &ReconcileResult,
-  active_discoveries: &[String],
 ) -> Result<String> {
-  let projection = ProgressProjection::from_reconciliation(
-    revision,
-    catalog_hash,
-    reconciliation,
-    active_discoveries,
-  );
+  let projection = ProgressProjection::from_reconciliation(catalog_hash, reconciliation)?;
   let bytes = serde_json::to_vec(&projection)?;
   let digest = Sha256::digest(bytes);
   let mut fingerprint = String::with_capacity(digest.len() * 2);
@@ -92,11 +85,9 @@ pub fn progress_fingerprint(
 
 #[derive(Serialize)]
 struct ProgressProjection<'a> {
-  revision: &'a str,
   catalog_hash: &'a str,
   requirements: Vec<RequirementProgress>,
   work_units: Vec<WorkUnitProgress>,
-  active_discoveries: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -106,21 +97,22 @@ struct RequirementProgress {
   missing_evidence: Vec<ObligationId>,
 }
 
-#[derive(Serialize)]
-struct WorkUnitProgress {
-  id: String,
+#[derive(Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct SemanticWorkSignature {
+  requirement_ids: Vec<RequirementId>,
+  criterion_ids: Vec<tenet_domain::ids::CriterionId>,
   verification_obligation_ids: Vec<ObligationId>,
-  depends_on: Vec<String>,
   scope_paths: Vec<String>,
 }
 
+#[derive(Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct WorkUnitProgress {
+  target: SemanticWorkSignature,
+  dependencies: Vec<SemanticWorkSignature>,
+}
+
 impl<'a> ProgressProjection<'a> {
-  fn from_reconciliation(
-    revision: &'a str,
-    catalog_hash: &'a str,
-    reconciliation: &ReconcileResult,
-    active_discoveries: &[String],
-  ) -> Self {
+  fn from_reconciliation(catalog_hash: &'a str, reconciliation: &ReconcileResult) -> Result<Self> {
     let mut requirements: Vec<_> = reconciliation
       .requirements
       .iter()
@@ -132,30 +124,75 @@ impl<'a> ProgressProjection<'a> {
       .collect();
     requirements.sort_by(|left, right| left.requirement_id.cmp(&right.requirement_id));
 
-    let mut work_units: Vec<_> = reconciliation
+    let targets: BTreeMap<_, _> = reconciliation
       .work_units
       .iter()
-      .map(|unit| WorkUnitProgress {
-        id: unit.id.clone(),
-        verification_obligation_ids: canonical_obligations(
-          unit.verification_obligation_ids.clone(),
-        ),
-        depends_on: canonical_strings(unit.depends_on.clone()),
-        scope_paths: canonical_strings(unit.scope.paths.clone()),
-      })
+      .map(|unit| (unit.id.as_str(), semantic_work_signature(unit)))
       .collect();
-    work_units.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut work_units = Vec::with_capacity(reconciliation.work_units.len());
+    for unit in &reconciliation.work_units {
+      let mut dependencies = unit
+        .depends_on
+        .iter()
+        .map(|dependency| {
+          targets.get(dependency.as_str()).cloned().with_context(|| {
+            format!(
+              "work unit {} depends on unknown work unit {dependency}",
+              unit.id
+            )
+          })
+        })
+        .collect::<Result<Vec<_>>>()?;
+      dependencies.sort();
+      dependencies.dedup();
+      work_units.push(WorkUnitProgress {
+        target: semantic_work_signature(unit),
+        dependencies,
+      });
+    }
+    work_units.sort();
+    work_units.dedup();
 
-    Self {
-      revision,
+    Ok(Self {
       catalog_hash,
       requirements,
       work_units,
-      active_discoveries: canonical_strings(active_discoveries.to_vec()),
-    }
+    })
   }
 }
 
+fn semantic_work_signature(unit: &WorkUnit) -> SemanticWorkSignature {
+  SemanticWorkSignature {
+    requirement_ids: canonical_requirements(unit.requirement_ids.clone()),
+    criterion_ids: canonical_criteria(unit.criterion_ids.clone()),
+    verification_obligation_ids: canonical_obligations(unit.verification_obligation_ids.clone()),
+    scope_paths: canonical_scope_paths(&unit.scope.paths),
+  }
+}
+
+fn canonical_requirements(mut values: Vec<RequirementId>) -> Vec<RequirementId> {
+  values.sort();
+  values.dedup();
+  values
+}
+
+fn canonical_criteria(
+  mut values: Vec<tenet_domain::ids::CriterionId>,
+) -> Vec<tenet_domain::ids::CriterionId> {
+  values.sort();
+  values.dedup();
+  values
+}
+
+fn canonical_scope_paths(paths: &[String]) -> Vec<String> {
+  let mut paths: Vec<_> = paths
+    .iter()
+    .map(|path| tenet_runtime::scheduler::normalize_scope_pattern(path))
+    .collect();
+  paths.sort();
+  paths.dedup();
+  paths
+}
 /// Admits canonical, deduplicated discoveries from explicit worker observations.
 pub fn record_discoveries(
   state: &mut tenet_domain::model::State,
@@ -345,6 +382,13 @@ pub fn authorize_frontier(
   frontier.sort_by(|left, right| left.id.cmp(&right.id));
   let mut candidates: Vec<_> = candidates.iter().collect();
   candidates.sort_by(|left, right| left.git_ref.cmp(&right.git_ref));
+  if candidates
+    .windows(2)
+    .any(|pair| pair[0].git_ref == pair[1].git_ref)
+  {
+    bail!("duplicate deferred candidate Git ref");
+  }
+  let mut selected_refs = BTreeSet::new();
   let mut work_units = Vec::with_capacity(frontier.len());
   let mut deferred_candidates = Vec::with_capacity(frontier.len());
   for unit in frontier {
@@ -358,7 +402,11 @@ pub fn authorize_frontier(
         continue;
       }
       saw_matching = true;
+      if selected_refs.contains(&candidate.git_ref) {
+        continue;
+      }
       if tenet_runtime::scheduler::deferred_candidate_authorized(candidate, &unit)? {
+        selected_refs.insert(candidate.git_ref.clone());
         authorized = Some((*candidate).clone());
         break;
       }
@@ -758,14 +806,6 @@ fn bind_judgments<T, Handle>(
   Ok(bound)
 }
 
-fn canonical_strings(values: Vec<String>) -> Vec<String> {
-  values
-    .into_iter()
-    .collect::<BTreeSet<_>>()
-    .into_iter()
-    .collect()
-}
-
 fn canonical_obligations(values: Vec<ObligationId>) -> Vec<ObligationId> {
   values
     .into_iter()
@@ -1075,7 +1115,7 @@ mod tests {
   }
 
   #[test]
-  fn progress_fingerprint_ignores_agent_prose_and_ordering() {
+  fn progress_fingerprint_ignores_agent_prose_order_and_duplicate_semantic_work() {
     let left = materialize_reconciliation(&catalog(), proposal()).expect("materialize left");
     let mut right = left.clone();
     right.summary = "Different model summary".into();
@@ -1084,21 +1124,136 @@ mod tests {
     right.work_units[0].title = "Different work title".into();
     right.work_units[0].objective = "Different work objective".into();
     right.work_units[0].suggested_checks[0].command = "different advisory command".into();
-
-    let mut second = right.work_units[0].clone();
-    second.id = "WU-002".into();
-    right.work_units.push(second.clone());
-    let mut left = left;
-    left.work_units.push(second);
-    left.work_units.reverse();
+    let mut duplicate = right.work_units[0].clone();
+    duplicate.id = "WU-duplicate".into();
+    right.work_units.push(duplicate);
     right.work_units.reverse();
 
-    let left = progress_fingerprint("revision", "catalog", &left, &["B".into(), "A".into()])
-      .expect("left fingerprint");
-    let right = progress_fingerprint("revision", "catalog", &right, &["A".into(), "B".into()])
-      .expect("right fingerprint");
+    assert_eq!(
+      progress_fingerprint("catalog", &left).expect("left fingerprint"),
+      progress_fingerprint("catalog", &right).expect("right fingerprint")
+    );
+  }
 
-    assert_eq!(left, right);
+  #[test]
+  fn progress_fingerprint_ignores_generated_work_ids_and_dependency_ids() {
+    let mut left = materialize_reconciliation(&catalog(), proposal()).expect("materialize left");
+    let mut dependent = left.work_units[0].clone();
+    dependent.id = "WU-002".into();
+    dependent.scope.paths = vec!["tests/**".into()];
+    dependent.depends_on = vec!["WU-001".into()];
+    left.work_units.push(dependent);
+    let mut right = left.clone();
+    right.work_units[0].id = "generated-root".into();
+    right.work_units[1].id = "generated-dependent".into();
+    right.work_units[1].depends_on = vec!["generated-root".into()];
+
+    assert_eq!(
+      progress_fingerprint("catalog", &left).expect("left fingerprint"),
+      progress_fingerprint("catalog", &right).expect("right fingerprint")
+    );
+  }
+
+  #[test]
+  fn progress_fingerprint_changes_with_semantic_dependency_topology() {
+    let mut dependent =
+      materialize_reconciliation(&catalog(), proposal()).expect("materialize dependent graph");
+    let mut second = dependent.work_units[0].clone();
+    second.id = "WU-002".into();
+    second.scope.paths = vec!["tests/**".into()];
+    second.depends_on = vec!["WU-001".into()];
+    dependent.work_units.push(second);
+    let mut independent = dependent.clone();
+    independent.work_units[1].depends_on.clear();
+
+    assert_ne!(
+      progress_fingerprint("catalog", &dependent).expect("dependent fingerprint"),
+      progress_fingerprint("catalog", &independent).expect("independent fingerprint")
+    );
+  }
+
+  #[test]
+  fn progress_fingerprint_changes_with_implementation_state() {
+    let left = materialize_reconciliation(&catalog(), proposal()).expect("materialize left");
+    let mut right = left.clone();
+    right.requirements[0].implementation_state = ImplementationState::Absent;
+
+    assert_ne!(
+      progress_fingerprint("catalog", &left).expect("left fingerprint"),
+      progress_fingerprint("catalog", &right).expect("right fingerprint")
+    );
+  }
+
+  #[test]
+  fn progress_fingerprint_changes_with_missing_evidence() {
+    let left = materialize_reconciliation(&catalog(), proposal()).expect("materialize left");
+    let mut right = left.clone();
+    right.requirements[0].missing_evidence.clear();
+
+    assert_ne!(
+      progress_fingerprint("catalog", &left).expect("left fingerprint"),
+      progress_fingerprint("catalog", &right).expect("right fingerprint")
+    );
+  }
+
+  #[test]
+  fn progress_fingerprint_changes_with_authoritative_catalog() {
+    let reconciliation =
+      materialize_reconciliation(&catalog(), proposal()).expect("materialize reconciliation");
+
+    assert_ne!(
+      progress_fingerprint("catalog-a", &reconciliation).expect("first fingerprint"),
+      progress_fingerprint("catalog-b", &reconciliation).expect("second fingerprint")
+    );
+  }
+
+  #[test]
+  fn progress_fingerprint_changes_with_obligation_targets() {
+    let left = materialize_reconciliation(&catalog(), proposal()).expect("materialize left");
+    let mut right = left.clone();
+    right.work_units[0].verification_obligation_ids.clear();
+
+    assert_ne!(
+      progress_fingerprint("catalog", &left).expect("left fingerprint"),
+      progress_fingerprint("catalog", &right).expect("right fingerprint")
+    );
+  }
+
+  #[test]
+  fn progress_fingerprint_changes_with_material_scope() {
+    let left = materialize_reconciliation(&catalog(), proposal()).expect("materialize left");
+    let mut right = left.clone();
+    right.work_units[0].scope.paths = vec!["tests/**".into()];
+
+    assert_ne!(
+      progress_fingerprint("catalog", &left).expect("left fingerprint"),
+      progress_fingerprint("catalog", &right).expect("right fingerprint")
+    );
+  }
+
+  #[test]
+  fn progress_fingerprint_normalizes_equivalent_scope_paths() {
+    let left = materialize_reconciliation(&catalog(), proposal()).expect("materialize left");
+    let mut right = left.clone();
+    right.work_units[0].scope.paths = vec!["./src//**".into()];
+
+    assert_eq!(
+      progress_fingerprint("catalog", &left).expect("left fingerprint"),
+      progress_fingerprint("catalog", &right).expect("right fingerprint")
+    );
+  }
+
+  #[test]
+  fn progress_fingerprint_preserves_glob_escape_semantics() {
+    let mut left = materialize_reconciliation(&catalog(), proposal()).expect("materialize left");
+    left.work_units[0].scope.paths = vec!["src/foo/**".into()];
+    let mut right = left.clone();
+    right.work_units[0].scope.paths = vec!["src\\foo/**".into()];
+
+    assert_ne!(
+      progress_fingerprint("catalog", &left).expect("left fingerprint"),
+      progress_fingerprint("catalog", &right).expect("right fingerprint")
+    );
   }
 
   fn deferred_candidate(catalog_hash: &str) -> DeferredCandidate {
@@ -1131,6 +1286,7 @@ mod tests {
       discoveries: Vec::new(),
       catalog_hash: catalog_hash.into(),
       git_ref: "refs/tenet/candidate-1".into(),
+      repair_attempts: 0,
     }
   }
 
@@ -1308,6 +1464,65 @@ mod tests {
 
     assert!(authorization.work_units.is_empty());
     assert!(authorization.deferred_candidates.is_empty());
+  }
+
+  #[test]
+  fn deferred_candidate_authorizes_at_most_one_lease_per_round() {
+    let candidate = deferred_candidate("spec-v1");
+    let mut first = candidate.lease.work_unit.clone();
+    first.id = "A".into();
+    let mut second = first.clone();
+    second.id = "B".into();
+
+    let authorization = authorize_frontier(vec![second, first], &[candidate], "spec-v1", "rev-1")
+      .expect("authorize one lease");
+    let selected_refs: Vec<_> = authorization
+      .deferred_candidates
+      .iter()
+      .filter_map(|candidate| {
+        candidate
+          .as_ref()
+          .map(|candidate| candidate.git_ref.as_str())
+      })
+      .collect();
+
+    assert_eq!(
+      authorization
+        .work_units
+        .iter()
+        .map(|unit| unit.id.as_str())
+        .collect::<Vec<_>>(),
+      ["A"]
+    );
+    assert_eq!(selected_refs, ["refs/tenet/candidate-1"]);
+  }
+
+  #[test]
+  fn deferred_candidate_assignment_is_independent_of_input_order() {
+    let first_candidate = deferred_candidate("spec-v1");
+    let mut second_candidate = first_candidate.clone();
+    second_candidate.git_ref = "refs/tenet/candidate-2".into();
+    let mut first = first_candidate.lease.work_unit.clone();
+    first.id = "A".into();
+    let mut second = first.clone();
+    second.id = "B".into();
+
+    let forward = authorize_frontier(
+      vec![first.clone(), second.clone()],
+      &[first_candidate.clone(), second_candidate.clone()],
+      "spec-v1",
+      "rev-1",
+    )
+    .expect("forward authorization");
+    let reversed = authorize_frontier(
+      vec![second, first],
+      &[second_candidate, first_candidate],
+      "spec-v1",
+      "rev-1",
+    )
+    .expect("reversed authorization");
+
+    assert_eq!(forward, reversed);
   }
 
   #[test]

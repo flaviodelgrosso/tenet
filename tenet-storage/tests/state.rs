@@ -106,6 +106,7 @@ async fn deferred_candidate_survives_new_run_publication_before_reconciliation()
     discoveries: Vec::new(),
     catalog_hash: "spec-hash".into(),
     git_ref: "refs/tenet/candidates/candidate-revision".into(),
+    repair_attempts: 2,
   };
   let mut first = State::fresh();
   first.run_id = Some("run-1".into());

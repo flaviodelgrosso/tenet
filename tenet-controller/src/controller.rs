@@ -30,7 +30,7 @@ use tenet_domain::{
 };
 
 use tenet_runtime::{
-  backend::BackendContext,
+  backend::{BackendContext, CompletionBudget},
   git,
   graph::WorkGraph,
   integration::{IntegrationOutcome, Integrator},
@@ -147,6 +147,7 @@ impl Controller {
       cancel: cancel.clone(),
       events: events.clone(),
       launch,
+      completion_budget: None,
       worker_id: format!("controller-{run_id}"),
       lease_id: None,
       work_unit_id: None,
@@ -338,18 +339,8 @@ impl Controller {
         )
         .await?;
       let graph = WorkGraph::from_reconcile(&catalog, &reconciliation)?;
-      let active_discoveries: Vec<_> = state
-        .discoveries
-        .iter()
-        .filter(|record| record.status == DiscoveryStatus::Active)
-        .map(|record| record.fingerprint.clone())
-        .collect();
-      let fingerprint = decision::progress_fingerprint(
-        &current_revision,
-        &catalog.spec_hash,
-        &reconciliation,
-        &active_discoveries,
-      )?;
+      let catalog_hash = catalog.catalog_hash()?;
+      let fingerprint = decision::progress_fingerprint(&catalog_hash, &reconciliation)?;
       let stagnation = decision::advance_stagnation(
         state.progress_fingerprint.as_deref(),
         state.stagnation_count,
@@ -526,24 +517,47 @@ impl Controller {
         let mut execution = Box::pin(scheduler.execute_leases(leases, deferred_by_lease));
         loop {
           tokio::select! {
-            result = &mut execution => break result,
-            Some(update) = update_receiver.recv() => {
-              match update {
-                ExecutionUpdate::Implementing { work_unit_id } => {
-                  state.phase = Phase::Implementing;
-                  state.current_repair = None;
-                  state.last_summary = format!("Implementing {work_unit_id}");
-                }
-                ExecutionUpdate::Repairing { work_unit_id, attempt } => {
-                  state.phase = Phase::Repairing;
-                  state.current_repair = Some(RepairProgress {
-                    work_unit_id: work_unit_id.clone(),
+              result = &mut execution => break result,
+              Some(update) = update_receiver.recv() => {
+                let persisted = match update {
+                  ExecutionUpdate::Implementing { work_unit_id } => {
+                    state.phase = Phase::Implementing;
+                    state.current_repair = None;
+                    state.last_summary = format!("Implementing {work_unit_id}");
+                    None
+                  }
+                  ExecutionUpdate::Repairing {
+                    work_unit_id,
                     attempt,
-                  });
-                  state.last_summary = format!("Repairing {work_unit_id}, attempt {attempt}");
+                    deferred_git_ref,
+                    persisted,
+                  } => {
+                    if let Some(git_ref) = deferred_git_ref {
+                      let candidate = state
+                        .deferred_candidates
+                        .iter_mut()
+                        .find(|candidate| candidate.git_ref == git_ref)
+                        .with_context(|| {
+                          format!("deferred candidate {git_ref} disappeared before repair")
+                        })?;
+                      if attempt != candidate.repair_attempts.saturating_add(1) {
+                        bail!("deferred candidate repair attempt is not sequential");
+                      }
+                      candidate.repair_attempts = attempt;
+                    }
+                    state.phase = Phase::Repairing;
+                    state.current_repair = Some(RepairProgress {
+                      work_unit_id: work_unit_id.clone(),
+                      attempt,
+                    });
+                    state.last_summary = format!("Repairing {work_unit_id}, attempt {attempt}");
+                    Some(persisted)
+                  }
+                };
+                self.publish(&context.events, state).await?;
+                if let Some(persisted) = persisted {
+                  let _ = persisted.send(());
                 }
-              }
-              self.publish(&context.events, state).await?;
             }
           }
         }
@@ -989,6 +1003,8 @@ impl Controller {
     self.publish(&context.events, state).await?;
     let mut catalog_batches = Vec::with_capacity(architect_batches.len());
     for batch in architect_batches {
+      let completion_budget =
+        CompletionBudget::from_retries(context.config.agent.completion_retries);
       let mut feedback = None;
       let mut attempt = 0;
       let candidate = loop {
@@ -1003,6 +1019,7 @@ impl Controller {
         let output = self
           .read_only_worker(
             context,
+            &completion_budget,
             "architect",
             None,
             move |inspection_context| async move {
@@ -1079,6 +1096,7 @@ impl Controller {
     F: Fn(BackendContext, Option<String>) -> Fut + Clone,
     Fut: Future<Output = Result<AgentReconciliationProposal>>,
   {
+    let completion_budget = CompletionBudget::from_retries(context.config.agent.completion_retries);
     let mut feedback = None;
     for attempt in 0..=context.config.agent.completion_retries {
       let generate = generate.clone();
@@ -1086,6 +1104,7 @@ impl Controller {
       let proposal = self
         .read_only_worker(
           context,
+          &completion_budget,
           name,
           Some(expected_revision),
           move |inspection_context| generate(inspection_context, attempt_feedback),
@@ -1118,6 +1137,7 @@ impl Controller {
     F: Fn(BackendContext, Option<String>) -> Fut + Clone,
     Fut: Future<Output = Result<SemanticAssessmentProposal>>,
   {
+    let completion_budget = CompletionBudget::from_retries(context.config.agent.completion_retries);
     let mut feedback = None;
     for attempt in 0..=context.config.agent.completion_retries {
       let generate = generate.clone();
@@ -1125,6 +1145,7 @@ impl Controller {
       let proposal = self
         .read_only_worker(
           context,
+          &completion_budget,
           "assessment",
           Some(expected_revision),
           move |inspection_context| generate(inspection_context, attempt_feedback),
@@ -1151,6 +1172,7 @@ impl Controller {
   async fn read_only_worker<T, F, Fut>(
     &self,
     context: &BackendContext,
+    completion_budget: &CompletionBudget,
     name: &str,
     expected_revision: Option<&str>,
     call: F,
@@ -1159,6 +1181,7 @@ impl Controller {
     F: FnOnce(BackendContext) -> Fut,
     Fut: Future<Output = Result<T>>,
   {
+    completion_budget.reserve()?;
     let canonical_before = git::repository_state(&self.cwd).await?;
     if let Some(expected_revision) = expected_revision {
       if canonical_before.head != expected_revision {
@@ -1181,6 +1204,7 @@ impl Controller {
       .materialize_repository_file(&workspace, &context.config.spec_file)
       .await?;
     let mut inspection_context = context.clone();
+    inspection_context.completion_budget = Some(completion_budget.clone());
     inspection_context.cwd.clone_from(&workspace);
     inspection_context.runtime_dir = context.runtime_dir.join(name);
     inspection_context.worker_id = format!("{}-{name}", context.worker_id);

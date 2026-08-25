@@ -2,11 +2,15 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use anyhow::{Context, Result};
-use tokio::fs;
+use tokio::{fs, sync::Mutex};
 
 use tenet_domain::config::normalize_protected_path;
 
 use crate::git;
+
+// Git worktrees share mutable metadata under the canonical repository. Serialize the
+// add/list/remove sequence so parallel workers cannot corrupt that registry.
+static WORKTREE_REGISTRY_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Creates disposable Git worktrees that isolate repository mutations.
 ///
@@ -89,6 +93,11 @@ impl WorkspaceManager {
       .with_context(|| format!("materialize repository file {}", destination.display()))
   }
   pub async fn remove(&self, path: &Path) -> Result<()> {
+    let _guard = WORKTREE_REGISTRY_LOCK.lock().await;
+    self.remove_locked(path).await
+  }
+
+  async fn remove_locked(&self, path: &Path) -> Result<()> {
     let registered = git::is_worktree_registered(&self.repository, path).await?;
     if !path.exists() && !registered {
       return Ok(());
@@ -135,8 +144,9 @@ impl WorkspaceManager {
   }
 
   async fn create(&self, path: &Path, revision: &str) -> Result<()> {
+    let _guard = WORKTREE_REGISTRY_LOCK.lock().await;
     if path.exists() {
-      self.remove(path).await?;
+      self.remove_locked(path).await?;
     }
     if let Some(parent) = path.parent() {
       fs::create_dir_all(parent).await?;
@@ -144,5 +154,66 @@ impl WorkspaceManager {
     git::add_worktree(&self.repository, path, revision)
       .await
       .with_context(|| format!("create worktree {} at {revision}", path.display()))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use std::process::Command;
+
+  use tempfile::tempdir;
+  use tokio::task::JoinSet;
+
+  use super::WorkspaceManager;
+  use crate::git;
+
+  fn run_git(repository: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+      .args(args)
+      .current_dir(repository)
+      .status()
+      .expect("run git");
+    assert!(status.success(), "git {} failed", args.join(" "));
+  }
+
+  #[tokio::test]
+  async fn parallel_workspace_lifecycles_preserve_git_registry() {
+    let repository = tempdir().expect("temporary repository");
+    run_git(repository.path(), &["init", "-q"]);
+    std::fs::write(repository.path().join("README.txt"), "initial").expect("write fixture");
+    run_git(repository.path(), &["add", "README.txt"]);
+    run_git(
+      repository.path(),
+      &[
+        "-c",
+        "user.name=Tenet Test",
+        "-c",
+        "user.email=tenet@example.test",
+        "commit",
+        "-q",
+        "-m",
+        "initial",
+      ],
+    );
+    let revision = git::head(repository.path()).await.expect("repository head");
+    let manager = WorkspaceManager::new(repository.path().to_path_buf(), "parallel");
+    let mut tasks = JoinSet::new();
+    for index in 0..8 {
+      let manager = manager.clone();
+      let revision = revision.clone();
+      tasks.spawn(async move {
+        let workspace = manager
+          .create_disposable(&format!("worker-{index}"), &revision)
+          .await?;
+        manager.remove(&workspace).await
+      });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+      result
+        .expect("workspace task")
+        .expect("workspace lifecycle");
+    }
+    manager.cleanup_run().await.expect("cleanup run");
   }
 }

@@ -252,6 +252,7 @@ enum BackendMode {
   Normal,
   LargeCatalog,
   EmptyImplementationThenRepair,
+  EmptyThenNeverPassingVerification,
   RequireSpecification,
   IncompleteCatalogThenCorrect,
   AlwaysIncompleteCatalog,
@@ -262,18 +263,21 @@ enum BackendMode {
   RepairDiscovery,
   InvalidVerificationCheck,
   NeverPassingVerification,
+  VerificationBlockerThenRepairFailure,
   IncompleteAssessment,
   SemanticGapThenRepair,
   CleanupFailure,
   InvalidReconcileThenCorrect,
   InvalidAssessmentThenCorrect,
   AlwaysInvalidReconcile,
+  StructuralRetryThenInvalidReconcile,
   ContradictoryReconcileThenCorrect,
   AlwaysContradictoryReconcile,
   InvalidScopeThenCorrect,
   InvalidAssessmentScopeThenCorrect,
   RepairScopeMutation,
   UnapprovedScopeMutation,
+  SemanticallyRepeatedWork,
   ScopeMutation(ScopeMutation),
   ReadOnlyMutation {
     role: tenet_domain::model::WorkerRole,
@@ -408,6 +412,13 @@ impl AgentBackend for FakeBackend {
     self
       .mutate_read_only_workspace(ctx, tenet_domain::model::WorkerRole::Reconcile)
       .await?;
+    if matches!(self.mode, BackendMode::StructuralRetryThenInvalidReconcile) {
+      ctx
+        .completion_budget
+        .as_ref()
+        .expect("read-only worker supplies a completion budget")
+        .reserve()?;
+    }
     let reconcile_call = self.reconcile_calls.fetch_add(1, Ordering::SeqCst);
     if let Some(feedback) = semantic_validation_feedback {
       self
@@ -427,6 +438,19 @@ impl AgentBackend for FakeBackend {
     self
       .discoveries_seen
       .fetch_add(discoveries.len(), Ordering::SeqCst);
+    if matches!(self.mode, BackendMode::SemanticallyRepeatedWork) {
+      let id = format!("repeat-{reconcile_call}");
+      let mut work_unit = proposed_unit(&id, &[]);
+      work_unit.title = format!("Planner prose {reconcile_call}");
+      work_unit.objective = format!("Repeated objective {reconcile_call}");
+      work_unit.suggested_checks.clear();
+      work_unit.scope.paths = vec!["repeat/**".into()];
+      return Ok(AgentReconciliationProposal {
+        summary: format!("Repeated summary {reconcile_call}"),
+        requirements: vec![assessment(false)],
+        work_units: vec![work_unit],
+      });
+    }
     if matches!(self.mode, BackendMode::LargeCatalog) {
       let requirements = catalog
         .requirements
@@ -517,7 +541,12 @@ impl AgentBackend for FakeBackend {
         }];
       }
     }
-    if matches!(self.mode, BackendMode::NeverPassingVerification) {
+    if matches!(
+      self.mode,
+      BackendMode::NeverPassingVerification
+        | BackendMode::EmptyThenNeverPassingVerification
+        | BackendMode::VerificationBlockerThenRepairFailure
+    ) {
       if let Some(unit) = work_units.iter_mut().find(|unit| unit.id == "A") {
         unit.suggested_checks = vec![CandidateCheck {
           obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
@@ -533,8 +562,10 @@ impl AgentBackend for FakeBackend {
         }];
       }
     }
-    if matches!(self.mode, BackendMode::AlwaysInvalidReconcile)
-      || matches!(self.mode, BackendMode::InvalidReconcileThenCorrect) && reconcile_call == 0
+    if matches!(
+      self.mode,
+      BackendMode::AlwaysInvalidReconcile | BackendMode::StructuralRetryThenInvalidReconcile
+    ) || matches!(self.mode, BackendMode::InvalidReconcileThenCorrect) && reconcile_call == 0
     {
       work_units[0].verification_obligation_ids = vec![ObligationId::from("REQ-999/AC-01/VO-01")];
     }
@@ -574,6 +605,15 @@ impl AgentBackend for FakeBackend {
       .lock()
       .expect("workspace lock")
       .push((work_unit.id.clone(), ctx.cwd.clone()));
+    if matches!(self.mode, BackendMode::SemanticallyRepeatedWork) {
+      fs::create_dir_all(ctx.cwd.join("repeat")).await?;
+      fs::write(
+        ctx.cwd.join("repeat").join(format!("{}.txt", work_unit.id)),
+        work_unit.id.as_bytes(),
+      )
+      .await?;
+      return Ok(summary(Vec::new()));
+    }
     if matches!(self.mode, BackendMode::WorkerTimeout) {
       bail!("implement worker timed out after 1s");
     }
@@ -585,7 +625,10 @@ impl AgentBackend for FakeBackend {
       ctx.cancel.cancelled().await;
       bail!("run cancelled");
     }
-    if matches!(self.mode, BackendMode::EmptyImplementationThenRepair) {
+    if matches!(
+      self.mode,
+      BackendMode::EmptyImplementationThenRepair | BackendMode::EmptyThenNeverPassingVerification
+    ) {
       return Ok(summary(Vec::new()));
     }
     if work_unit.id == "A" {
@@ -638,7 +681,19 @@ impl AgentBackend for FakeBackend {
     _report: &VerificationReport,
   ) -> Result<WorkerSummary> {
     let repair_number = self.repair_calls.fetch_add(1, Ordering::SeqCst) + 1;
-    if matches!(self.mode, BackendMode::EmptyImplementationThenRepair) {
+    if matches!(self.mode, BackendMode::VerificationBlockerThenRepairFailure) && work_unit.id == "A"
+    {
+      if repair_number == 1 {
+        return Ok(summary(vec![Discovery::VerificationBlocker {
+          description: "defer the candidate once".into(),
+        }]));
+      }
+      bail!("synthetic resumed repair failure");
+    }
+    if matches!(
+      self.mode,
+      BackendMode::EmptyImplementationThenRepair | BackendMode::EmptyThenNeverPassingVerification
+    ) {
       fs::write(
         ctx.cwd.join(format!("{}.txt", work_unit.id)),
         work_unit.id.as_bytes(),
@@ -646,7 +701,11 @@ impl AgentBackend for FakeBackend {
       .await?;
       return Ok(summary(Vec::new()));
     }
-    if matches!(self.mode, BackendMode::NeverPassingVerification) && work_unit.id == "A" {
+    if matches!(
+      self.mode,
+      BackendMode::NeverPassingVerification | BackendMode::EmptyThenNeverPassingVerification
+    ) && work_unit.id == "A"
+    {
       fs::write(ctx.cwd.join("A.txt"), format!("repair-{repair_number}")).await?;
       return Ok(summary(Vec::new()));
     }
@@ -1314,6 +1373,26 @@ async fn malformed_reconciliation_is_retried_with_feedback_and_corrected() {
 }
 
 #[tokio::test]
+async fn structural_and_semantic_retries_cannot_multiply_completion_budget() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(
+    BackendMode::StructuralRetryThenInvalidReconcile,
+  ));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  rewrite_config(&repository, |config| config.agent.completion_retries = 1).await;
+
+  let error = controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("shared completion budget must be exhausted");
+
+  assert!(error
+    .to_string()
+    .contains("agent completion attempt budget exhausted after 2 completion(s)"));
+  assert_eq!(backend.reconcile_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn contradictory_reconciliation_is_retried_with_targeted_feedback_and_corrected() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(
@@ -1750,7 +1829,7 @@ async fn repeated_unapproved_scope_expansion_is_bounded_by_stagnation() {
     .expect("stagnation blocks repeated unapproved expansion");
 
   assert_eq!(state.status, tenet_domain::model::RunStatus::Blocked);
-  assert_eq!(state.cycle, 3);
+  assert_eq!(state.cycle, 2);
   assert!(state
     .blocked_reason
     .as_deref()
@@ -2027,6 +2106,53 @@ async fn invalid_verification_discovery_returns_to_reconciliation_without_repair
   assert_eq!(list.matches("worktree ").count(), 1);
 }
 
+#[tokio::test]
+async fn deferred_candidate_cannot_reset_repair_budget() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::InvalidVerificationCheck));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  rewrite_config(&repository, |config| {
+    config.max_cycles = 2;
+    config.max_repair_attempts = 1;
+  })
+  .await;
+
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("resumed candidate cannot receive a second repair budget");
+
+  assert_eq!(backend.repair_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn failed_resumed_repair_keeps_consumed_attempt_persisted() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(
+    BackendMode::VerificationBlockerThenRepairFailure,
+  ));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  rewrite_config(&repository, |config| {
+    config.max_cycles = 3;
+    config.max_repair_attempts = 2;
+  })
+  .await;
+
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("resumed repair fails after consuming final attempt");
+  let failed = store::read_state(repository.path())
+    .await
+    .expect("failed state retains deferred candidate");
+  assert_eq!(failed.deferred_candidates[0].repair_attempts, 2);
+
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("exhausted deferred candidate cannot repair again");
+  assert_eq!(backend.repair_calls.load(Ordering::SeqCst), 2);
+}
 #[tokio::test]
 async fn dirty_canonical_tree_is_rejected_before_worktree_execution() {
   let repository = TempRepo::new();
@@ -3001,6 +3127,23 @@ async fn repair_attempt_count_matches_configured_bound_exactly() {
 }
 
 #[tokio::test]
+async fn repair_budget_is_shared_across_empty_and_verification_recovery() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(
+    BackendMode::EmptyThenNeverPassingVerification,
+  ));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 1).await;
+  rewrite_config(&repository, |config| config.max_repair_attempts = 2).await;
+
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("combined recovery exhausts one shared repair budget");
+
+  assert_eq!(backend.repair_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
 async fn semantic_gap_repair_creates_new_revision_and_requires_reverification() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::SemanticGapThenRepair));
@@ -3096,11 +3239,49 @@ async fn stagnation_limit_blocks_on_exact_unchanged_transition() {
     .expect("stagnation produces blocked state");
 
   assert_eq!(state.status, tenet_domain::model::RunStatus::Blocked);
-  assert_eq!(state.cycle, 6);
+  assert_eq!(state.cycle, 5);
   assert!(state
     .blocked_reason
     .as_deref()
     .is_some_and(|reason| reason.contains("Stagnation limit (1)")));
+}
+
+#[tokio::test]
+async fn equivalent_work_across_revisions_blocks_before_max_cycles() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::SemanticallyRepeatedWork));
+  let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
+  rewrite_config(&repository, |config| {
+    config.max_cycles = 10;
+    config.stagnation_limit = 1;
+  })
+  .await;
+  let initial_revision = git::head(repository.path())
+    .await
+    .expect("initial revision");
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("semantic stagnation produces blocked state");
+
+  assert_eq!(state.status, RunStatus::Blocked);
+  assert_eq!(state.cycle, 2);
+  assert_ne!(
+    git::head(repository.path())
+      .await
+      .expect("advanced revision"),
+    initial_revision
+  );
+  assert!(state
+    .blocked_reason
+    .as_deref()
+    .is_some_and(|reason| reason.contains("Stagnation limit (1)")));
+  assert_eq!(
+    backend.workspaces.lock().expect("workspace lock").len(),
+    1,
+    "a new revision and generated work ID must not authorize repeated execution"
+  );
 }
 
 #[tokio::test]
