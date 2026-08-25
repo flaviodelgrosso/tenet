@@ -96,6 +96,22 @@ fn semantic_feedback(feedback: Option<&str>) -> String {
     .unwrap_or_default()
 }
 
+fn reconciliation_prompt(
+  request: &ReconciliationRequest<'_>,
+  semantic_validation_feedback: Option<&str>,
+) -> Result<String> {
+  let requirement_handles = serde_json::to_string_pretty(request.requirement_handles)?;
+  let catalog = serde_json::to_string_pretty(request.catalog)?;
+  let evidence = serde_json::to_string_pretty(request.evidence)?;
+  let recent_completed = serde_json::to_string_pretty(request.recent_completed)?;
+  let discoveries = serde_json::to_string_pretty(request.discoveries)?;
+  let feedback = semantic_feedback(semantic_validation_feedback);
+
+  Ok(format!(
+    "Reconcile the repository implementation against this controller-selected catalog. Inspect it directly. Return exactly one requirement judgment for every supplied requirementHandle; output order is irrelevant. Identify implementation gaps and missing evidence. Propose work units by targeting verification-obligation IDs; do not reproduce requirement or criterion relationships because the controller derives them. Semantic work dependencies remain your responsibility. The controller alone decides verification and concurrency.\n\nController-assigned requirement handles:\n{requirement_handles}\n\nController-selected catalog:\n{catalog}\n\nController-derived evidence projections:\n{evidence}\n\nRecent completed work:\n{recent_completed}\n\nWorker- and controller-derived discoveries requiring reconsideration:\n{discoveries}{feedback}"
+  ))
+}
+
 #[async_trait]
 impl AgentBackend for AcpRuntime {
   async fn resolve_launch(
@@ -131,7 +147,13 @@ impl AgentBackend for AcpRuntime {
     request: ReconciliationRequest<'_>,
     semantic_validation_feedback: Option<&str>,
   ) -> Result<AgentReconciliationProposal> {
-    self.run_typed(ctx, WorkerRole::Reconcile, format!("Reconcile the repository implementation against this controller-selected catalog. Inspect it directly. Return exactly one requirement judgment for every supplied requirementHandle; output order is irrelevant. Identify implementation gaps and missing evidence. Propose work units by targeting verification-obligation IDs; do not reproduce requirement or criterion relationships because the controller derives them. Semantic work dependencies remain your responsibility. The controller alone decides verification and concurrency.\n\nController-assigned requirement handles:\n{}\n\nController-selected catalog:\n{}\n\nController-derived evidence projections:\n{}\n\nRecent completed work:\n{}\n\nWorker- and controller-derived discoveries requiring reconsideration:\n{}{}", serde_json::to_string_pretty(request.requirement_handles)?, serde_json::to_string_pretty(request.catalog)?, serde_json::to_string_pretty(request.recent_completed)?, serde_json::to_string_pretty(request.discoveries)?, serde_json::to_string_pretty(request.evidence)?, semantic_feedback(semantic_validation_feedback))).await
+    self
+      .run_typed(
+        ctx,
+        WorkerRole::Reconcile,
+        reconciliation_prompt(&request, semantic_validation_feedback)?,
+      )
+      .await
   }
 
   async fn implement(
@@ -1194,6 +1216,14 @@ fn build_worker_prompt(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::collections::BTreeMap;
+
+  use tenet_domain::{
+    evidence::{EvidenceProjection, VerificationState},
+    ids::{RequirementId, VerificationRunId},
+    model::CompletedWorkUnit,
+    worker::CatalogCoverage,
+  };
 
   fn valid_reconcile_output() -> Value {
     json!({
@@ -1228,6 +1258,113 @@ mod tests {
 
     assert!(feedback.contains("REQ-025 is internally inconsistent"));
     assert!(!feedback.contains("correct the reported relationships"));
+  }
+
+  #[test]
+  fn reconciliation_prompt_places_each_controller_input_in_its_section() {
+    fn section<'a>(prompt: &'a str, heading: &str, next_heading: Option<&str>) -> &'a str {
+      let content = prompt
+        .split_once(heading)
+        .unwrap_or_else(|| panic!("missing prompt heading {heading:?}"))
+        .1;
+      next_heading
+        .map(|next| {
+          content
+            .split_once(next)
+            .unwrap_or_else(|| panic!("missing next prompt heading {next:?}"))
+            .0
+        })
+        .unwrap_or(content)
+        .trim()
+    }
+
+    let requirement_handles = BTreeMap::from([(
+      RequirementId::from("HANDLE-REQUIREMENT"),
+      "HANDLE_SENTINEL".to_owned(),
+    )]);
+    let catalog = RequirementCatalog {
+      spec_hash: "CATALOG_SENTINEL".into(),
+      requirements: Vec::new(),
+      acceptance_criteria: Vec::new(),
+      verification_obligations: Vec::new(),
+      coverage: CatalogCoverage {
+        normative_fragments: Vec::new(),
+        uncovered_fragment_ids: Vec::new(),
+      },
+    };
+    let evidence = vec![EvidenceProjection {
+      requirement_id: RequirementId::from("EVIDENCE_SENTINEL"),
+      verification_state: VerificationState::Unverified,
+      criteria: Vec::new(),
+    }];
+    let recent_completed = vec![CompletedWorkUnit {
+      work_unit: WorkUnit {
+        id: "RECENT_WORK_SENTINEL".into(),
+        title: "Recent work".into(),
+        objective: "Recent objective".into(),
+        requirement_ids: Vec::new(),
+        criterion_ids: Vec::new(),
+        verification_obligation_ids: Vec::new(),
+        suggested_checks: Vec::new(),
+        depends_on: Vec::new(),
+        scope: tenet_domain::model::WorkScope { paths: Vec::new() },
+      },
+      completed_at: "RECENT_COMPLETED_SENTINEL".into(),
+      verification_run_id: VerificationRunId::new(),
+    }];
+    let discoveries = vec![Discovery::Blocker {
+      description: "DISCOVERY_SENTINEL".into(),
+    }];
+    let request = ReconciliationRequest {
+      catalog: &catalog,
+      requirement_handles: &requirement_handles,
+      recent_completed: &recent_completed,
+      discoveries: &discoveries,
+      evidence: &evidence,
+    };
+
+    let prompt = reconciliation_prompt(&request, None).expect("build reconciliation prompt");
+
+    assert_eq!(
+      section(
+        &prompt,
+        "Controller-assigned requirement handles:\n",
+        Some("\n\nController-selected catalog:\n")
+      ),
+      serde_json::to_string_pretty(request.requirement_handles).expect("serialize handles")
+    );
+    assert_eq!(
+      section(
+        &prompt,
+        "Controller-selected catalog:\n",
+        Some("\n\nController-derived evidence projections:\n")
+      ),
+      serde_json::to_string_pretty(request.catalog).expect("serialize catalog")
+    );
+    assert_eq!(
+      section(
+        &prompt,
+        "Controller-derived evidence projections:\n",
+        Some("\n\nRecent completed work:\n")
+      ),
+      serde_json::to_string_pretty(request.evidence).expect("serialize evidence")
+    );
+    assert_eq!(
+      section(
+        &prompt,
+        "Recent completed work:\n",
+        Some("\n\nWorker- and controller-derived discoveries requiring reconsideration:\n")
+      ),
+      serde_json::to_string_pretty(request.recent_completed).expect("serialize completed work")
+    );
+    assert_eq!(
+      section(
+        &prompt,
+        "Worker- and controller-derived discoveries requiring reconsideration:\n",
+        None
+      ),
+      serde_json::to_string_pretty(request.discoveries).expect("serialize discoveries")
+    );
   }
 
   #[test]
