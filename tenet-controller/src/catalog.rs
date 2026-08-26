@@ -529,7 +529,11 @@ fn validate_contract(contract: &EvidenceContract, checks: &BTreeSet<&str>) -> Re
     }
     EvidenceContract::Artifact {
       predicate: EvidencePredicate::SourceInspection,
-    } => {}
+    } => {
+      bail!(
+        "source inspection is supporting evidence and cannot satisfy an authoritative evidence contract"
+      );
+    }
     EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => {
       if requirements.is_empty() {
         bail!("composite evidence contract must not be empty");
@@ -718,12 +722,50 @@ mod tests {
   }
 
   #[test]
-  fn source_inspection_contract_is_admitted_only_for_fail_closed_adjudication() {
+  fn configured_named_project_check_is_admitted() {
     let contract = EvidenceContract::Artifact {
-      predicate: EvidencePredicate::SourceInspection,
+      predicate: EvidencePredicate::NamedProjectCheck {
+        name: "quality".into(),
+      },
     };
-    validate_contract(&contract, &BTreeSet::new())
-      .expect("source inspection can collect supporting evidence but cannot prove");
+
+    validate_contract(&contract, &BTreeSet::from(["quality"]))
+      .expect("configured named check has an authoritative controller issuer");
+  }
+
+  #[test]
+  fn composites_of_configured_named_checks_are_admitted_recursively() {
+    let named_check = || EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck {
+        name: "quality".into(),
+      },
+    };
+    let contract = EvidenceContract::All {
+      requirements: vec![
+        named_check(),
+        EvidenceContract::Any {
+          requirements: vec![named_check()],
+        },
+      ],
+    };
+
+    validate_contract(&contract, &BTreeSet::from(["quality"]))
+      .expect("every composite branch has an authoritative controller issuer");
+  }
+
+  #[test]
+  fn unknown_named_project_check_is_rejected() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck {
+        name: "unknown".into(),
+      },
+    };
+
+    let error = validate_contract(&contract, &BTreeSet::from(["quality"]))
+      .expect_err("unknown named check has no controller issuer");
+    assert!(error
+      .to_string()
+      .contains("named project check \"unknown\" is not controller-configured"));
   }
 
   #[test]
@@ -739,15 +781,16 @@ mod tests {
   }
 
   #[test]
-  fn human_attestation_requires_a_controller_issuer() {
-    let contract = EvidenceContract::HumanAttestation {
-      statement: "Release approved".into(),
+  fn source_inspection_cannot_be_an_authoritative_contract() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::SourceInspection,
     };
+
     let error = validate_contract(&contract, &BTreeSet::new())
-      .expect_err("human attestation has no configured issuer");
-    assert!(error
-      .to_string()
-      .contains("human attestation requires a configured controller issuer"));
+      .expect_err("supporting source inspection cannot close a proof obligation");
+    assert!(error.to_string().contains(
+      "source inspection is supporting evidence and cannot satisfy an authoritative evidence contract"
+    ));
   }
 
   #[test]
@@ -760,6 +803,62 @@ mod tests {
     assert!(error
       .to_string()
       .contains("requires a trusted verifier that is not configured"));
+  }
+
+  #[test]
+  fn human_attestation_requires_a_controller_issuer() {
+    let contract = EvidenceContract::HumanAttestation {
+      statement: "Release approved".into(),
+    };
+    let error = validate_contract(&contract, &BTreeSet::new())
+      .expect_err("human attestation has no configured issuer");
+    assert!(error
+      .to_string()
+      .contains("human attestation requires a configured controller issuer"));
+  }
+
+  #[test]
+  fn all_rejects_an_unsupported_source_inspection_branch() {
+    let contract = EvidenceContract::All {
+      requirements: vec![
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "quality".into(),
+          },
+        },
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::SourceInspection,
+        },
+      ],
+    };
+
+    let error = validate_contract(&contract, &BTreeSet::from(["quality"]))
+      .expect_err("every all branch must have an authoritative issuer");
+    assert!(error
+      .to_string()
+      .contains("source inspection is supporting evidence"));
+  }
+
+  #[test]
+  fn any_rejects_an_unsupported_branch_even_when_another_branch_is_valid() {
+    let contract = EvidenceContract::Any {
+      requirements: vec![
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "quality".into(),
+          },
+        },
+        EvidenceContract::HumanAttestation {
+          statement: "Release approved".into(),
+        },
+      ],
+    };
+
+    let error = validate_contract(&contract, &BTreeSet::from(["quality"]))
+      .expect_err("every any branch must have an authoritative issuer");
+    assert!(error
+      .to_string()
+      .contains("human attestation requires a configured controller issuer"));
   }
 
   #[test]

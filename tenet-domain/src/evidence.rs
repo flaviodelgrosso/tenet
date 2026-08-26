@@ -932,6 +932,32 @@ mod tests {
   }
 
   #[test]
+  fn internal_adjudication_model_suspicion_cannot_create_authoritative_contradiction() {
+    let mut graph = graph();
+    graph
+      .record_assessment_judgments(
+        "abc",
+        now(),
+        "assess",
+        vec![(
+          ObligationId::from("REQ-007/AC-01/VO-01"),
+          AssessmentJudgment::Contradicted {
+            artifact_ids: Vec::new(),
+            rationale: "model suspects a counterexample".into(),
+            proposals: Vec::new(),
+          },
+        )],
+      )
+      .expect("record advisory suspicion");
+    graph.derive_proofs("abc");
+
+    assert_eq!(
+      graph.proof_derivations[&ObligationId::from("REQ-007/AC-01/VO-01")].state,
+      ProofState::Insufficient
+    );
+  }
+
+  #[test]
   fn agent_suggestion_cannot_authorize_obligation() {
     let mut graph = graph();
     graph.record_project_verification(&project_run("abc", "suite", true));

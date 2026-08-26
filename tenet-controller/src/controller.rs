@@ -888,25 +888,7 @@ impl Controller {
     apply_semantic_layers(&mut state.verification_layers, evidence_graph, policy);
     state.last_summary.clone_from(&semantic_report.summary);
 
-    let implementation_gaps: Vec<_> = semantic_report
-      .assessments
-      .iter()
-      .filter_map(|assessment| match &assessment.assessment {
-        AssessmentJudgment::Insufficient {
-          reason,
-          gap_kind: GapKind::Implementation,
-          ..
-        } => Some(WorkerDiscovery {
-          discovery: Discovery::VerificationBlocker {
-            description: format!("{}: {reason}", assessment.obligation_id),
-          },
-          role: tenet_domain::model::WorkerRole::Assess,
-        }),
-        AssessmentJudgment::Supported { .. }
-        | AssessmentJudgment::Contradicted { .. }
-        | AssessmentJudgment::Insufficient { .. } => None,
-      })
-      .collect();
+    let implementation_gaps = implementation_gap_discoveries(&semantic_report);
     if !implementation_gaps.is_empty() {
       decision::record_discoveries(
         state,
@@ -1374,6 +1356,28 @@ async fn retire_deferred_candidates(
   Ok(())
 }
 
+fn implementation_gap_discoveries(report: &SemanticAssessmentReport) -> Vec<WorkerDiscovery> {
+  report
+    .assessments
+    .iter()
+    .filter_map(|assessment| match &assessment.assessment {
+      AssessmentJudgment::Insufficient {
+        reason,
+        gap_kind: GapKind::Implementation,
+        ..
+      } => Some(WorkerDiscovery {
+        discovery: Discovery::VerificationBlocker {
+          description: format!("{}: {reason}", assessment.obligation_id),
+        },
+        role: tenet_domain::model::WorkerRole::Assess,
+      }),
+      AssessmentJudgment::Supported { .. }
+      | AssessmentJudgment::Contradicted { .. }
+      | AssessmentJudgment::Insufficient { .. } => None,
+    })
+    .collect()
+}
+
 fn requirement_counts(
   catalog: &RequirementCatalog,
   graph: &EvidenceGraphState,
@@ -1640,7 +1644,7 @@ pub async fn manual_verify(cwd: &Path) -> Result<ProjectVerificationRun> {
 mod tests {
   use super::*;
   use tenet_domain::{
-    evidence::{AcceptanceCriterion, VerificationObligation},
+    evidence::{AcceptanceCriterion, ObligationAssessmentResult, VerificationObligation},
     ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId, VerificationRunId},
     model::{ArchitectOutput, ArchitectRequirement, Requirement, RequirementAssessment},
     verification::{CommandResult, ProjectCheckResult, VerificationSpec},
@@ -1954,5 +1958,47 @@ mod tests {
       .items
       .iter()
       .all(|item| item.outcome == CompletionGateOutcome::Satisfied));
+  }
+
+  #[test]
+  fn internal_adjudication_routes_implementation_gaps_to_reconciliation() {
+    let report = SemanticAssessmentReport {
+      summary: "implementation is incomplete".into(),
+      assessments: vec![ObligationAssessmentResult {
+        obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+        assessment: AssessmentJudgment::Insufficient {
+          reason: "missing behavior".into(),
+          proposals: Vec::new(),
+          gap_kind: GapKind::Implementation,
+        },
+      }],
+    };
+
+    let discoveries = implementation_gap_discoveries(&report);
+
+    assert!(matches!(
+      discoveries.as_slice(),
+      [WorkerDiscovery {
+        discovery: Discovery::VerificationBlocker { description },
+        role: tenet_domain::model::WorkerRole::Assess,
+      }] if description.contains("missing behavior")
+    ));
+  }
+
+  #[test]
+  fn internal_adjudication_does_not_turn_evidence_gaps_into_implementation_work() {
+    let report = SemanticAssessmentReport {
+      summary: "evidence is unavailable".into(),
+      assessments: vec![ObligationAssessmentResult {
+        obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+        assessment: AssessmentJudgment::Insufficient {
+          reason: "missing authoritative artifact".into(),
+          proposals: Vec::new(),
+          gap_kind: GapKind::Evidence,
+        },
+      }],
+    };
+
+    assert!(implementation_gap_discoveries(&report).is_empty());
   }
 }

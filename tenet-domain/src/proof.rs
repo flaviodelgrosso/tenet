@@ -744,6 +744,29 @@ mod tests {
       compatible_revisions: BTreeSet::new(),
     }
   }
+  fn source_inspection_artifact() -> EvidenceArtifact {
+    EvidenceArtifact {
+      id: ArtifactId::new(),
+      revision: "r1".into(),
+      observed_at: Utc::now(),
+      authority: ArtifactAuthority::Supporting,
+      provenance: ArtifactProvenance::ControllerSourceInspection,
+      observation: ArtifactObservation::Supports,
+      kind: EvidenceArtifactKind::SourceSpan {
+        path: "src/lib.rs".into(),
+        blob_sha256: "blob-hash".into(),
+        content_sha256: "span-hash".into(),
+        start_byte: 0,
+        end_byte: 10,
+      },
+      obligation_ids: [ObligationId::from("VO-1")].into(),
+      validity: ArtifactValidity::Valid,
+      dependencies: DependencySurface::Paths {
+        blob_hashes: BTreeMap::from([("src/lib.rs".into(), "blob-hash".into())]),
+      },
+      compatible_revisions: BTreeSet::new(),
+    }
+  }
 
   fn human_attestation(statement: &str) -> EvidenceArtifact {
     EvidenceArtifact {
@@ -780,6 +803,22 @@ mod tests {
       [&item],
       "r1",
     );
+    assert_eq!(derivation.state, ProofState::Insufficient);
+  }
+  #[test]
+  fn supporting_source_inspection_cannot_prove_an_admissible_named_check_contract() {
+    let item = source_inspection_artifact();
+    let derivation = derive_proof_state(
+      &ObligationId::from("VO-1"),
+      &EvidenceContract::Artifact {
+        predicate: EvidencePredicate::NamedProjectCheck {
+          name: "behavior".into(),
+        },
+      },
+      [&item],
+      "r1",
+    );
+
     assert_eq!(derivation.state, ProofState::Insufficient);
   }
 

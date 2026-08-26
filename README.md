@@ -272,12 +272,12 @@ Pure deterministic proof evaluation matches current, valid, authoritative artifa
 
 The implemented authority boundary is deliberately narrow:
 
-- **Authoritative:** controller-configured named project checks.
-- **Supporting:** controller-owned immutable source inspection.
+- **Authoritative:** controller-configured named project checks. A configured named check is the only currently admissible leaf obligation contract; `All` and `Any` are admissible only when every branch is independently admissible.
+- **Supporting:** controller-owned immutable source inspection. Source inspection can inform falsification and evidence-gap analysis, but catalog validation rejects it as an authoritative obligation contract.
 - **Advisory request only:** assessor-proposed reproduction commands; Tenet records the request but does not execute it or issue an artifact.
-- **Unsupported authoritative issuers:** generic trusted verifiers and human attestation. Catalog validation rejects both.
+- **Unsupported authoritative issuers:** generic trusted executable verification and human attestation. Catalog validation rejects both.
 
-Assess is a falsifier and evidence-gap finder. It may refer only to controller-supplied artifact IDs and may propose configured checks, source inspection, or deferred reproduction. Neither support nor suspicion changes `ProofState` directly.
+With this authoritative contract set, production-valid obligations are mechanically decidable from controller-configured named checks. Assess remains a falsifier and evidence-gap finder for future hybrid or non-mechanical issuers. It may refer only to controller-supplied artifact IDs and may propose configured checks, supporting source inspection, or deferred reproduction. Supporting artifacts, model support, and model suspicion cannot close or contradict an authoritative proof obligation.
 
 On repository transitions, invalidation is conservative. Repository-wide and unknown dependency surfaces become stale at an incompatible revision. Although the domain can represent path/blob compatibility, the controller does not currently supply current blob hashes during invalidation, so it does not claim dependency-aware reuse.
 
@@ -363,9 +363,9 @@ A failed advisory verification attempt becomes structured input to a new Repair 
 
 A verified candidate is integrated through the controller rather than being allowed to mutate canonical state directly. Tenet maintains a durable integration journal around canonical advancement — if interruption occurs, startup reconciles the journal against the actual Git revision rather than guessing whether the operation succeeded. After integration, the repository is reconciled again: yesterday's plan is not automatically trusted after today's code change.
 
-### 7 · Adjudicate and acquire evidence
+### 7 · Advisory adjudication
 
-When deterministic contracts remain insufficient, a fresh skeptical worker inspects controller-provided artifacts, searches for unsupported leaps or counterexamples, classifies the gap, and may request evidence. Its `Supported` or `Contradicted` judgment is advisory. The controller may acquire immutable supporting source spans; reproduction requests are retained but not executed. Only configured named-check results currently receive authoritative issuance. Pure proof evaluation and completion remain controller-owned.
+Current production-valid obligation contracts are mechanically decided by controller-configured named checks, so completion does not call Assess merely to confirm a proven contract. Tenet retains an advisory adjudication and falsification path for future hybrid or non-mechanical evidence issuers: a skeptical worker can inspect controller-provided artifacts, identify evidence or implementation gaps, report suspicions, and request supporting source spans or deferred reproduction. Those judgments and source spans cannot issue authoritative proof, and reproduction requests are not executed. Pure proof evaluation and completion remain controller-owned.
 
 ---
 

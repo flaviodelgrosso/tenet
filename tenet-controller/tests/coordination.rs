@@ -30,7 +30,7 @@ use tenet_domain::{
     AcceptanceCriterion, AgentObligationAssessment, ImplementationState,
     SemanticAssessmentProposal, VerificationObligation,
   },
-  ids::{ArchitectSourceRef, ArtifactId, CriterionId, ObligationId, RequirementId},
+  ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId},
   model::{
     AgentReconciliationProposal, AgentRequirementAssessment, AgentWorkUnit, ArchitectOutput,
     ArchitectRequirement, CandidateCheck, CatalogApproval, CompletedWorkUnit, Discovery,
@@ -38,10 +38,7 @@ use tenet_domain::{
     ReconcileResult, Requirement, RequirementCatalog, RunStatus, State, VerificationReport,
     WorkExecution, WorkLease, WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
-  proof::{
-    AssessmentJudgment, EvidenceContract, EvidencePredicate, EvidenceRequestProposal, GapKind,
-    ProofState,
-  },
+  proof::{AssessmentJudgment, EvidenceContract, EvidencePredicate, GapKind, ProofState},
   verification::ProjectVerificationRun,
   worker::{derive_normative_fragments, CatalogCoverage},
 };
@@ -161,26 +158,16 @@ fn criterion() -> AcceptanceCriterion {
 }
 
 fn obligation() -> VerificationObligation {
-  obligation_with_contract(EvidenceContract::Artifact {
-    predicate: EvidencePredicate::NamedProjectCheck {
-      name: "project verification".into(),
-    },
-  })
-}
-
-fn obligation_with_contract(evidence_contract: EvidenceContract) -> VerificationObligation {
   VerificationObligation {
     id: ObligationId::from("REQ-001/AC-01/VO-01"),
     criterion_id: CriterionId::from("REQ-001/AC-01"),
     description: "Verify every diamond output".into(),
     required: true,
-    evidence_contract,
-  }
-}
-
-fn source_inspection_contract() -> EvidenceContract {
-  EvidenceContract::Artifact {
-    predicate: EvidencePredicate::SourceInspection,
+    evidence_contract: EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck {
+        name: "project verification".into(),
+      },
+    },
   }
 }
 
@@ -284,10 +271,6 @@ enum BackendMode {
   NeverPassingVerification,
   VerificationBlockerThenRepairFailure,
   IncompleteAssessment,
-  EvidenceGap,
-  FabricatedArtifactThenEvidenceGap,
-  ModelSuspicion,
-  ReproduceProposal,
   SemanticGapThenRepair,
   CleanupFailure,
   InvalidReconcileThenCorrect,
@@ -829,44 +812,6 @@ impl AgentBackend for FakeBackend {
     }
     let semantic_repair_present = ctx.cwd.join("semantic-fix.txt").exists();
     let assessment = match self.mode {
-      BackendMode::EvidenceGap => AssessmentJudgment::Insufficient {
-        reason: "authoritative evidence is unavailable".into(),
-        proposals: Vec::new(),
-        gap_kind: GapKind::Evidence,
-      },
-      BackendMode::FabricatedArtifactThenEvidenceGap if assessment_call == 0 => {
-        AssessmentJudgment::Supported {
-          artifact_ids: vec![ArtifactId::new()],
-          rationale: "invented reference".into(),
-        }
-      }
-      BackendMode::FabricatedArtifactThenEvidenceGap => AssessmentJudgment::Insufficient {
-        reason: "the controller rejected the invented artifact".into(),
-        proposals: Vec::new(),
-        gap_kind: GapKind::Evidence,
-      },
-      BackendMode::ModelSuspicion => AssessmentJudgment::Contradicted {
-        artifact_ids: Vec::new(),
-        rationale: "model suspects a counterexample".into(),
-        proposals: Vec::new(),
-      },
-      BackendMode::ReproduceProposal => {
-        let marker = self
-          .canonical
-          .lock()
-          .expect("canonical path lock")
-          .as_ref()
-          .expect("canonical path configured")
-          .join("assessor-command-ran");
-        AssessmentJudgment::Insufficient {
-          reason: "reproduction requested".into(),
-          proposals: vec![EvidenceRequestProposal::Reproduce {
-            program: "touch".into(),
-            args: vec![marker.display().to_string()],
-          }],
-          gap_kind: GapKind::Evidence,
-        }
-      }
       BackendMode::SemanticGapThenRepair if !semantic_repair_present => {
         AssessmentJudgment::Insufficient {
           reason: "semantic implementation is missing".into(),
@@ -925,21 +870,6 @@ async fn configured_controller(
   backend: Arc<FakeBackend>,
   max_parallel_workers: usize,
 ) -> (Controller, mpsc::UnboundedReceiver<RunEvent>) {
-  configured_controller_with_contract(
-    repository,
-    backend,
-    max_parallel_workers,
-    obligation().evidence_contract,
-  )
-  .await
-}
-
-async fn configured_controller_with_contract(
-  repository: &TempRepo,
-  backend: Arc<FakeBackend>,
-  max_parallel_workers: usize,
-  evidence_contract: EvidenceContract,
-) -> (Controller, mpsc::UnboundedReceiver<RunEvent>) {
   *backend.canonical.lock().expect("canonical path lock") = Some(repository.path().to_path_buf());
   let mut config = Config::default();
   config.agent.custom = Some(CustomAgentConfig {
@@ -978,7 +908,7 @@ async fn configured_controller_with_contract(
       spec_hash,
       requirements: vec![requirement()],
       acceptance_criteria: vec![criterion()],
-      verification_obligations: vec![obligation_with_contract(evidence_contract)],
+      verification_obligations: vec![obligation()],
       coverage: CatalogCoverage::derive("diamond", &[requirement()]),
     },
   )
@@ -3371,163 +3301,5 @@ async fn mechanical_proof_skips_unneeded_assessor_workspace_cleanup() {
   assert_eq!(
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
     ProofState::Proven
-  );
-}
-
-#[tokio::test]
-async fn evidence_gap_invokes_assess_and_remains_fail_closed() {
-  let repository = TempRepo::new();
-  let backend = Arc::new(FakeBackend::new(BackendMode::EvidenceGap));
-  let (controller, _) = configured_controller_with_contract(
-    &repository,
-    backend.clone(),
-    2,
-    source_inspection_contract(),
-  )
-  .await;
-
-  let state = controller.run(CancellationToken::new()).await.expect("run");
-  let catalog = store::read_catalog(repository.path())
-    .await
-    .expect("read catalog")
-    .expect("catalog");
-  let graph = controller_evidence::load(repository.path(), &catalog)
-    .await
-    .expect("load evidence");
-
-  assert_eq!(state.status, RunStatus::Blocked);
-  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 1);
-  assert!(graph.artifacts.is_empty());
-  assert_eq!(
-    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Insufficient
-  );
-}
-
-#[tokio::test]
-async fn fabricated_artifact_id_is_retried_and_never_persisted() {
-  let repository = TempRepo::new();
-  let backend = Arc::new(FakeBackend::new(
-    BackendMode::FabricatedArtifactThenEvidenceGap,
-  ));
-  let (controller, _) = configured_controller_with_contract(
-    &repository,
-    backend.clone(),
-    2,
-    source_inspection_contract(),
-  )
-  .await;
-
-  let state = controller.run(CancellationToken::new()).await.expect("run");
-  let catalog = store::read_catalog(repository.path())
-    .await
-    .expect("read catalog")
-    .expect("catalog");
-  let graph = controller_evidence::load(repository.path(), &catalog)
-    .await
-    .expect("load evidence");
-
-  assert_eq!(state.status, RunStatus::Blocked);
-  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 2);
-  assert!(backend
-    .semantic_feedback
-    .lock()
-    .expect("semantic feedback lock")
-    .iter()
-    .any(|(_, feedback)| feedback.contains("unknown evidence artifact")));
-  assert!(graph.artifacts.is_empty());
-  assert_eq!(graph.assessments.len(), 1);
-}
-
-#[tokio::test]
-async fn model_suspicion_does_not_create_authoritative_contradiction() {
-  let repository = TempRepo::new();
-  let backend = Arc::new(FakeBackend::new(BackendMode::ModelSuspicion));
-  let (controller, _) = configured_controller_with_contract(
-    &repository,
-    backend.clone(),
-    2,
-    source_inspection_contract(),
-  )
-  .await;
-
-  let state = controller.run(CancellationToken::new()).await.expect("run");
-  let catalog = store::read_catalog(repository.path())
-    .await
-    .expect("read catalog")
-    .expect("catalog");
-  let graph = controller_evidence::load(repository.path(), &catalog)
-    .await
-    .expect("load evidence");
-
-  assert_eq!(state.status, RunStatus::Blocked);
-  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 1);
-  assert_eq!(
-    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Insufficient
-  );
-}
-
-#[tokio::test]
-async fn implementation_gap_returns_to_reconciliation_without_synthesizing_proof() {
-  let repository = TempRepo::new();
-  let backend = Arc::new(FakeBackend::new(BackendMode::SemanticGapThenRepair));
-  let (controller, _) = configured_controller_with_contract(
-    &repository,
-    backend.clone(),
-    2,
-    source_inspection_contract(),
-  )
-  .await;
-
-  let state = controller.run(CancellationToken::new()).await.expect("run");
-  let catalog = store::read_catalog(repository.path())
-    .await
-    .expect("read catalog")
-    .expect("catalog");
-  let graph = controller_evidence::load(repository.path(), &catalog)
-    .await
-    .expect("load evidence");
-
-  assert_eq!(state.status, RunStatus::Blocked);
-  assert!(state
-    .completed_work_units
-    .iter()
-    .any(|completed| completed.work_unit.id == "semantic-fix"));
-  assert!(backend.reconcile_calls.load(Ordering::SeqCst) >= 2);
-  assert_eq!(
-    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Insufficient
-  );
-}
-
-#[tokio::test]
-async fn reproduce_proposal_cannot_execute_or_create_an_artifact() {
-  let repository = TempRepo::new();
-  let backend = Arc::new(FakeBackend::new(BackendMode::ReproduceProposal));
-  let (controller, _) = configured_controller_with_contract(
-    &repository,
-    backend.clone(),
-    2,
-    source_inspection_contract(),
-  )
-  .await;
-
-  let state = controller.run(CancellationToken::new()).await.expect("run");
-  let catalog = store::read_catalog(repository.path())
-    .await
-    .expect("read catalog")
-    .expect("catalog");
-  let graph = controller_evidence::load(repository.path(), &catalog)
-    .await
-    .expect("load evidence");
-
-  assert_eq!(state.status, RunStatus::Blocked);
-  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 1);
-  assert!(!repository.path().join("assessor-command-ran").exists());
-  assert!(graph.artifacts.is_empty());
-  assert_eq!(
-    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Insufficient
   );
 }

@@ -381,6 +381,74 @@ pub fn stale_evidence(graph: &EvidenceGraphState) -> impl Iterator<Item = Eviden
 mod tests {
   use super::*;
 
+  fn run_git(cwd: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+      .args(args)
+      .current_dir(cwd)
+      .output()
+      .expect("run git");
+    assert!(
+      output.status.success(),
+      "git {} failed: {}",
+      args.join(" "),
+      String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+  }
+
+  #[tokio::test]
+  async fn controller_source_inspection_issues_only_revision_bound_supporting_artifacts() {
+    let project = tempfile::tempdir().expect("temporary project");
+    run_git(project.path(), &["init"]);
+    run_git(project.path(), &["config", "user.name", "Tenet Test"]);
+    run_git(
+      project.path(),
+      &["config", "user.email", "tenet-test@localhost"],
+    );
+    std::fs::create_dir_all(project.path().join("src")).expect("create source directory");
+    std::fs::write(
+      project.path().join("src/lib.rs"),
+      "pub fn value() -> u8 { 1 }\n",
+    )
+    .expect("write source");
+    run_git(project.path(), &["add", "src/lib.rs"]);
+    run_git(project.path(), &["commit", "-m", "source"]);
+    let revision = run_git(project.path(), &["rev-parse", "HEAD"]);
+
+    let artifact = inspect_source(
+      project.path(),
+      &revision,
+      "src/lib.rs",
+      1,
+      1,
+      tenet_domain::ids::ObligationId::from("VO-1"),
+    )
+    .await
+    .expect("inspect immutable source");
+
+    assert_eq!(artifact.revision, revision);
+    assert_eq!(artifact.authority, ArtifactAuthority::Supporting);
+    assert_eq!(
+      artifact.provenance,
+      ArtifactProvenance::ControllerSourceInspection
+    );
+    assert!(artifact.validate().is_ok());
+    assert!(matches!(
+      (&artifact.kind, &artifact.dependencies),
+      (
+        EvidenceArtifactKind::SourceSpan {
+          path,
+          blob_sha256,
+          content_sha256,
+          ..
+        },
+        DependencySurface::Paths { blob_hashes }
+      ) if path == "src/lib.rs"
+        && !content_sha256.is_empty()
+        && blob_hashes.get(path) == Some(blob_sha256)
+    ));
+  }
+
   #[tokio::test]
   async fn inadmissible_source_proposal_is_rejected_without_error() {
     let artifact = acquire_source_proposal(

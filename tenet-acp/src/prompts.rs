@@ -30,7 +30,7 @@ Rules:
 - Every controller-annotated sourceRef token in the assigned batch must map to at least one requirement. Copy only the exact short sourceRef tokens into sourceRefs; never emit SPEC fragment IDs, hashes, sections, or reference objects.
 - Treat every normative requirement as required, every acceptance criterion as mandatory, and every supporting obligation as required. Do not use false flags to remove scope.
 - Acceptance criteria describe observable, falsifiable truths. Verification obligations describe claims and must include an explicit evidenceContract.
-- Use `artifact/named_project_check` with an exact controller-provided configured check name for behavior covered by that check. Generic `artifact/project_verification` is not an admissible obligation contract; repository-wide verification remains a separate global completion gate. Source inspection is supporting only and cannot be selected as an authoritative proof contract until the controller provides a mechanical source predicate. Generic `artifact/executable_evidence` and `human_attestation` are currently unsupported because no trusted verifier or human-attestation issuer is configured; the controller rejects those contracts. Compose requirements with `all` or `any` only where every branch is admissible.
+- The only currently admissible leaf obligation contract is `artifact/named_project_check` with an exact controller-provided configured check name. `all` and `any` are admissible only when every branch is independently admissible. Generic `artifact/project_verification` is not an obligation contract; repository-wide verification remains a separate global completion gate. Source inspection is supporting only and cannot satisfy an authoritative proof contract. Generic `artifact/executable_evidence` and `human_attestation` are unsupported because no trusted verifier or human-attestation issuer is configured. The controller rejects every unsupported leaf, including one nested inside `all` or `any`.
 - Work-unit suggested checks and assessor proposals are advisory. They never become trusted evidence solely because an agent proposed them.
 - Project verification commands come only from project configuration and are executed by the controller.
 - You are read-only. Inspect only when useful; do not modify the repository.
@@ -165,10 +165,13 @@ mod tests {
   }
 
   #[test]
-  fn architect_keeps_obligations_semantic_and_project_commands_controller_owned() {
+  fn architect_names_the_complete_admissible_contract_surface() {
     let prompt = full_role_prompt(WorkerRole::Architect, "requirements/product.md");
 
-    assert!(prompt.contains("must include an explicit evidenceContract"));
+    assert!(prompt.contains("only currently admissible leaf obligation contract"));
+    assert!(prompt.contains("every branch is independently admissible"));
+    assert!(prompt.contains("Source inspection is supporting only"));
+    assert!(prompt.contains("controller rejects every unsupported leaf"));
     assert!(prompt.contains("Project verification commands come only from project configuration"));
   }
 
