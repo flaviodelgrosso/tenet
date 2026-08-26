@@ -124,14 +124,16 @@ impl Storage {
         description: criterion.get("description"),
         mandatory: criterion.get("mandatory"),
       }).collect();
-    let verification_obligations = sqlx::query("SELECT obligation.id, obligation.criterion_id, obligation.description, obligation.required FROM work_unit_obligations AS link JOIN verification_obligations AS obligation ON obligation.id = link.obligation_id WHERE link.run_id = ? AND link.work_unit_id = ? ORDER BY link.ordinal")
+    let verification_obligations = sqlx::query("SELECT obligation.id, obligation.criterion_id, obligation.description, obligation.required, obligation.evidence_contract_json FROM work_unit_obligations AS link JOIN verification_obligations AS obligation ON obligation.id = link.obligation_id WHERE link.run_id = ? AND link.work_unit_id = ? ORDER BY link.ordinal")
       .bind(&run_id).bind(work_unit_id).fetch_all(&self.pool).await.map_err(StorageError::from_sqlx)?
-      .into_iter().map(|obligation| VerificationObligation {
+      .into_iter().map(|obligation| Ok(VerificationObligation {
         id: ObligationId::from(obligation.get::<String, _>("id")),
         criterion_id: CriterionId::from(obligation.get::<String, _>("criterion_id")),
         description: obligation.get("description"),
         required: obligation.get("required"),
-      }).collect();
+        evidence_contract: serde_json::from_str(&obligation.get::<String, _>("evidence_contract_json"))
+          .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?,
+      })).collect::<Result<Vec<_>, StorageError>>()?;
     let normative_fragments = sqlx::query("SELECT DISTINCT fragment.id, fragment.section, fragment.text, fragment.text_hash, fragment.ordinal FROM work_unit_requirements AS work_link JOIN requirement_source_fragments AS source_link ON source_link.requirement_id = work_link.requirement_id JOIN spec_fragments AS fragment ON fragment.id = source_link.fragment_id WHERE work_link.run_id = ? AND work_link.work_unit_id = ? ORDER BY fragment.ordinal")
       .bind(&run_id).bind(work_unit_id).fetch_all(&self.pool).await.map_err(StorageError::from_sqlx)?
       .into_iter().map(|fragment| SpecFragment {

@@ -8,13 +8,12 @@ use anyhow::Result;
 use colored::Colorize;
 use tenet_domain::{
   events::{CompletionGate, CompletionGateOutcome, RunEvent},
-  evidence::{
-    Evidence, EvidenceResult, EvidenceSource, ObligationAssessment, SemanticAssessmentReport,
-  },
+  evidence::{Evidence, EvidenceResult, EvidenceSource, SemanticAssessmentReport},
   model::{
     Phase, RepositoryChange, RunStatus, State, WorkExecution, WorkLease, WorkUnit, WorkerEvent,
     WorkerRole,
   },
+  proof::AssessmentJudgment,
   verification::{ProjectVerificationRun, VerificationReport},
 };
 
@@ -481,7 +480,7 @@ impl ConsolePresenter {
           report
             .assessments
             .iter()
-            .filter(|item| !matches!(item.assessment, ObligationAssessment::Satisfied { .. }))
+            .filter(|item| !matches!(item.assessment, AssessmentJudgment::Supported { .. }))
             .map(|item| item.obligation_id.to_string()),
         );
         vec![ConsoleEvent::SemanticAssessment {

@@ -27,8 +27,8 @@ use tenet_domain::{
   config::{read_config, Config, CustomAgentConfig, ProjectVerificationCheck},
   events::{EventSink, RunEvent},
   evidence::{
-    AcceptanceCriterion, AgentObligationAssessment, EvidencePolicy, ImplementationState,
-    ObligationAssessment, SemanticAssessmentProposal, VerificationObligation, VerificationState,
+    AcceptanceCriterion, AgentObligationAssessment, ImplementationState,
+    SemanticAssessmentProposal, VerificationObligation,
   },
   ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId},
   model::{
@@ -38,6 +38,7 @@ use tenet_domain::{
     ReconcileResult, Requirement, RequirementCatalog, RunStatus, State, VerificationReport,
     WorkExecution, WorkLease, WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
+  proof::{AssessmentJudgment, EvidenceContract, EvidencePredicate, ProofState},
   verification::ProjectVerificationRun,
   worker::{derive_normative_fragments, CatalogCoverage},
 };
@@ -162,6 +163,9 @@ fn obligation() -> VerificationObligation {
     criterion_id: CriterionId::from("REQ-001/AC-01"),
     description: "Verify every diamond output".into(),
     required: true,
+    evidence_contract: EvidenceContract::Artifact {
+      predicate: EvidencePredicate::ProjectVerification,
+    },
   }
 }
 
@@ -767,9 +771,9 @@ impl AgentBackend for FakeBackend {
               .get(&obligation.id)
               .expect("controller supplies a handle for every obligation")
               .clone(),
-            judgment: ObligationAssessment::Satisfied {
+            judgment: AssessmentJudgment::Supported {
+              artifact_ids: Vec::new(),
               rationale: "the immutable revision satisfies the batch requirement".into(),
-              evidence_refs: vec!["README.txt".into()],
             },
           })
           .collect(),
@@ -809,18 +813,15 @@ impl AgentBackend for FakeBackend {
       || matches!(self.mode, BackendMode::SemanticGapThenRepair) && !semantic_repair_present
       || !satisfied
     {
-      ObligationAssessment::Gap {
-        description: "diamond implementation is incomplete".into(),
+      AssessmentJudgment::Contradicted {
+        artifact_ids: Vec::new(),
+        rationale: "diamond implementation is incomplete".into(),
+        proposals: Vec::new(),
       }
     } else {
-      ObligationAssessment::Satisfied {
+      AssessmentJudgment::Supported {
+        artifact_ids: Vec::new(),
         rationale: "A, B, C, and D exist in the immutable revision".into(),
-        evidence_refs: vec![
-          "A.txt".into(),
-          "B.txt".into(),
-          "C.txt".into(),
-          "D.txt".into(),
-        ],
       }
     };
     Ok(SemanticAssessmentProposal {
@@ -1316,29 +1317,21 @@ async fn directory_scope_is_retried_with_recursive_glob_feedback() {
 }
 
 #[tokio::test]
-async fn assessment_directory_scope_is_retried_with_recursive_glob_feedback() {
+async fn mechanical_proof_skips_assessment_scope_retry() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(
     BackendMode::InvalidAssessmentScopeThenCorrect,
   ));
   let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
 
-  let state = controller
-    .run(CancellationToken::new())
-    .await
-    .expect("corrected assessment scope proceeds");
-
+  let state = controller.run(CancellationToken::new()).await.expect("run");
   assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
-  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 2);
-  let feedback = backend
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+  assert!(backend
     .semantic_feedback
     .lock()
-    .expect("semantic feedback lock");
-  assert_eq!(feedback.len(), 1);
-  assert_eq!(feedback[0].0, WorkerRole::Assess);
-  assert!(feedback[0]
-    .1
-    .contains("missing semantic obligation handle O001"));
+    .expect("feedback lock")
+    .is_empty());
 }
 
 #[tokio::test]
@@ -1425,31 +1418,14 @@ async fn contradictory_reconciliation_is_retried_with_targeted_feedback_and_corr
 }
 
 #[tokio::test]
-async fn malformed_assessment_is_retried_with_feedback_and_corrected() {
+async fn mechanical_proof_does_not_require_assessment_retries() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::InvalidAssessmentThenCorrect));
   let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
 
-  let state = controller
-    .run(CancellationToken::new())
-    .await
-    .expect("corrected assessment proceeds");
-
+  let state = controller.run(CancellationToken::new()).await.expect("run");
   assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
-  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 2);
-  assert!(!repository
-    .path()
-    .join("semantic-assessment-attempt.txt")
-    .exists());
-  let feedback = backend
-    .semantic_feedback
-    .lock()
-    .expect("semantic feedback lock");
-  assert_eq!(feedback.len(), 1);
-  assert_eq!(feedback[0].0, WorkerRole::Assess);
-  assert!(feedback[0]
-    .1
-    .contains("missing semantic obligation handle O001"));
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -1535,8 +1511,6 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
   let mut integrations = Vec::new();
   let mut worker_ids = std::collections::BTreeSet::new();
   let mut candidates = Vec::new();
-  let mut evidence_events = 0;
-  let mut verified_transition = false;
   while let Ok(event) = events.try_recv() {
     match event {
       RunEvent::IntegrationAccepted { work_unit_id, .. } => integrations.push(work_unit_id),
@@ -1544,19 +1518,12 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
         worker_ids.insert(worker_id);
       }
       RunEvent::CandidateProduced(candidate) => candidates.push(candidate),
-      RunEvent::EvidenceEstablished(_) => evidence_events += 1,
-      RunEvent::RequirementVerificationChanged {
-        current: VerificationState::Verified,
-        ..
-      } => verified_transition = true,
       _ => {}
     }
   }
   assert_eq!(integrations, ["A", "B", "C", "D"]);
   assert_eq!(worker_ids.len(), 4);
   assert_eq!(candidates.len(), 4);
-  assert!(evidence_events > 0);
-  assert!(verified_transition);
   let catalog = store::read_catalog(repository.path())
     .await
     .expect("read catalog")
@@ -1565,18 +1532,14 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
     .await
     .expect("read evidence graph");
   let head = git::head(repository.path()).await.expect("head");
-  let config = read_config(repository.path()).await.expect("config");
-  let suite_hash = config.verification.suite_hash().expect("suite hash");
-  let policy = EvidencePolicy::new(&head, &suite_hash);
-  assert!(graph.all_required_verified(policy));
-  let explanation = graph
-    .projection(&RequirementId::from("REQ-001"), policy)
-    .expect("requirement explanation");
-  assert_eq!(explanation.verification_state, VerificationState::Verified);
-  assert!(explanation.criteria[0].obligations[0]
-    .evidence
-    .iter()
-    .any(|evidence| evidence.revision == head));
+  let derivation = &graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")];
+  assert_eq!(derivation.revision, head);
+  assert_eq!(derivation.state, ProofState::Proven);
+  let artifact_id = match &derivation.reason {
+    tenet_domain::proof::ProofReason::Artifact { artifact_id, .. } => *artifact_id,
+    reason => panic!("expected artifact proof, got {reason:?}"),
+  };
+  assert_eq!(graph.artifacts[&artifact_id].revision, head);
 
   let b_candidate = candidates
     .iter()
@@ -3144,62 +3107,22 @@ async fn repair_budget_is_shared_across_empty_and_verification_recovery() {
 }
 
 #[tokio::test]
-async fn semantic_gap_repair_creates_new_revision_and_requires_reverification() {
+async fn mechanical_proof_does_not_route_model_suspicion_to_repair() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::SemanticGapThenRepair));
-  let (controller, mut events) = configured_controller(&repository, backend.clone(), 2).await;
+  let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
 
-  let state = controller
-    .run(CancellationToken::new())
-    .await
-    .expect("semantic gap is repaired");
-
+  let state = controller.run(CancellationToken::new()).await.expect("run");
   assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
-  assert!(state
+  assert!(!state
     .completed_work_units
     .iter()
     .any(|completed| completed.work_unit.id == "semantic-fix"));
-  assert!(backend.assessment_calls.load(Ordering::SeqCst) >= 2);
-  let semantic_reports: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
-    .filter_map(|event| match event {
-      RunEvent::SemanticAssessment(report) => Some(report),
-      _ => None,
-    })
-    .collect();
-  assert!(semantic_reports.iter().any(|report| report
-    .assessments
-    .iter()
-    .any(|item| matches!(item.assessment, ObligationAssessment::Gap { .. }))));
-  assert!(semantic_reports.iter().any(|report| report
-    .assessments
-    .iter()
-    .any(|item| matches!(item.assessment, ObligationAssessment::Satisfied { .. }))));
-
-  let catalog = store::read_catalog(repository.path())
-    .await
-    .expect("catalog read")
-    .expect("catalog");
-  let graph = controller_evidence::load(repository.path(), &catalog)
-    .await
-    .expect("evidence graph");
-  let head = git::head(repository.path()).await.expect("head");
-  assert!(graph.evidence.values().any(|evidence| {
-    evidence.result == tenet_domain::evidence::EvidenceResult::Failed
-      && evidence.revision != head
-      && matches!(
-        evidence.validity,
-        tenet_domain::evidence::EvidenceValidity::Stale { .. }
-      )
-  }));
-  assert!(graph.evidence.values().any(|evidence| {
-    evidence.result == tenet_domain::evidence::EvidenceResult::Passed
-      && evidence.revision == head
-      && evidence.validity.is_valid()
-  }));
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
-async fn maximum_cycle_count_blocks_on_exact_configured_cycle() {
+async fn incomplete_model_assessment_cannot_block_mechanical_proof_at_max_cycles() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::IncompleteAssessment));
   let (controller, _) = configured_controller(&repository, backend, 2).await;
@@ -3209,21 +3132,12 @@ async fn maximum_cycle_count_blocks_on_exact_configured_cycle() {
   })
   .await;
 
-  let state = controller
-    .run(CancellationToken::new())
-    .await
-    .expect("max cycles produces blocked state");
-
-  assert_eq!(state.status, tenet_domain::model::RunStatus::Blocked);
-  assert_eq!(state.cycle, 5);
-  assert_eq!(
-    state.blocked_reason.as_deref(),
-    Some("Maximum cycle count (5) reached")
-  );
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
 }
 
 #[tokio::test]
-async fn stagnation_limit_blocks_on_exact_unchanged_transition() {
+async fn incomplete_model_assessment_cannot_create_stagnation() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::IncompleteAssessment));
   let (controller, _) = configured_controller(&repository, backend, 2).await;
@@ -3233,17 +3147,8 @@ async fn stagnation_limit_blocks_on_exact_unchanged_transition() {
   })
   .await;
 
-  let state = controller
-    .run(CancellationToken::new())
-    .await
-    .expect("stagnation produces blocked state");
-
-  assert_eq!(state.status, tenet_domain::model::RunStatus::Blocked);
-  assert_eq!(state.cycle, 5);
-  assert!(state
-    .blocked_reason
-    .as_deref()
-    .is_some_and(|reason| reason.contains("Stagnation limit (1)")));
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
 }
 
 #[tokio::test]
@@ -3367,23 +3272,12 @@ async fn orphan_evidence_before_journal_does_not_claim_completion() {
 }
 
 #[tokio::test]
-async fn cleanup_failure_prevents_persisted_done_state() {
+async fn mechanical_proof_skips_unneeded_assessor_workspace_cleanup() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::CleanupFailure));
-  let (controller, _) = configured_controller(&repository, backend, 2).await;
+  let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
 
-  controller
-    .run(CancellationToken::new())
-    .await
-    .expect_err("required cleanup failure must fail the run");
-  let state = store::read_state(repository.path())
-    .await
-    .expect("read cleanup failure state");
-
-  assert_eq!(state.status, tenet_domain::model::RunStatus::Failed);
-  assert_ne!(state.status, tenet_domain::model::RunStatus::Done);
-  assert!(state
-    .last_error
-    .as_deref()
-    .is_some_and(|error| error.contains("workspace cleanup failed")));
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+  assert_eq!(state.status, tenet_domain::model::RunStatus::Done);
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
 }

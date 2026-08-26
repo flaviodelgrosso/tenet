@@ -1,164 +1,160 @@
+use std::collections::BTreeMap;
+
 use chrono::{TimeZone, Utc};
 use tenet_domain::{
-  evidence::{
-    EvidencePolicy, ObligationAssessment, ObligationAssessmentResult, SemanticAssessmentReport,
-    VerificationState,
-  },
-  ids::{ObligationId, RequirementId, VerificationRunId},
+  evidence::{ObligationAssessmentResult, SemanticAssessmentReport},
+  ids::{ArtifactId, ObligationId, VerificationRunId},
+  proof::{AssessmentJudgment, EvidenceContract, EvidencePredicate, ProofState},
   verification::{CommandResult, ProjectCheckResult, ProjectVerificationRun, VerificationSpec},
 };
 use tenet_storage::Storage;
 
 mod support;
 
-#[tokio::test]
-async fn evidence_graph_round_trip_preserves_policy_semantics() {
-  let project = tempfile::tempdir().expect("temporary project");
-  let storage = Storage::open(project.path()).await.expect("open storage");
-  let catalog = support::catalog();
-  storage
-    .persist_catalog("spec.md", Utc::now(), &catalog)
-    .await
-    .expect("catalog");
-  storage.create_run("run-1").await.expect("run");
-  let now = Utc.with_ymd_and_hms(2026, 8, 20, 10, 0, 0).unwrap();
-  let verification = ProjectVerificationRun {
+fn project_run(revision: &str) -> ProjectVerificationRun {
+  let now = Utc.with_ymd_and_hms(2026, 8, 26, 10, 0, 0).unwrap();
+  ProjectVerificationRun {
     run_id: VerificationRunId::new(),
-    revision: "revision-1".into(),
-    suite_hash: "suite-1".into(),
+    revision: revision.into(),
+    suite_hash: "suite".into(),
     checks: vec![ProjectCheckResult {
       name: "quality".into(),
       spec: VerificationSpec {
-        program: "cargo".into(),
-        args: vec!["test".into()],
+        program: "true".into(),
+        args: Vec::new(),
         working_directory: ".".into(),
-        environment: [("CI".into(), "true".into())].into_iter().collect(),
+        environment: BTreeMap::new(),
       },
-      timeout_secs: 60,
+      timeout_secs: 10,
       result: CommandResult {
-        command: "cargo test".into(),
+        command: "true".into(),
         exit_code: Some(0),
         timed_out: false,
-        duration_ms: 12,
-        stdout: "ok".into(),
+        duration_ms: 1,
+        stdout: String::new(),
         stderr: String::new(),
       },
     }],
     passed: true,
     started_at: now,
     finished_at: now,
+  }
+}
+
+async fn prepared_storage() -> (
+  tempfile::TempDir,
+  Storage,
+  tenet_domain::model::RequirementCatalog,
+) {
+  let project = tempfile::tempdir().expect("temporary project");
+  let storage = Storage::open(project.path()).await.expect("open storage");
+  let mut catalog = support::catalog();
+  catalog.verification_obligations[0].evidence_contract = EvidenceContract::Artifact {
+    predicate: EvidencePredicate::NamedProjectCheck {
+      name: "quality".into(),
+    },
   };
   storage
-    .record_project_verification("run-1", &verification)
-    .await
-    .expect("verification");
-  storage
-    .record_semantic_assessment(
-      "run-1",
-      "revision-1",
-      now,
-      "assessor-1",
-      &SemanticAssessmentReport {
-        summary: "satisfied".into(),
-        assessments: vec![ObligationAssessmentResult {
-          obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
-          assessment: ObligationAssessment::Satisfied {
-            rationale: "Observed durable state".into(),
-            evidence_refs: vec!["verification:quality".into()],
-          },
-        }],
-      },
-    )
-    .await
-    .expect("semantic evidence");
-
-  let graph = storage.load_evidence_graph(&catalog).await.expect("graph");
-  assert_eq!(
-    graph.requirement_verification_state(
-      &RequirementId::from("REQ-001"),
-      EvidencePolicy::new("revision-1", "suite-1")
-    ),
-    Ok(VerificationState::Verified)
-  );
-  assert_eq!(graph.project_evidence.len(), 1);
-  assert_eq!(graph.evidence.len(), 1);
-}
-
-#[tokio::test]
-async fn stale_evidence_is_excluded_from_current_obligation_projection() {
-  let project = tempfile::tempdir().expect("temporary project");
-  let storage = Storage::open(project.path()).await.expect("open storage");
-  let catalog = support::catalog();
-  storage
     .persist_catalog("spec.md", Utc::now(), &catalog)
     .await
     .expect("catalog");
   storage.create_run("run-1").await.expect("run");
-  let now = Utc::now();
-  storage
-    .record_semantic_assessment(
-      "run-1",
-      "revision-1",
-      now,
-      "assessor-1",
-      &SemanticAssessmentReport {
-        summary: "satisfied".into(),
-        assessments: vec![ObligationAssessmentResult {
-          obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
-          assessment: ObligationAssessment::Satisfied {
-            rationale: "Observed".into(),
-            evidence_refs: Vec::new(),
-          },
-        }],
-      },
-    )
-    .await
-    .expect("evidence");
-  storage
-    .invalidate_evidence_for_revision("run-1", "revision-2", now)
-    .await
-    .expect("invalidate");
+  (project, storage, catalog)
+}
 
-  let current = storage
-    .load_obligation_evidence(&ObligationId::from("REQ-001/AC-01/VO-01"), "revision-2")
+#[tokio::test]
+async fn artifact_and_derivation_survive_restart_with_provenance() {
+  let (project_dir, storage, catalog) = prepared_storage().await;
+  let project = project_run("revision-1");
+  storage
+    .record_project_verification("run-1", &project)
     .await
-    .expect("projection");
+    .expect("project verification");
+  let mut graph = support::empty_graph(&catalog);
+  graph.record_project_verification(&project);
+  let ids = graph.record_project_artifacts(&project).expect("artifacts");
+  graph.derive_proofs("revision-1");
+  storage
+    .persist_evidence_graph("run-1", &graph)
+    .await
+    .expect("persist graph");
 
-  assert!(current.is_empty());
-  let full = storage
+  let reopened = Storage::open(project_dir.path())
+    .await
+    .expect("reopen storage");
+  let loaded = reopened
     .load_evidence_graph(&catalog)
     .await
-    .expect("full graph");
-  assert_eq!(full.evidence.len(), 1);
+    .expect("load graph");
+  assert_eq!(loaded.artifacts.get(&ids[0]), graph.artifacts.get(&ids[0]));
+  assert_eq!(
+    loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Proven
+  );
 }
 
 #[tokio::test]
-async fn semantic_assessment_rolls_back_when_any_obligation_is_unknown() {
-  let project = tempfile::tempdir().expect("temporary project");
-  let storage = Storage::open(project.path()).await.expect("open storage");
-  let catalog = support::catalog();
+async fn stale_artifact_and_blocking_proof_survive_restart() {
+  let (_project, storage, catalog) = prepared_storage().await;
+  let project = project_run("revision-1");
+  let mut graph = support::empty_graph(&catalog);
+  graph.record_project_verification(&project);
+  graph.record_project_artifacts(&project).expect("artifacts");
+  graph.derive_proofs("revision-1");
+  graph.transition_artifacts("revision-2", None);
   storage
-    .persist_catalog("spec.md", Utc::now(), &catalog)
+    .persist_evidence_graph("run-1", &graph)
     .await
-    .expect("catalog");
-  storage.create_run("run-1").await.expect("run");
+    .expect("persist stale graph");
+
+  let loaded = storage
+    .load_evidence_graph(&catalog)
+    .await
+    .expect("load graph");
+  assert_eq!(
+    loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Stale
+  );
+}
+
+#[tokio::test]
+async fn fabricated_artifact_reference_is_rejected() {
+  let (_project, _storage, catalog) = prepared_storage().await;
+  let mut graph = support::empty_graph(&catalog);
   let report = SemanticAssessmentReport {
-    summary: "invalid".into(),
+    summary: "fabricated".into(),
     assessments: vec![ObligationAssessmentResult {
-      obligation_id: ObligationId::from("REQ-404/AC-01/VO-01"),
-      assessment: ObligationAssessment::Gap {
-        description: "missing".into(),
+      obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+      assessment: AssessmentJudgment::Supported {
+        artifact_ids: vec![ArtifactId::new()],
+        rationale: "invented".into(),
       },
     }],
   };
+  let error = graph
+    .record_semantic_assessment("revision-1", Utc::now(), "assessor", &report)
+    .expect_err("fabricated artifact rejected");
+  assert!(error.to_string().contains("unknown evidence artifact"));
+}
+#[tokio::test]
+async fn forged_controller_execution_cannot_be_persisted() {
+  let (_project, storage, catalog) = prepared_storage().await;
+  let project = project_run("revision-1");
+  let mut graph = support::empty_graph(&catalog);
+  graph.record_project_verification(&project);
+  graph.record_project_artifacts(&project).expect("artifacts");
+  let artifact = graph.artifacts.values_mut().next().expect("artifact");
+  if let tenet_domain::proof::EvidenceArtifactKind::CommandExecution { result, .. } =
+    &mut artifact.kind
+  {
+    result.exit_code = Some(99);
+  } else {
+    panic!("expected command artifact");
+  }
 
-  storage
-    .record_semantic_assessment("run-1", "revision-1", Utc::now(), "assessor", &report)
+  let error = storage
+    .persist_evidence_graph("run-1", &graph)
     .await
-    .expect_err("unknown obligation rejected");
-
-  assert_eq!(
-    storage.load_evidence_graph(&catalog).await.expect("graph"),
-    support::empty_graph(&catalog)
-  );
+    .expect_err("forged execution rejected");
+  assert!(error.to_string().contains("unauthorized combination"));
 }

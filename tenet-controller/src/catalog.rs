@@ -12,6 +12,7 @@ use tenet_domain::{
   evidence::{AcceptanceCriterion, VerificationObligation},
   ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId, SpecFragmentId},
   model::{ArchitectOutput, Requirement, RequirementCatalog},
+  proof::{EvidenceContract, EvidencePredicate},
   worker::{derive_normative_fragments, CatalogCoverage, SpecFragment},
 };
 
@@ -30,6 +31,14 @@ pub async fn inspect(cwd: &Path, config: &Config) -> Result<Inspection> {
   if let Some(catalog) = &cached {
     validate(catalog).context("cached requirement catalog is structurally invalid")?;
     if catalog.spec_hash == specification_hash {
+      if validate_evidence_contracts(catalog, config).is_err() {
+        return Ok(Inspection {
+          specification,
+          specification_hash,
+          authoritative: None,
+          had_cached_catalog: true,
+        });
+      }
       validate_coverage(catalog, &specification)
         .context("cached requirement catalog coverage is invalid")?;
       return Ok(Inspection {
@@ -372,6 +381,7 @@ fn merge_batches(
         criterion_id,
         description: obligation.description,
         required: true,
+        evidence_contract: obligation.evidence_contract,
       });
     }
   }
@@ -482,6 +492,58 @@ pub fn validate(catalog: &RequirementCatalog) -> Result<()> {
   Ok(())
 }
 
+pub fn validate_evidence_contracts(catalog: &RequirementCatalog, config: &Config) -> Result<()> {
+  let checks: BTreeSet<_> = config
+    .verification
+    .checks
+    .iter()
+    .map(|check| check.name.as_str())
+    .collect();
+  for obligation in &catalog.verification_obligations {
+    validate_contract(&obligation.evidence_contract, &checks)
+      .with_context(|| format!("invalid evidence contract for {}", obligation.id))?;
+  }
+  Ok(())
+}
+
+fn validate_contract(contract: &EvidenceContract, checks: &BTreeSet<&str>) -> Result<()> {
+  match contract {
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck { name },
+    } => {
+      if !checks.contains(name.as_str()) {
+        bail!("named project check {name:?} is not controller-configured");
+      }
+    }
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::ExecutableEvidence,
+    } => {
+      bail!("generic executable evidence requires a trusted verifier that is not configured");
+    }
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::SourceInspection,
+    } => {
+      bail!(
+        "source inspection is supporting evidence until a controller-evaluable source predicate is configured"
+      );
+    }
+    EvidenceContract::Artifact { .. } => {}
+    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => {
+      if requirements.is_empty() {
+        bail!("composite evidence contract must not be empty");
+      }
+      for requirement in requirements {
+        validate_contract(requirement, checks)?;
+      }
+    }
+    EvidenceContract::HumanAttestation { statement } if statement.trim().is_empty() => {
+      bail!("human attestation statement must not be blank");
+    }
+    EvidenceContract::HumanAttestation { .. } => {}
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use tenet_domain::{
@@ -526,6 +588,7 @@ mod tests {
         criterion_id: criterion.id.clone(),
         description: "Establish the assigned behavior".into(),
         required: true,
+        evidence_contract: Default::default(),
       })
       .collect();
     ArchitectOutput {
@@ -651,6 +714,18 @@ mod tests {
     assert!(catalog.coverage.is_complete());
     assert_eq!(catalog.coverage.normative_fragments.len(), 200);
     validate_derived_coverage(&catalog).expect("validate global coverage");
+  }
+
+  #[test]
+  fn generic_source_inspection_cannot_be_an_authoritative_contract() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::SourceInspection,
+    };
+    let error = validate_contract(&contract, &BTreeSet::new())
+      .expect_err("source span alone must not prove a semantic claim");
+    assert!(error
+      .to_string()
+      .contains("supporting evidence until a controller-evaluable source predicate"));
   }
 
   #[test]

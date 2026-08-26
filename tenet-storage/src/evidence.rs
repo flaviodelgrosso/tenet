@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 
@@ -9,6 +11,10 @@ use tenet_domain::{
   },
   ids::{EvidenceId, ObligationId, VerificationRunId},
   model::RequirementCatalog,
+  proof::{
+    derive_proof_state, ArtifactAuthority, ArtifactProvenance, ArtifactValidity, EvidenceArtifact,
+    EvidenceArtifactKind, ProofDerivation, ProofState,
+  },
   verification::{CommandResult, ProjectCheckResult, ProjectVerificationRun, VerificationSpec},
 };
 
@@ -108,8 +114,7 @@ impl Storage {
     }
     transaction.commit().await.map_err(StorageError::from_sqlx)
   }
-
-  /// Validates and atomically establishes obligation-bound semantic evidence.
+  /// Validates and atomically records advisory assessment judgments.
   pub async fn record_semantic_assessment(
     &self,
     run_id: &str,
@@ -122,19 +127,22 @@ impl Storage {
       StorageError::UnexpectedCardinality("semantic assessment requires an active catalog".into())
     })?;
     let mut graph = empty_graph(&catalog)?;
-    let ids = graph
+    graph
       .record_semantic_assessment(revision, observed_at, worker_id, report)
       .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
     let mut transaction = self.pool.begin().await.map_err(StorageError::from_sqlx)?;
-    for id in &ids {
-      let evidence = &graph.evidence[id];
-      insert_evidence(&mut transaction, run_id, evidence).await?;
+    for assessment in &graph.assessments {
+      let json = serde_json::to_string(assessment)
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+      sqlx::query("INSERT INTO assessment_judgments(run_id, obligation_id, revision, judgment_json, observed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_id, obligation_id, revision) DO UPDATE SET judgment_json = excluded.judgment_json, observed_at = excluded.observed_at")
+        .bind(run_id).bind(assessment.obligation_id.as_str()).bind(revision).bind(json).bind(observed_at.to_rfc3339())
+        .execute(&mut *transaction).await.map_err(StorageError::from_sqlx)?;
     }
     transaction
       .commit()
       .await
       .map_err(StorageError::from_sqlx)?;
-    Ok(ids)
+    Ok(Vec::new())
   }
 
   /// Conservatively marks valid semantic evidence from older revisions stale.
@@ -189,6 +197,33 @@ impl Storage {
         .establish_evidence(evidence)
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
     }
+    for artifact in self.load_artifacts().await? {
+      graph
+        .establish_artifact(artifact)
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    }
+    graph.assessments = self.load_assessments().await?;
+    let derivations = self.load_proof_derivations().await?;
+    for derivation in derivations.values() {
+      let obligation = graph
+        .obligations
+        .get(&derivation.obligation_id)
+        .ok_or_else(|| {
+          StorageError::IntegrityViolation("proof derivation targets unknown obligation".into())
+        })?;
+      let reconstructed = derive_proof_state(
+        &obligation.id,
+        &obligation.evidence_contract,
+        graph.artifacts.values(),
+        &derivation.revision,
+      );
+      if reconstructed != *derivation {
+        return Err(StorageError::IntegrityViolation(
+          "persisted proof derivation is not reconstructible from authoritative artifacts".into(),
+        ));
+      }
+    }
+    graph.proof_derivations = derivations;
     Ok(graph)
   }
 
@@ -252,7 +287,11 @@ impl Storage {
           .map_err(StorageError::from_sqlx)?;
       }
     }
-    transaction.commit().await.map_err(StorageError::from_sqlx)
+    transaction
+      .commit()
+      .await
+      .map_err(StorageError::from_sqlx)?;
+    self.persist_proof_state(run_id, graph).await
   }
 
   /// Loads one controller verification run by stable identity.
@@ -408,6 +447,223 @@ impl Storage {
       });
     }
     Ok(evidence)
+  }
+  async fn load_artifacts(&self) -> Result<Vec<EvidenceArtifact>, StorageError> {
+    let rows = sqlx::query(
+      "SELECT id, revision, authority, validity, artifact_json FROM evidence_artifacts ORDER BY id",
+    )
+    .fetch_all(&self.pool)
+    .await
+    .map_err(StorageError::from_sqlx)?;
+    let mut artifacts = Vec::with_capacity(rows.len());
+    for row in rows {
+      let id = row.get::<String, _>("id");
+      let artifact: EvidenceArtifact = serde_json::from_str(&row.get::<String, _>("artifact_json"))
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+      artifact
+        .validate()
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+      self.validate_artifact_issuance(&artifact).await?;
+      let bindings: BTreeSet<_> = sqlx::query_scalar::<_, String>("SELECT obligation_id FROM artifact_obligations WHERE artifact_id = ? ORDER BY obligation_id")
+        .bind(&id).fetch_all(&self.pool).await.map_err(StorageError::from_sqlx)?
+        .into_iter().map(ObligationId::from).collect();
+      if artifact.id.to_string() != id
+        || artifact.revision != row.get::<String, _>("revision")
+        || authority_name(artifact.authority) != row.get::<String, _>("authority")
+        || artifact_validity_name(&artifact.validity) != row.get::<String, _>("validity")
+        || artifact.obligation_ids != bindings
+      {
+        return Err(StorageError::IntegrityViolation(
+          "evidence artifact columns or bindings disagree with authenticated payload".into(),
+        ));
+      }
+      artifacts.push(artifact);
+    }
+    Ok(artifacts)
+  }
+
+  async fn validate_artifact_issuance(
+    &self,
+    artifact: &EvidenceArtifact,
+  ) -> Result<(), StorageError> {
+    match (&artifact.provenance, &artifact.kind) {
+      (
+        ArtifactProvenance::ControllerProjectVerification,
+        EvidenceArtifactKind::ProjectVerification {
+          run_id,
+          suite_hash,
+          passed,
+        },
+      ) => {
+        let run = self
+          .load_project_verification(*run_id)
+          .await?
+          .ok_or_else(|| {
+            StorageError::IntegrityViolation(
+              "project artifact references an unknown controller verification run".into(),
+            )
+          })?;
+        if run.revision != artifact.revision
+          || run.suite_hash != *suite_hash
+          || run.passed != *passed
+        {
+          return Err(StorageError::IntegrityViolation(
+            "project artifact disagrees with controller verification run".into(),
+          ));
+        }
+      }
+      (
+        ArtifactProvenance::ControllerConfiguredCheck,
+        EvidenceArtifactKind::CommandExecution {
+          run_id,
+          check_name: Some(name),
+          spec,
+          result,
+          ..
+        },
+      ) => {
+        let run = self
+          .load_project_verification(*run_id)
+          .await?
+          .ok_or_else(|| {
+            StorageError::IntegrityViolation(
+              "execution artifact references an unknown controller verification run".into(),
+            )
+          })?;
+        let check = run
+          .checks
+          .iter()
+          .find(|check| check.name == *name)
+          .ok_or_else(|| {
+            StorageError::IntegrityViolation(
+              "execution artifact references an unknown configured check".into(),
+            )
+          })?;
+        let matches = run.revision == artifact.revision
+          && check.spec == *spec
+          && check.result.command == result.command
+          && check.result.exit_code == result.exit_code
+          && check.result.timed_out == result.timed_out
+          && check.result.duration_ms == u128::from(result.duration_ms)
+          && check.result.stdout == result.stdout
+          && check.result.stderr == result.stderr;
+        if !matches {
+          return Err(StorageError::IntegrityViolation(
+            "execution artifact disagrees with controller verification observation".into(),
+          ));
+        }
+      }
+      (ArtifactProvenance::ControllerTrustedVerifier, _) => {
+        return Err(StorageError::IntegrityViolation(
+          "trusted verifier artifacts require a configured issuer registry".into(),
+        ));
+      }
+      (ArtifactProvenance::ControllerHumanAttestation { .. }, _) => {
+        return Err(StorageError::IntegrityViolation(
+          "human attestations require a configured issuer registry".into(),
+        ));
+      }
+      _ => {}
+    }
+    Ok(())
+  }
+
+  async fn load_assessments(
+    &self,
+  ) -> Result<Vec<tenet_domain::proof::AssessmentRecord>, StorageError> {
+    sqlx::query_scalar::<_, String>(
+      "SELECT judgment_json FROM assessment_judgments ORDER BY observed_at, obligation_id",
+    )
+    .fetch_all(&self.pool)
+    .await
+    .map_err(StorageError::from_sqlx)?
+    .into_iter()
+    .map(|json| {
+      serde_json::from_str(&json)
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))
+    })
+    .collect()
+  }
+
+  async fn load_proof_derivations(
+    &self,
+  ) -> Result<std::collections::BTreeMap<ObligationId, ProofDerivation>, StorageError> {
+    let rows = sqlx::query_scalar::<_, String>(
+      "SELECT derivation_json FROM proof_derivations ORDER BY derived_at, obligation_id",
+    )
+    .fetch_all(&self.pool)
+    .await
+    .map_err(StorageError::from_sqlx)?;
+    let mut values = std::collections::BTreeMap::new();
+    for json in rows {
+      let derivation: ProofDerivation = serde_json::from_str(&json)
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+      values.insert(derivation.obligation_id.clone(), derivation);
+    }
+    Ok(values)
+  }
+
+  async fn persist_proof_state(
+    &self,
+    run_id: &str,
+    graph: &EvidenceGraphState,
+  ) -> Result<(), StorageError> {
+    let mut transaction = self.pool.begin().await.map_err(StorageError::from_sqlx)?;
+    for artifact in graph.artifacts.values() {
+      artifact
+        .validate()
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+      self.validate_artifact_issuance(artifact).await?;
+      let json = serde_json::to_string(artifact)
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+      sqlx::query("INSERT INTO evidence_artifacts(id, run_id, revision, authority, validity, artifact_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET validity = excluded.validity, artifact_json = excluded.artifact_json")
+        .bind(artifact.id.to_string()).bind(run_id).bind(&artifact.revision)
+        .bind(authority_name(artifact.authority)).bind(artifact_validity_name(&artifact.validity)).bind(json)
+        .execute(&mut *transaction).await.map_err(StorageError::from_sqlx)?;
+      for obligation_id in &artifact.obligation_ids {
+        sqlx::query("INSERT INTO artifact_obligations(artifact_id, obligation_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
+          .bind(artifact.id.to_string()).bind(obligation_id.as_str())
+          .execute(&mut *transaction).await.map_err(StorageError::from_sqlx)?;
+      }
+    }
+    for assessment in &graph.assessments {
+      let json = serde_json::to_string(assessment)
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+      sqlx::query("INSERT INTO assessment_judgments(run_id, obligation_id, revision, judgment_json, observed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(run_id, obligation_id, revision) DO UPDATE SET judgment_json = excluded.judgment_json, observed_at = excluded.observed_at")
+        .bind(run_id).bind(assessment.obligation_id.as_str()).bind(&assessment.revision).bind(json).bind(assessment.observed_at.to_rfc3339())
+        .execute(&mut *transaction).await.map_err(StorageError::from_sqlx)?;
+    }
+    for derivation in graph.proof_derivations.values() {
+      let json = serde_json::to_string(derivation)
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+      sqlx::query("INSERT INTO proof_derivations(run_id, obligation_id, revision, state, derivation_json, derived_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(run_id, obligation_id, revision) DO UPDATE SET state = excluded.state, derivation_json = excluded.derivation_json, derived_at = excluded.derived_at")
+        .bind(run_id).bind(derivation.obligation_id.as_str()).bind(&derivation.revision).bind(proof_state_name(derivation.state)).bind(json).bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction).await.map_err(StorageError::from_sqlx)?;
+    }
+    transaction.commit().await.map_err(StorageError::from_sqlx)
+  }
+}
+fn authority_name(authority: ArtifactAuthority) -> &'static str {
+  match authority {
+    ArtifactAuthority::Authoritative => "authoritative",
+    ArtifactAuthority::Supporting => "supporting",
+    ArtifactAuthority::Advisory => "advisory",
+  }
+}
+
+fn artifact_validity_name(validity: &ArtifactValidity) -> &'static str {
+  match validity {
+    ArtifactValidity::Valid => "valid",
+    ArtifactValidity::Stale { .. } => "stale",
+  }
+}
+
+fn proof_state_name(state: ProofState) -> &'static str {
+  match state {
+    ProofState::Proven => "proven",
+    ProofState::Contradicted => "contradicted",
+    ProofState::Insufficient => "insufficient",
+    ProofState::Stale => "stale",
   }
 }
 

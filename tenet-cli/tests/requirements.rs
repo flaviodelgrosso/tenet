@@ -71,6 +71,7 @@ fn catalog(description: &str) -> RequirementCatalog {
       criterion_id: CriterionId::from("REQ-001/AC-01"),
       description: "Round trip is equal".into(),
       required: true,
+      evidence_contract: Default::default(),
     }],
     coverage: CatalogCoverage {
       normative_fragments: vec![fragment],
