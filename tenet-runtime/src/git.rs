@@ -1,4 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::{
+  io::{Seek, SeekFrom},
+  path::{Path, PathBuf},
+  process::Stdio,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::process::Command;
@@ -52,6 +56,76 @@ pub async fn add_worktree(repository: &Path, workspace: &Path, revision: &str) -
   )
   .await
   .map(|_| ())
+}
+pub async fn clone_without_checkout(source: &Path, destination: &Path) -> Result<()> {
+  let source = path_text(source)?;
+  let destination = path_text(destination)?;
+  run(
+    Path::new("."),
+    &[
+      "clone",
+      "--no-hardlinks",
+      "--no-checkout",
+      "--",
+      source,
+      destination,
+    ],
+  )
+  .await
+  .map(|_| ())
+}
+
+pub async fn checkout_detached(cwd: &Path, revision: &str) -> Result<()> {
+  run(cwd, &["checkout", "--detach", revision])
+    .await
+    .map(|_| ())
+}
+
+pub async fn read_blob(cwd: &Path, revision: &str, path: &str) -> Result<String> {
+  run(cwd, &["show", &format!("{revision}:{path}")]).await
+}
+
+pub async fn parent(cwd: &Path, revision: &str) -> Result<String> {
+  run(cwd, &["rev-parse", &format!("{revision}^{{commit}}^")]).await
+}
+
+pub async fn has_gitlinks(cwd: &Path, revision: &str) -> Result<bool> {
+  Ok(
+    run(cwd, &["ls-tree", "-r", revision])
+      .await?
+      .lines()
+      .any(|line| line.starts_with("160000 ")),
+  )
+}
+pub async fn path_exists(cwd: &Path, revision: &str, path: &str) -> Result<bool> {
+  Ok(
+    !run(cwd, &["ls-tree", "--name-only", revision, "--", path])
+      .await?
+      .is_empty(),
+  )
+}
+
+pub async fn archive(cwd: &Path, revision: &str) -> Result<std::fs::File> {
+  let mut archive = tempfile::tempfile().context("create anonymous Git archive")?;
+  let output = archive.try_clone().context("clone anonymous Git archive")?;
+  let status = Command::new("git")
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .args(["archive", "--format=tar", revision])
+    .current_dir(cwd)
+    .stdout(Stdio::from(output))
+    .stderr(Stdio::piped())
+    .output()
+    .await
+    .context("run git archive")?;
+  if !status.status.success() {
+    bail!(
+      "git archive failed: {}",
+      String::from_utf8_lossy(&status.stderr).trim()
+    );
+  }
+  archive.seek(SeekFrom::Start(0))?;
+  Ok(archive)
 }
 
 pub async fn remove_worktree(repository: &Path, workspace: &Path) -> Result<()> {
@@ -135,7 +209,6 @@ pub async fn conflict_paths(cwd: &Path) -> Result<Vec<String>> {
   let output = run(cwd, &["diff", "--name-only", "--diff-filter=U"]).await?;
   Ok(output.lines().map(str::to_owned).collect())
 }
-
 pub async fn abort_cherry_pick(cwd: &Path) -> Result<()> {
   run(cwd, &["cherry-pick", "--abort"]).await.map(|_| ())
 }
@@ -165,6 +238,8 @@ fn normalized_path(path: &Path) -> PathBuf {
 }
 async fn run(cwd: &Path, args: &[&str]) -> Result<String> {
   let output = Command::new("git")
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
     .args(args)
     .current_dir(cwd)
     .output()

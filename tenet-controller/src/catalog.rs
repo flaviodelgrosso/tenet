@@ -499,14 +499,35 @@ pub fn validate_evidence_contracts(catalog: &RequirementCatalog, config: &Config
     .iter()
     .map(|check| check.name.as_str())
     .collect();
+  for check in &config.verification.trusted_checks {
+    check.validate().with_context(|| {
+      format!(
+        "invalid controller-configured trusted verifier {:?}",
+        check.name
+      )
+    })?;
+  }
+  let trusted: BTreeSet<_> = config
+    .verification
+    .trusted_checks
+    .iter()
+    .map(|check| check.name.as_str())
+    .collect();
+  if trusted.len() != config.verification.trusted_checks.len() {
+    bail!("trusted verifier names must be unique");
+  }
   for obligation in &catalog.verification_obligations {
-    validate_contract(&obligation.evidence_contract, &checks)
+    validate_contract(&obligation.evidence_contract, &checks, &trusted)
       .with_context(|| format!("invalid evidence contract for {}", obligation.id))?;
   }
   Ok(())
 }
 
-fn validate_contract(contract: &EvidenceContract, checks: &BTreeSet<&str>) -> Result<()> {
+fn validate_contract(
+  contract: &EvidenceContract,
+  checks: &BTreeSet<&str>,
+  trusted: &BTreeSet<&str>,
+) -> Result<()> {
   match contract {
     EvidenceContract::Artifact {
       predicate: EvidencePredicate::NamedProjectCheck { name },
@@ -523,9 +544,11 @@ fn validate_contract(contract: &EvidenceContract, checks: &BTreeSet<&str>) -> Re
       );
     }
     EvidenceContract::Artifact {
-      predicate: EvidencePredicate::ExecutableEvidence,
+      predicate: EvidencePredicate::TrustedVerifierCheck { name },
     } => {
-      bail!("generic executable evidence requires a trusted verifier that is not configured");
+      if !trusted.contains(name.as_str()) {
+        bail!("trusted verifier check {name:?} is not controller-configured");
+      }
     }
     EvidenceContract::Artifact {
       predicate: EvidencePredicate::SourceInspection,
@@ -539,7 +562,7 @@ fn validate_contract(contract: &EvidenceContract, checks: &BTreeSet<&str>) -> Re
         bail!("composite evidence contract must not be empty");
       }
       for requirement in requirements {
-        validate_contract(requirement, checks)?;
+        validate_contract(requirement, checks, trusted)?;
       }
     }
     EvidenceContract::HumanAttestation { .. } => {
@@ -729,7 +752,7 @@ mod tests {
       },
     };
 
-    validate_contract(&contract, &BTreeSet::from(["quality"]))
+    validate_contract(&contract, &BTreeSet::from(["quality"]), &BTreeSet::new())
       .expect("configured named check has an authoritative controller issuer");
   }
 
@@ -749,7 +772,7 @@ mod tests {
       ],
     };
 
-    validate_contract(&contract, &BTreeSet::from(["quality"]))
+    validate_contract(&contract, &BTreeSet::from(["quality"]), &BTreeSet::new())
       .expect("every composite branch has an authoritative controller issuer");
   }
 
@@ -761,7 +784,7 @@ mod tests {
       },
     };
 
-    let error = validate_contract(&contract, &BTreeSet::from(["quality"]))
+    let error = validate_contract(&contract, &BTreeSet::from(["quality"]), &BTreeSet::new())
       .expect_err("unknown named check has no controller issuer");
     assert!(error
       .to_string()
@@ -773,7 +796,7 @@ mod tests {
     let contract = EvidenceContract::Artifact {
       predicate: EvidencePredicate::ProjectVerification,
     };
-    let error = validate_contract(&contract, &BTreeSet::new())
+    let error = validate_contract(&contract, &BTreeSet::new(), &BTreeSet::new())
       .expect_err("project verification remains an independent completion gate");
     assert!(error
       .to_string()
@@ -786,7 +809,7 @@ mod tests {
       predicate: EvidencePredicate::SourceInspection,
     };
 
-    let error = validate_contract(&contract, &BTreeSet::new())
+    let error = validate_contract(&contract, &BTreeSet::new(), &BTreeSet::new())
       .expect_err("supporting source inspection cannot close a proof obligation");
     assert!(error.to_string().contains(
       "source inspection is supporting evidence and cannot satisfy an authoritative evidence contract"
@@ -794,15 +817,34 @@ mod tests {
   }
 
   #[test]
-  fn generic_executable_evidence_requires_a_trusted_verifier() {
+  fn unknown_trusted_verifier_contract_is_rejected() {
     let contract = EvidenceContract::Artifact {
-      predicate: EvidencePredicate::ExecutableEvidence,
+      predicate: EvidencePredicate::TrustedVerifierCheck {
+        name: "unknown".into(),
+      },
     };
-    let error = validate_contract(&contract, &BTreeSet::new())
-      .expect_err("trusted executable issuer is unavailable");
+    let error = validate_contract(&contract, &BTreeSet::new(), &BTreeSet::new())
+      .expect_err("unknown trusted verifier has no controller issuer");
+
     assert!(error
       .to_string()
-      .contains("requires a trusted verifier that is not configured"));
+      .contains("trusted verifier check \"unknown\" is not controller-configured"));
+  }
+
+  #[test]
+  fn configured_trusted_verifier_contract_is_admitted() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::TrustedVerifierCheck {
+        name: "expiry-boundary".into(),
+      },
+    };
+
+    validate_contract(
+      &contract,
+      &BTreeSet::new(),
+      &BTreeSet::from(["expiry-boundary"]),
+    )
+    .expect("configured trusted verifier has a controller issuer");
   }
 
   #[test]
@@ -810,7 +852,7 @@ mod tests {
     let contract = EvidenceContract::HumanAttestation {
       statement: "Release approved".into(),
     };
-    let error = validate_contract(&contract, &BTreeSet::new())
+    let error = validate_contract(&contract, &BTreeSet::new(), &BTreeSet::new())
       .expect_err("human attestation has no configured issuer");
     assert!(error
       .to_string()
@@ -832,7 +874,7 @@ mod tests {
       ],
     };
 
-    let error = validate_contract(&contract, &BTreeSet::from(["quality"]))
+    let error = validate_contract(&contract, &BTreeSet::from(["quality"]), &BTreeSet::new())
       .expect_err("every all branch must have an authoritative issuer");
     assert!(error
       .to_string()
@@ -854,7 +896,7 @@ mod tests {
       ],
     };
 
-    let error = validate_contract(&contract, &BTreeSet::from(["quality"]))
+    let error = validate_contract(&contract, &BTreeSet::from(["quality"]), &BTreeSet::new())
       .expect_err("every any branch must have an authoritative issuer");
     assert!(error
       .to_string()

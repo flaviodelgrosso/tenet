@@ -7,5 +7,6 @@ pub mod evidence;
 pub mod ids;
 pub mod model;
 pub mod proof;
+pub mod trusted_verifier;
 pub mod verification;
 pub mod worker;

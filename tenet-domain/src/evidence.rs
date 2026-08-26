@@ -13,6 +13,7 @@ use crate::{
     EvidenceArtifactKind, EvidenceContract, EvidencePredicate, ExecutionDomain,
     ExecutionObservation, ProofDerivation, ProofState,
   },
+  trusted_verifier::{TrustedExecutionRecord, TrustedVerificationSpec},
   verification::{ProjectCheckResult, ProjectVerificationRun, VerificationAuthority},
 };
 
@@ -471,6 +472,62 @@ impl EvidenceGraphState {
     }
     Ok(ids)
   }
+  pub fn record_trusted_execution(
+    &mut self,
+    record: &TrustedExecutionRecord,
+    spec: &TrustedVerificationSpec,
+  ) -> Result<Option<ArtifactId>, EvidenceGraphError> {
+    if !record.can_issue_authority(spec) {
+      return Ok(None);
+    }
+    let predicate = EvidencePredicate::TrustedVerifierCheck {
+      name: spec.name.clone(),
+    };
+    let bindings: BTreeSet<_> = self
+      .obligations
+      .values()
+      .filter(|obligation| contract_contains(&obligation.evidence_contract, &predicate))
+      .map(|obligation| obligation.id.clone())
+      .collect();
+    let observed_bindings: BTreeSet<_> = record.obligation_ids.iter().cloned().collect();
+    if bindings.is_empty() || bindings != observed_bindings {
+      return Err(EvidenceGraphError::TrustedExecutionBindingMismatch);
+    }
+    let observation = record
+      .result
+      .authoritative_observation()
+      .ok_or(EvidenceGraphError::TrustedExecutionNotAuthoritative)?;
+    let attestation = record
+      .attestation
+      .clone()
+      .ok_or(EvidenceGraphError::TrustedExecutionNotAuthoritative)?;
+    let artifact = EvidenceArtifact {
+      id: ArtifactId::new(),
+      revision: record.revision.clone(),
+      observed_at: record.finished_at,
+      authority: ArtifactAuthority::Authoritative,
+      provenance: ArtifactProvenance::ControllerTrustedVerifier,
+      observation,
+      kind: EvidenceArtifactKind::TrustedExecution {
+        run_id: record.id,
+        verifier_name: record.verifier_name.clone(),
+        spec_hash: record.spec_hash.clone(),
+        isolation_policy_hash: record.isolation_policy_hash.clone(),
+        execution_record_hash: record
+          .record_hash()
+          .map_err(|error| EvidenceGraphError::InvalidArtifact(error.to_string()))?,
+        attestation,
+        result: record.observation.clone(),
+      },
+      obligation_ids: bindings,
+      validity: ArtifactValidity::Valid,
+      dependencies: DependencySurface::RepositoryWide,
+      compatible_revisions: BTreeSet::new(),
+    };
+    let id = artifact.id;
+    self.establish_artifact(artifact)?;
+    Ok(Some(id))
+  }
 
   pub fn record_assessment_judgments(
     &mut self,
@@ -830,6 +887,10 @@ pub enum EvidenceGraphError {
   DuplicateArtifact,
   #[error("invalid evidence artifact: {0}")]
   InvalidArtifact(String),
+  #[error("trusted execution does not bind exactly the configured verifier obligations")]
+  TrustedExecutionBindingMismatch,
+  #[error("trusted execution cannot issue authoritative evidence")]
+  TrustedExecutionNotAuthoritative,
   #[error("unknown evidence artifact {0}")]
   UnknownArtifact(ArtifactId),
   #[error("assessment for {0} must reference at least one existing artifact")]

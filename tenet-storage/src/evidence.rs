@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use tenet_domain::{
@@ -15,10 +17,13 @@ use tenet_domain::{
     derive_proof_state, ArtifactAuthority, ArtifactProvenance, ArtifactValidity, EvidenceArtifact,
     EvidenceArtifactKind, ProofDerivation, ProofState,
   },
+  trusted_verifier::{TrustedExecutionRecord, TrustedExecutionResult, TrustedVerificationSpec},
   verification::{CommandResult, ProjectCheckResult, ProjectVerificationRun, VerificationSpec},
 };
 
-use crate::{Storage, StorageError};
+use crate::{controller_authority_key, Storage, StorageError};
+
+type AuthorityMac = Hmac<Sha256>;
 
 impl Storage {
   /// Creates and selects a run identity for controller-owned state.
@@ -114,6 +119,60 @@ impl Storage {
     }
     transaction.commit().await.map_err(StorageError::from_sqlx)
   }
+  /// Persists a controller-owned trusted execution before any artifact may reference it.
+  pub async fn record_trusted_execution(
+    &self,
+    run_id: &str,
+    record: &TrustedExecutionRecord,
+    spec: &TrustedVerificationSpec,
+  ) -> Result<(), StorageError> {
+    spec
+      .validate()
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    if !record.can_issue_authority(spec) {
+      return Err(StorageError::IntegrityViolation(
+        "trusted execution record failed authority admission".into(),
+      ));
+    }
+    let result = match record.result {
+      TrustedExecutionResult::Supports => "supports",
+      TrustedExecutionResult::Contradicts { .. } => "contradicts",
+      TrustedExecutionResult::TimedOut | TrustedExecutionResult::InfrastructureFailure { .. } => {
+        return Err(StorageError::IntegrityViolation(
+          "non-semantic trusted execution cannot issue persisted authority".into(),
+        ));
+      }
+    };
+    let authority_context_hash = self
+      .authority_context_hash(record.obligation_ids.iter())
+      .await?;
+    let spec_json = serde_json::to_string(spec)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let record_json = serde_json::to_string(record)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let authority_mac = authority_mac(&[
+      authority_context_hash.as_bytes(),
+      run_id.as_bytes(),
+      spec_json.as_bytes(),
+      record_json.as_bytes(),
+    ])?;
+    sqlx::query("INSERT INTO trusted_verifier_executions(id, run_id, revision, verifier_name, spec_hash, isolation_policy_hash, result, spec_json, record_json, authority_context_hash, authority_mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(record.id.to_string())
+      .bind(run_id)
+      .bind(&record.revision)
+      .bind(&record.verifier_name)
+      .bind(&record.spec_hash)
+      .bind(&record.isolation_policy_hash)
+      .bind(result)
+      .bind(spec_json)
+      .bind(record_json)
+      .bind(authority_context_hash)
+      .bind(authority_mac)
+      .execute(&self.pool)
+      .await
+      .map(|_| ())
+      .map_err(StorageError::from_sqlx)
+  }
   /// Validates and atomically records advisory assessment judgments.
   pub async fn record_semantic_assessment(
     &self,
@@ -181,6 +240,7 @@ impl Storage {
   pub async fn load_evidence_graph(
     &self,
     catalog: &RequirementCatalog,
+    trusted_specs: &[TrustedVerificationSpec],
   ) -> Result<EvidenceGraphState, StorageError> {
     let mut graph = empty_graph(catalog)?;
     for project in self.load_project_verifications().await? {
@@ -197,14 +257,15 @@ impl Storage {
         .establish_evidence(evidence)
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
     }
-    for artifact in self.load_artifacts().await? {
+    let (artifacts, trusted_authority_rejected) = self.load_artifacts(trusted_specs).await?;
+    for artifact in artifacts {
       graph
         .establish_artifact(artifact)
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
     }
     graph.assessments = self.load_assessments().await?;
-    let derivations = self.load_proof_derivations().await?;
-    for derivation in derivations.values() {
+    let mut derivations = self.load_proof_derivations().await?;
+    for derivation in derivations.values_mut() {
       let obligation = graph
         .obligations
         .get(&derivation.obligation_id)
@@ -218,9 +279,12 @@ impl Storage {
         &derivation.revision,
       );
       if reconstructed != *derivation {
-        return Err(StorageError::IntegrityViolation(
-          "persisted proof derivation is not reconstructible from authoritative artifacts".into(),
-        ));
+        if !trusted_authority_rejected {
+          return Err(StorageError::IntegrityViolation(
+            "persisted proof derivation is not reconstructible from authoritative artifacts".into(),
+          ));
+        }
+        *derivation = reconstructed;
       }
     }
     graph.proof_derivations = derivations;
@@ -448,22 +512,131 @@ impl Storage {
     }
     Ok(evidence)
   }
-  async fn load_artifacts(&self) -> Result<Vec<EvidenceArtifact>, StorageError> {
+  async fn load_trusted_execution(
+    &self,
+    id: VerificationRunId,
+  ) -> Result<(TrustedExecutionRecord, TrustedVerificationSpec), StorageError> {
+    let id_text = id.to_string();
+    let row = sqlx::query("SELECT run_id, revision, verifier_name, spec_hash, isolation_policy_hash, result, spec_json, record_json, authority_context_hash, authority_mac FROM trusted_verifier_executions WHERE id = ?")
+      .bind(&id_text)
+      .fetch_optional(&self.pool)
+      .await
+      .map_err(StorageError::from_sqlx)?
+      .ok_or_else(|| {
+        StorageError::IntegrityViolation(
+          "trusted artifact references an unknown controller execution".into(),
+        )
+      })?;
+    let run_id = row.get::<String, _>("run_id");
+    let spec_json = row.get::<String, _>("spec_json");
+    let record_json = row.get::<String, _>("record_json");
+    let spec: TrustedVerificationSpec = serde_json::from_str(&spec_json)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let record: TrustedExecutionRecord = serde_json::from_str(&record_json)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let authority_context_hash = self
+      .authority_context_hash(record.obligation_ids.iter())
+      .await?;
+    if authority_context_hash != row.get::<String, _>("authority_context_hash") {
+      return Err(StorageError::IntegrityViolation(
+        "trusted execution authority context is stale".into(),
+      ));
+    }
+    verify_authority_mac(
+      &[
+        authority_context_hash.as_bytes(),
+        run_id.as_bytes(),
+        spec_json.as_bytes(),
+        record_json.as_bytes(),
+      ],
+      &row.get::<String, _>("authority_mac"),
+    )?;
+    let result = match &record.result {
+      TrustedExecutionResult::Supports => "supports",
+      TrustedExecutionResult::Contradicts { .. } => "contradicts",
+      TrustedExecutionResult::TimedOut | TrustedExecutionResult::InfrastructureFailure { .. } => {
+        "infrastructure"
+      }
+    };
+    let columns_match = record.id == id
+      && record.revision == row.get::<String, _>("revision")
+      && record.verifier_name == row.get::<String, _>("verifier_name")
+      && record.spec_hash == row.get::<String, _>("spec_hash")
+      && record.isolation_policy_hash == row.get::<String, _>("isolation_policy_hash")
+      && result == row.get::<String, _>("result")
+      && record.can_issue_authority(&spec);
+    if !columns_match {
+      return Err(StorageError::IntegrityViolation(
+        "trusted execution columns disagree with controller record".into(),
+      ));
+    }
+    Ok((record, spec))
+  }
+
+  async fn load_artifacts(
+    &self,
+    trusted_specs: &[TrustedVerificationSpec],
+  ) -> Result<(Vec<EvidenceArtifact>, bool), StorageError> {
     let rows = sqlx::query(
-      "SELECT id, revision, authority, validity, artifact_json FROM evidence_artifacts ORDER BY id",
+      "SELECT id, run_id, revision, authority, validity, artifact_json, authority_context_hash, authority_mac FROM evidence_artifacts ORDER BY id",
     )
     .fetch_all(&self.pool)
     .await
     .map_err(StorageError::from_sqlx)?;
     let mut artifacts = Vec::with_capacity(rows.len());
+    let mut trusted_authority_rejected = false;
     for row in rows {
       let id = row.get::<String, _>("id");
-      let artifact: EvidenceArtifact = serde_json::from_str(&row.get::<String, _>("artifact_json"))
+      let artifact_json = row.get::<String, _>("artifact_json");
+      let artifact: EvidenceArtifact = serde_json::from_str(&artifact_json)
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
       artifact
         .validate()
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
-      self.validate_artifact_issuance(&artifact).await?;
+      if artifact.provenance == ArtifactProvenance::ControllerTrustedVerifier {
+        let Some(tag) = row.get::<Option<String>, _>("authority_mac") else {
+          trusted_authority_rejected = true;
+          continue;
+        };
+        let Some(stored_context_hash) = row.get::<Option<String>, _>("authority_context_hash")
+        else {
+          trusted_authority_rejected = true;
+          continue;
+        };
+        let authority_context_hash = match self
+          .authority_context_hash(artifact.obligation_ids.iter())
+          .await
+        {
+          Ok(value) => value,
+          Err(_) => {
+            trusted_authority_rejected = true;
+            continue;
+          }
+        };
+        let run_id = row.get::<String, _>("run_id");
+        if authority_context_hash != stored_context_hash
+          || verify_authority_mac(
+            &[
+              authority_context_hash.as_bytes(),
+              run_id.as_bytes(),
+              artifact_json.as_bytes(),
+            ],
+            &tag,
+          )
+          .is_err()
+          || self
+            .validate_artifact_issuance(&artifact, Some(trusted_specs))
+            .await
+            .is_err()
+        {
+          trusted_authority_rejected = true;
+          continue;
+        }
+      } else {
+        self
+          .validate_artifact_issuance(&artifact, Some(trusted_specs))
+          .await?;
+      }
       let bindings: BTreeSet<_> = sqlx::query_scalar::<_, String>("SELECT obligation_id FROM artifact_obligations WHERE artifact_id = ? ORDER BY obligation_id")
         .bind(&id).fetch_all(&self.pool).await.map_err(StorageError::from_sqlx)?
         .into_iter().map(ObligationId::from).collect();
@@ -479,12 +652,13 @@ impl Storage {
       }
       artifacts.push(artifact);
     }
-    Ok(artifacts)
+    Ok((artifacts, trusted_authority_rejected))
   }
 
   async fn validate_artifact_issuance(
     &self,
     artifact: &EvidenceArtifact,
+    trusted_specs: Option<&[TrustedVerificationSpec]>,
   ) -> Result<(), StorageError> {
     match (&artifact.provenance, &artifact.kind) {
       (
@@ -553,10 +727,46 @@ impl Storage {
           ));
         }
       }
-      (ArtifactProvenance::ControllerTrustedVerifier, _) => {
-        return Err(StorageError::IntegrityViolation(
-          "trusted verifier artifacts require a configured issuer registry".into(),
-        ));
+      (
+        ArtifactProvenance::ControllerTrustedVerifier,
+        EvidenceArtifactKind::TrustedExecution {
+          run_id,
+          verifier_name,
+          spec_hash,
+          isolation_policy_hash,
+          execution_record_hash,
+          attestation,
+          result,
+        },
+      ) => {
+        let (record, persisted_spec) = self.load_trusted_execution(*run_id).await?;
+        let bindings: BTreeSet<_> = record.obligation_ids.iter().cloned().collect();
+        let matches_record = record.revision == artifact.revision
+          && record.verifier_name == *verifier_name
+          && record.spec_hash == *spec_hash
+          && record.isolation_policy_hash == *isolation_policy_hash
+          && record.record_hash().ok().as_deref() == Some(execution_record_hash.as_str())
+          && record.attestation.as_ref() == Some(attestation)
+          && record.observation == *result
+          && bindings == artifact.obligation_ids
+          && record.can_issue_authority(&persisted_spec);
+        if !matches_record {
+          return Err(StorageError::IntegrityViolation(
+            "trusted verifier artifact disagrees with controller execution record".into(),
+          ));
+        }
+        if let Some(specs) = trusted_specs {
+          let configured = specs.iter().find(|spec| spec.name == *verifier_name);
+          if configured
+            .and_then(|spec| spec.fingerprint().ok())
+            .as_deref()
+            != Some(spec_hash.as_str())
+          {
+            return Err(StorageError::IntegrityViolation(
+              "trusted verifier artifact does not match the current controller registry".into(),
+            ));
+          }
+        }
       }
       (ArtifactProvenance::ControllerHumanAttestation { .. }, _) => {
         return Err(StorageError::IntegrityViolation(
@@ -603,6 +813,55 @@ impl Storage {
     Ok(values)
   }
 
+  async fn authority_context_hash<'a, I>(&self, obligation_ids: I) -> Result<String, StorageError>
+  where
+    I: IntoIterator<Item = &'a ObligationId>,
+  {
+    let catalog = self.load_active_catalog().await?.ok_or_else(|| {
+      StorageError::IntegrityViolation(
+        "trusted authority requires an active requirement catalog".into(),
+      )
+    })?;
+    let catalog_hash = catalog
+      .catalog_hash()
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let ids: BTreeSet<_> = obligation_ids
+      .into_iter()
+      .map(ObligationId::as_str)
+      .collect();
+    if ids.is_empty() {
+      return Err(StorageError::IntegrityViolation(
+        "trusted authority requires an obligation binding".into(),
+      ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"tenet-trusted-authority-context-v1");
+    digest.update((catalog_hash.len() as u64).to_be_bytes());
+    digest.update(catalog_hash.as_bytes());
+    for id in ids {
+      let obligation = catalog
+        .verification_obligations
+        .iter()
+        .find(|obligation| obligation.id.as_str() == id)
+        .ok_or_else(|| {
+          StorageError::IntegrityViolation(format!(
+            "trusted authority references unknown obligation {id}"
+          ))
+        })?;
+      let encoded = serde_json::to_vec(obligation)
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+      digest.update((encoded.len() as u64).to_be_bytes());
+      digest.update(encoded);
+    }
+    Ok(
+      digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect(),
+    )
+  }
+
   async fn persist_proof_state(
     &self,
     run_id: &str,
@@ -613,12 +872,27 @@ impl Storage {
       artifact
         .validate()
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
-      self.validate_artifact_issuance(artifact).await?;
+      self.validate_artifact_issuance(artifact, None).await?;
       let json = serde_json::to_string(artifact)
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
-      sqlx::query("INSERT INTO evidence_artifacts(id, run_id, revision, authority, validity, artifact_json) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET validity = excluded.validity, artifact_json = excluded.artifact_json")
+      let authority_context_hash =
+        if artifact.provenance == ArtifactProvenance::ControllerTrustedVerifier {
+          Some(
+            self
+              .authority_context_hash(artifact.obligation_ids.iter())
+              .await?,
+          )
+        } else {
+          None
+        };
+      let authority_mac = authority_context_hash
+        .as_ref()
+        .map(|context| authority_mac(&[context.as_bytes(), run_id.as_bytes(), json.as_bytes()]))
+        .transpose()?;
+      sqlx::query("INSERT INTO evidence_artifacts(id, run_id, revision, authority, validity, artifact_json, authority_context_hash, authority_mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET validity = excluded.validity, artifact_json = excluded.artifact_json, authority_context_hash = excluded.authority_context_hash, authority_mac = excluded.authority_mac")
         .bind(artifact.id.to_string()).bind(run_id).bind(&artifact.revision)
         .bind(authority_name(artifact.authority)).bind(artifact_validity_name(&artifact.validity)).bind(json)
+        .bind(authority_context_hash).bind(authority_mac)
         .execute(&mut *transaction).await.map_err(StorageError::from_sqlx)?;
       for obligation_id in &artifact.obligation_ids {
         sqlx::query("INSERT INTO artifact_obligations(artifact_id, obligation_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
@@ -823,4 +1097,46 @@ fn parse_validity(
       "invalid evidence validity columns".into(),
     )),
   }
+}
+
+fn authority_mac(parts: &[&[u8]]) -> Result<String, StorageError> {
+  let mut mac = AuthorityMac::new_from_slice(controller_authority_key()?)
+    .expect("HMAC accepts every key length");
+  for part in parts {
+    mac.update(&(part.len() as u64).to_be_bytes());
+    mac.update(part);
+  }
+  Ok(
+    mac
+      .finalize()
+      .into_bytes()
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect(),
+  )
+}
+
+fn verify_authority_mac(parts: &[&[u8]], encoded: &str) -> Result<(), StorageError> {
+  if encoded.len() != 64 {
+    return Err(StorageError::IntegrityViolation(
+      "controller authority authentication tag is malformed".into(),
+    ));
+  }
+  let mut tag = [0_u8; 32];
+  for (index, output) in tag.iter_mut().enumerate() {
+    *output = u8::from_str_radix(&encoded[index * 2..index * 2 + 2], 16).map_err(|_| {
+      StorageError::IntegrityViolation(
+        "controller authority authentication tag is malformed".into(),
+      )
+    })?;
+  }
+  let mut mac = AuthorityMac::new_from_slice(controller_authority_key()?)
+    .expect("HMAC accepts every key length");
+  for part in parts {
+    mac.update(&(part.len() as u64).to_be_bytes());
+    mac.update(part);
+  }
+  mac.verify_slice(&tag).map_err(|_| {
+    StorageError::IntegrityViolation("controller authority authentication tag is invalid".into())
+  })
 }

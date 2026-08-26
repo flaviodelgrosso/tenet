@@ -171,6 +171,56 @@
         }
       }
     },
+    "trustedIsolationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "candidate_filesystem": { "type": "string", "const": "read_only", "default": "read_only" },
+        "root_filesystem": { "type": "string", "const": "read_only", "default": "read_only" },
+        "temporary_filesystem": { "type": "string", "const": "disposable_tmpfs", "default": "disposable_tmpfs" },
+        "network": { "type": "string", "const": "disabled", "default": "disabled" },
+        "environment": { "type": "string", "const": "explicit_only", "default": "explicit_only" },
+        "process_namespace": { "type": "string", "const": "private", "default": "private" },
+        "control_plane": { "type": "string", "const": "exclusive_mutual_tls", "default": "exclusive_mutual_tls" }
+      }
+    },
+    "trustedResourcePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "memory_bytes": { "type": "integer", "minimum": 6291456, "default": 1073741824 },
+        "cpu_millis": { "type": "integer", "minimum": 1, "default": 1000 },
+        "process_limit": { "type": "integer", "minimum": 1, "default": 256 },
+        "writable_tmp_bytes": { "type": "integer", "minimum": 1, "default": 536870912 }
+      }
+    },
+    "trustedVerificationSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "backend", "image", "program"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+        "backend": { "type": "string", "const": "docker" },
+        "image": {
+          "type": "string",
+          "pattern": "^.+@sha256:[0-9A-Fa-f]{64}$",
+          "description": "Controller-selected immutable verifier image reference."
+        },
+        "program": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+        "args": { "$ref": "#/$defs/stringList", "default": [] },
+        "working_directory": { "type": "string", "minLength": 1, "default": "." },
+        "environment": {
+          "type": "object",
+          "default": {},
+          "propertyNames": { "not": { "enum": ["HOME", "TMPDIR", ""] } },
+          "additionalProperties": { "type": "string" }
+        },
+        "timeout_secs": { "type": "integer", "minimum": 1, "default": 300 },
+        "isolation": { "$ref": "#/$defs/trustedIsolationPolicy" },
+        "resources": { "$ref": "#/$defs/trustedResourcePolicy" },
+        "protocol": { "type": "string", "const": "exit_code", "default": "exit_code" }
+      }
+    },
     "verificationConfig": {
       "type": "object",
       "additionalProperties": false,
@@ -182,6 +232,12 @@
           "items": { "$ref": "#/$defs/projectVerificationCheck" },
           "default": [],
           "description": "Mandatory project verification checks executed in declaration order with fail-fast behavior."
+        },
+        "trusted_checks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/trustedVerificationSpec" },
+          "default": [],
+          "description": "Named controller-owned checks executed only through enforced trusted isolation."
         },
         "timeout_secs": {
           "type": "integer",

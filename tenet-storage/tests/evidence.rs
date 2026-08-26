@@ -4,10 +4,20 @@ use chrono::{TimeZone, Utc};
 use tenet_domain::{
   evidence::{ObligationAssessmentResult, SemanticAssessmentReport},
   ids::{ArtifactId, ObligationId, VerificationRunId},
-  proof::{AssessmentJudgment, EvidenceContract, EvidencePredicate, ProofState},
+  proof::{
+    ArtifactAuthority, AssessmentJudgment, EvidenceContract, EvidencePredicate,
+    ExecutionObservation, ProofState,
+  },
+  trusted_verifier::{
+    CandidateFilesystemPolicy, ControlPlanePolicy, EnvironmentPolicy, NetworkPolicy,
+    ProcessNamespacePolicy, RootFilesystemPolicy, TemporaryFilesystemPolicy,
+    TrustedExecutionAttestation, TrustedExecutionRecord, TrustedExecutionResult,
+    TrustedIsolationPolicy, TrustedResourcePolicy, TrustedVerificationSpec, TrustedVerifierBackend,
+    TrustedVerifierProtocol,
+  },
   verification::{CommandResult, ProjectCheckResult, ProjectVerificationRun, VerificationSpec},
 };
-use tenet_storage::Storage;
+use tenet_storage::{install_controller_authority_key, Storage};
 
 mod support;
 
@@ -90,7 +100,7 @@ async fn artifact_and_derivation_survive_restart_with_provenance() {
     .await
     .expect("reopen storage");
   let loaded = reopened
-    .load_evidence_graph(&catalog)
+    .load_evidence_graph(&catalog, &[])
     .await
     .expect("load graph");
   assert_eq!(loaded.artifacts.get(&ids[0]), graph.artifacts.get(&ids[0]));
@@ -116,7 +126,7 @@ async fn stale_artifact_and_blocking_proof_survive_restart() {
     .expect("persist stale graph");
 
   let loaded = storage
-    .load_evidence_graph(&catalog)
+    .load_evidence_graph(&catalog, &[])
     .await
     .expect("load graph");
   assert_eq!(
@@ -165,4 +175,259 @@ async fn forged_controller_execution_cannot_be_persisted() {
     .await
     .expect_err("forged execution rejected");
   assert!(error.to_string().contains("unauthorized combination"));
+}
+
+fn trusted_spec() -> TrustedVerificationSpec {
+  TrustedVerificationSpec {
+    name: "expiry-boundary".into(),
+    backend: TrustedVerifierBackend::Docker,
+    image: format!("example/verifier@sha256:{}", "a".repeat(64)),
+    program: "verify".into(),
+    args: Vec::new(),
+    working_directory: ".".into(),
+    environment: BTreeMap::new(),
+    timeout_secs: 30,
+    isolation: TrustedIsolationPolicy::default(),
+    resources: TrustedResourcePolicy::default(),
+    protocol: TrustedVerifierProtocol::ExitCode,
+  }
+}
+
+fn trusted_record(
+  spec: &TrustedVerificationSpec,
+  result: TrustedExecutionResult,
+) -> TrustedExecutionRecord {
+  let exit_code = match result {
+    TrustedExecutionResult::Supports => 0,
+    TrustedExecutionResult::Contradicts { exit_code } => exit_code,
+    _ => panic!("fixture requires a semantic result"),
+  };
+  let now = Utc.with_ymd_and_hms(2026, 8, 26, 11, 0, 0).unwrap();
+  TrustedExecutionRecord {
+    id: VerificationRunId::new(),
+    revision: "revision-1".into(),
+    verifier_name: spec.name.clone(),
+    spec_hash: spec.fingerprint().expect("spec hash"),
+    isolation_policy_hash: spec.isolation_policy_hash().expect("policy hash"),
+    attestation: Some(TrustedExecutionAttestation {
+      backend: TrustedVerifierBackend::Docker,
+      backend_version: "27.0".into(),
+      image_id: "sha256:image".into(),
+      control_plane: ControlPlanePolicy::ExclusiveMutualTls,
+      control_plane_fingerprint: "control-plane".into(),
+      candidate_filesystem: CandidateFilesystemPolicy::ReadOnly,
+      root_filesystem: RootFilesystemPolicy::ReadOnly,
+      temporary_filesystem: TemporaryFilesystemPolicy::DisposableTmpfs,
+      network: NetworkPolicy::Disabled,
+      environment: EnvironmentPolicy::ExplicitOnly,
+      process_namespace: ProcessNamespacePolicy::Private,
+      capabilities_dropped: true,
+      no_new_privileges: true,
+      unprivileged_user: true,
+      memory_bytes: spec.resources.memory_bytes,
+      cpu_millis: spec.resources.cpu_millis,
+      process_limit: spec.resources.process_limit,
+      writable_tmp_bytes: spec.resources.writable_tmp_bytes,
+    }),
+    started_at: now,
+    finished_at: now,
+    result,
+    observation: ExecutionObservation {
+      command: spec.fingerprint().expect("command identity"),
+      exit_code: Some(exit_code),
+      timed_out: false,
+      duration_ms: 1,
+      stdout: String::new(),
+      stderr: String::new(),
+    },
+    obligation_ids: vec![ObligationId::from("REQ-001/AC-01/VO-01")],
+  }
+}
+
+async fn prepared_trusted_storage() -> (
+  tempfile::TempDir,
+  Storage,
+  tenet_domain::model::RequirementCatalog,
+  TrustedVerificationSpec,
+) {
+  install_controller_authority_key("tenet-storage-tests", b"tenet-storage-test-authority")
+    .expect("install test authority identity");
+  let project = tempfile::tempdir().expect("temporary project");
+  let storage = Storage::open(project.path()).await.expect("open storage");
+  let mut catalog = support::catalog();
+  catalog.verification_obligations[0].evidence_contract = EvidenceContract::Artifact {
+    predicate: EvidencePredicate::TrustedVerifierCheck {
+      name: "expiry-boundary".into(),
+    },
+  };
+  storage
+    .persist_catalog("spec.md", Utc::now(), &catalog)
+    .await
+    .expect("catalog");
+  storage.create_run("run-1").await.expect("run");
+  (project, storage, catalog, trusted_spec())
+}
+
+#[tokio::test]
+async fn trusted_execution_authority_survives_restart_and_revalidation() {
+  let (project, storage, catalog, spec) = prepared_trusted_storage().await;
+  let record = trusted_record(&spec, TrustedExecutionResult::Supports);
+  storage
+    .record_trusted_execution("run-1", &record, &spec)
+    .await
+    .expect("trusted record");
+  let mut graph = support::empty_graph(&catalog);
+  let artifact_id = graph
+    .record_trusted_execution(&record, &spec)
+    .expect("trusted artifact")
+    .expect("authoritative artifact");
+  graph.derive_proofs("revision-1");
+  storage
+    .persist_evidence_graph("run-1", &graph)
+    .await
+    .expect("persist graph");
+
+  let reopened = Storage::open(project.path()).await.expect("reopen");
+  let loaded = reopened
+    .load_evidence_graph(&catalog, std::slice::from_ref(&spec))
+    .await
+    .expect("revalidated graph");
+
+  assert_eq!(
+    loaded.artifacts[&artifact_id].authority,
+    ArtifactAuthority::Authoritative
+  );
+  assert_eq!(
+    loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Proven
+  );
+}
+
+#[tokio::test]
+async fn changed_controller_verifier_spec_rejects_persisted_authority() {
+  let (_project, storage, catalog, spec) = prepared_trusted_storage().await;
+  let record = trusted_record(&spec, TrustedExecutionResult::Supports);
+  storage
+    .record_trusted_execution("run-1", &record, &spec)
+    .await
+    .expect("trusted record");
+  let mut graph = support::empty_graph(&catalog);
+  graph
+    .record_trusted_execution(&record, &spec)
+    .expect("trusted artifact");
+  graph.derive_proofs("revision-1");
+  storage
+    .persist_evidence_graph("run-1", &graph)
+    .await
+    .expect("persist graph");
+  let mut changed = spec;
+  changed.args.push("--changed".into());
+
+  let loaded = storage
+    .load_evidence_graph(&catalog, &[changed])
+    .await
+    .expect("stale verifier authority is rejected without blocking reload");
+
+  assert!(loaded.artifacts.is_empty());
+  assert_eq!(
+    loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Insufficient
+  );
+}
+
+#[tokio::test]
+async fn prior_catalog_authority_cannot_replay_for_a_reused_obligation_id() {
+  let (project, storage, catalog, spec) = prepared_trusted_storage().await;
+  let record = trusted_record(&spec, TrustedExecutionResult::Supports);
+  storage
+    .record_trusted_execution("run-1", &record, &spec)
+    .await
+    .expect("trusted record");
+  let mut graph = support::empty_graph(&catalog);
+  graph
+    .record_trusted_execution(&record, &spec)
+    .expect("trusted artifact");
+  graph.derive_proofs("revision-1");
+  storage
+    .persist_evidence_graph("run-1", &graph)
+    .await
+    .expect("persist graph");
+
+  let changed_description = "A different claim that deliberately reuses the old obligation ID";
+  let mut changed_catalog = catalog;
+  changed_catalog.verification_obligations[0].description = changed_description.into();
+  let database = project.path().join(".tenet/tenet.db");
+  let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
+    .await
+    .expect("open database for replay mutation");
+  sqlx::query("UPDATE verification_obligations SET description = ? WHERE id = ?")
+    .bind(changed_description)
+    .bind("REQ-001/AC-01/VO-01")
+    .execute(&pool)
+    .await
+    .expect("reuse obligation ID for a changed claim");
+  pool.close().await;
+
+  let loaded = storage
+    .load_evidence_graph(&changed_catalog, &[spec])
+    .await
+    .expect("stale catalog authority is rejected without blocking reload");
+
+  assert!(loaded.artifacts.is_empty());
+}
+
+#[tokio::test]
+async fn forged_trusted_artifact_without_execution_record_is_rejected() {
+  let (_project, storage, catalog, spec) = prepared_trusted_storage().await;
+  let record = trusted_record(&spec, TrustedExecutionResult::Supports);
+  let mut graph = support::empty_graph(&catalog);
+  graph
+    .record_trusted_execution(&record, &spec)
+    .expect("domain artifact");
+
+  let error = storage
+    .persist_evidence_graph("run-1", &graph)
+    .await
+    .expect_err("unbacked trusted artifact rejected");
+
+  assert!(error.to_string().contains("unknown controller execution"));
+}
+
+#[tokio::test]
+async fn tampered_trusted_execution_record_fails_authentication() {
+  let (project, storage, catalog, spec) = prepared_trusted_storage().await;
+  let record = trusted_record(&spec, TrustedExecutionResult::Supports);
+  storage
+    .record_trusted_execution("run-1", &record, &spec)
+    .await
+    .expect("trusted record");
+  let mut graph = support::empty_graph(&catalog);
+  graph
+    .record_trusted_execution(&record, &spec)
+    .expect("trusted artifact");
+  graph.derive_proofs("revision-1");
+  storage
+    .persist_evidence_graph("run-1", &graph)
+    .await
+    .expect("persist graph");
+
+  let database = project.path().join(".tenet/tenet.db");
+  let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
+    .await
+    .expect("open database for adversarial mutation");
+  sqlx::query("UPDATE trusted_verifier_executions SET verifier_name = 'forged', record_json = json_set(record_json, '$.verifier_name', 'forged')")
+    .execute(&pool)
+    .await
+    .expect("tamper execution record");
+  pool.close().await;
+  let loaded = storage
+    .load_evidence_graph(&catalog, &[spec])
+    .await
+    .expect("tampered authority is rejected without blocking reload");
+
+  assert!(loaded.artifacts.is_empty());
+  assert_eq!(
+    loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Insufficient
+  );
 }

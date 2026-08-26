@@ -12,9 +12,11 @@ pub use context::WorkUnitContext;
 use std::{
   path::{Path, PathBuf},
   str::FromStr,
+  sync::OnceLock,
   time::Duration,
 };
 
+use sha2::{Digest, Sha256};
 use sqlx::{
   migrate::Migrator,
   sqlite::{
@@ -25,6 +27,49 @@ use sqlx::{
 use thiserror::Error;
 
 static MIGRATOR: Migrator = sqlx::migrate!();
+static CONTROLLER_AUTHORITY_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// Installs controller-only key material used to authenticate trusted authority across restarts.
+pub fn install_controller_authority_key(
+  authority_namespace: &str,
+  key_material: &[u8],
+) -> Result<(), StorageError> {
+  if authority_namespace.trim().is_empty() || key_material.is_empty() {
+    return Err(StorageError::IntegrityViolation(
+      "controller authority namespace and key material cannot be empty".into(),
+    ));
+  }
+  let mut digest = Sha256::new();
+  digest.update(b"tenet-controller-authority-v2");
+  digest.update((authority_namespace.len() as u64).to_be_bytes());
+  digest.update(authority_namespace.as_bytes());
+  digest.update((key_material.len() as u64).to_be_bytes());
+  digest.update(key_material);
+  let derived: [u8; 32] = digest.finalize().into();
+  if let Some(current) = CONTROLLER_AUTHORITY_KEY.get() {
+    if current != &derived {
+      return Err(StorageError::IntegrityViolation(
+        "controller authority identity changed within this process".into(),
+      ));
+    }
+    return Ok(());
+  }
+  match CONTROLLER_AUTHORITY_KEY.set(derived) {
+    Ok(()) => Ok(()),
+    Err(raced) if CONTROLLER_AUTHORITY_KEY.get() == Some(&raced) => Ok(()),
+    Err(_) => Err(StorageError::IntegrityViolation(
+      "controller authority identity changed during initialization".into(),
+    )),
+  }
+}
+
+pub(crate) fn controller_authority_key() -> Result<&'static [u8; 32], StorageError> {
+  CONTROLLER_AUTHORITY_KEY.get().ok_or_else(|| {
+    StorageError::IntegrityViolation(
+      "trusted authority requires a controller-only external identity".into(),
+    )
+  })
+}
 
 /// The file name of the authoritative controller database.
 pub const DATABASE_FILE: &str = "tenet.db";

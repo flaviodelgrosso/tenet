@@ -18,9 +18,18 @@ use tenet_domain::{
     CatalogApproval, CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
     RequirementCatalog, State,
   },
+  trusted_verifier::{TrustedExecutionRecord, TrustedVerificationSpec},
   verification::ProjectVerificationRun,
 };
 use tenet_storage::Storage;
+
+pub fn install_controller_authority_key(
+  authority_namespace: &str,
+  key_material: &[u8],
+) -> Result<()> {
+  tenet_storage::install_controller_authority_key(authority_namespace, key_material)
+    .context("install controller authority identity")
+}
 
 pub async fn ensure_layout(cwd: &Path) -> Result<()> {
   fs::create_dir_all(cwd.join(TENET_DIR).join("runs")).await?;
@@ -124,7 +133,10 @@ pub async fn read_evidence_graph(
     .load_active_catalog()
     .await?
     .ok_or_else(|| anyhow!("cannot load evidence without an active catalog"))?;
-  let graph = storage.load_evidence_graph(&catalog).await?;
+  let config = read_config(cwd).await?;
+  let graph = storage
+    .load_evidence_graph(&catalog, &config.verification.trusted_checks)
+    .await?;
   if graph.specification_hash != expected.specification_hash
     || graph.requirements != expected.requirements
     || graph.required_requirements != expected.required_requirements
@@ -184,6 +196,23 @@ pub async fn record_manual_verification(
     .record_project_verification(run_id, report)
     .await
     .context("record project verification")?;
+  Ok(())
+}
+pub async fn record_trusted_execution(
+  cwd: &Path,
+  record: &TrustedExecutionRecord,
+  spec: &TrustedVerificationSpec,
+) -> Result<()> {
+  let storage = Storage::open(cwd).await?;
+  let state = storage.load_current_state().await?;
+  let run_id = state
+    .run_id
+    .as_deref()
+    .ok_or_else(|| anyhow!("cannot persist trusted execution without an active run"))?;
+  storage
+    .record_trusted_execution(run_id, record, spec)
+    .await
+    .context("record controller-owned trusted execution")?;
   Ok(())
 }
 
