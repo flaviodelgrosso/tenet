@@ -6,8 +6,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-  ids::{CriterionId, EvidenceId, ObligationId, RequirementId, VerificationRunId},
-  verification::{ProjectCheckResult, ProjectVerificationRun},
+  ids::{ArtifactId, CriterionId, EvidenceId, ObligationId, RequirementId, VerificationRunId},
+  proof::{
+    derive_proof_state, ArtifactAuthority, ArtifactObservation, ArtifactProvenance,
+    ArtifactValidity, AssessmentJudgment, AssessmentRecord, DependencySurface, EvidenceArtifact,
+    EvidenceArtifactKind, EvidenceContract, EvidencePredicate, ExecutionDomain,
+    ExecutionObservation, ProofDerivation, ProofState,
+  },
+  verification::{ProjectCheckResult, ProjectVerificationRun, VerificationAuthority},
 };
 
 /// Implementation completeness observed in the repository, independent from verification and evidence state.
@@ -56,6 +62,8 @@ pub struct VerificationObligation {
   pub description: String,
   #[serde(default = "default_true")]
   pub required: bool,
+  #[serde(rename = "evidenceContract")]
+  pub evidence_contract: EvidenceContract,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -168,56 +176,13 @@ pub struct Evidence {
   pub validity: EvidenceValidity,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ObligationAssessment {
-  Satisfied {
-    rationale: String,
-    #[serde(rename = "evidenceRefs")]
-    evidence_refs: Vec<String>,
-  },
-  Gap {
-    description: String,
-  },
-  Uncertain {
-    reason: String,
-    #[serde(default, rename = "specificationAmbiguous")]
-    specification_ambiguous: bool,
-  },
-}
-
-impl ObligationAssessment {
-  fn result(&self) -> EvidenceResult {
-    match self {
-      Self::Satisfied { .. } => EvidenceResult::Passed,
-      Self::Gap { .. } => EvidenceResult::Failed,
-      Self::Uncertain { .. } => EvidenceResult::Inconclusive,
-    }
-  }
-
-  fn rationale(&self) -> &str {
-    match self {
-      Self::Satisfied { rationale, .. } => rationale,
-      Self::Gap { description } => description,
-      Self::Uncertain { reason, .. } => reason,
-    }
-  }
-
-  fn evidence_refs(&self) -> &[String] {
-    match self {
-      Self::Satisfied { evidence_refs, .. } => evidence_refs,
-      Self::Gap { .. } | Self::Uncertain { .. } => &[],
-    }
-  }
-}
-
-/// Agent-facing semantic judgment keyed by a controller-generated obligation handle.
+/// Agent-facing advisory judgment keyed by a controller-generated obligation handle.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AgentObligationAssessment {
   #[serde(rename = "obligationHandle")]
   pub obligation_handle: String,
-  pub judgment: ObligationAssessment,
+  pub judgment: AssessmentJudgment,
 }
 
 /// Agent-facing semantic judgments keyed by controller-selected obligation handles.
@@ -233,7 +198,7 @@ pub struct SemanticAssessmentProposal {
 pub struct ObligationAssessmentResult {
   #[serde(rename = "obligationId")]
   pub obligation_id: ObligationId,
-  pub assessment: ObligationAssessment,
+  pub assessment: AssessmentJudgment,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -313,11 +278,18 @@ pub struct EvidenceGraphState {
   pub obligations: BTreeMap<ObligationId, VerificationObligation>,
   #[serde(default, rename = "projectEvidence")]
   pub project_evidence: BTreeMap<VerificationRunId, ProjectVerificationEvidence>,
+  #[serde(default)]
   pub evidence: BTreeMap<EvidenceId, Evidence>,
+  #[serde(default)]
+  pub artifacts: BTreeMap<ArtifactId, EvidenceArtifact>,
+  #[serde(default)]
+  pub assessments: Vec<AssessmentRecord>,
+  #[serde(default, rename = "proofDerivations")]
+  pub proof_derivations: BTreeMap<ObligationId, ProofDerivation>,
 }
 
 impl EvidenceGraphState {
-  pub const VERSION: u32 = 3;
+  pub const VERSION: u32 = 4;
 
   pub fn new(specification_hash: impl Into<String>) -> Self {
     Self {
@@ -329,6 +301,9 @@ impl EvidenceGraphState {
       obligations: BTreeMap::new(),
       project_evidence: BTreeMap::new(),
       evidence: BTreeMap::new(),
+      artifacts: BTreeMap::new(),
+      assessments: Vec::new(),
+      proof_derivations: BTreeMap::new(),
     }
   }
 
@@ -403,6 +378,161 @@ impl EvidenceGraphState {
     self.evidence.insert(evidence.id, evidence);
     Ok(())
   }
+  pub fn establish_artifact(
+    &mut self,
+    artifact: EvidenceArtifact,
+  ) -> Result<(), EvidenceGraphError> {
+    artifact
+      .validate()
+      .map_err(|error| EvidenceGraphError::InvalidArtifact(error.to_string()))?;
+    for obligation_id in &artifact.obligation_ids {
+      if !self.obligations.contains_key(obligation_id) {
+        return Err(EvidenceGraphError::UnknownObligation(obligation_id.clone()));
+      }
+    }
+    if self.artifacts.contains_key(&artifact.id) {
+      return Err(EvidenceGraphError::DuplicateArtifact);
+    }
+    self.artifacts.insert(artifact.id, artifact);
+    Ok(())
+  }
+
+  pub fn record_project_artifacts(
+    &mut self,
+    run: &ProjectVerificationRun,
+  ) -> Result<Vec<ArtifactId>, EvidenceGraphError> {
+    let mut ids = Vec::new();
+    for check in &run.checks {
+      let predicate = EvidencePredicate::NamedProjectCheck {
+        name: check.name.clone(),
+      };
+      let bindings: BTreeSet<_> = self
+        .obligations
+        .values()
+        .filter(|obligation| contract_contains(&obligation.evidence_contract, &predicate))
+        .map(|obligation| obligation.id.clone())
+        .collect();
+      if bindings.is_empty() {
+        continue;
+      }
+      for existing in self.artifacts.values_mut().filter(|artifact| {
+        artifact.revision == run.revision
+          && matches!(
+            &artifact.kind,
+            EvidenceArtifactKind::CommandExecution {
+              check_name: Some(existing_name),
+              ..
+            } if existing_name == &check.name
+          )
+          && matches!(
+            artifact.provenance,
+            ArtifactProvenance::ControllerConfiguredCheck
+          )
+      }) {
+        existing.supersede(
+          &run.revision,
+          "replaced by a newer configured-check observation",
+        );
+      }
+      let passed = check.result.exit_code == Some(0) && !check.result.timed_out;
+      let artifact = EvidenceArtifact {
+        id: ArtifactId::new(),
+        revision: run.revision.clone(),
+        observed_at: run.finished_at,
+        authority: ArtifactAuthority::Authoritative,
+        provenance: ArtifactProvenance::ControllerConfiguredCheck,
+        observation: if passed {
+          ArtifactObservation::Supports
+        } else {
+          ArtifactObservation::Contradicts
+        },
+        kind: EvidenceArtifactKind::CommandExecution {
+          check_name: Some(check.name.clone()),
+          run_id: run.run_id,
+          spec: check.spec.clone(),
+          result: ExecutionObservation {
+            command: check.result.command.clone(),
+            exit_code: check.result.exit_code,
+            timed_out: check.result.timed_out,
+            duration_ms: u64::try_from(check.result.duration_ms).unwrap_or(u64::MAX),
+            stdout: check.result.stdout.clone(),
+            stderr: check.result.stderr.clone(),
+          },
+          domain: ExecutionDomain::CandidatePublicVerification,
+          execution_authority: VerificationAuthority::ProjectConfigured,
+        },
+        obligation_ids: bindings,
+        validity: ArtifactValidity::Valid,
+        dependencies: DependencySurface::RepositoryWide,
+        compatible_revisions: BTreeSet::new(),
+      };
+      ids.push(artifact.id);
+      self.establish_artifact(artifact)?;
+    }
+    Ok(ids)
+  }
+
+  pub fn record_assessment_judgments(
+    &mut self,
+    revision: &str,
+    observed_at: DateTime<Utc>,
+    worker_id: &str,
+    judgments: Vec<(ObligationId, AssessmentJudgment)>,
+  ) -> Result<(), EvidenceGraphError> {
+    let expected: BTreeSet<_> = self
+      .obligations
+      .values()
+      .filter(|item| item.required)
+      .map(|item| item.id.clone())
+      .collect();
+    let actual: BTreeSet<_> = judgments.iter().map(|(id, _)| id.clone()).collect();
+    if expected != actual || actual.len() != judgments.len() {
+      return Err(EvidenceGraphError::SemanticAssessmentCoverageMismatch);
+    }
+    for (obligation_id, judgment) in judgments {
+      if matches!(judgment, AssessmentJudgment::Supported { ref artifact_ids, .. } if artifact_ids.is_empty())
+      {
+        return Err(EvidenceGraphError::MissingArtifactReference(obligation_id));
+      }
+      for artifact_id in judgment.artifact_ids() {
+        let artifact = self
+          .artifacts
+          .get(artifact_id)
+          .ok_or(EvidenceGraphError::UnknownArtifact(*artifact_id))?;
+        if !artifact.obligation_ids.contains(&obligation_id) {
+          return Err(EvidenceGraphError::ArtifactBindingMismatch(
+            *artifact_id,
+            obligation_id,
+          ));
+        }
+      }
+      self.assessments.push(AssessmentRecord {
+        obligation_id,
+        revision: revision.to_owned(),
+        observed_at,
+        worker_id: worker_id.to_owned(),
+        judgment,
+      });
+    }
+    Ok(())
+  }
+
+  pub fn derive_proofs(&mut self, revision: &str) {
+    self.proof_derivations = self
+      .obligations
+      .values()
+      .filter(|obligation| obligation.required)
+      .map(|obligation| {
+        let derivation = derive_proof_state(
+          &obligation.id,
+          &obligation.evidence_contract,
+          self.artifacts.values(),
+          revision,
+        );
+        (obligation.id.clone(), derivation)
+      })
+      .collect();
+  }
 
   pub fn record_project_verification(&mut self, run: &ProjectVerificationRun) {
     self.project_evidence.insert(
@@ -430,58 +560,20 @@ impl EvidenceGraphState {
     observed_at: DateTime<Utc>,
     worker_id: &str,
     report: &SemanticAssessmentReport,
-  ) -> Result<Vec<EvidenceId>, EvidenceGraphError> {
+  ) -> Result<(), EvidenceGraphError> {
     if report.summary.trim().is_empty() {
       return Err(EvidenceGraphError::BlankSemanticSummary);
     }
-    let expected: BTreeSet<_> = self
-      .obligations
-      .values()
-      .filter(|obligation| obligation.required)
-      .map(|obligation| obligation.id.clone())
-      .collect();
-    let actual: BTreeSet<_> = report
-      .assessments
-      .iter()
-      .map(|assessment| assessment.obligation_id.clone())
-      .collect();
-    if expected != actual || actual.len() != report.assessments.len() {
-      return Err(EvidenceGraphError::SemanticAssessmentCoverageMismatch);
-    }
-
-    let mut ids = Vec::with_capacity(report.assessments.len());
-    for item in &report.assessments {
-      if item.assessment.rationale().trim().is_empty() {
-        return Err(EvidenceGraphError::BlankAssessment(
-          item.obligation_id.clone(),
-        ));
-      }
-      let obligation = self
-        .obligations
-        .get(&item.obligation_id)
-        .ok_or_else(|| EvidenceGraphError::UnknownObligation(item.obligation_id.clone()))?;
-      let criterion = self
-        .criteria
-        .get(&obligation.criterion_id)
-        .ok_or_else(|| EvidenceGraphError::UnknownCriterion(obligation.criterion_id.clone()))?;
-      let id = EvidenceId::new();
-      self.establish_evidence(Evidence {
-        id,
-        requirement_id: criterion.requirement_id.clone(),
-        criterion_id: criterion.id.clone(),
-        obligation_id: obligation.id.clone(),
-        source: EvidenceSource::SemanticAssessment,
-        result: item.assessment.result(),
-        revision: revision.to_owned(),
-        observed_at,
-        provenance: EvidenceProvenance::independent_assessment(worker_id),
-        rationale: item.assessment.rationale().to_owned(),
-        evidence_refs: item.assessment.evidence_refs().to_vec(),
-        validity: EvidenceValidity::Valid,
-      })?;
-      ids.push(id);
-    }
-    Ok(ids)
+    self.record_assessment_judgments(
+      revision,
+      observed_at,
+      worker_id,
+      report
+        .assessments
+        .iter()
+        .map(|item| (item.obligation_id.clone(), item.assessment.clone()))
+        .collect(),
+    )
   }
 
   pub fn invalidate_where(
@@ -500,6 +592,22 @@ impl EvidenceGraphState {
         invalidated.push(evidence.id);
       }
     }
+    invalidated
+  }
+  pub fn transition_artifacts(
+    &mut self,
+    revision: &str,
+    current_blob_hashes: Option<&BTreeMap<String, String>>,
+  ) -> Vec<ArtifactId> {
+    let mut invalidated = Vec::new();
+    for artifact in self.artifacts.values_mut() {
+      let was_valid = artifact.validity.is_valid();
+      artifact.transition_revision(revision, current_blob_hashes);
+      if was_valid && !artifact.validity.is_valid() {
+        invalidated.push(artifact.id);
+      }
+    }
+    self.derive_proofs(revision);
     invalidated
   }
 
@@ -574,6 +682,13 @@ impl EvidenceGraphState {
               .filter(|evidence| evidence.obligation_id == obligation.id)
               .cloned()
               .collect(),
+            artifacts: self
+              .artifacts
+              .values()
+              .filter(|artifact| artifact.obligation_ids.contains(&obligation.id))
+              .cloned()
+              .collect(),
+            proof: self.proof_derivations.get(&obligation.id).cloned(),
           })
           .collect(),
       })
@@ -615,34 +730,26 @@ impl EvidenceGraphState {
     obligation_id: &ObligationId,
     policy: EvidencePolicy<'_>,
   ) -> VerificationState {
-    let evidence: Vec<_> = self
-      .evidence
-      .values()
-      .filter(|evidence| evidence.obligation_id == *obligation_id)
-      .collect();
-    if evidence.iter().any(|evidence| policy.blocks(evidence)) {
-      return VerificationState::Contradicted;
+    match self.proof_derivations.get(obligation_id) {
+      Some(derivation) if derivation.revision == policy.revision => match derivation.state {
+        ProofState::Proven => VerificationState::Verified,
+        ProofState::Contradicted => VerificationState::Contradicted,
+        ProofState::Insufficient => VerificationState::Unverified,
+        ProofState::Stale => VerificationState::Stale,
+      },
+      Some(_) => VerificationState::Stale,
+      None => VerificationState::Unverified,
     }
-    if evidence
+  }
+}
+
+fn contract_contains(contract: &EvidenceContract, predicate: &EvidencePredicate) -> bool {
+  match contract {
+    EvidenceContract::Artifact { predicate: actual } => actual == predicate,
+    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => requirements
       .iter()
-      .any(|evidence| policy.is_uncertain(evidence))
-    {
-      return VerificationState::Uncertain;
-    }
-    if evidence
-      .iter()
-      .any(|evidence| policy.authorizes(self, evidence))
-    {
-      return VerificationState::Verified;
-    }
-    if evidence.iter().any(|evidence| {
-      evidence.result == EvidenceResult::Passed
-        && evidence.source == EvidenceSource::SemanticAssessment
-        && (!evidence.validity.is_valid() || evidence.revision != policy.revision)
-    }) {
-      return VerificationState::Stale;
-    }
-    VerificationState::Unverified
+      .any(|item| contract_contains(item, predicate)),
+    EvidenceContract::HumanAttestation { .. } => false,
   }
 }
 
@@ -701,6 +808,8 @@ pub struct ObligationProjection {
   pub obligation: VerificationObligation,
   pub state: VerificationState,
   pub evidence: Vec<Evidence>,
+  pub artifacts: Vec<EvidenceArtifact>,
+  pub proof: Option<ProofDerivation>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -717,6 +826,16 @@ pub enum EvidenceGraphError {
   DuplicateObligation,
   #[error("duplicate evidence id")]
   DuplicateEvidence,
+  #[error("duplicate evidence artifact id")]
+  DuplicateArtifact,
+  #[error("invalid evidence artifact: {0}")]
+  InvalidArtifact(String),
+  #[error("unknown evidence artifact {0}")]
+  UnknownArtifact(ArtifactId),
+  #[error("assessment for {0} must reference at least one existing artifact")]
+  MissingArtifactReference(ObligationId),
+  #[error("artifact {0} is not bound to assessment obligation {1}")]
+  ArtifactBindingMismatch(ArtifactId, ObligationId),
   #[error("evidence {0} does not match its criterion and obligation relationships")]
   RelationshipMismatch(EvidenceId),
   #[error("{0} has a blank description")]
@@ -735,10 +854,9 @@ fn default_true() -> bool {
 
 #[cfg(test)]
 mod tests {
-  use chrono::TimeZone;
-
   use super::*;
   use crate::verification::{CommandResult, ProjectCheckResult};
+  use chrono::TimeZone;
 
   fn graph() -> EvidenceGraphState {
     let mut graph = EvidenceGraphState::new("spec-hash");
@@ -757,6 +875,7 @@ mod tests {
         criterion_id: CriterionId::from("REQ-007/AC-01"),
         description: "An expired token is rejected with HTTP 401".into(),
         required: true,
+        evidence_contract: Default::default(),
       })
       .expect("obligation");
     graph
@@ -795,16 +914,6 @@ mod tests {
     }
   }
 
-  fn assessment(assessment: ObligationAssessment) -> SemanticAssessmentReport {
-    SemanticAssessmentReport {
-      summary: "Independent assessment".into(),
-      assessments: vec![ObligationAssessmentResult {
-        obligation_id: ObligationId::from("REQ-007/AC-01/VO-01"),
-        assessment,
-      }],
-    }
-  }
-
   fn state(graph: &EvidenceGraphState, revision: &str, suite: &str) -> VerificationState {
     graph
       .requirement_verification_state(
@@ -823,81 +932,29 @@ mod tests {
   }
 
   #[test]
-  fn semantic_satisfaction_alone_does_not_verify_when_project_checks_fail() {
+  fn internal_adjudication_model_suspicion_cannot_create_authoritative_contradiction() {
     let mut graph = graph();
-    graph.record_project_verification(&project_run("abc", "suite", false));
     graph
-      .record_semantic_assessment(
+      .record_assessment_judgments(
         "abc",
         now(),
-        "assess-1",
-        &assessment(ObligationAssessment::Satisfied {
-          rationale: "Implementation rejects the token".into(),
-          evidence_refs: vec!["src/auth.rs".into()],
-        }),
+        "assess",
+        vec![(
+          ObligationId::from("REQ-007/AC-01/VO-01"),
+          AssessmentJudgment::Contradicted {
+            artifact_ids: Vec::new(),
+            rationale: "model suspects a counterexample".into(),
+            proposals: Vec::new(),
+          },
+        )],
       )
-      .expect("semantic evidence");
-
-    assert_eq!(state(&graph, "abc", "suite"), VerificationState::Unverified);
-  }
-
-  #[test]
-  fn project_pass_and_semantic_satisfaction_verify_obligation() {
-    let mut graph = graph();
-    graph.record_project_verification(&project_run("abc", "suite", true));
-    graph
-      .record_semantic_assessment(
-        "abc",
-        now(),
-        "assess-1",
-        &assessment(ObligationAssessment::Satisfied {
-          rationale: "Implementation rejects the token".into(),
-          evidence_refs: vec!["src/auth.rs".into()],
-        }),
-      )
-      .expect("semantic evidence");
-
-    assert_eq!(state(&graph, "abc", "suite"), VerificationState::Verified);
-  }
-
-  #[test]
-  fn semantic_gap_contradicts_project_pass() {
-    let mut graph = graph();
-    graph.record_project_verification(&project_run("abc", "suite", true));
-    graph
-      .record_semantic_assessment(
-        "abc",
-        now(),
-        "assess-1",
-        &assessment(ObligationAssessment::Gap {
-          description: "Expired tokens are accepted".into(),
-        }),
-      )
-      .expect("semantic evidence");
+      .expect("record advisory suspicion");
+    graph.derive_proofs("abc");
 
     assert_eq!(
-      state(&graph, "abc", "suite"),
-      VerificationState::Contradicted
+      graph.proof_derivations[&ObligationId::from("REQ-007/AC-01/VO-01")].state,
+      ProofState::Insufficient
     );
-  }
-
-  #[test]
-  fn semantic_uncertainty_fails_closed() {
-    let mut graph = graph();
-    graph.record_project_verification(&project_run("abc", "suite", true));
-    graph
-      .record_semantic_assessment(
-        "abc",
-        now(),
-        "assess-1",
-        &assessment(ObligationAssessment::Uncertain {
-          reason: "Criterion is ambiguous".into(),
-          specification_ambiguous: true,
-        }),
-      )
-      .expect("semantic evidence");
-
-    assert_eq!(state(&graph, "abc", "suite"), VerificationState::Uncertain);
   }
 
   #[test]
@@ -923,82 +980,44 @@ mod tests {
 
     assert_eq!(state(&graph, "abc", "suite"), VerificationState::Unverified);
   }
-
   #[test]
-  fn evidence_is_bound_to_repository_revision() {
+  fn newer_same_revision_verification_supersedes_failed_artifacts() {
     let mut graph = graph();
-    graph.record_project_verification(&project_run("abc", "suite", true));
     graph
-      .record_semantic_assessment(
-        "abc",
-        now(),
-        "assess-1",
-        &assessment(ObligationAssessment::Satisfied {
-          rationale: "Satisfied at abc".into(),
-          evidence_refs: Vec::new(),
-        }),
-      )
-      .expect("semantic evidence");
-
-    assert_ne!(state(&graph, "def", "suite"), VerificationState::Verified);
-  }
-
-  #[test]
-  fn changing_project_suite_invalidates_verified_eligibility() {
-    let mut graph = graph();
-    graph.record_project_verification(&project_run("abc", "suite-a", true));
+      .obligations
+      .get_mut(&ObligationId::from("REQ-007/AC-01/VO-01"))
+      .expect("obligation")
+      .evidence_contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck {
+        name: "quality".into(),
+      },
+    };
+    let failed = project_run("abc", "suite", false);
     graph
-      .record_semantic_assessment(
-        "abc",
-        now(),
-        "assess-1",
-        &assessment(ObligationAssessment::Satisfied {
-          rationale: "Satisfied".into(),
-          evidence_refs: Vec::new(),
-        }),
-      )
-      .expect("semantic evidence");
+      .record_project_artifacts(&failed)
+      .expect("failed artifacts");
+    graph.derive_proofs("abc");
+    assert_eq!(
+      graph.proof_derivations[&ObligationId::from("REQ-007/AC-01/VO-01")].state,
+      ProofState::Contradicted
+    );
 
-    assert_ne!(state(&graph, "abc", "suite-b"), VerificationState::Verified);
-  }
-
-  #[test]
-  fn old_semantic_assessment_is_stale_after_revision_change() {
-    let mut graph = graph();
-    graph.record_project_verification(&project_run("abc", "suite", true));
+    let passed = project_run("abc", "suite", true);
     graph
-      .record_semantic_assessment(
-        "abc",
-        now(),
-        "assess-1",
-        &assessment(ObligationAssessment::Satisfied {
-          rationale: "Satisfied".into(),
-          evidence_refs: Vec::new(),
-        }),
-      )
-      .expect("semantic evidence");
-    graph.invalidate_where("def", now(), |_| true);
-
-    assert_eq!(state(&graph, "def", "suite"), VerificationState::Stale);
-  }
-
-  #[test]
-  fn contradictory_project_results_do_not_use_optimistic_voting() {
-    let mut graph = graph();
-    graph.record_project_verification(&project_run("abc", "suite", true));
-    graph.record_project_verification(&project_run("abc", "suite", false));
-    graph
-      .record_semantic_assessment(
-        "abc",
-        now(),
-        "assess-1",
-        &assessment(ObligationAssessment::Satisfied {
-          rationale: "Satisfied".into(),
-          evidence_refs: Vec::new(),
-        }),
-      )
-      .expect("semantic evidence");
-
-    assert_ne!(state(&graph, "abc", "suite"), VerificationState::Verified);
+      .record_project_artifacts(&passed)
+      .expect("replacement artifacts");
+    graph.derive_proofs("abc");
+    assert_eq!(
+      graph.proof_derivations[&ObligationId::from("REQ-007/AC-01/VO-01")].state,
+      ProofState::Proven
+    );
+    assert_eq!(
+      graph
+        .artifacts
+        .values()
+        .filter(|artifact| artifact.validity.is_valid())
+        .count(),
+      1
+    );
   }
 }

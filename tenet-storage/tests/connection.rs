@@ -113,6 +113,91 @@ async fn existing_database_migrates_to_review_required_lifecycle() {
 }
 
 #[tokio::test]
+async fn proof_contract_migration_invalidates_legacy_active_catalog() {
+  let project = tempfile::tempdir().expect("temporary project");
+  let state_directory = project.path().join(".tenet");
+  tokio::fs::create_dir(&state_directory)
+    .await
+    .expect("state directory");
+  let database_path = state_directory.join("tenet.db");
+  let pool = SqlitePoolOptions::new()
+    .connect_with(
+      SqliteConnectOptions::from_str("sqlite::memory:")
+        .expect("sqlite options")
+        .filename(&database_path)
+        .in_memory(false)
+        .create_if_missing(true)
+        .foreign_keys(true),
+    )
+    .await
+    .expect("open legacy database");
+  let legacy_migrations = tempfile::tempdir().expect("migration directory");
+  for (name, contents) in [
+    (
+      "20260820000000_initial.sql",
+      include_str!("../migrations/20260820000000_initial.sql"),
+    ),
+    (
+      "20260825000000_catalog_approval.sql",
+      include_str!("../migrations/20260825000000_catalog_approval.sql"),
+    ),
+    (
+      "20260825010000_deferred_repair_attempts.sql",
+      include_str!("../migrations/20260825010000_deferred_repair_attempts.sql"),
+    ),
+    (
+      "20260826000000_proof_artifacts.sql",
+      include_str!("../migrations/20260826000000_proof_artifacts.sql"),
+    ),
+  ] {
+    tokio::fs::write(legacy_migrations.path().join(name), contents)
+      .await
+      .expect("write legacy migration");
+  }
+  sqlx::migrate::Migrator::new(legacy_migrations.path())
+    .await
+    .expect("load legacy migrations")
+    .run(&pool)
+    .await
+    .expect("apply legacy migrations");
+  for statement in [
+    "INSERT INTO specification_snapshots(hash, source_path, observed_at) VALUES ('spec', 'spec.md', '2026-08-26T10:00:00Z')",
+    "INSERT INTO requirements(id, spec_hash, ordinal, title, description, required) VALUES ('REQ-001', 'spec', 0, 'Legacy', 'Legacy requirement', 1)",
+    "INSERT INTO acceptance_criteria(id, requirement_id, ordinal, description, mandatory) VALUES ('REQ-001/AC-01', 'REQ-001', 0, 'Legacy criterion', 1)",
+    "INSERT INTO verification_obligations(id, criterion_id, ordinal, description, required) VALUES ('REQ-001/AC-01/VO-01', 'REQ-001/AC-01', 0, 'Legacy obligation', 1)",
+    "INSERT INTO storage_metadata(key, value) VALUES ('active_spec_hash', 'spec'), ('active_catalog_hash', '0000000000000000000000000000000000000000000000000000000000000000')",
+    "INSERT INTO catalog_approvals(singleton, spec_hash, catalog_hash, approved_at) VALUES (1, 'spec', '0000000000000000000000000000000000000000000000000000000000000000', '2026-08-26T10:00:00Z')",
+  ] {
+    sqlx::query(statement)
+      .execute(&pool)
+      .await
+      .expect("seed legacy catalog");
+  }
+  let default_contract: String = sqlx::query_scalar(
+    "SELECT evidence_contract_json FROM verification_obligations WHERE id = 'REQ-001/AC-01/VO-01'",
+  )
+  .fetch_one(&pool)
+  .await
+  .expect("legacy default contract");
+  assert!(default_contract.contains("human_attestation"));
+  drop(pool);
+
+  let storage = Storage::open(project.path())
+    .await
+    .expect("apply regeneration migration");
+  assert!(storage
+    .load_active_catalog()
+    .await
+    .expect("load active catalog")
+    .is_none());
+  assert!(storage
+    .load_catalog_approval()
+    .await
+    .expect("load approval")
+    .is_none());
+}
+
+#[tokio::test]
 async fn existing_only_open_does_not_replace_a_missing_database() {
   let project = tempfile::tempdir().expect("temporary project");
 

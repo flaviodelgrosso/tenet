@@ -170,14 +170,16 @@ controller-run project verification               │
                          final project checks at R
                                        │
                                        ▼
-                    fresh independent semantic Assess
-                         (obligation by obligation)
+                  controller-issued EvidenceArtifacts
+                                       │
+                                       ▼
+                    deterministic EvidenceContract
                                        │
                      ┌─────────────────┼─────────────────┐
-                   GAP             UNCERTAIN         SATISFIED
+                  PROVEN          INSUFFICIENT      CONTRADICTED
                      │                 │                 │
                      ▼                 ▼                 ▼
-                Reconcile          BLOCKED           DONE?
+                   DONE?       acquire/adjudicate      BLOCKED
 ```
 
 The repository evolves. The plan is allowed to evolve with it. The specification and controller-owned evidence remain the reference points.
@@ -201,13 +203,13 @@ valid requirement catalog
         +
 mandatory acceptance criteria
         +
-required semantic verification obligations
+required verification obligations with explicit EvidenceContracts
         +
-project-owner-configured deterministic suite passes at revision R
+controller-issued, revision-compatible authoritative artifacts satisfy every contract
         +
-every required obligation has current independent semantic satisfaction at R
+deterministically derived ProofState::Proven for every required obligation
         +
-no current semantic gap, uncertainty, or contradictory evidence
+advisory model support, suspicion, or prose has no proof authority
         +
 no remaining work from current reconciliation
         +
@@ -224,9 +226,9 @@ DONE(R)
 
 `DONE` does **not** mean mathematically proven correct. It means:
 
-> **the repository satisfied the specification through the evidence and assessment mechanisms available to this run.**
+> **every required obligation's explicit evidence contract is satisfied by controller-owned authoritative artifacts at the canonical revision, and every independent controller safety gate passes.**
 
-That distinction matters. A bad specification can still produce the wrong software. Weak tests can still produce weak evidence. An agent can still miss something.
+That distinction matters. A bad specification or weak evidence contract can still describe or prove the wrong thing. Human-attestation and generic trusted-executable contracts are rejected while no controller issuer is configured; advisory model judgments cannot bridge missing evidence.
 
 Tenet does not remove uncertainty from software engineering — it tries to make that uncertainty **explicit, revision-bound, inspectable, and harder to hand-wave away**.
 
@@ -248,34 +250,38 @@ AC-003-01
 A token is accepted before expiry and rejected after expiry.
 ```
 
-A verification obligation is a semantic claim about that criterion:
+A verification obligation is a claim paired with an explicit evidence contract:
 
 ```
 VO-003-01
-Demonstrate token expiration semantics.
+Claim: expired reset tokens are rejected
+Contract: Artifact(NamedProjectCheck("password-reset-expiry"))
 ```
 
-An executable check is configured separately. For example, a project-configured check or an agent-proposed advisory check may be:
+The configured check is structured controller policy, not an assessor-provided shell string:
 
 ```
-cargo test password_reset_expiry
-```
-
-Tenet's authoritative record of a controller-executed project check is closer to:
-
-```
-revision:     abc123...
+name:         password-reset-expiry
 program:      cargo
 arguments:    test password_reset_expiry
-exit_code:    0
-observed_by:  controller
 ```
 
-That result is revision-bound project-verification evidence. It is not an executable binding for `VO-003-01`, and it does not by itself establish the generated semantic obligation. Semantic obligations are assessed separately.
+After executing it in the public verification domain, the controller issues an `EvidenceArtifact` containing the immutable revision, verification-run identity, structured execution specification and result, provenance, authority, validity, and dependency surface. The artifact is bound to the obligation; an agent can only refer to its existing `ArtifactId`. Generic repository-wide project verification remains a separate completion gate and cannot satisfy an arbitrary obligation contract.
 
-If a later change touches the dependency scope supporting that evidence, Tenet can mark it stale and require verification again.
+Pure deterministic proof evaluation matches current, valid, authoritative artifacts against the contract. Mechanical proof requires no positive assessor verdict. Missing, advisory, supporting, stale, wrong-revision, unsupported, or ambiguously affected evidence yields `Insufficient` or `Stale`, never `Proven`.
 
-**The model proposes. The controller observes.**
+The implemented authority boundary is deliberately narrow:
+
+- **Authoritative:** controller-configured named project checks. A configured named check is the only currently admissible leaf obligation contract; `All` and `Any` are admissible only when every branch is independently admissible.
+- **Supporting:** controller-owned immutable source inspection. Source inspection can inform falsification and evidence-gap analysis, but catalog validation rejects it as an authoritative obligation contract.
+- **Advisory request only:** assessor-proposed reproduction commands; Tenet records the request but does not execute it or issue an artifact.
+- **Unsupported authoritative issuers:** generic trusted executable verification and human attestation. Catalog validation rejects both.
+
+With this authoritative contract set, production-valid obligations are mechanically decidable from controller-configured named checks. Assess remains a falsifier and evidence-gap finder for future hybrid or non-mechanical issuers. It may refer only to controller-supplied artifact IDs and may propose configured checks, supporting source inspection, or deferred reproduction. Supporting artifacts, model support, and model suspicion cannot close or contradict an authoritative proof obligation.
+
+On repository transitions, invalidation is conservative. Repository-wide and unknown dependency surfaces become stale at an incompatible revision. Although the domain can represent path/blob compatibility, the controller does not currently supply current blob hashes during invalidation, so it does not claim dependency-aware reuse.
+
+**The model proposes and interprets. The controller acquires, validates, and proves.**
 
 ---
 
@@ -347,7 +353,7 @@ A worker receives bounded work and an explicit repository scope, in an isolated 
 
 ### 4 · Verify
 
-The candidate is committed first; project verification then runs against clean disposable checkouts of that candidate revision (for example `cargo test`, `make ci`, or `./scripts/acceptance.sh`). Project-configured checks are controller-authorized and mandatory; they run in declaration order and fail fast. Agent-proposed checks remain advisory. Project-suite results are persisted with their revision and configuration fingerprint, but are not treated as evidence for generated semantic obligations.
+The candidate is committed first; project verification then runs against clean disposable checkouts of that candidate revision (for example `cargo test`, `make ci`, or `./scripts/acceptance.sh`). Project-configured checks are controller-authorized and mandatory; they run in declaration order and fail fast. Matching named checks may produce obligation-bound authoritative artifacts when admitted by an explicit evidence contract. Assessor-proposed reproduction commands are deferred advisory requests and are never executed.
 
 ### 5 · Repair
 
@@ -357,9 +363,9 @@ A failed advisory verification attempt becomes structured input to a new Repair 
 
 A verified candidate is integrated through the controller rather than being allowed to mutate canonical state directly. Tenet maintains a durable integration journal around canonical advancement — if interruption occurs, startup reconciles the journal against the actual Git revision rather than guessing whether the operation succeeded. After integration, the repository is reconciled again: yesterday's plan is not automatically trusted after today's code change.
 
-### 7 · Assess
+### 7 · Advisory adjudication
 
-Once the project verification suite passes and requirement evidence policy is satisfied, a fresh skeptical worker searches for concrete implementation or evidence gaps. Assess can **veto** completion by proposing a specific gap — it cannot authorize completion. The controller remains the final authority.
+Current production-valid obligation contracts are mechanically decided by controller-configured named checks, so completion does not call Assess merely to confirm a proven contract. Tenet retains an advisory adjudication and falsification path for future hybrid or non-mechanical evidence issuers: a skeptical worker can inspect controller-provided artifacts, identify evidence or implementation gaps, report suspicions, and request supporting source spans or deferred reproduction. Those judgments and source spans cannot issue authoritative proof, and reproduction requests are not executed. Pure proof evaluation and completion remain controller-owned.
 
 ---
 

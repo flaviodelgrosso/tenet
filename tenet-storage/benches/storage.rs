@@ -3,11 +3,12 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tenet_domain::{
   evidence::{
-    AcceptanceCriterion, ObligationAssessment, ObligationAssessmentResult,
-    SemanticAssessmentReport, VerificationObligation,
+    AcceptanceCriterion, ObligationAssessmentResult, SemanticAssessmentReport,
+    VerificationObligation,
   },
   ids::{CriterionId, ObligationId, RequirementId, SpecFragmentId},
   model::{ReconcileResult, Requirement, RequirementCatalog, State, WorkScope, WorkUnit},
+  proof::{AssessmentJudgment, GapKind},
   worker::{CatalogCoverage, SpecFragment, SpecReference},
 };
 use tenet_storage::Storage;
@@ -43,6 +44,7 @@ fn catalog() -> RequirementCatalog {
       criterion_id,
       description: "Observe storage result".into(),
       required: true,
+      evidence_contract: Default::default(),
     }],
     coverage: CatalogCoverage {
       normative_fragments: vec![SpecFragment {
@@ -115,9 +117,10 @@ fn main() {
           summary: "Benchmark evidence".into(),
           assessments: vec![ObligationAssessmentResult {
             obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
-            assessment: ObligationAssessment::Satisfied {
-              rationale: "Observed".into(),
-              evidence_refs: vec!["benchmark:result".into()],
+            assessment: AssessmentJudgment::Insufficient {
+              reason: "Benchmark evidence is advisory".into(),
+              proposals: Vec::new(),
+              gap_kind: GapKind::Evidence,
             },
           }],
         },

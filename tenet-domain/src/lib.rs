@@ -6,5 +6,6 @@ pub mod events;
 pub mod evidence;
 pub mod ids;
 pub mod model;
+pub mod proof;
 pub mod verification;
 pub mod worker;

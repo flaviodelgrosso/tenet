@@ -126,6 +126,7 @@ mod tests {
         criterion_id: CriterionId::from("REQ-001/AC-01"),
         description: "Required behavior is observable".into(),
         required: true,
+        evidence_contract: Default::default(),
       }],
       coverage: CatalogCoverage {
         normative_fragments: Vec::new(),
