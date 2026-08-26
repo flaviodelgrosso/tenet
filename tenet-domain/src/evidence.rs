@@ -402,54 +402,6 @@ impl EvidenceGraphState {
     run: &ProjectVerificationRun,
   ) -> Result<Vec<ArtifactId>, EvidenceGraphError> {
     let mut ids = Vec::new();
-    let project_bindings: BTreeSet<_> = self
-      .obligations
-      .values()
-      .filter(|obligation| {
-        contract_contains(
-          &obligation.evidence_contract,
-          &EvidencePredicate::ProjectVerification,
-        )
-      })
-      .map(|obligation| obligation.id.clone())
-      .collect();
-    if !project_bindings.is_empty() {
-      for existing in self.artifacts.values_mut().filter(|artifact| {
-        artifact.revision == run.revision
-          && matches!(
-            artifact.provenance,
-            ArtifactProvenance::ControllerProjectVerification
-          )
-      }) {
-        existing.supersede(
-          &run.revision,
-          "replaced by a newer project verification run",
-        );
-      }
-      let artifact = EvidenceArtifact {
-        id: ArtifactId::new(),
-        revision: run.revision.clone(),
-        observed_at: run.finished_at,
-        authority: ArtifactAuthority::Authoritative,
-        provenance: ArtifactProvenance::ControllerProjectVerification,
-        observation: if run.passed {
-          ArtifactObservation::Supports
-        } else {
-          ArtifactObservation::Contradicts
-        },
-        kind: EvidenceArtifactKind::ProjectVerification {
-          run_id: run.run_id,
-          suite_hash: run.suite_hash.clone(),
-          passed: run.passed,
-        },
-        obligation_ids: project_bindings,
-        validity: ArtifactValidity::Valid,
-        dependencies: DependencySurface::RepositoryWide,
-        compatible_revisions: BTreeSet::new(),
-      };
-      ids.push(artifact.id);
-      self.establish_artifact(artifact)?;
-    }
     for check in &run.checks {
       let predicate = EvidencePredicate::NamedProjectCheck {
         name: check.name.clone(),
@@ -1009,17 +961,10 @@ mod tests {
       .obligations
       .get_mut(&ObligationId::from("REQ-007/AC-01/VO-01"))
       .expect("obligation")
-      .evidence_contract = EvidenceContract::All {
-      requirements: vec![
-        EvidenceContract::Artifact {
-          predicate: EvidencePredicate::ProjectVerification,
-        },
-        EvidenceContract::Artifact {
-          predicate: EvidencePredicate::NamedProjectCheck {
-            name: "quality".into(),
-          },
-        },
-      ],
+      .evidence_contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck {
+        name: "quality".into(),
+      },
     };
     let failed = project_run("abc", "suite", false);
     graph
@@ -1046,7 +991,7 @@ mod tests {
         .values()
         .filter(|artifact| artifact.validity.is_valid())
         .count(),
-      2
+      1
     );
   }
 }

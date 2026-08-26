@@ -49,10 +49,17 @@ async fn prepared_storage() -> (
   let project = tempfile::tempdir().expect("temporary project");
   let storage = Storage::open(project.path()).await.expect("open storage");
   let mut catalog = support::catalog();
-  catalog.verification_obligations[0].evidence_contract = EvidenceContract::Artifact {
-    predicate: EvidencePredicate::NamedProjectCheck {
-      name: "quality".into(),
-    },
+  catalog.verification_obligations[0].evidence_contract = EvidenceContract::Any {
+    requirements: vec![
+      EvidenceContract::Artifact {
+        predicate: EvidencePredicate::NamedProjectCheck {
+          name: "quality".into(),
+        },
+      },
+      EvidenceContract::Artifact {
+        predicate: EvidencePredicate::SourceInspection,
+      },
+    ],
   };
   storage
     .persist_catalog("spec.md", Utc::now(), &catalog)
@@ -91,6 +98,7 @@ async fn artifact_and_derivation_survive_restart_with_provenance() {
     loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
     ProofState::Proven
   );
+  assert_eq!(loaded.proof_derivations, graph.proof_derivations);
 }
 
 #[tokio::test]

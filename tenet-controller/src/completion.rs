@@ -244,7 +244,9 @@ mod tests {
         description: "Behavior is present".into(),
         required: true,
         evidence_contract: EvidenceContract::Artifact {
-          predicate: EvidencePredicate::ProjectVerification,
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "quality".into(),
+          },
         },
       }],
     }
@@ -309,7 +311,9 @@ mod tests {
       project_passed,
       outcome,
       EvidenceContract::Artifact {
-        predicate: EvidencePredicate::ProjectVerification,
+        predicate: EvidencePredicate::NamedProjectCheck {
+          name: "quality".into(),
+        },
       },
     )
   }

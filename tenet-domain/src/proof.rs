@@ -310,10 +310,6 @@ impl EvidenceArtifact {
         true
       }
       (
-        EvidencePredicate::ProjectVerification,
-        EvidenceArtifactKind::ProjectVerification { .. },
-      ) => true,
-      (
         EvidencePredicate::NamedProjectCheck { name },
         EvidenceArtifactKind::CommandExecution {
           check_name: Some(actual),
@@ -440,7 +436,7 @@ pub enum ProofReason {
     reasons: Vec<ProofReason>,
   },
   Any {
-    reason: Box<ProofReason>,
+    reasons: Vec<ProofReason>,
   },
   Missing {
     requirement: String,
@@ -542,29 +538,11 @@ fn evaluate(
         .iter()
         .map(|item| evaluate(item, artifacts, revision))
         .collect();
-      if let Some((_, reason)) = evaluated
-        .iter()
-        .find(|(state, _)| *state == ProofState::Proven)
-      {
-        return (
-          ProofState::Proven,
-          ProofReason::Any {
-            reason: Box::new(reason.clone()),
-          },
-        );
-      }
       let state = combine_any(evaluated.iter().map(|(state, _)| *state));
-      let reason = evaluated
-        .into_iter()
-        .next()
-        .map(|(_, reason)| reason)
-        .unwrap_or(ProofReason::Missing {
-          requirement: "non-empty Any contract".into(),
-        });
       (
         state,
         ProofReason::Any {
-          reason: Box::new(reason),
+          reasons: evaluated.into_iter().map(|(_, reason)| reason).collect(),
         },
       )
     }
@@ -937,17 +915,17 @@ mod tests {
   }
 
   #[test]
-  fn failed_project_verification_contradicts_its_contract() {
+  fn generic_project_verification_artifact_cannot_prove_an_obligation() {
     let mut item = artifact(
       ArtifactAuthority::Authoritative,
       "r1",
-      ArtifactObservation::Contradicts,
+      ArtifactObservation::Supports,
     );
     item.provenance = ArtifactProvenance::ControllerProjectVerification;
     item.kind = EvidenceArtifactKind::ProjectVerification {
       run_id: VerificationRunId::new(),
       suite_hash: "suite".into(),
-      passed: false,
+      passed: true,
     };
     let derivation = derive_proof_state(
       &ObligationId::from("VO-1"),
@@ -957,7 +935,7 @@ mod tests {
       [&item],
       "r1",
     );
-    assert_eq!(derivation.state, ProofState::Contradicted);
+    assert_eq!(derivation.state, ProofState::Insufficient);
   }
 
   #[test]
@@ -1033,5 +1011,137 @@ mod tests {
     };
     let derivation = derive_proof_state(&ObligationId::from("VO-1"), &contract, [&item], "r1");
     assert_eq!(derivation.state, ProofState::Proven);
+  }
+
+  #[test]
+  fn any_proven_and_missing_is_proven_with_both_reasons() {
+    let item = artifact(
+      ArtifactAuthority::Authoritative,
+      "r1",
+      ArtifactObservation::Supports,
+    );
+    let contract = EvidenceContract::Any {
+      requirements: vec![
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "behavior".into(),
+          },
+        },
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "missing".into(),
+          },
+        },
+      ],
+    };
+    let derivation = derive_proof_state(&ObligationId::from("VO-1"), &contract, [&item], "r1");
+    assert_eq!(derivation.state, ProofState::Proven);
+    assert!(matches!(
+      derivation.reason,
+      ProofReason::Any { reasons }
+        if matches!(reasons.as_slice(), [ProofReason::Artifact { .. }, ProofReason::Missing { .. }])
+    ));
+  }
+
+  #[test]
+  fn any_two_contradictions_is_contradicted_with_both_reasons() {
+    let first = artifact(
+      ArtifactAuthority::Authoritative,
+      "r1",
+      ArtifactObservation::Contradicts,
+    );
+    let mut second = first.clone();
+    second.id = ArtifactId::new();
+    if let EvidenceArtifactKind::CommandExecution { check_name, .. } = &mut second.kind {
+      *check_name = Some("second".into());
+    }
+    let contract = EvidenceContract::Any {
+      requirements: vec![
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "behavior".into(),
+          },
+        },
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "second".into(),
+          },
+        },
+      ],
+    };
+    let derivation = derive_proof_state(
+      &ObligationId::from("VO-1"),
+      &contract,
+      [&first, &second],
+      "r1",
+    );
+    assert_eq!(derivation.state, ProofState::Contradicted);
+    assert!(matches!(
+      derivation.reason,
+      ProofReason::Any { reasons }
+        if reasons.iter().all(|reason| matches!(reason, ProofReason::Contradiction { .. }))
+          && reasons.len() == 2
+    ));
+  }
+
+  #[test]
+  fn any_missing_and_stale_is_stale_with_both_reasons() {
+    let item = artifact(
+      ArtifactAuthority::Authoritative,
+      "r1",
+      ArtifactObservation::Supports,
+    );
+    let contract = EvidenceContract::Any {
+      requirements: vec![
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "missing".into(),
+          },
+        },
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "behavior".into(),
+          },
+        },
+      ],
+    };
+    let derivation = derive_proof_state(&ObligationId::from("VO-1"), &contract, [&item], "r2");
+    assert_eq!(derivation.state, ProofState::Stale);
+    assert!(matches!(
+      derivation.reason,
+      ProofReason::Any { reasons }
+        if matches!(reasons.as_slice(), [ProofReason::Missing { .. }, ProofReason::Stale { .. }])
+    ));
+  }
+
+  #[test]
+  fn any_two_missing_branches_is_insufficient_with_both_reasons() {
+    let contract = EvidenceContract::Any {
+      requirements: vec![
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "first".into(),
+          },
+        },
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "second".into(),
+          },
+        },
+      ],
+    };
+    let derivation = derive_proof_state(
+      &ObligationId::from("VO-1"),
+      &contract,
+      std::iter::empty::<&EvidenceArtifact>(),
+      "r1",
+    );
+    assert_eq!(derivation.state, ProofState::Insufficient);
+    assert!(matches!(
+      derivation.reason,
+      ProofReason::Any { reasons }
+        if reasons.iter().all(|reason| matches!(reason, ProofReason::Missing { .. }))
+          && reasons.len() == 2
+    ));
   }
 }

@@ -247,10 +247,6 @@ impl Controller {
   }
 
   async fn run_inner(&self, context: &BackendContext, state: &mut State) -> Result<State> {
-    let mut catalog = self.ensure_catalog(context, state).await?;
-    if !store::catalog_is_approved(&self.cwd, &catalog).await? {
-      return self.review_required(context, state, &catalog).await;
-    }
     if context.config.verification.checks.is_empty() {
       return self
         .block(
@@ -259,6 +255,10 @@ impl Controller {
           "No trusted project verification checks are configured.\n\nConfigure at least one:\n\n[[verification.checks]]\nname = \"project verification\"\ncommand = [\"./verify\"]",
         )
         .await;
+    }
+    let mut catalog = self.ensure_catalog(context, state).await?;
+    if !store::catalog_is_approved(&self.cwd, &catalog).await? {
+      return self.review_required(context, state, &catalog).await;
     }
     let mut evidence_graph = evidence_graph::load(&self.cwd, &catalog).await?;
     store::write_evidence_graph(&self.cwd, &evidence_graph).await?;
@@ -836,6 +836,7 @@ impl Controller {
       .validated_semantic_assessment(
         context,
         catalog,
+        evidence_graph,
         &verified_revision,
         move |inspection_context, feedback| {
           let backend = backend.clone();
@@ -879,10 +880,7 @@ impl Controller {
       &self.cwd,
       evidence_graph,
       &verified_revision,
-      &assessment_worker_id,
       &semantic_report,
-      &context.config,
-      &context.cancel,
     )
     .await?;
     let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
@@ -1150,6 +1148,7 @@ impl Controller {
     &self,
     context: &BackendContext,
     catalog: &RequirementCatalog,
+    evidence_graph: &EvidenceGraphState,
     expected_revision: &str,
     generate: F,
   ) -> Result<SemanticAssessmentReport>
@@ -1173,7 +1172,7 @@ impl Controller {
         .await?;
       let result =
         decision::materialize_semantic_assessment(catalog, proposal).and_then(|result| {
-          verification::validate_semantic_assessment(catalog, &result)?;
+          verification::validate_semantic_assessment(evidence_graph, &result)?;
           Ok(result)
         });
       match result {

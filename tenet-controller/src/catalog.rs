@@ -516,18 +516,20 @@ fn validate_contract(contract: &EvidenceContract, checks: &BTreeSet<&str>) -> Re
       }
     }
     EvidenceContract::Artifact {
+      predicate: EvidencePredicate::ProjectVerification,
+    } => {
+      bail!(
+        "generic project verification is a global completion gate, not an obligation evidence contract"
+      );
+    }
+    EvidenceContract::Artifact {
       predicate: EvidencePredicate::ExecutableEvidence,
     } => {
       bail!("generic executable evidence requires a trusted verifier that is not configured");
     }
     EvidenceContract::Artifact {
       predicate: EvidencePredicate::SourceInspection,
-    } => {
-      bail!(
-        "source inspection is supporting evidence until a controller-evaluable source predicate is configured"
-      );
-    }
-    EvidenceContract::Artifact { .. } => {}
+    } => {}
     EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => {
       if requirements.is_empty() {
         bail!("composite evidence contract must not be empty");
@@ -536,10 +538,9 @@ fn validate_contract(contract: &EvidenceContract, checks: &BTreeSet<&str>) -> Re
         validate_contract(requirement, checks)?;
       }
     }
-    EvidenceContract::HumanAttestation { statement } if statement.trim().is_empty() => {
-      bail!("human attestation statement must not be blank");
+    EvidenceContract::HumanAttestation { .. } => {
+      bail!("human attestation requires a configured controller issuer");
     }
-    EvidenceContract::HumanAttestation { .. } => {}
   }
   Ok(())
 }
@@ -717,15 +718,48 @@ mod tests {
   }
 
   #[test]
-  fn generic_source_inspection_cannot_be_an_authoritative_contract() {
+  fn source_inspection_contract_is_admitted_only_for_fail_closed_adjudication() {
     let contract = EvidenceContract::Artifact {
       predicate: EvidencePredicate::SourceInspection,
     };
+    validate_contract(&contract, &BTreeSet::new())
+      .expect("source inspection can collect supporting evidence but cannot prove");
+  }
+
+  #[test]
+  fn generic_project_verification_cannot_prove_an_obligation() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::ProjectVerification,
+    };
     let error = validate_contract(&contract, &BTreeSet::new())
-      .expect_err("source span alone must not prove a semantic claim");
+      .expect_err("project verification remains an independent completion gate");
     assert!(error
       .to_string()
-      .contains("supporting evidence until a controller-evaluable source predicate"));
+      .contains("global completion gate, not an obligation evidence contract"));
+  }
+
+  #[test]
+  fn human_attestation_requires_a_controller_issuer() {
+    let contract = EvidenceContract::HumanAttestation {
+      statement: "Release approved".into(),
+    };
+    let error = validate_contract(&contract, &BTreeSet::new())
+      .expect_err("human attestation has no configured issuer");
+    assert!(error
+      .to_string()
+      .contains("human attestation requires a configured controller issuer"));
+  }
+
+  #[test]
+  fn generic_executable_evidence_requires_a_trusted_verifier() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::ExecutableEvidence,
+    };
+    let error = validate_contract(&contract, &BTreeSet::new())
+      .expect_err("trusted executable issuer is unavailable");
+    assert!(error
+      .to_string()
+      .contains("requires a trusted verifier that is not configured"));
   }
 
   #[test]

@@ -228,7 +228,7 @@ DONE(R)
 
 > **every required obligation's explicit evidence contract is satisfied by controller-owned authoritative artifacts at the canonical revision, and every independent controller safety gate passes.**
 
-That distinction matters. A bad specification or weak evidence contract can still describe or prove the wrong thing. Human-attestation obligations remain blocked until attested; advisory model judgments cannot bridge missing evidence.
+That distinction matters. A bad specification or weak evidence contract can still describe or prove the wrong thing. Human-attestation and generic trusted-executable contracts are rejected while no controller issuer is configured; advisory model judgments cannot bridge missing evidence.
 
 Tenet does not remove uncertainty from software engineering — it tries to make that uncertainty **explicit, revision-bound, inspectable, and harder to hand-wave away**.
 
@@ -266,13 +266,20 @@ program:      cargo
 arguments:    test password_reset_expiry
 ```
 
-After executing it in the public verification domain, the controller issues an `EvidenceArtifact` containing the immutable revision, verification-run identity, structured execution specification and result, provenance, authority, validity, and dependency surface. The artifact is bound to the obligation; an agent can only refer to its existing `ArtifactId`.
+After executing it in the public verification domain, the controller issues an `EvidenceArtifact` containing the immutable revision, verification-run identity, structured execution specification and result, provenance, authority, validity, and dependency surface. The artifact is bound to the obligation; an agent can only refer to its existing `ArtifactId`. Generic repository-wide project verification remains a separate completion gate and cannot satisfy an arbitrary obligation contract.
 
-Pure deterministic proof evaluation matches current, valid, authoritative artifacts against the contract. Mechanical proof requires no positive assessor verdict. Missing, advisory, stale, wrong-revision, unsupported, or ambiguously affected evidence yields `Insufficient` or `Stale`, never `Proven`.
+Pure deterministic proof evaluation matches current, valid, authoritative artifacts against the contract. Mechanical proof requires no positive assessor verdict. Missing, advisory, supporting, stale, wrong-revision, unsupported, or ambiguously affected evidence yields `Insufficient` or `Stale`, never `Proven`.
 
-Assess is a falsifier and evidence-gap finder. It may propose a configured check, source inspection, or reproduction. Arbitrary agent-proposed executions run only in a disposable worktree and remain advisory. A suspected counterexample becomes authoritative only after controller-approved acquisition confirms it.
+The implemented authority boundary is deliberately narrow:
 
-On repository transitions, dependency impact is conservative: only a directly proven unchanged dependency surface may retain compatibility; affected, possible, or unknown impact becomes stale.
+- **Authoritative:** controller-configured named project checks.
+- **Supporting:** controller-owned immutable source inspection.
+- **Advisory request only:** assessor-proposed reproduction commands; Tenet records the request but does not execute it or issue an artifact.
+- **Unsupported authoritative issuers:** generic trusted verifiers and human attestation. Catalog validation rejects both.
+
+Assess is a falsifier and evidence-gap finder. It may refer only to controller-supplied artifact IDs and may propose configured checks, source inspection, or deferred reproduction. Neither support nor suspicion changes `ProofState` directly.
+
+On repository transitions, invalidation is conservative. Repository-wide and unknown dependency surfaces become stale at an incompatible revision. Although the domain can represent path/blob compatibility, the controller does not currently supply current blob hashes during invalidation, so it does not claim dependency-aware reuse.
 
 **The model proposes and interprets. The controller acquires, validates, and proves.**
 
@@ -346,7 +353,7 @@ A worker receives bounded work and an explicit repository scope, in an isolated 
 
 ### 4 · Verify
 
-The candidate is committed first; project verification then runs against clean disposable checkouts of that candidate revision (for example `cargo test`, `make ci`, or `./scripts/acceptance.sh`). Project-configured checks are controller-authorized and mandatory; they run in declaration order and fail fast. Matching checks may produce obligation-bound authoritative artifacts when admitted by an explicit evidence contract. Agent-proposed commands execute only as advisory observations and cannot self-promote to trusted-verifier provenance.
+The candidate is committed first; project verification then runs against clean disposable checkouts of that candidate revision (for example `cargo test`, `make ci`, or `./scripts/acceptance.sh`). Project-configured checks are controller-authorized and mandatory; they run in declaration order and fail fast. Matching named checks may produce obligation-bound authoritative artifacts when admitted by an explicit evidence contract. Assessor-proposed reproduction commands are deferred advisory requests and are never executed.
 
 ### 5 · Repair
 
@@ -358,7 +365,7 @@ A verified candidate is integrated through the controller rather than being allo
 
 ### 7 · Adjudicate and acquire evidence
 
-When deterministic contracts remain insufficient, a fresh skeptical worker inspects controller-provided artifacts, searches for unsupported leaps or counterexamples, classifies the gap, and may propose evidence acquisition. Its `Supported` or `Contradicted` judgment is advisory. The controller validates proposals, owns acquisition and artifact issuance, reruns pure proof evaluation, and alone decides completion.
+When deterministic contracts remain insufficient, a fresh skeptical worker inspects controller-provided artifacts, searches for unsupported leaps or counterexamples, classifies the gap, and may request evidence. Its `Supported` or `Contradicted` judgment is advisory. The controller may acquire immutable supporting source spans; reproduction requests are retained but not executed. Only configured named-check results currently receive authoritative issuance. Pure proof evaluation and completion remain controller-owned.
 
 ---
 

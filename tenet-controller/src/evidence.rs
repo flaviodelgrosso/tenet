@@ -6,28 +6,25 @@ use std::{
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use tokio_util::sync::CancellationToken;
 
 use tenet_domain::{
-  config::{Config, CONFIG_FILE, TENET_DIR},
+  config::{CONFIG_FILE, TENET_DIR},
   events::{EventSink, RunEvent},
   evidence::{
     EvidenceGraphState, EvidencePolicy, EvidenceProjection, EvidenceValidity,
     SemanticAssessmentReport, VerificationState,
   },
-  ids::{ArtifactId, CriterionId, EvidenceId, RequirementId, VerificationRunId},
+  ids::{ArtifactId, CriterionId, EvidenceId, RequirementId},
   model::RequirementCatalog,
   proof::{
     ArtifactAuthority, ArtifactObservation, ArtifactProvenance, ArtifactValidity,
     DependencySurface, EvidenceArtifact, EvidenceArtifactKind, EvidenceContract, EvidencePredicate,
-    EvidenceRequestProposal, ExecutionDomain, ExecutionObservation,
+    EvidenceRequestProposal,
   },
-  verification::{
-    ProjectVerificationRun, VerificationAuthority, VerificationExecutionRequest, VerificationSpec,
-  },
+  verification::ProjectVerificationRun,
 };
 
-use tenet_runtime::{store, verifier, workspace::WorkspaceManager};
+use tenet_runtime::store;
 
 pub fn graph_from_catalog(catalog: &RequirementCatalog) -> Result<EvidenceGraphState> {
   let mut graph = EvidenceGraphState::new(&catalog.spec_hash);
@@ -134,10 +131,7 @@ pub async fn acquire_assessment_proposals(
   cwd: &Path,
   graph: &mut EvidenceGraphState,
   revision: &str,
-  worker_id: &str,
   report: &SemanticAssessmentReport,
-  config: &Config,
-  cancel: &CancellationToken,
 ) -> Result<Vec<ArtifactId>> {
   let mut acquired = Vec::new();
   for item in &report.assessments {
@@ -181,85 +175,15 @@ pub async fn acquire_assessment_proposals(
             .establish_artifact(artifact)
             .context("record controller source inspection")?;
         }
-        EvidenceRequestProposal::Reproduce { program, args } => {
-          if program.trim().is_empty() {
-            continue;
-          }
-          let manager = WorkspaceManager::new(cwd.to_path_buf(), format!("evidence-{worker_id}"));
-          let workspace = match manager
-            .create_disposable("agent-reproduction", revision)
-            .await
-          {
-            Ok(workspace) => workspace,
-            Err(_) => continue,
-          };
-          let request = VerificationExecutionRequest {
-            run_id: VerificationRunId::new(),
-            obligation_id: item.obligation_id.clone(),
-            spec: VerificationSpec {
-              program: program.clone(),
-              args: args.clone(),
-              working_directory: ".".into(),
-              environment: BTreeMap::new(),
-            },
-            authority: VerificationAuthority::AgentProposed,
-          };
-          let execution =
-            verifier::run_execution_requests_cancelled(&workspace, config, &[request], cancel)
-              .await;
-          let cleanup = manager.remove(&workspace).await;
-          let execution = match (execution, cleanup) {
-            (_, Err(error)) => return Err(error).context("remove evidence workspace"),
-            (Err(error), Ok(())) => {
-              if cancel.is_cancelled() {
-                return Err(error);
-              }
-              continue;
-            }
-            (Ok(execution), Ok(())) => execution,
-          };
-          for result in execution.executions {
-            let artifact = EvidenceArtifact {
-              id: ArtifactId::new(),
-              revision: revision.to_owned(),
-              observed_at: execution.finished_at,
-              authority: ArtifactAuthority::Advisory,
-              provenance: ArtifactProvenance::AgentProposedExecution {
-                worker_role: "assess".into(),
-              },
-              observation: if result.result.exit_code == Some(0) && !result.result.timed_out {
-                ArtifactObservation::Supports
-              } else {
-                ArtifactObservation::Contradicts
-              },
-              kind: EvidenceArtifactKind::CommandExecution {
-                check_name: None,
-                run_id: result.run_id,
-                spec: result.spec,
-                result: ExecutionObservation {
-                  command: result.result.command.clone(),
-                  exit_code: result.result.exit_code,
-                  timed_out: result.result.timed_out,
-                  duration_ms: u64::try_from(result.result.duration_ms).unwrap_or(u64::MAX),
-                  stdout: result.result.stdout,
-                  stderr: result.result.stderr,
-                },
-                domain: ExecutionDomain::Worker,
-                execution_authority: VerificationAuthority::AgentProposed,
-              },
-              obligation_ids: BTreeSet::from([item.obligation_id.clone()]),
-              validity: ArtifactValidity::Valid,
-              dependencies: DependencySurface::Unknown,
-              compatible_revisions: BTreeSet::new(),
-            };
-            acquired.push(artifact.id);
-            graph
-              .establish_artifact(artifact)
-              .context("record advisory reproduction")?;
-          }
+        EvidenceRequestProposal::Reproduce { .. } => {
+          // A reproduction request is assessor advice, not an execution grant. The
+          // persisted assessment retains it for a future controller-owned issuer.
         }
       }
     }
+  }
+  if acquired.is_empty() {
+    return Ok(acquired);
   }
   graph.derive_proofs(revision);
   store::write_evidence_graph(cwd, graph).await?;
@@ -469,5 +393,66 @@ mod tests {
     )
     .await;
     assert!(artifact.is_none());
+  }
+
+  #[tokio::test]
+  async fn reproduce_proposal_is_deferred_without_execution_or_artifact() {
+    use tenet_domain::{
+      evidence::{AcceptanceCriterion, ObligationAssessmentResult, VerificationObligation},
+      ids::{CriterionId, ObligationId, RequirementId},
+      proof::{AssessmentJudgment, EvidenceContract, EvidenceRequestProposal, GapKind, ProofState},
+    };
+
+    let project = tempfile::tempdir().expect("temporary project");
+    let marker = project.path().join("assessor-command-ran");
+    let obligation_id = ObligationId::from("REQ-001/AC-01/VO-01");
+    let mut graph = EvidenceGraphState::new("spec");
+    graph.register_requirement(RequirementId::from("REQ-001"), true);
+    graph
+      .add_criterion(AcceptanceCriterion {
+        id: CriterionId::from("REQ-001/AC-01"),
+        requirement_id: RequirementId::from("REQ-001"),
+        description: "Observable behavior".into(),
+        mandatory: true,
+      })
+      .expect("criterion");
+    graph
+      .add_obligation(VerificationObligation {
+        id: obligation_id.clone(),
+        criterion_id: CriterionId::from("REQ-001/AC-01"),
+        description: "Unsupported proof".into(),
+        required: true,
+        evidence_contract: EvidenceContract::HumanAttestation {
+          statement: "unavailable".into(),
+        },
+      })
+      .expect("obligation");
+    graph.derive_proofs("revision");
+    let report = SemanticAssessmentReport {
+      summary: "request deferred".into(),
+      assessments: vec![ObligationAssessmentResult {
+        obligation_id: obligation_id.clone(),
+        assessment: AssessmentJudgment::Insufficient {
+          reason: "evidence absent".into(),
+          proposals: vec![EvidenceRequestProposal::Reproduce {
+            program: "touch".into(),
+            args: vec![marker.display().to_string()],
+          }],
+          gap_kind: GapKind::Evidence,
+        },
+      }],
+    };
+
+    let acquired = acquire_assessment_proposals(project.path(), &mut graph, "revision", &report)
+      .await
+      .expect("defer proposal");
+
+    assert!(acquired.is_empty());
+    assert!(!marker.exists());
+    assert!(graph.artifacts.is_empty());
+    assert_eq!(
+      graph.proof_derivations[&obligation_id].state,
+      ProofState::Insufficient
+    );
   }
 }
