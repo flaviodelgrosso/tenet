@@ -497,8 +497,8 @@ impl EvidenceGraphState {
       .result
       .authoritative_observation()
       .ok_or(EvidenceGraphError::TrustedExecutionNotAuthoritative)?;
-    let attestation = record
-      .attestation
+    let isolation_report = record
+      .isolation_report
       .clone()
       .ok_or(EvidenceGraphError::TrustedExecutionNotAuthoritative)?;
     let artifact = EvidenceArtifact {
@@ -516,7 +516,7 @@ impl EvidenceGraphState {
         execution_record_hash: record
           .record_hash()
           .map_err(|error| EvidenceGraphError::InvalidArtifact(error.to_string()))?,
-        attestation,
+        isolation_report: Box::new(isolation_report),
         result: record.observation.clone(),
       },
       obligation_ids: bindings,

@@ -246,6 +246,10 @@ impl App {
       .await?
       .context("no active requirement catalog")?;
     let config = read_config(&self.cwd).await?;
+    if storage.has_trusted_authority().await? {
+      store::bootstrap_controller_authority_identity()
+        .context("trusted evidence inspection requires controller authority identity")?;
+    }
     let graph = storage
       .load_evidence_graph(&catalog, &config.verification.trusted_checks)
       .await?;

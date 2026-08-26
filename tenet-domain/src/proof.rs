@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::{
   ids::{ArtifactId, ObligationId, VerificationRunId},
-  trusted_verifier::TrustedExecutionAttestation,
+  trusted_verifier::IsolationCapabilityReport,
   verification::{VerificationAuthority, VerificationSpec},
 };
 
@@ -151,7 +151,8 @@ pub enum EvidenceArtifactKind {
     isolation_policy_hash: String,
     #[serde(rename = "executionRecordHash")]
     execution_record_hash: String,
-    attestation: TrustedExecutionAttestation,
+    #[serde(rename = "isolationReport")]
+    isolation_report: Box<IsolationCapabilityReport>,
     result: ExecutionObservation,
   },
   ProjectVerification {
@@ -221,7 +222,7 @@ impl EvidenceArtifact {
           spec_hash,
           isolation_policy_hash,
           execution_record_hash,
-          attestation,
+          isolation_report,
           result,
           ..
         },
@@ -231,8 +232,21 @@ impl EvidenceArtifact {
           && !spec_hash.is_empty()
           && !isolation_policy_hash.is_empty()
           && !execution_record_hash.is_empty()
-          && !attestation.backend_version.trim().is_empty()
-          && !attestation.image_id.trim().is_empty()
+          && !isolation_report.backend_version.trim().is_empty()
+          && !isolation_report.runtime_identity.trim().is_empty()
+          && !isolation_report.image.trim().is_empty()
+          && !isolation_report.resolved_image_digest.trim().is_empty()
+          && !isolation_report.input_revision.trim().is_empty()
+          && !isolation_report
+            .input_materialization_hash
+            .trim()
+            .is_empty()
+          && isolation_report.max_input_archive_bytes > 0
+          && isolation_report.max_input_tree_bytes > 0
+          && isolation_report.max_input_entries > 0
+          && isolation_report.input_archive_bytes <= isolation_report.max_input_archive_bytes
+          && isolation_report.input_tree_bytes <= isolation_report.max_input_tree_bytes
+          && isolation_report.input_entries <= isolation_report.max_input_entries
           && result.exit_code.is_some()
           && !result.timed_out
           && self.compatible_revisions.is_empty()
@@ -715,9 +729,9 @@ pub enum ArtifactValidationError {
 mod tests {
   use super::*;
   use crate::trusted_verifier::{
-    CandidateFilesystemPolicy, ControlPlanePolicy, EnvironmentPolicy, NetworkPolicy,
-    ProcessNamespacePolicy, RootFilesystemPolicy, TemporaryFilesystemPolicy,
-    TrustedVerifierBackend,
+    CandidateFilesystemPolicy, ControlChannel, EnvironmentPolicy, GuestSecurityProfile,
+    HostRepositoryMountPolicy, IsolationBoundary, NetworkPolicy, TrustedExecutionBackend,
+    WritableStoragePolicy,
   };
 
   fn artifact(
@@ -810,26 +824,37 @@ mod tests {
         spec_hash: "spec-hash".into(),
         isolation_policy_hash: "policy-hash".into(),
         execution_record_hash: "record-hash".into(),
-        attestation: TrustedExecutionAttestation {
-          backend: TrustedVerifierBackend::Docker,
-          backend_version: "27.0".into(),
-          image_id: "sha256:image".into(),
-          control_plane: ControlPlanePolicy::ExclusiveMutualTls,
-          control_plane_fingerprint: "control-plane".into(),
-          candidate_filesystem: CandidateFilesystemPolicy::ReadOnly,
-          root_filesystem: RootFilesystemPolicy::ReadOnly,
-          temporary_filesystem: TemporaryFilesystemPolicy::DisposableTmpfs,
+        isolation_report: Box::new(IsolationCapabilityReport {
+          backend: TrustedExecutionBackend::Microsandbox,
+          backend_version: "microsandbox-rust-sdk/0.6.15".into(),
+          runtime_identity: "local-msb/sdk-protocol-compatible".into(),
+          boundary: IsolationBoundary::HardwareVirtualizedMicroVm,
+          image: format!("example/verifier@sha256:{}", "a".repeat(64)),
+          resolved_image_digest: format!("sha256:{}", "b".repeat(64)),
+          input_revision: revision.into(),
+          input_materialization_hash: "archive-hash".into(),
+          input_archive_bytes: 1024,
+          input_tree_bytes: 512,
+          input_entries: 2,
+          candidate_filesystem: CandidateFilesystemPolicy::PrivateWritable,
+          host_repository_mounts: HostRepositoryMountPolicy::None,
+          writable_storage: WritableStoragePolicy::DisposableSandboxPrivate,
           network: NetworkPolicy::Disabled,
           environment: EnvironmentPolicy::ExplicitOnly,
-          process_namespace: ProcessNamespacePolicy::Private,
-          capabilities_dropped: true,
-          no_new_privileges: true,
+          guest_security_profile: GuestSecurityProfile::Restricted,
+          guest_user: "65532".into(),
           unprivileged_user: true,
-          memory_bytes: 1024 * 1024 * 1024,
-          cpu_millis: 1000,
+          control_channel: ControlChannel::LocalHostDriven,
+          memory_mib: 1024,
+          vcpus: 1,
           process_limit: 256,
-          writable_tmp_bytes: 512 * 1024 * 1024,
-        },
+          writable_root_mib: 4096,
+          max_input_archive_bytes: 536_870_912,
+          max_input_tree_bytes: 268_435_456,
+          max_input_entries: 100_000,
+          execution_timeout_secs: 30,
+          sandbox_lifetime_secs: 60,
+        }),
         result,
       },
       obligation_ids: [ObligationId::from("VO-1")].into(),

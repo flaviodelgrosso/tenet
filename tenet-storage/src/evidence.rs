@@ -735,7 +735,7 @@ impl Storage {
           spec_hash,
           isolation_policy_hash,
           execution_record_hash,
-          attestation,
+          isolation_report,
           result,
         },
       ) => {
@@ -746,7 +746,7 @@ impl Storage {
           && record.spec_hash == *spec_hash
           && record.isolation_policy_hash == *isolation_policy_hash
           && record.record_hash().ok().as_deref() == Some(execution_record_hash.as_str())
-          && record.attestation.as_ref() == Some(attestation)
+          && record.isolation_report.as_ref() == Some(isolation_report)
           && record.observation == *result
           && bindings == artifact.obligation_ids
           && record.can_issue_authority(&persisted_spec);

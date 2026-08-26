@@ -259,13 +259,15 @@ Artifact(TrustedVerifierCheck("private-expiry-boundary"))
 
 `NamedProjectCheck` binds a public project check from `verification.checks`. It runs in a disposable Git worktree. This protects canonical repository mutation, but it is not a security sandbox.
 
-`TrustedVerifierCheck` binds a check from `verification.trusted_checks`. Its specification is controller configuration: a digest-pinned image, structured program and argument vector, repository-relative working directory, explicit environment, timeout, fixed no-network isolation policy, and resource bounds. Agent output cannot create or modify this specification, select the image, add mounts, pass environment, or grant authority.
+`TrustedVerifierCheck` binds a check from `verification.trusted_checks`. Its specification is controller configuration: a digest-pinned image, structured program and argument vector, repository-relative working directory, explicit environment, timeout, fixed no-network isolation policy, guest resource bounds, host archive/tree byte limits, and an input-entry limit. Agent output cannot create or modify this specification, select the image, add mounts, pass environment, or grant authority.
 
-The Docker backend first derives a private Git commit from the exact candidate revision with a controller-generated Dockerfile and Dockerfile-specific ignore policy that excludes only the generated build files, validates that the derivation changed only those generated files, and streams a Git archive over an authenticated Docker Engine API connection to build a content-addressed snapshot image. Git submodules are rejected because their contents require candidate-selected remotes. The execution container receives the candidate only through that immutable image: no candidate or canonical host path is mounted. Tenet creates—not shells into—the container and inspects its configuration before and after execution. Authority admission requires every configured control: no network or effective network attachment, no image pull, a read-only root filesystem, no host mounts, disposable size-bounded `/tmp`, private PID namespace, all Linux capabilities dropped with none re-added, enabled `no-new-privileges`, an unprivileged fixed user, the exact image/program/arguments/working directory/environment, and configured memory, CPU, process, timeout, and temporary-storage limits. The effective container environment must exactly equal `HOME`, `TMPDIR`, and explicitly configured entries; digest-pinned verifier images with additional baked-in `ENV` entries must declare and override those entries in controller configuration or execution fails closed.
+Controller-owned ceilings reject configuration above 16 GiB guest memory, 16 vCPUs, 4,096 processes, 16 GiB writable root storage, 1 GiB archive input, 1 GiB expanded file content, 250,000 input entries, a one-hour verifier lifetime, or 16 MiB of retained output. These are admission ceilings, not defaults; lower per-verifier limits remain fingerprinted authority policy.
 
-After admitted execution, the controller authenticates the complete trusted-execution payload and artifact with an HMAC key derived from the externally supplied mTLS private-key identity and a stable operator-assigned repository authority namespace before persistence, then issues an obligation-bound `Authoritative` artifact with `ControllerTrustedVerifier` provenance. The authenticated context binds the active catalog hash and serialized definitions of every bound obligation, in addition to the exact Git revision, verifier name, specification hash, isolation-policy hash, derived image/backend attestation, mutually authenticated control-plane fingerprint, execution observation, and record hash. Reload accepts authority only when both authentication tags, the persisted controller record, current verifier configuration, current catalog/contract context, and the same externally supplied controller identity and repository namespace match. The namespace is included in the control-plane fingerprint and must be unique per repository authority boundary; copying database rows across repositories or replaying authority after a claim changes cannot preserve authority. Missing or changed identity/namespace rejects prior trusted authority as insufficient. A missing exclusive endpoint, namespace, credential descriptor, TLS failure, missing image, malformed specification, timeout, startup failure, OOM, failed cleanup, weaker inspected capability, or unauthenticated persisted payload issues no authoritative artifact.
+The Microsandbox backend exports the exact requested Git revision, rejects gitlinks and controller-owned `.tenet` content, hashes the deterministic archive, and copies that export into `/workspace` in a disposable local microVM. The guest workspace is private and writable, while the canonical repository is never mounted or exposed to the guest. Tenet uses the typed Microsandbox SDK rather than invoking or parsing the `msb` CLI or constructing shell commands. Through that SDK it requests a digest-pinned OCI image, hardware-virtualized microVM boundary, disabled networking, the restricted guest profile, a numeric non-root user, explicit CPU and memory limits, a process limit, a bounded sandbox lifetime, no secrets, no vsock, and no volumes. It validates the requested and effective configuration before admitting authority. Git submodules are rejected because their contents cannot be materialized without candidate-selected external state.
 
-The exit-code protocol is controller-defined: exit `0` supports the bound claim; a completed non-zero verifier assertion contradicts it. Infrastructure and isolation failures are not semantic contradictions. Deterministic proof evaluation requires a current, valid, authoritative artifact from exactly the named verifier. No positive assessor verdict is required.
+After admitted execution, the controller authenticates the complete trusted-execution payload and artifact with an HMAC key derived from an independently supplied Tenet controller-authority key and a stable operator-assigned repository authority namespace. The sandbox backend never owns or receives this identity. The authenticated context binds the active catalog hash and serialized definitions of every bound obligation, plus the exact Git revision, input archive hash, verifier name, specification hash, isolation-policy hash, controller-observed isolation capability report, image digest, execution observation, and record hash. Reload accepts authority only when both authentication tags, the persisted execution record, catalog context, current revision, and current verifier registry still agree.
+
+The exit-code protocol is controller-defined: exit `0` supports the bound claim and exit `1` is the sole semantic contradiction status. Other statuses—including crash and signal conventions—are infrastructure failures and issue no semantic artifact. Timeouts, isolation failures, and cleanup failures likewise are not contradictions. Deterministic proof evaluation requires a current, valid, authoritative artifact from exactly the named verifier. No positive assessor verdict is required.
 
 The authority classes are:
 
@@ -351,7 +353,7 @@ A worker receives bounded work and an explicit repository scope, in an isolated 
 
 The candidate is committed first. Public project verification runs against clean disposable checkouts of that exact revision. Configured named checks can issue obligation-bound public verification artifacts when an evidence contract names them exactly.
 
-Required trusted-verifier contracts then run through the Docker isolation backend. Tenet materializes the exact revision in a disposable worktree but treats that worktree only as immutable input to the container boundary. The controller verifies the created container's policy before starting it and persists the execution record before issuing authority. A trusted assertion failure creates authoritative contradiction; sandbox or runtime failure creates no semantic evidence. Assessor-proposed reproduction commands remain deferred.
+Required trusted-verifier contracts then run through the local Microsandbox backend. Tenet exports and hashes the exact revision, copies it into the microVM's disposable private filesystem, validates the requested and effective microVM policy, and persists the execution record before issuing authority. A trusted assertion failure creates authoritative contradiction; sandbox, virtualization, timeout, cleanup, or runtime failure creates no semantic evidence. Assessor-proposed reproduction commands remain deferred.
 
 ### 5 · Repair
 
@@ -385,9 +387,9 @@ Tenet treats agent execution and canonical repository state as separate concerns
 
 Coding agents still run under the configured ACP runtime and may inherit host filesystem, network, process, environment, credential, Docker, SSH, or cloud access. Tenet does not claim arbitrary worker execution is safe on a sensitive host.
 
-Trusted verification is a separate boundary. It requires a dedicated remote Docker-compatible Linux daemon whose API accepts only the controller's mTLS client identity, plus a verifier image already present there by immutable digest. Tenet never connects to a local/default Docker socket and never falls back to host execution. The backend streams the named Git revision to that daemon, materializes it as a derived content-addressed image, uses no host bind mounts for candidate input, verifies the created container configuration before and after execution, and fails closed if the daemon cannot attest every requested control. No Docker socket, canonical repository path, `.tenet` state, user home, SSH/cloud credential path, or unrelated host path is mounted.
+Trusted verification is a separate boundary. It uses local Microsandbox microVMs with their own guest Linux kernel and host hardware virtualization. Tenet does not use Microsandbox Cloud and never falls back to host, Docker, Podman, an ordinary worktree, or another execution path. Each verifier receives only an exact controller-exported Git revision in its disposable private guest filesystem. Networking is explicitly disabled; no canonical repository path, `.tenet` state, user home, SSH/cloud credential path, host environment, secret, vsock, or volume is exposed. The verifier runs as the configured numeric non-root guest user under Microsandbox's restricted security profile with explicit CPU, memory, process, root-disk, execution-time, and sandbox-lifetime limits.
 
-This is container isolation backed by an exclusive authenticated control plane, not a VM or protection against every hostile-kernel/container-runtime exploit. The daemon and its client-certificate admission policy are trusted infrastructure; sharing the daemon with worker-accessible credentials invalidates the boundary. Tenet does not provide confidential hidden tests, a secrets broker, Git-submodule verification, or security for ordinary coding-agent work. Trusted verifier assets are not supported in this release rather than exposing controller-side assets to unsandboxed workers.
+Microsandbox is a beta dependency isolated behind `tenet-runtime::TrustedVerifierRunner`. Tenet records the pinned Rust SDK version and SHA-256 identities of the resolved local `msb` and `libkrunfw` runtime files, rejecting an execution if those files change before cleanup completes. The local `msb` binary version remains unreported because the SDK does not expose it through the typed runtime API; file digests bind the observed host runtime but do not authenticate its publisher. The capability report records controller-requested and controller-observed runtime properties; it is not cryptographic remote attestation. Tenet does not claim confidential computing, hardware attestation, verifier-image signature/provenance verification, or protection against a microVM/hypervisor escape. Digest pinning establishes immutable OCI layer identity, not publisher provenance. Git submodules and network-dependent authoritative verifiers are unsupported.
 
 ---
 
@@ -484,30 +486,36 @@ command = ["./test"]
 
 [[verification.trusted_checks]]
 name = "expiry-boundary"
-backend = "docker"
+backend = "microsandbox"
 image = "registry.example/expiry-verifier@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 program = "verify-expiry"
 args = ["--assert-boundary"]
 working_directory = "."
 timeout_secs = 120
 environment = { CI = "true", CARGO_TARGET_DIR = "/tmp/target" }
-resources = { memory_bytes = 1073741824, cpu_millis = 1000, process_limit = 256, writable_tmp_bytes = 536870912 }
+resources = { memory_mib = 1024, vcpus = 1, process_limit = 256, writable_root_mib = 4096, max_input_archive_bytes = 536870912, max_input_tree_bytes = 268435456, max_input_entries = 100000 }
 ```
 
-Every `verification.checks` entry is a mandatory public project gate and runs in declaration order with fail-fast behavior. A `verification.trusted_checks` entry runs during final verification only when an approved obligation contract names it exactly. Trusted names are unique, images must be digest-pinned and preloaded on the dedicated daemon, the backend is currently `docker`, and network is always disabled. Missing exclusive Docker connectivity or mTLS credentials, missing images, unsupported isolation, and infrastructure failures stop verification without issuing evidence. Complex trusted pipelines belong inside the pinned verifier image.
+Every `verification.checks` entry is a mandatory public project gate and runs in declaration order with fail-fast behavior. A `verification.trusted_checks` entry runs during final verification only when an approved obligation contract names it exactly. Trusted names are unique, images must be OCI digest references, the only production backend is `microsandbox`, and network access is always disabled. Missing local Microsandbox or hardware-virtualization support, missing images, unsupported isolation, timeouts, cleanup failures, and other infrastructure failures stop verification without issuing evidence. Complex trusted pipelines belong inside the pinned verifier image.
 
-The trusted Docker endpoint and mTLS identity are controller-launch inputs, not repository configuration. Supply the HTTPS origin and three already-open descriptors; Tenet reads and closes the descriptors and removes their environment names while constructing the controller, before any agent operation:
+The controller-authority identity is a Tenet launch input independent of Microsandbox. Supply a stable namespace and an already-open descriptor containing secret key material:
 
 ```bash
-TENET_TRUSTED_DOCKER_HOST=https://verifier.internal:2376 \
-TENET_TRUSTED_AUTHORITY_NAMESPACE=production-password-service \
-TENET_TRUSTED_DOCKER_CA_FD=3 \
-TENET_TRUSTED_DOCKER_CERT_FD=4 \
-TENET_TRUSTED_DOCKER_KEY_FD=5 \
-tenet run 3<docker-ca.pem 4<tenet-client-cert.pem 5<tenet-client-key.pem
+TENET_CONTROLLER_AUTHORITY_NAMESPACE=production-password-service \
+TENET_CONTROLLER_AUTHORITY_KEY_FD=3 \
+tenet run 3<tenet-controller-authority.key
 ```
 
-The private key is parsed directly from its descriptor into the in-process TLS client. It and `TENET_TRUSTED_AUTHORITY_NAMESPACE` are consumed before agent work begins and are never serialized into `tenet.toml`, `.tenet`, a worker workspace, a subprocess command line, or a worker environment. The namespace is not a secret, but it must be a stable, operator-controlled identifier unique to this repository authority boundary; changing it intentionally invalidates previously persisted trusted authority. The endpoint must expose only TLS, require client certificates, and authorize this controller identity as its sole mutation client for the verifier lifecycle.
+Tenet reads and closes the descriptor, removes both environment names before agent work, derives the persistence authentication key in memory, and never serializes the supplied key or namespace into `tenet.toml`, SQLite, a worker workspace, a subprocess argument, the microVM, or a verifier environment. The namespace is not secret, but it must remain stable and unique to this repository authority boundary. A missing or changed identity fails closed when trusted authority must be created or validated. `tenet evidence dump` requires the same identity when trusted evidence exists and returns an explicit error without it.
+
+Run the real backend acceptance test on a supported hardware-virtualization host before release. It starts a local microVM from an architecture-matched pinned Alpine manifest, verifies the exact exported revision, non-root UID, absent planted host secret, unavailable outbound guest network, private writable workspace, authoritative-capable execution record, unchanged canonical repository, and confirmed sandbox cleanup:
+
+```bash
+TENET_MICROSANDBOX_PLANTED_SECRET=must-not-enter-guest \
+cargo test -p tenet-runtime trusted_verifier::tests::local_microsandbox_acceptance_establishes_the_real_boundary -- --ignored --exact
+```
+
+An ignored or skipped result is not evidence that the Microsandbox boundary works.
 
 ### 6. Run
 

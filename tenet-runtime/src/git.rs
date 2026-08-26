@@ -5,7 +5,10 @@ use std::{
 };
 
 use anyhow::{anyhow, bail, Context, Result};
-use tokio::process::Command;
+use tokio::{
+  io::{AsyncReadExt, AsyncWriteExt},
+  process::Command,
+};
 
 use tenet_domain::model::RepositoryChange;
 
@@ -105,27 +108,63 @@ pub async fn path_exists(cwd: &Path, revision: &str, path: &str) -> Result<bool>
   )
 }
 
-pub async fn archive(cwd: &Path, revision: &str) -> Result<std::fs::File> {
-  let mut archive = tempfile::tempfile().context("create anonymous Git archive")?;
-  let output = archive.try_clone().context("clone anonymous Git archive")?;
-  let status = Command::new("git")
+pub async fn archive(cwd: &Path, revision: &str, max_bytes: u64) -> Result<(std::fs::File, u64)> {
+  let archive = tempfile::tempfile().context("create anonymous Git archive")?;
+  let mut archive = tokio::fs::File::from_std(archive);
+  let mut child = Command::new("git")
     .env("GIT_CONFIG_NOSYSTEM", "1")
     .env("GIT_CONFIG_GLOBAL", "/dev/null")
     .args(["archive", "--format=tar", revision])
     .current_dir(cwd)
-    .stdout(Stdio::from(output))
+    .stdout(Stdio::piped())
     .stderr(Stdio::piped())
-    .output()
+    .spawn()
+    .context("spawn git archive")?;
+  let mut stdout = child.stdout.take().context("capture git archive output")?;
+  let stderr = child.stderr.take().context("capture git archive errors")?;
+  let stderr_task = tokio::spawn(async move {
+    let mut bytes = Vec::new();
+    stderr
+      .take(64 * 1024)
+      .read_to_end(&mut bytes)
+      .await
+      .map(|_| bytes)
+  });
+  let mut total = 0_u64;
+  let mut buffer = [0_u8; 64 * 1024];
+  loop {
+    let read = stdout.read(&mut buffer).await.context("read git archive")?;
+    if read == 0 {
+      break;
+    }
+    total = total
+      .checked_add(read as u64)
+      .context("Git archive size overflow")?;
+    if total > max_bytes {
+      let _ = child.kill().await;
+      let _ = child.wait().await;
+      let _ = stderr_task.await;
+      bail!("Git archive exceeds trusted input limit of {max_bytes} bytes");
+    }
+    archive
+      .write_all(&buffer[..read])
+      .await
+      .context("write bounded Git archive")?;
+  }
+  let status = child.wait().await.context("run git archive")?;
+  let stderr = stderr_task
     .await
-    .context("run git archive")?;
-  if !status.status.success() {
+    .context("join git archive stderr reader")??;
+  if !status.success() {
     bail!(
       "git archive failed: {}",
-      String::from_utf8_lossy(&status.stderr).trim()
+      String::from_utf8_lossy(&stderr).trim()
     );
   }
+  archive.flush().await.context("flush Git archive")?;
+  let mut archive = archive.into_std().await;
   archive.seek(SeekFrom::Start(0))?;
-  Ok(archive)
+  Ok((archive, total))
 }
 
 pub async fn remove_worktree(repository: &Path, workspace: &Path) -> Result<()> {
@@ -275,9 +314,11 @@ fn parse_status(output: &str) -> Vec<RepositoryChange> {
 
 #[cfg(test)]
 mod tests {
+  use std::process::Command as StdCommand;
+
   use uuid::Uuid;
 
-  use super::head;
+  use super::{archive, head};
 
   #[tokio::test]
   async fn head_requires_an_existing_repository_with_a_commit() {
@@ -289,5 +330,53 @@ mod tests {
 
     assert!(error
       .contains("worktree execution requires an existing Git repository with at least one commit"));
+  }
+
+  #[tokio::test]
+  async fn archive_streams_the_exact_commit_tree() {
+    let repository = tempfile::tempdir().expect("temporary Git repository");
+    let run = |arguments: &[&str]| {
+      let output = StdCommand::new("git")
+        .arg("-C")
+        .arg(repository.path())
+        .args(arguments)
+        .output()
+        .expect("run fixture Git command");
+      assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        arguments,
+        String::from_utf8_lossy(&output.stderr)
+      );
+    };
+    run(&["init", "-q"]);
+    run(&["config", "user.email", "tenet@example.invalid"]);
+    run(&["config", "user.name", "Tenet Test"]);
+    std::fs::write(repository.path().join("exact.txt"), "revision-bound\n").expect("write fixture");
+    run(&["add", "exact.txt"]);
+    run(&["commit", "-q", "-m", "fixture"]);
+    let revision = head(repository.path()).await.expect("fixture revision");
+    let error = archive(repository.path(), &revision, 1)
+      .await
+      .expect_err("archive must respect controller byte limit");
+    assert!(error.to_string().contains("exceeds trusted input limit"));
+
+    let (file, bytes) = archive(repository.path(), &revision, 1024 * 1024)
+      .await
+      .expect("Git archive");
+    assert!(bytes > 0);
+    assert_eq!(file.metadata().expect("archive metadata").len(), bytes);
+    let paths = tar::Archive::new(file)
+      .entries()
+      .expect("archive entries")
+      .map(|entry| {
+        entry
+          .expect("archive entry")
+          .path()
+          .expect("archive path")
+          .into_owned()
+      })
+      .collect::<Vec<_>>();
+    assert!(paths.contains(&std::path::PathBuf::from("exact.txt")));
   }
 }

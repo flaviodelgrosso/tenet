@@ -43,11 +43,11 @@ use tenet_domain::{
     ProofState,
   },
   trusted_verifier::{
-    CandidateFilesystemPolicy, ControlPlanePolicy, EnvironmentPolicy, NetworkPolicy,
-    ProcessNamespacePolicy, RootFilesystemPolicy, TemporaryFilesystemPolicy,
-    TrustedExecutionAttestation, TrustedExecutionRecord, TrustedExecutionResult,
-    TrustedIsolationPolicy, TrustedResourcePolicy, TrustedVerificationSpec, TrustedVerifierBackend,
-    TrustedVerifierProtocol,
+    CandidateFilesystemPolicy, ControlChannel, EnvironmentPolicy, GuestSecurityProfile,
+    HostRepositoryMountPolicy, IsolationBoundary, IsolationCapabilityReport, NetworkPolicy,
+    TrustedExecutionBackend, TrustedExecutionRecord, TrustedExecutionResult,
+    TrustedIsolationPolicy, TrustedResourcePolicy, TrustedVerificationSpec,
+    TrustedVerifierProtocol, WritableStoragePolicy,
   },
   verification::ProjectVerificationRun,
   worker::{derive_normative_fragments, CatalogCoverage},
@@ -3318,7 +3318,7 @@ async fn mechanical_proof_skips_unneeded_assessor_workspace_cleanup() {
 fn trusted_verification_spec() -> TrustedVerificationSpec {
   TrustedVerificationSpec {
     name: "expiry-boundary".into(),
-    backend: TrustedVerifierBackend::Docker,
+    backend: TrustedExecutionBackend::Microsandbox,
     image: format!("example/verifier@sha256:{}", "a".repeat(64)),
     program: "verify".into(),
     args: Vec::new(),
@@ -3366,6 +3366,7 @@ impl TrustedVerifierRunner for FakeTrustedVerifier {
     let record = TrustedExecutionRecord {
       id: VerificationRunId::new(),
       revision: revision.into(),
+      input_materialization_hash: "test-archive-hash".into(),
       verifier_name: spec.name.clone(),
       spec_hash: spec
         .fingerprint()
@@ -3373,25 +3374,36 @@ impl TrustedVerifierRunner for FakeTrustedVerifier {
       isolation_policy_hash: spec
         .isolation_policy_hash()
         .map_err(|error| TrustedVerifierError::InvalidTrustedVerifierSpec(error.to_string()))?,
-      attestation: Some(TrustedExecutionAttestation {
-        backend: TrustedVerifierBackend::Docker,
-        backend_version: "test-docker".into(),
-        image_id: "sha256:test-image".into(),
-        control_plane: ControlPlanePolicy::ExclusiveMutualTls,
-        control_plane_fingerprint: "control-plane".into(),
-        candidate_filesystem: CandidateFilesystemPolicy::ReadOnly,
-        root_filesystem: RootFilesystemPolicy::ReadOnly,
-        temporary_filesystem: TemporaryFilesystemPolicy::DisposableTmpfs,
+      isolation_report: Some(IsolationCapabilityReport {
+        backend: TrustedExecutionBackend::Microsandbox,
+        backend_version: "test-microsandbox-sdk".into(),
+        runtime_identity: "test-local-runtime".into(),
+        boundary: IsolationBoundary::HardwareVirtualizedMicroVm,
+        image: spec.image.clone(),
+        resolved_image_digest: format!("sha256:{}", "b".repeat(64)),
+        input_revision: revision.into(),
+        input_materialization_hash: "test-archive-hash".into(),
+        input_archive_bytes: 1024,
+        input_tree_bytes: 512,
+        input_entries: 2,
+        candidate_filesystem: CandidateFilesystemPolicy::PrivateWritable,
+        host_repository_mounts: HostRepositoryMountPolicy::None,
+        writable_storage: WritableStoragePolicy::DisposableSandboxPrivate,
         network: NetworkPolicy::Disabled,
         environment: EnvironmentPolicy::ExplicitOnly,
-        process_namespace: ProcessNamespacePolicy::Private,
-        capabilities_dropped: true,
-        no_new_privileges: true,
+        guest_security_profile: GuestSecurityProfile::Restricted,
+        guest_user: "65532".into(),
         unprivileged_user: true,
-        memory_bytes: spec.resources.memory_bytes,
-        cpu_millis: spec.resources.cpu_millis,
+        control_channel: ControlChannel::LocalHostDriven,
+        memory_mib: spec.resources.memory_mib,
+        vcpus: spec.resources.vcpus,
         process_limit: spec.resources.process_limit,
-        writable_tmp_bytes: spec.resources.writable_tmp_bytes,
+        writable_root_mib: spec.resources.writable_root_mib,
+        max_input_archive_bytes: spec.resources.max_input_archive_bytes,
+        max_input_tree_bytes: spec.resources.max_input_tree_bytes,
+        max_input_entries: spec.resources.max_input_entries,
+        execution_timeout_secs: spec.timeout_secs,
+        sandbox_lifetime_secs: spec.timeout_secs + 30,
       }),
       started_at: now,
       finished_at: now,
@@ -3428,7 +3440,7 @@ impl TrustedVerifierRunner for UnavailableTrustedVerifier {
     _cancel: &CancellationToken,
   ) -> std::result::Result<TrustedVerifierExecution, TrustedVerifierError> {
     Err(TrustedVerifierError::TrustedVerifierInfrastructureFailure(
-      "container startup failed".into(),
+      "microVM startup failed".into(),
     ))
   }
 }
@@ -3559,7 +3571,7 @@ async fn trusted_verifier_infrastructure_failure_issues_no_semantic_artifact() {
     .await
     .expect("graph reload");
 
-  assert!(error.to_string().contains("container startup failed"));
+  assert!(error.to_string().contains("microVM startup failed"));
   assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
   assert!(!graph.artifacts.values().any(|artifact| matches!(
     artifact.provenance,

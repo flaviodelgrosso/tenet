@@ -9,11 +9,11 @@ use tenet_domain::{
     ExecutionObservation, ProofState,
   },
   trusted_verifier::{
-    CandidateFilesystemPolicy, ControlPlanePolicy, EnvironmentPolicy, NetworkPolicy,
-    ProcessNamespacePolicy, RootFilesystemPolicy, TemporaryFilesystemPolicy,
-    TrustedExecutionAttestation, TrustedExecutionRecord, TrustedExecutionResult,
-    TrustedIsolationPolicy, TrustedResourcePolicy, TrustedVerificationSpec, TrustedVerifierBackend,
-    TrustedVerifierProtocol,
+    CandidateFilesystemPolicy, ControlChannel, EnvironmentPolicy, GuestSecurityProfile,
+    HostRepositoryMountPolicy, IsolationBoundary, IsolationCapabilityReport, NetworkPolicy,
+    TrustedExecutionBackend, TrustedExecutionRecord, TrustedExecutionResult,
+    TrustedIsolationPolicy, TrustedResourcePolicy, TrustedVerificationSpec,
+    TrustedVerifierProtocol, WritableStoragePolicy,
   },
   verification::{CommandResult, ProjectCheckResult, ProjectVerificationRun, VerificationSpec},
 };
@@ -180,7 +180,7 @@ async fn forged_controller_execution_cannot_be_persisted() {
 fn trusted_spec() -> TrustedVerificationSpec {
   TrustedVerificationSpec {
     name: "expiry-boundary".into(),
-    backend: TrustedVerifierBackend::Docker,
+    backend: TrustedExecutionBackend::Microsandbox,
     image: format!("example/verifier@sha256:{}", "a".repeat(64)),
     program: "verify".into(),
     args: Vec::new(),
@@ -206,28 +206,40 @@ fn trusted_record(
   TrustedExecutionRecord {
     id: VerificationRunId::new(),
     revision: "revision-1".into(),
+    input_materialization_hash: "archive-hash".into(),
     verifier_name: spec.name.clone(),
     spec_hash: spec.fingerprint().expect("spec hash"),
     isolation_policy_hash: spec.isolation_policy_hash().expect("policy hash"),
-    attestation: Some(TrustedExecutionAttestation {
-      backend: TrustedVerifierBackend::Docker,
-      backend_version: "27.0".into(),
-      image_id: "sha256:image".into(),
-      control_plane: ControlPlanePolicy::ExclusiveMutualTls,
-      control_plane_fingerprint: "control-plane".into(),
-      candidate_filesystem: CandidateFilesystemPolicy::ReadOnly,
-      root_filesystem: RootFilesystemPolicy::ReadOnly,
-      temporary_filesystem: TemporaryFilesystemPolicy::DisposableTmpfs,
+    isolation_report: Some(IsolationCapabilityReport {
+      backend: TrustedExecutionBackend::Microsandbox,
+      backend_version: "microsandbox-rust-sdk/0.6.15".into(),
+      runtime_identity: "local-msb/sdk-protocol-compatible".into(),
+      boundary: IsolationBoundary::HardwareVirtualizedMicroVm,
+      image: spec.image.clone(),
+      resolved_image_digest: format!("sha256:{}", "b".repeat(64)),
+      input_revision: "revision-1".into(),
+      input_materialization_hash: "archive-hash".into(),
+      input_archive_bytes: 1024,
+      input_tree_bytes: 512,
+      input_entries: 2,
+      candidate_filesystem: CandidateFilesystemPolicy::PrivateWritable,
+      host_repository_mounts: HostRepositoryMountPolicy::None,
+      writable_storage: WritableStoragePolicy::DisposableSandboxPrivate,
       network: NetworkPolicy::Disabled,
       environment: EnvironmentPolicy::ExplicitOnly,
-      process_namespace: ProcessNamespacePolicy::Private,
-      capabilities_dropped: true,
-      no_new_privileges: true,
+      guest_security_profile: GuestSecurityProfile::Restricted,
+      guest_user: "65532".into(),
       unprivileged_user: true,
-      memory_bytes: spec.resources.memory_bytes,
-      cpu_millis: spec.resources.cpu_millis,
+      control_channel: ControlChannel::LocalHostDriven,
+      memory_mib: spec.resources.memory_mib,
+      vcpus: spec.resources.vcpus,
       process_limit: spec.resources.process_limit,
-      writable_tmp_bytes: spec.resources.writable_tmp_bytes,
+      writable_root_mib: spec.resources.writable_root_mib,
+      max_input_archive_bytes: spec.resources.max_input_archive_bytes,
+      max_input_tree_bytes: spec.resources.max_input_tree_bytes,
+      max_input_entries: spec.resources.max_input_entries,
+      execution_timeout_secs: spec.timeout_secs,
+      sandbox_lifetime_secs: spec.timeout_secs + 30,
     }),
     started_at: now,
     finished_at: now,
@@ -430,4 +442,20 @@ async fn tampered_trusted_execution_record_fails_authentication() {
     loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
     ProofState::Insufficient
   );
+}
+
+#[test]
+fn changed_controller_authority_identity_is_rejected() {
+  install_controller_authority_key("tenet-storage-tests", b"tenet-storage-test-authority")
+    .expect("install stable test authority identity");
+
+  let error = install_controller_authority_key(
+    "different-repository-authority",
+    b"different-controller-authority-key",
+  )
+  .expect_err("changed authority identity must fail closed");
+
+  assert!(error
+    .to_string()
+    .contains("controller authority identity changed"));
 }

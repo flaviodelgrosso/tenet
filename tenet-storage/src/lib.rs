@@ -282,6 +282,21 @@ impl Storage {
   pub fn pool(&self) -> &SqlitePool {
     &self.pool
   }
+  /// Returns whether persisted trusted authority requires external identity validation.
+  pub async fn has_trusted_authority(&self) -> Result<bool, StorageError> {
+    let executions =
+      sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trusted_verifier_executions")
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StorageError::from_sqlx)?;
+    let artifacts = sqlx::query_scalar::<_, i64>(
+      "SELECT COUNT(*) FROM evidence_artifacts WHERE authority_mac IS NOT NULL",
+    )
+    .fetch_one(&self.pool)
+    .await
+    .map_err(StorageError::from_sqlx)?;
+    Ok(executions > 0 || artifacts > 0)
+  }
 
   /// Runs SQLite's bounded `quick_check` diagnostic.
   ///

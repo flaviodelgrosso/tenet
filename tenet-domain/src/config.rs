@@ -23,6 +23,8 @@ const DEFAULT_COMPLETION_RETRIES: u32 = 2;
 const DEFAULT_TURN_TIMEOUT_SECS: u64 = 900;
 const DEFAULT_VERIFICATION_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_VERIFICATION_TIMEOUT_SECS: u64 = 3_600;
+const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_STAGNATION_LIMIT: u32 = 3;
 const DEFAULT_MAX_PARALLEL_WORKERS: usize = 1;
 
@@ -368,8 +370,11 @@ impl Default for VerificationConfig {
 
 impl VerificationConfig {
   fn validate(&self) -> Result<()> {
-    if self.timeout_secs == 0 {
-      anyhow::bail!("verification.timeout_secs must be at least 1");
+    if !(1..=MAX_VERIFICATION_TIMEOUT_SECS).contains(&self.timeout_secs) {
+      anyhow::bail!("verification.timeout_secs is outside controller bounds");
+    }
+    if self.max_output_bytes > MAX_OUTPUT_BYTES {
+      anyhow::bail!("verification.max_output_bytes exceeds the controller limit");
     }
     let mut trusted_names = BTreeSet::new();
     for check in &self.trusted_checks {
@@ -393,8 +398,11 @@ impl VerificationConfig {
       if check.working_directory.trim().is_empty() {
         anyhow::bail!("project verification check working_directory must not be blank");
       }
-      if check.timeout_secs == Some(0) {
-        anyhow::bail!("project verification check timeout_secs must be at least 1");
+      if check
+        .timeout_secs
+        .is_some_and(|timeout| !(1..=MAX_VERIFICATION_TIMEOUT_SECS).contains(&timeout))
+      {
+        anyhow::bail!("project verification check timeout_secs is outside controller bounds");
       }
     }
     Ok(())
@@ -575,7 +583,7 @@ mod tests {
 
   use super::{
     config_path, config_schema_path, ensure_config, read_config, Config, CONFIG_SCHEMA_DIRECTIVE,
-    CONFIG_SCHEMA_FILE, TENET_DIR,
+    CONFIG_SCHEMA_FILE, MAX_OUTPUT_BYTES, TENET_DIR,
   };
   use crate::model::WorkerRole;
 
@@ -955,6 +963,17 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn read_config_rejects_excessive_verification_output_retention() {
+    let text = serialized_config(
+      |config| config.verification.max_output_bytes = MAX_OUTPUT_BYTES + 1,
+      "",
+    );
+    let error = read_error(text).await;
+
+    assert!(error.contains("verification.max_output_bytes exceeds the controller limit"));
+  }
+
+  #[tokio::test]
   async fn read_config_rejects_blank_registry_identity() {
     let text = serialized_config(|config| config.agent.id = Some(" \t".into()), "");
     let error = read_error(text).await;
@@ -1047,7 +1066,7 @@ mod tests {
   fn structured_trusted_check_deserializes_with_enforced_defaults() {
     let image = format!("example/verifier@sha256:{}", "a".repeat(64));
     let text = format!(
-      "version = 1\nspec_file = \"spec.md\"\nmax_cycles = 25\nmax_repair_attempts = 3\n[agent]\nid = \"test-agent\"\n[[verification.trusted_checks]]\nname = \"expiry-boundary\"\nbackend = \"docker\"\nimage = \"{image}\"\nprogram = \"verify\"\nargs = [\"--expiry\"]\n"
+      "version = 1\nspec_file = \"spec.md\"\nmax_cycles = 25\nmax_repair_attempts = 3\n[agent]\nid = \"test-agent\"\n[[verification.trusted_checks]]\nname = \"expiry-boundary\"\nbackend = \"microsandbox\"\nimage = \"{image}\"\nprogram = \"verify\"\nargs = [\"--expiry\"]\n"
     );
 
     let config: Config = toml::from_str(&text).expect("structured trusted check");
@@ -1062,7 +1081,7 @@ mod tests {
   fn duplicate_trusted_check_names_are_rejected() {
     let image = format!("example/verifier@sha256:{}", "a".repeat(64));
     let check = format!(
-      "[[verification.trusted_checks]]\nname = \"expiry-boundary\"\nbackend = \"docker\"\nimage = \"{image}\"\nprogram = \"verify\"\n"
+      "[[verification.trusted_checks]]\nname = \"expiry-boundary\"\nbackend = \"microsandbox\"\nimage = \"{image}\"\nprogram = \"verify\"\n"
     );
     let text = format!(
       "version = 1\nspec_file = \"spec.md\"\nmax_cycles = 25\nmax_repair_attempts = 3\n[agent]\nid = \"test-agent\"\n{check}{check}"

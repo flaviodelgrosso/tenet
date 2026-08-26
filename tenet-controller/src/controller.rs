@@ -38,7 +38,7 @@ use tenet_runtime::{
   scheduler::{CandidateExecutor, ExecutionUpdate, Scheduler},
   store::{self, RunLock},
   trusted_verifier::{
-    run_isolated_trusted_verifier, DockerTrustedVerifier, TrustedVerifierRequest,
+    run_isolated_trusted_verifier, MicrosandboxTrustedVerifier, TrustedVerifierRequest,
     TrustedVerifierRunner,
   },
   verifier,
@@ -96,7 +96,7 @@ impl Controller {
       cwd,
       backend,
       events,
-      Arc::new(DockerTrustedVerifier::default()),
+      Arc::new(MicrosandboxTrustedVerifier::default()),
     )
   }
 
