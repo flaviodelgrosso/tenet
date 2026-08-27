@@ -265,7 +265,7 @@ fn generated_skill_is_portable_concise_and_not_authoritative() {
     .expect("read skill");
 
   assert!(skill.starts_with("---\nname: tenet\n"));
-  assert!(skill.contains("tenet-skill-version: \"3\""));
+  assert!(skill.contains("tenet-skill-version: \"4\""));
   assert!(skill.contains("On `pending_approval`, show the user the exact proposal"));
   assert!(skill.contains("every requirement and obligation ID and statement"));
   assert!(skill.contains("every primary verifier mapping"));
@@ -278,6 +278,10 @@ fn generated_skill_is_portable_concise_and_not_authoritative() {
   assert!(skill
     .contains("tenet gate --authority-revision <authority-sha> --revision <candidate-sha> --json"));
   assert!(skill.contains("exact (A, R) pair"));
+  assert!(skill.contains("tenet policy schema --json"));
+  assert!(skill.contains("`strings`, `nm`, `objdump`"));
+  assert!(skill.contains("never infer hidden configuration"));
+  assert!(skill.contains("capability absent from this CLI schema is unsupported"));
   assert!(skill.lines().count() < 45);
   for forbidden in [
     "Codex",
@@ -290,6 +294,41 @@ fn generated_skill_is_portable_concise_and_not_authoritative() {
   ] {
     assert!(!skill.contains(forbidden), "skill contains {forbidden}");
   }
+}
+
+#[test]
+fn policy_schema_exposes_every_supported_verifier_field() {
+  let repository = Repository::new();
+  let schema = success_json(repository.tenet(&["policy", "schema", "--json"]));
+  let verifier = &schema["$defs"]["VerifierSpec"];
+  let properties = verifier["properties"]
+    .as_object()
+    .expect("verifier properties");
+
+  for field in [
+    "id",
+    "argv",
+    "cwd",
+    "timeout_seconds",
+    "max_output_bytes",
+    "env",
+    "environment_mode",
+    "authority",
+    "oracle_path",
+  ] {
+    assert!(
+      properties.contains_key(field),
+      "missing verifier field {field}"
+    );
+  }
+  assert_eq!(
+    schema["$defs"]["VerifierAuthority"]["enum"],
+    json!(["project", "authority_snapshot"])
+  );
+  assert_eq!(
+    schema["$defs"]["EnvironmentMode"]["enum"],
+    json!(["ambient", "declared"])
+  );
 }
 
 #[test]

@@ -25,6 +25,9 @@ impl Cli {
         | ContractCommand::Propose { json, .. }
         | ContractCommand::Approve { json, .. } => *json,
       },
+      Command::Policy { command } => match command {
+        PolicyCommand::Schema { json } => *json,
+      },
     }
   }
 }
@@ -47,6 +50,11 @@ pub enum Command {
   Contract {
     #[command(subcommand)]
     command: ContractCommand,
+  },
+  /// Inspect the verification-policy configuration interface.
+  Policy {
+    #[command(subcommand)]
+    command: PolicyCommand,
   },
   /// Evaluate one exact candidate commit under one exact authority commit.
   Gate {
@@ -88,6 +96,15 @@ pub enum ContractCommand {
     proposal: String,
     #[arg(long)]
     digest: String,
+    #[arg(long)]
+    json: bool,
+  },
+}
+
+#[derive(Subcommand)]
+pub enum PolicyCommand {
+  /// Emit the verification-policy JSON Schema generated from Tenet's Rust types.
+  Schema {
     #[arg(long)]
     json: bool,
   },

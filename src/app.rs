@@ -18,12 +18,14 @@ use tenet_domain::{
     ArtifactAuthority, ArtifactProvenance, ArtifactValidity, DependencySurface, EvidenceArtifact,
     EvidenceEffect, GitObjectId, OracleIdentity, VerifierEvidence,
   },
-  policy::{validate_policy, VerificationPolicy, VerifierAuthority, VerifierSpec},
+  policy::{
+    validate_policy, RepositoryConfig, VerificationPolicy, VerifierAuthority, VerifierSpec,
+  },
 };
 
 use crate::{
   audit::AuditState,
-  cli::{Cli, Command, ContractCommand},
+  cli::{Cli, Command, ContractCommand, PolicyCommand},
   repository::{
     self, atomic_write, discover_root, load_policy, policy_digest, specification_digest,
     MaterializedRevision, CONFIG_PATH, CONTRACT_PATH, SKILL_PATH, TENET_DIR,
@@ -41,6 +43,7 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     Command::Init { spec, json } => initialize(&cwd, &spec, json),
     Command::Status { json } => status(&cwd, json),
     Command::Contract { command } => contract(&cwd, command),
+    Command::Policy { command } => policy(command),
     Command::Gate {
       authority_revision,
       revision,
@@ -165,6 +168,16 @@ fn contract(cwd: &Path, command: ContractCommand) -> Result<ExitCode> {
       digest,
       json,
     } => approve(cwd, &proposal, &digest, json),
+  }
+}
+
+fn policy(command: PolicyCommand) -> Result<ExitCode> {
+  match command {
+    PolicyCommand::Schema { .. } => {
+      let schema = schema_for!(RepositoryConfig);
+      println!("{}", serde_json::to_string_pretty(&schema)?);
+      Ok(ExitCode::SUCCESS)
+    }
   }
 }
 
