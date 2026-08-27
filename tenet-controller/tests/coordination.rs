@@ -894,7 +894,7 @@ async fn configured_controller(
   backend: Arc<FakeBackend>,
   max_parallel_workers: usize,
 ) -> (Controller, mpsc::UnboundedReceiver<RunEvent>) {
-  store::install_controller_authority_key(
+  tenet_storage::install_controller_authority_key(
     "tenet-controller-tests",
     b"tenet-controller-test-authority",
   )
@@ -968,7 +968,7 @@ async fn run_after_approval_if_required(
 
 #[tokio::test]
 async fn manual_verify_runs_project_suite_without_requirement_catalog() {
-  store::install_controller_authority_key(
+  tenet_storage::install_controller_authority_key(
     "tenet-controller-tests",
     b"tenet-controller-test-authority",
   )
@@ -2827,7 +2827,7 @@ async fn write_recovery_transaction(
   new_head: &str,
   phase: IntegrationPhase,
 ) -> IntegrationTransaction {
-  store::install_controller_authority_key(
+  tenet_storage::install_controller_authority_key(
     "tenet-controller-tests",
     b"tenet-controller-test-authority",
   )
@@ -3633,7 +3633,7 @@ async fn configured_trusted_controller(
   backend: Arc<FakeBackend>,
   trusted: Arc<dyn TrustedVerifierRunner>,
 ) -> Controller {
-  store::install_controller_authority_key(
+  tenet_storage::install_controller_authority_key(
     "tenet-controller-tests",
     b"tenet-controller-test-authority",
   )
@@ -3949,7 +3949,7 @@ async fn unchanged_scoped_dependencies_reuse_trusted_contract_satisfaction_witho
 async fn trusted_verifier_executes_only_contract_requested_name() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
-  store::install_controller_authority_key(
+  tenet_storage::install_controller_authority_key(
     "tenet-controller-tests",
     b"tenet-controller-test-authority",
   )
@@ -4102,7 +4102,7 @@ async fn configured_falsifier_controller(
   runner: Arc<dyn TrustedVerifierRunner>,
   spec: FalsifierSpec,
 ) -> Controller {
-  store::install_controller_authority_key(
+  tenet_storage::install_controller_authority_key(
     "tenet-controller-tests",
     b"tenet-controller-test-authority",
   )

@@ -448,7 +448,9 @@ Inside the repository Tenet should operate on:
 tenet init
 ```
 
-A run requires an existing Git repository, at least one commit, and a clean canonical working tree. `tenet init` creates the project configuration, Tenet state directory, and a local `.tenet/config.schema.json` referenced by `tenet.toml`.
+`tenet init` creates the project configuration, Tenet state directory, local configuration schema, and a stable repository authority identity. Its secret is generated locally and stored in the OS credential store (macOS Keychain, Windows Credential Manager, or Secret Service on Linux). Later `run`, `resume`, `status`, `state dump`, `verify`, and `evidence` commands resolve it automatically. The normal local authority flow is therefore only `tenet init` followed by `tenet run`; no authority environment variables, descriptors, secret files, or namespace choices are required.
+
+A run also requires an existing Git repository, at least one commit, a clean canonical working tree, a selected agent, and configured project checks. `.tenet/` is added to `.gitignore` during initialization.
 
 ### 3. Write the specification
 
@@ -512,19 +514,23 @@ publicKey = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
 dependencies = { policy = "repository_wide" }
 ```
 
-Every authoritative project-check, trusted-verifier, falsifier, and human artifact—including controller-admitted cross-revision compatibility—is authenticated with the controller-authority identity. The human signature remains a separate proof of explicit human action; the controller key cannot mint it. `tenet run` always requires the stable controller namespace and key descriptor; `tenet evidence dump` and `tenet evidence attest` require the same identity whenever authoritative state exists or is created.
+Every authoritative project-check, trusted-verifier, falsifier, and human artifact—including controller-admitted cross-revision compatibility—is authenticated with the repository's controller-authority identity. The human signature remains a separate proof of explicit human action; the controller credential cannot mint it. Authority credentials are loaded only by CLI application composition before controller-owned state is used. Domain policy, controller logic, storage records, agents, verifiers, and microVMs never resolve credentials themselves.
 
-Every `verification.checks` entry is a mandatory public project gate and runs in declaration order with fail-fast behavior. Trusted verifier and falsifier names are unique, images must be immutable OCI digest references, the production backend is `microsandbox`, and network access is disabled. Missing runtime support, timeouts, cleanup failures, malformed falsifier results, and other infrastructure failures stop acquisition without issuing semantic evidence. `dependencies` defaults to `repository_wide`; path policies are trusted only from this configuration.
+The default credential provider uses the OS credential store. `.tenet/authority.json` contains only the stable, non-secret repository identity, provider kind, and a credential-consistency binding. It contains no credential key material. The credential is never written to `tenet.toml`, SQLite, Git, agent context, a worker workspace, a subprocess argument or environment, a verifier environment, or a microVM. Missing, locked, malformed, or mismatched credentials fail closed before trusted state is used.
 
-The controller-authority identity is a Tenet launch input independent of Microsandbox. Supply a stable namespace and an already-open descriptor containing secret key material:
+For CI and externally managed secret systems, the inherited-FD provider remains available as an explicit advanced mode. Its input must be exactly 32 cryptographically random bytes generated and retained by the external secret system. Supply the same non-secret namespace and a newly opened descriptor to both initialization and every authority-bearing command:
 
 ```bash
-TENET_CONTROLLER_AUTHORITY_NAMESPACE=production-password-service \
-TENET_CONTROLLER_AUTHORITY_KEY_FD=3 \
-tenet run 3<tenet-controller-authority.key
+credential-command | TENET_CONTROLLER_AUTHORITY_NAMESPACE=ci-repository-identity \
+  TENET_CONTROLLER_AUTHORITY_KEY_FD=0 tenet init
+
+credential-command | TENET_CONTROLLER_AUTHORITY_NAMESPACE=ci-repository-identity \
+  TENET_CONTROLLER_AUTHORITY_KEY_FD=0 tenet run
 ```
 
-Tenet reads and closes the descriptor, removes both environment names before agent work, derives the persistence authentication key in memory, and never serializes the supplied key or namespace into `tenet.toml`, SQLite, a worker workspace, a subprocess argument, the microVM, or a verifier environment. The namespace is not secret, but it must remain stable and unique to this repository authority boundary. A missing or changed identity fails closed whenever authoritative state is created or validated. `tenet evidence dump` requires the same identity when authoritative evidence exists and returns an explicit error without it.
+Tenet immediately removes both selector variables, marks the inherited descriptor close-on-exec, reads and closes it only during controller bootstrap, and never forwards it. A repository initialized with this advanced provider requires the same namespace and credential on later authority-bearing commands.
+
+If a local OS credential is unavailable, first unlock or restore the user's credential store and retry. If the credential is permanently lost, authenticated controller state cannot be recovered: preserve any needed inspection exports, remove `.tenet/` to explicitly discard that state, then run `tenet init` to establish a new repository authority. An identity-mismatch error means the repository metadata and supplied credential are from different authority lifecycles; use the original credential rather than bypassing the check.
 
 Run the real backend acceptance test on a supported hardware-virtualization host before release. It starts a local microVM from an architecture-matched pinned Alpine manifest, verifies that the runtime-resolved manifest digest equals the controller-authorized digest, and checks the exact exported revision, non-root UID, absent planted host secret, unavailable outbound guest network, private writable workspace, authoritative-capable execution record, unchanged canonical repository, and confirmed sandbox cleanup:
 
@@ -629,8 +635,9 @@ tenet requirements dump --json
 tenet evidence dump --json
 tenet evidence dump --json --requirement REQ-001
 
-# Explicitly sign one pending human contract; FD 3 is controller authority and FD 7 is the human Ed25519 key
-TENET_CONTROLLER_AUTHORITY_NAMESPACE=production-password-service TENET_CONTROLLER_AUTHORITY_KEY_FD=3 tenet evidence attest --obligation REQ-001/AC-01/VO-01 --statement "Manual UX review confirms the expiry interaction" --attestor alice --signing-key-fd 7 3<controller.key 7<attestor.key
+# Explicitly sign one pending human contract; FD 7 is the human Ed25519 key.
+# The controller authority is resolved automatically from the OS credential store.
+tenet evidence attest --obligation REQ-001/AC-01/VO-01 --statement "Manual UX review confirms the expiry interaction" --attestor alice --signing-key-fd 7 7<attestor.key
 tenet run
 tenet roadmap dump --json
 
@@ -645,9 +652,9 @@ tenet agents login
 
 ### Controller-state storage and backup
 
-Controller-generated durable state lives in `.tenet/tenet.db`. SQLite WAL mode may also create `.tenet/tenet.db-wal` and `.tenet/tenet.db-shm` while Tenet is running; all three belong to controller state. The specification and `tenet.toml` remain ordinary authoritative files.
+Controller-generated durable state lives in `.tenet/tenet.db`; non-secret authority metadata lives in `.tenet/authority.json`. SQLite WAL mode may also create `.tenet/tenet.db-wal` and `.tenet/tenet.db-shm` while Tenet is running. All of these belong to local controller state and remain excluded from Git. The controller authority secret is stored separately by the selected credential provider and is never part of a `.tenet/` backup. The specification and `tenet.toml` remain ordinary authoritative files.
 
-Do not copy a live `tenet.db` file while the controller is writing. Stop Tenet first, run `tenet db check`, then copy the database with no live `-wal` file, or capture deterministic JSON projections with the dump commands above. Dump output is for inspection and recovery tooling; normal execution never reads it back.
+Do not copy a live `tenet.db` file while the controller is writing. Stop Tenet first, run `tenet db check`, then copy `.tenet/` with no live `-wal` file, or capture deterministic JSON projections with the dump commands above. A usable state restore also requires the matching OS credential or advanced-provider secret; without it, authenticated evidence fails closed. Dump output is for inspection and recovery tooling; normal execution never reads it back.
 
 ---
 

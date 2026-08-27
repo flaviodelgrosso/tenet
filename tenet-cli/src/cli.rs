@@ -17,7 +17,7 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Command {
-  /// Initialize tenet.toml and .tenet/ in the current project.
+  /// Initialize project state and provision its controller authority credential.
   Init,
   /// Discover and configure agents from the canonical ACP Registry.
   #[command(name = "agents")]
@@ -78,6 +78,20 @@ pub(crate) enum Command {
     #[command(subcommand)]
     command: DumpCommand,
   },
+}
+
+impl Command {
+  pub(crate) fn requires_authority(&self) -> bool {
+    matches!(
+      self,
+      Self::Run { .. }
+        | Self::Resume { .. }
+        | Self::Status { .. }
+        | Self::Verify { .. }
+        | Self::State { .. }
+        | Self::Evidence { .. }
+    )
+  }
 }
 
 #[derive(Subcommand)]
@@ -250,5 +264,32 @@ mod tests {
         command: super::RequirementsCommand::Approve
       }
     ));
+  }
+  #[test]
+  fn evidence_derived_commands_require_controller_authority() {
+    for arguments in [
+      vec!["tenet", "run"],
+      vec!["tenet", "resume"],
+      vec!["tenet", "status"],
+      vec!["tenet", "verify"],
+      vec!["tenet", "state", "dump"],
+      vec!["tenet", "evidence", "dump"],
+    ] {
+      let cli = Cli::try_parse_from(arguments).expect("parse authority-bearing command");
+      assert!(cli.command.requires_authority());
+    }
+  }
+
+  #[test]
+  fn metadata_only_commands_do_not_load_controller_credentials() {
+    for arguments in [
+      vec!["tenet", "init"],
+      vec!["tenet", "db", "check"],
+      vec!["tenet", "requirements", "dump"],
+      vec!["tenet", "roadmap", "dump"],
+    ] {
+      let cli = Cli::try_parse_from(arguments).expect("parse metadata-only command");
+      assert!(!cli.command.requires_authority());
+    }
   }
 }

@@ -1,9 +1,7 @@
-#[cfg(unix)]
-use std::os::fd::{FromRawFd, RawFd};
 use std::{
   fmt::Write as _,
   fs::OpenOptions,
-  io::{Read, Write},
+  io::Write,
   path::{Path, PathBuf},
   process::Command,
 };
@@ -29,87 +27,6 @@ use tenet_domain::{
 use tenet_storage::Storage;
 
 use crate::{verifier, workspace::WorkspaceManager};
-const AUTHORITY_NAMESPACE_ENV: &str = "TENET_CONTROLLER_AUTHORITY_NAMESPACE";
-const AUTHORITY_KEY_FD_ENV: &str = "TENET_CONTROLLER_AUTHORITY_KEY_FD";
-const MAX_AUTHORITY_KEY_BYTES: u64 = 1024 * 1024;
-
-struct ControllerAuthorityIdentity {
-  namespace: String,
-  key_material: Vec<u8>,
-}
-
-impl ControllerAuthorityIdentity {
-  fn from_environment() -> Result<Self> {
-    let namespace = std::env::var(AUTHORITY_NAMESPACE_ENV)
-      .with_context(|| format!("{AUTHORITY_NAMESPACE_ENV} is required for trusted authority"))?;
-    std::env::remove_var(AUTHORITY_NAMESPACE_ENV);
-    if namespace.trim().is_empty() {
-      anyhow::bail!("{AUTHORITY_NAMESPACE_ENV} must not be blank");
-    }
-    let descriptor = std::env::var(AUTHORITY_KEY_FD_ENV)
-      .with_context(|| format!("{AUTHORITY_KEY_FD_ENV} is required for trusted authority"))?;
-    std::env::remove_var(AUTHORITY_KEY_FD_ENV);
-    let descriptor = descriptor.parse::<i64>().with_context(|| {
-      format!("{AUTHORITY_KEY_FD_ENV} must contain an inherited file descriptor")
-    })?;
-    let key_material = read_authority_key(descriptor)?;
-    if key_material.is_empty() {
-      anyhow::bail!("controller authority key must not be empty");
-    }
-    Ok(Self {
-      namespace,
-      key_material,
-    })
-  }
-
-  fn install(mut self) -> Result<()> {
-    let result = install_controller_authority_key(&self.namespace, &self.key_material);
-    self.key_material.fill(0);
-    result
-  }
-}
-
-#[cfg(unix)]
-fn read_authority_key(descriptor: i64) -> Result<Vec<u8>> {
-  let descriptor = RawFd::try_from(descriptor)
-    .context("controller authority key file descriptor is outside the supported range")?;
-  if descriptor < 0 {
-    anyhow::bail!("controller authority key file descriptor must not be negative");
-  }
-  // SAFETY: ownership of this inherited descriptor is transferred by the launcher contract.
-  let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
-  let mut key = Vec::new();
-  Read::by_ref(&mut file)
-    .take(MAX_AUTHORITY_KEY_BYTES + 1)
-    .read_to_end(&mut key)
-    .context("read controller authority key file descriptor")?;
-  if key.len() as u64 > MAX_AUTHORITY_KEY_BYTES {
-    key.fill(0);
-    anyhow::bail!("controller authority key exceeds {MAX_AUTHORITY_KEY_BYTES} bytes");
-  }
-  Ok(key)
-}
-
-#[cfg(not(unix))]
-fn read_authority_key(_descriptor: i64) -> Result<Vec<u8>> {
-  anyhow::bail!("inherited controller authority key descriptors require a Unix host")
-}
-
-pub fn bootstrap_controller_authority_identity() -> Result<()> {
-  ControllerAuthorityIdentity::from_environment()?.install()
-}
-
-pub async fn trusted_authority_identity_required(cwd: &Path) -> Result<bool> {
-  Ok(Storage::open(cwd).await?.has_trusted_authority().await?)
-}
-
-pub fn install_controller_authority_key(
-  authority_namespace: &str,
-  key_material: &[u8],
-) -> Result<()> {
-  tenet_storage::install_controller_authority_key(authority_namespace, key_material)
-    .context("install controller authority identity")
-}
 
 pub async fn ensure_layout(cwd: &Path) -> Result<()> {
   fs::create_dir_all(cwd.join(TENET_DIR).join("runs")).await?;
@@ -582,25 +499,37 @@ pub struct RunLock {
 impl RunLock {
   pub fn acquire(cwd: &Path) -> Result<Self> {
     let path = cwd.join(TENET_DIR).join("run.lock");
-    if path.exists() {
-      if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-          if let Some(pid) = value.get("pid").and_then(serde_json::Value::as_u64) {
-            if process_alive(pid as u32) {
-              return Err(anyhow!("another tenet run is active (pid {pid})"));
-            }
+    loop {
+      match OpenOptions::new().create_new(true).write(true).open(&path) {
+        Ok(mut file) => {
+          let payload =
+            serde_json::json!({"pid":std::process::id(),"startedAt":Utc::now().to_rfc3339()});
+          if let Err(error) =
+            writeln!(file, "{}", serde_json::to_string(&payload)?).and_then(|()| file.sync_all())
+          {
+            let _ = std::fs::remove_file(&path);
+            return Err(error.into());
           }
+          return Ok(Self { path });
         }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+          let text = std::fs::read_to_string(&path)
+            .context("another Tenet process is acquiring the run lock; retry after it finishes")?;
+          let value: serde_json::Value = serde_json::from_str(&text).context(
+            "the Tenet run lock is incomplete; if no Tenet process is active, remove `.tenet/run.lock` and retry",
+          )?;
+          let pid = value
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("the Tenet run lock has no process identity"))?;
+          if process_alive(pid as u32) {
+            return Err(anyhow!("another tenet run is active (pid {pid})"));
+          }
+          std::fs::remove_file(&path).context("remove stale Tenet run lock")?;
+        }
+        Err(error) => return Err(error.into()),
       }
-      let _ = std::fs::remove_file(&path);
     }
-    let mut file = OpenOptions::new()
-      .create_new(true)
-      .write(true)
-      .open(&path)?;
-    let payload = serde_json::json!({"pid":std::process::id(),"startedAt":Utc::now().to_rfc3339()});
-    writeln!(file, "{}", serde_json::to_string(&payload)?)?;
-    Ok(Self { path })
   }
 }
 
@@ -716,6 +645,22 @@ mod tests {
       .expect_err("failed evidence")
       .to_string()
       .contains("requires passing"));
+  }
+
+  #[test]
+  fn run_lock_does_not_delete_an_incomplete_concurrent_lock() {
+    let project = tempfile::tempdir().expect("temporary project");
+    let directory = project.path().join(TENET_DIR);
+    std::fs::create_dir_all(&directory).expect("create Tenet directory");
+    let lock = directory.join("run.lock");
+    std::fs::write(&lock, b"{").expect("write partial lock");
+
+    let error = RunLock::acquire(project.path())
+      .err()
+      .expect("partial lock must fail closed");
+
+    assert!(error.to_string().contains("run lock is incomplete"));
+    assert!(lock.exists());
   }
 
   #[tokio::test]

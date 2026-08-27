@@ -21,7 +21,6 @@ pub(crate) async fn run(
   options: RunOptions,
 ) -> Result<State> {
   let config = read_config(&cwd).await.ok();
-  store::bootstrap_controller_authority_identity()?;
   let initial = store::read_state(&cwd).await?;
   let catalog = store::read_catalog(&cwd).await?;
   let mode = InformationMode::from_flags(options.quiet, options.verbose);

@@ -21,12 +21,23 @@ impl TempRepo {
       std::process::id()
     ));
     std::fs::create_dir_all(&path).expect("create repository");
+    let init = authority_command(&path, &["init"])
+      .output()
+      .expect("initialize controller authority");
+    assert!(
+      init.status.success(),
+      "{}",
+      String::from_utf8_lossy(&init.stderr)
+    );
     run_git(&path, &["init", "-q"]);
     run_git(&path, &["config", "user.name", "Tenet Test"]);
     run_git(&path, &["config", "user.email", "tenet-test@localhost"]);
     std::fs::write(path.join("README.txt"), "tracked\n").expect("write tracked file");
     std::fs::write(path.join("tenet.toml"), config).expect("write config");
-    run_git(&path, &["add", "README.txt", "tenet.toml"]);
+    run_git(
+      &path,
+      &["add", ".gitignore", "README.txt", "spec.md", "tenet.toml"],
+    );
     run_git(&path, &["commit", "-q", "-m", "configure"]);
     Self(path)
   }
@@ -62,23 +73,38 @@ fn base_config(verification: &str) -> String {
   )
 }
 
-fn tenet_verify(repository: &TempRepo) -> Command {
-  let key_path = repository.path().with_extension("controller-authority-key");
-  std::fs::write(&key_path, b"tenet-cli-verify-test-authority")
-    .expect("write controller authority fixture");
+fn authority_command_with(
+  repository: &Path,
+  args: &[&str],
+  namespace: &str,
+  secret: &[u8],
+) -> Command {
+  let key_path = repository.with_extension("controller-authority-key");
+  std::fs::write(&key_path, secret).expect("write controller authority fixture");
   let key = std::fs::File::open(&key_path).expect("open controller authority fixture");
   std::fs::remove_file(key_path).expect("unlink controller authority fixture");
   let mut command = Command::new(env!("CARGO_BIN_EXE_tenet"));
   command
-    .env(
-      "TENET_CONTROLLER_AUTHORITY_NAMESPACE",
-      "tenet-cli-verify-tests",
-    )
+    .env("TENET_CONTROLLER_AUTHORITY_NAMESPACE", namespace)
     .env("TENET_CONTROLLER_AUTHORITY_KEY_FD", "0")
     .stdin(Stdio::from(key))
-    .args(["verify", "--cwd"])
-    .arg(repository.path());
+    .args(args)
+    .args(["--cwd"])
+    .arg(repository);
   command
+}
+
+fn authority_command(repository: &Path, args: &[&str]) -> Command {
+  authority_command_with(
+    repository,
+    args,
+    "tenet-cli-verify-tests",
+    b"abcdef0123456789abcdef0123456789",
+  )
+}
+
+fn tenet_verify(repository: &TempRepo) -> Command {
+  authority_command(repository.path(), &["verify"])
 }
 
 #[test]
@@ -117,4 +143,47 @@ fn verify_fails_clearly_without_project_checks() {
     "{stderr}"
   );
   assert!(stderr.contains("[[verification.checks]]"), "{stderr}");
+}
+
+#[test]
+fn verify_explains_when_an_inherited_authority_credential_is_not_supplied() {
+  let repository = TempRepo::new(&base_config(
+    "[verification]\n[[verification.checks]]\nname = \"tracked file\"\ncommand = [\"sh\", \"-c\", \"test -f README.txt\"]\n",
+  ));
+
+  let output = Command::new(env!("CARGO_BIN_EXE_tenet"))
+    .args(["verify", "--cwd"])
+    .arg(repository.path())
+    .output()
+    .expect("run tenet verify without inherited credential");
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(!output.status.success());
+  assert!(
+    stderr.contains("uses the advanced inherited-FD authority provider"),
+    "{stderr}"
+  );
+}
+
+#[test]
+fn verify_rejects_a_credential_from_another_repository_identity() {
+  let repository = TempRepo::new(&base_config(
+    "[verification]\n[[verification.checks]]\nname = \"tracked file\"\ncommand = [\"sh\", \"-c\", \"test -f README.txt\"]\n",
+  ));
+
+  let output = authority_command_with(
+    repository.path(),
+    &["verify"],
+    "another-repository-authority",
+    b"abcdef0123456789abcdef0123456789",
+  )
+  .output()
+  .expect("run tenet verify with mismatched authority");
+  let stderr = String::from_utf8_lossy(&output.stderr);
+
+  assert!(!output.status.success());
+  assert!(
+    stderr.contains("does not match this repository"),
+    "{stderr}"
+  );
 }

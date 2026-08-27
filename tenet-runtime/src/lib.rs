@@ -1,4 +1,5 @@
 //! Execution, repository, workspace, integration, verification, and persistence mechanisms for Tenet.
+pub mod authority;
 
 pub mod backend;
 pub mod git;

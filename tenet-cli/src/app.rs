@@ -20,7 +20,10 @@ use tenet_domain::{
   model::{CatalogApproval, RunStatus},
   proof::{statement_hash, EvidenceContract},
 };
-use tenet_runtime::store;
+use tenet_runtime::{
+  authority::{AuthorityBootstrap, AuthorityInitialization},
+  store,
+};
 use tenet_storage::{DatabaseHealth, Storage};
 
 use crate::{
@@ -33,6 +36,7 @@ pub(crate) struct App {
   cwd: PathBuf,
   backend: Arc<dyn AgentBackend>,
   command: Option<Command>,
+  authority: AuthorityBootstrap,
 }
 
 impl App {
@@ -40,21 +44,29 @@ impl App {
     let cli = Cli::parse();
     let cur_dir = std::env::current_dir().context("current directory")?;
 
+    let authority = AuthorityBootstrap::from_environment()?;
     Ok(Self {
       cwd: cli.cwd.unwrap_or(cur_dir),
       backend: Arc::new(AcpRuntime),
       command: Some(cli.command),
+      authority,
     })
   }
 
   pub(crate) async fn run(mut self) -> Result<ExitCode> {
-    let exit_code = match self.command.take() {
-      None => unreachable!("Clap requires an explicit subcommand"),
-      Some(Command::Init) => {
+    let command = self
+      .command
+      .take()
+      .expect("Clap requires an explicit subcommand");
+    if command.requires_authority() {
+      self.authority.install(&self.cwd)?;
+    }
+    let exit_code = match command {
+      Command::Init => {
         self.initialize().await?;
         ExitCode::SUCCESS
       }
-      Some(Command::Run { quiet, verbose } | Command::Resume { quiet, verbose }) => {
+      Command::Run { quiet, verbose } | Command::Resume { quiet, verbose } => {
         let state = run::run(self.cwd, self.backend, RunOptions { quiet, verbose }).await?;
         if matches!(
           state.status,
@@ -65,49 +77,49 @@ impl App {
           ExitCode::SUCCESS
         }
       }
-      Some(Command::Agent { command }) => {
+      Command::Agent { command } => {
         if agents::handle(&self.cwd, command).await? {
           ExitCode::SUCCESS
         } else {
           ExitCode::from(2)
         }
       }
-      Some(Command::Status { json }) => {
+      Command::Status { json } => {
         self.print_status(json).await?;
         ExitCode::SUCCESS
       }
-      Some(Command::Verify { json }) => self.verify(json).await?,
-      Some(Command::Db {
+      Command::Verify { json } => self.verify(json).await?,
+      Command::Db {
         command: DbCommand::Check,
-      }) => {
+      } => {
         self.check_database().await?;
         ExitCode::SUCCESS
       }
-      Some(Command::State {
+      Command::State {
         command: DumpCommand::Dump { json },
-      }) => {
+      } => {
         self.dump_state(json).await?;
         ExitCode::SUCCESS
       }
-      Some(Command::Requirements {
+      Command::Requirements {
         command: RequirementsCommand::Dump { json },
-      }) => {
+      } => {
         self.dump_requirements(json).await?;
         ExitCode::SUCCESS
       }
-      Some(Command::Requirements {
+      Command::Requirements {
         command: RequirementsCommand::Approve,
-      }) => {
+      } => {
         self.approve_requirements().await?;
         ExitCode::SUCCESS
       }
-      Some(Command::Evidence {
+      Command::Evidence {
         command: EvidenceCommand::Dump { json, requirement },
-      }) => {
+      } => {
         self.dump_evidence(json, requirement.as_deref()).await?;
         ExitCode::SUCCESS
       }
-      Some(Command::Evidence {
+      Command::Evidence {
         command:
           EvidenceCommand::Attest {
             obligation,
@@ -115,15 +127,15 @@ impl App {
             attestor,
             signing_key_fd,
           },
-      }) => {
+      } => {
         self
           .attest(&obligation, &statement, &attestor, signing_key_fd)
           .await?;
         ExitCode::SUCCESS
       }
-      Some(Command::Roadmap {
+      Command::Roadmap {
         command: DumpCommand::Dump { json },
-      }) => {
+      } => {
         self.dump_roadmap(json).await?;
         ExitCode::SUCCESS
       }
@@ -131,16 +143,30 @@ impl App {
     Ok(exit_code)
   }
 
-  async fn initialize(&self) -> Result<()> {
+  async fn initialize(&mut self) -> Result<()> {
+    let authority = self.authority.initialize(&self.cwd)?;
     store::ensure_layout(&self.cwd).await?;
+    store::ensure_gitignore(&self.cwd).await?;
     let config = tenet_domain::config::ensure_config(&self.cwd).await?;
     store::ensure_spec(&self.cwd, &config).await?;
-    self.print_initialization();
+    self.print_initialization(&authority);
     Ok(())
   }
 
-  fn print_initialization(&self) {
+  fn print_initialization(&self, authority: &AuthorityInitialization) {
     println!("Initialized tenet in {}", self.cwd.display());
+    println!(
+      "Controller authority: {} ({})",
+      authority.authority_id,
+      authority.provider.display_name()
+    );
+    if authority.created {
+      println!(
+        "The controller credential was provisioned securely and will be resolved automatically."
+      );
+    } else {
+      println!("The existing controller credential is available and consistent.");
+    }
     if std::io::stdout().is_terminal() {
       println!("Run `tenet agents` to browse ACP Registry agents, then `tenet agents select <id>`");
     } else {
@@ -271,10 +297,6 @@ impl App {
       .await?
       .context("no active requirement catalog")?;
     let config = read_config(&self.cwd).await?;
-    if storage.has_trusted_authority().await? {
-      store::bootstrap_controller_authority_identity()
-        .context("trusted evidence inspection requires controller authority identity")?;
-    }
     let graph = storage
       .load_evidence_graph(
         &catalog,
@@ -345,9 +367,6 @@ impl App {
     );
     secret_key.fill(0);
     let record = signed.context("sign exact human attestation")?;
-    store::bootstrap_controller_authority_identity().context(
-      "attestation requires a controller authority identity to authenticate artifact transitions",
-    )?;
     let mut graph = storage
       .load_evidence_graph(
         &catalog,
@@ -381,8 +400,6 @@ impl App {
   }
 
   async fn verify(&self, json: bool) -> Result<ExitCode> {
-    store::bootstrap_controller_authority_identity()
-      .context("project verification requires a controller authority identity")?;
     let report = manual_verify(&self.cwd).await?;
     if json {
       println!("{}", serde_json::to_string_pretty(&report)?);
