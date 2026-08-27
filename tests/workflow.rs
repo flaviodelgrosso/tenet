@@ -883,7 +883,7 @@ fn disposable_legacy_audit_state_does_not_block_a_new_gate() {
   let repository = Repository::new();
   let revision = repository.admitted(&["/usr/bin/true"]);
   let legacy = json!({
-    "schemaVersion": 1,
+    "schemaVersion": 3,
     "evidence": [],
     "gates": [{
       "schemaVersion": 1,
