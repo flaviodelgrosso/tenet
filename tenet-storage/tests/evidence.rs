@@ -216,7 +216,7 @@ fn trusted_record(
       runtime_identity: "local-msb/sdk-protocol-compatible".into(),
       boundary: IsolationBoundary::HardwareVirtualizedMicroVm,
       image: spec.image.clone(),
-      resolved_image_digest: format!("sha256:{}", "b".repeat(64)),
+      resolved_image_digest: format!("sha256:{}", "a".repeat(64)),
       input_revision: "revision-1".into(),
       input_materialization_hash: "archive-hash".into(),
       input_archive_bytes: 1024,
@@ -313,6 +313,26 @@ async fn trusted_execution_authority_survives_restart_and_revalidation() {
     loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
     ProofState::Proven
   );
+}
+
+#[tokio::test]
+async fn mismatched_resolved_image_digest_cannot_enter_persistence() {
+  let (_project, storage, _catalog, spec) = prepared_trusted_storage().await;
+  let mut record = trusted_record(&spec, TrustedExecutionResult::Supports);
+  record
+    .isolation_report
+    .as_mut()
+    .expect("capability report")
+    .resolved_image_digest = format!("sha256:{}", "b".repeat(64));
+
+  let error = storage
+    .record_trusted_execution("run-1", &record, &spec)
+    .await
+    .expect_err("mismatched report must not persist");
+
+  assert!(error
+    .to_string()
+    .contains("trusted execution record failed authority admission"));
 }
 
 #[tokio::test]

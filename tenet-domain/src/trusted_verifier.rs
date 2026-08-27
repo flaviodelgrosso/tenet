@@ -144,6 +144,34 @@ pub enum TrustedVerifierProtocol {
   ExitCode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OciImageDigest(String);
+
+impl OciImageDigest {
+  pub fn parse(value: &str) -> Option<Self> {
+    let hex = value.strip_prefix("sha256:")?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+      return None;
+    }
+    Some(Self(format!("sha256:{}", hex.to_ascii_lowercase())))
+  }
+
+  pub fn from_image_reference(image: &str) -> Option<Self> {
+    let (name, digest) = image.split_once('@')?;
+    if name.trim().is_empty()
+      || name.contains('@')
+      || name.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+      return None;
+    }
+    Self::parse(digest)
+  }
+
+  pub fn as_str(&self) -> &str {
+    &self.0
+  }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TrustedVerificationSpec {
@@ -175,9 +203,7 @@ impl TrustedVerificationSpec {
     if self.backend != TrustedExecutionBackend::Microsandbox {
       return Err(TrustedVerifierSpecError::UnsupportedBackend);
     }
-    if !is_digest_pinned_image(&self.image) {
-      return Err(TrustedVerifierSpecError::UnpinnedImage);
-    }
+    self.image_digest()?;
     if self.program.trim().is_empty() {
       return Err(TrustedVerifierSpecError::BlankProgram);
     }
@@ -218,6 +244,10 @@ impl TrustedVerificationSpec {
       }
     }
     Ok(())
+  }
+
+  pub fn image_digest(&self) -> Result<OciImageDigest, TrustedVerifierSpecError> {
+    OciImageDigest::from_image_reference(&self.image).ok_or(TrustedVerifierSpecError::UnpinnedImage)
   }
 
   pub fn fingerprint(&self) -> Result<String, serde_json::Error> {
@@ -305,7 +335,9 @@ impl IsolationCapabilityReport {
       && !self.runtime_identity.trim().is_empty()
       && self.boundary == spec.isolation.boundary
       && self.image == spec.image
-      && !self.resolved_image_digest.trim().is_empty()
+      && spec.image_digest().ok().is_some_and(|expected| {
+        OciImageDigest::parse(&self.resolved_image_digest).as_ref() == Some(&expected)
+      })
       && !self.input_revision.trim().is_empty()
       && !self.input_materialization_hash.trim().is_empty()
       && self.input_archive_bytes <= spec.resources.max_input_archive_bytes
@@ -420,15 +452,6 @@ fn default_timeout_secs() -> u64 {
   DEFAULT_TIMEOUT_SECS
 }
 
-fn is_digest_pinned_image(image: &str) -> bool {
-  let Some((name, digest)) = image.rsplit_once("@sha256:") else {
-    return false;
-  };
-  !name.trim().is_empty()
-    && digest.len() == 64
-    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
 fn validate_relative_directory(value: &str) -> Result<(), TrustedVerifierSpecError> {
   let path = std::path::Path::new(value);
   if value.trim().is_empty()
@@ -482,7 +505,11 @@ mod tests {
       runtime_identity: "local-msb/sdk-protocol-compatible".into(),
       boundary: IsolationBoundary::HardwareVirtualizedMicroVm,
       image: spec.image.clone(),
-      resolved_image_digest: format!("sha256:{}", "b".repeat(64)),
+      resolved_image_digest: spec
+        .image_digest()
+        .expect("pinned fixture image")
+        .as_str()
+        .into(),
       input_revision: "revision".into(),
       input_materialization_hash: "archive-hash".into(),
       input_archive_bytes: 1024,
@@ -545,6 +572,36 @@ mod tests {
     assert_eq!(
       value.validate(),
       Err(TrustedVerifierSpecError::UnpinnedImage)
+    );
+  }
+
+  #[test]
+  fn malformed_or_unpinned_image_digest_is_rejected() {
+    for image in [
+      "example/verifier:latest",
+      "example/verifier@sha512:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "example/verifier@sha256:abc",
+      "example/verifier@sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+      "example/first@example/verifier@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+      let mut value = spec();
+      value.image = image.into();
+      assert_eq!(
+        value.validate(),
+        Err(TrustedVerifierSpecError::UnpinnedImage),
+        "accepted malformed image {image}"
+      );
+    }
+  }
+
+  #[test]
+  fn image_digest_is_normalized_to_lowercase() {
+    let mut value = spec();
+    value.image = format!("example/verifier@sha256:{}", "A".repeat(64));
+
+    assert_eq!(
+      value.image_digest().expect("valid digest").as_str(),
+      format!("sha256:{}", "a".repeat(64))
     );
   }
 
@@ -618,6 +675,34 @@ mod tests {
       entries.validate(),
       Err(TrustedVerifierSpecError::InvalidInputEntryLimit)
     );
+  }
+
+  #[test]
+  fn matching_resolved_image_digest_satisfies_spec() {
+    let spec = spec();
+
+    assert!(report(&spec).satisfies(&spec));
+  }
+
+  #[test]
+  fn mismatched_resolved_image_digest_does_not_satisfy_spec() {
+    let spec = spec();
+    let mut report = report(&spec);
+    report.resolved_image_digest = format!("sha256:{}", "b".repeat(64));
+
+    assert!(!report.satisfies(&spec));
+  }
+
+  #[test]
+  fn reconstructed_mismatched_report_does_not_satisfy_spec() {
+    let spec = spec();
+    let mut original = report(&spec);
+    original.resolved_image_digest = format!("sha256:{}", "b".repeat(64));
+    let encoded = serde_json::to_vec(&original).expect("serialize report");
+    let reconstructed: IsolationCapabilityReport =
+      serde_json::from_slice(&encoded).expect("reconstruct report");
+
+    assert!(!reconstructed.satisfies(&spec));
   }
 
   #[test]

@@ -54,7 +54,7 @@ fn record(spec: &TrustedVerificationSpec) -> TrustedExecutionRecord {
       runtime_identity: "microsandbox-local-runtime/0.6.15".into(),
       boundary: IsolationBoundary::HardwareVirtualizedMicroVm,
       image: spec.image.clone(),
-      resolved_image_digest: format!("sha256:{}", "b".repeat(64)),
+      resolved_image_digest: format!("sha256:{}", "a".repeat(64)),
       input_revision: "revision-1".into(),
       input_materialization_hash: "archive-hash".into(),
       input_archive_bytes: 1024,

@@ -830,7 +830,7 @@ mod tests {
           runtime_identity: "local-msb/sdk-protocol-compatible".into(),
           boundary: IsolationBoundary::HardwareVirtualizedMicroVm,
           image: format!("example/verifier@sha256:{}", "a".repeat(64)),
-          resolved_image_digest: format!("sha256:{}", "b".repeat(64)),
+          resolved_image_digest: format!("sha256:{}", "a".repeat(64)),
           input_revision: revision.into(),
           input_materialization_hash: "archive-hash".into(),
           input_archive_bytes: 1024,

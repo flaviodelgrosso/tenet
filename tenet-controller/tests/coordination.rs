@@ -3333,6 +3333,7 @@ fn trusted_verification_spec() -> TrustedVerificationSpec {
 
 struct FakeTrustedVerifier {
   contradicts: bool,
+  resolved_digest_matches: bool,
   calls: AtomicUsize,
 }
 
@@ -3380,7 +3381,15 @@ impl TrustedVerifierRunner for FakeTrustedVerifier {
         runtime_identity: "test-local-runtime".into(),
         boundary: IsolationBoundary::HardwareVirtualizedMicroVm,
         image: spec.image.clone(),
-        resolved_image_digest: format!("sha256:{}", "b".repeat(64)),
+        resolved_image_digest: format!(
+          "sha256:{}",
+          if self.resolved_digest_matches {
+            "a"
+          } else {
+            "b"
+          }
+          .repeat(64)
+        ),
         input_revision: revision.into(),
         input_materialization_hash: "test-archive-hash".into(),
         input_archive_bytes: 1024,
@@ -3497,6 +3506,7 @@ async fn trusted_verifier_pass_proves_and_completes_without_assessor() {
   let trusted = Arc::new(FakeTrustedVerifier {
     contradicts: false,
     calls: AtomicUsize::new(0),
+    resolved_digest_matches: true,
   });
   let controller =
     configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
@@ -3526,6 +3536,7 @@ async fn trusted_verifier_assertion_failure_contradicts_and_blocks_without_asses
   let trusted = Arc::new(FakeTrustedVerifier {
     contradicts: true,
     calls: AtomicUsize::new(0),
+    resolved_digest_matches: true,
   });
   let controller =
     configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
@@ -3543,6 +3554,45 @@ async fn trusted_verifier_assertion_failure_contradicts_and_blocks_without_asses
   assert_eq!(trusted.calls.load(Ordering::SeqCst), 1);
   assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
   assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Contradicted
+  );
+}
+
+#[tokio::test]
+async fn mismatched_resolved_image_digest_cannot_issue_authoritative_evidence() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let trusted = Arc::new(FakeTrustedVerifier {
+    contradicts: false,
+    resolved_digest_matches: false,
+    calls: AtomicUsize::new(0),
+  });
+  let controller =
+    configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
+
+  let error = controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("digest mismatch must fail authority admission");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("catalog read")
+    .expect("catalog");
+  let graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("graph reload");
+
+  let error_chain = format!("{error:#}");
+  assert!(
+    error_chain.contains("trusted execution record failed authority admission"),
+    "unexpected failure: {error_chain}"
+  );
+  assert!(!graph.artifacts.values().any(|artifact| matches!(
+    artifact.provenance,
+    tenet_domain::proof::ArtifactProvenance::ControllerTrustedVerifier
+  )));
+  assert_ne!(
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
     ProofState::Contradicted
   );

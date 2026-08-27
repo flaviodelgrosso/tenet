@@ -28,8 +28,9 @@ use tenet_domain::{
   trusted_verifier::{
     CandidateFilesystemPolicy, ControlChannel, EnvironmentPolicy, GuestSecurityProfile,
     HostRepositoryMountPolicy, IsolationBoundary, IsolationCapabilityReport, NetworkPolicy,
-    TrustedExecutionBackend, TrustedExecutionRecord, TrustedExecutionResult, TrustedResourcePolicy,
-    TrustedVerificationSpec, WritableStoragePolicy, TRUSTED_VERIFIER_CONTRADICTION_EXIT_CODE,
+    OciImageDigest, TrustedExecutionBackend, TrustedExecutionRecord, TrustedExecutionResult,
+    TrustedResourcePolicy, TrustedVerificationSpec, WritableStoragePolicy,
+    TRUSTED_VERIFIER_CONTRADICTION_EXIT_CODE,
   },
 };
 
@@ -670,7 +671,29 @@ async fn validate_effective_config(
       "Microsandbox effective configuration changed or is weaker than requested".into(),
     )
   })?;
-  Ok(resolved_digest.to_owned())
+  bind_resolved_image_digest(spec, resolved_digest)
+}
+
+fn bind_resolved_image_digest(
+  spec: &TrustedVerificationSpec,
+  resolved_digest: &str,
+) -> Result<String, TrustedVerifierError> {
+  let expected = spec
+    .image_digest()
+    .map_err(|error| TrustedVerifierError::InvalidTrustedVerifierSpec(error.to_string()))?;
+  let resolved = OciImageDigest::parse(resolved_digest).ok_or_else(|| {
+    TrustedVerifierError::IsolationUnavailable(
+      "Microsandbox returned a malformed or unsupported OCI manifest digest".into(),
+    )
+  })?;
+  if resolved != expected {
+    return Err(TrustedVerifierError::IsolationUnavailable(format!(
+      "Microsandbox resolved verifier image digest {} instead of controller-authorized {}",
+      resolved.as_str(),
+      expected.as_str()
+    )));
+  }
+  Ok(resolved.as_str().into())
 }
 
 enum MaterializedEntry {
@@ -1249,6 +1272,25 @@ mod tests {
   }
 
   #[test]
+  fn mismatched_resolved_image_digest_is_an_isolation_failure() {
+    let error = bind_resolved_image_digest(&spec(), &format!("sha256:{}", "b".repeat(64)))
+      .expect_err("digest mismatch must fail closed");
+
+    assert!(matches!(
+      error,
+      TrustedVerifierError::IsolationUnavailable(_)
+    ));
+  }
+
+  #[test]
+  fn resolved_image_digest_is_safely_normalized() {
+    let resolved = bind_resolved_image_digest(&spec(), &format!("sha256:{}", "A".repeat(64)))
+      .expect("equivalent uppercase digest");
+
+    assert_eq!(resolved, format!("sha256:{}", "a".repeat(64)));
+  }
+
+  #[test]
   fn guest_working_directory_stays_inside_private_workspace() {
     assert_eq!(
       guest_working_directory("crates/domain"),
@@ -1417,7 +1459,8 @@ mod tests {
       .stdout
       .contains("microsandbox-acceptance-ok"));
     let report = record.isolation_report.as_ref().expect("capability report");
-    assert_eq!(report.resolved_image_digest, image_digest);
+    let expected_image_digest = spec.image_digest().expect("pinned acceptance image");
+    assert_eq!(report.resolved_image_digest, expected_image_digest.as_str());
     assert!(report.runtime_identity.starts_with("local-msb-sha256:"));
     assert!(report.runtime_identity.contains("/libkrunfw-sha256:"));
     assert!(!repository.path().join("guest-created.txt").exists());
