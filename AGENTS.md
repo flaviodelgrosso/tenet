@@ -84,10 +84,10 @@ Breaking changes are allowed during the MVP when they strengthen or simplify the
 
 ## Minimal architecture
 
-The workspace intentionally has two crates:
+The project intentionally uses one Cargo package with a root `src/` folder:
 
-- `tenet-domain`: contract validation, evidence types, and deterministic completion derivation;
-- `tenet-cli`: repository initialization, Git object reads and candidate materialization, verifier execution, audit persistence, and CLI rendering.
+- the library target contains contract validation, evidence types, and deterministic completion derivation;
+- the `tenet` binary contains repository initialization, Git object reads and candidate materialization, verifier execution, audit persistence, and CLI rendering.
 
 Prefer existing files and direct Git commands. Do not introduce provider integrations, model runtimes, general plugin systems, databases, generic rule engines, or speculative traits and frameworks. Add a dependency only for a concrete capability the existing stack cannot express cleanly.
 
@@ -115,7 +115,7 @@ Before completion, run:
 make ci
 ```
 
-This checks formatting, the workspace, Clippy with warnings denied, and all tests.
+This checks formatting, the package, Clippy with warnings denied, and all tests.
 
 ## Working style
 

@@ -12,7 +12,7 @@
 
 ## Checklist
 
-- [ ] `cargo fmt --all` passes
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes
-- [ ] `cargo test --workspace` passes
+- [ ] `cargo fmt` passes
+- [ ] `cargo clippy --all-targets -- -D warnings` passes
+- [ ] `cargo test --all-targets` passes
 - [ ] `README.md` updated if user-facing behavior changed

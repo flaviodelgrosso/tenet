@@ -193,10 +193,7 @@ No previous local audit state, proposal state, developer credential, or coding-a
 
 ## Architecture
 
-The workspace has two crates:
-
-- `tenet-domain`: pure contract validation, evidence types, and deterministic completion derivation;
-- `tenet-cli`: repository initialization, authority Git-object reads, candidate materialization, verifier execution, local audit persistence, and typed CLI rendering.
+The project is a single Cargo package with a root `src/` folder. Its library target contains pure contract validation, evidence types, and deterministic completion derivation; its `tenet` binary contains repository initialization, authority Git-object reads, candidate materialization, verifier execution, local audit persistence, and typed CLI rendering.
 
 The product boundary is strict: coding agents own reasoning, planning, editing, delegation, branches, worktrees, tests, and fixes. Tenet owns authority snapshots, admitted contracts, independent observations, evidence validity, and deterministic completion derivation for exact `(A, R)` pairs.
 

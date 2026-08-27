@@ -8,25 +8,25 @@ help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*##"; printf "Usage: make <target>\n\nTargets:\n"} /^[a-zA-Z0-9_.-]+:.*##/ {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 install: ## Install the release binary
-	$(CARGO) install --path tenet-cli --locked
+	$(CARGO) install --path . --locked
 
 fmt: ## Format Rust source files
-	$(CARGO) fmt --all
+	$(CARGO) fmt
 
 fmt-check: ## Check Rust formatting without modifying files
-	$(CARGO) fmt --all -- --check
+	$(CARGO) fmt -- --check
 
 check: ## Type-check all targets with every feature enabled
-	$(CARGO) check --workspace --all-targets --all-features --locked
+	$(CARGO) check --all-targets --all-features --locked
 
 test: ## Run all tests with every feature enabled
-	$(CARGO) test --workspace --all-targets --all-features --locked
+	$(CARGO) test --all-targets --all-features --locked
 
 clippy: ## Run Clippy with warnings treated as errors
-	$(CARGO) clippy --workspace --all-targets --all-features --locked -- -D warnings
+	$(CARGO) clippy --all-targets --all-features --locked -- -D warnings
 
 build: ## Build the release binary
-	$(CARGO) build --workspace --all-targets --all-features --release --locked
+	$(CARGO) build --all-targets --all-features --release --locked
 
 ci: fmt-check check clippy test ## Run the complete CI quality gate
 
