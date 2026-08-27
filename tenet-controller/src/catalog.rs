@@ -516,17 +516,41 @@ pub fn validate_evidence_contracts(catalog: &RequirementCatalog, config: &Config
   if trusted.len() != config.verification.trusted_checks.len() {
     bail!("trusted verifier names must be unique");
   }
+  let falsifiers: BTreeSet<_> = config
+    .verification
+    .falsifiers
+    .iter()
+    .map(|spec| spec.name())
+    .collect();
+  if falsifiers.len() != config.verification.falsifiers.len() {
+    bail!("falsifier names must be unique");
+  }
   for obligation in &catalog.verification_obligations {
-    validate_contract(&obligation.evidence_contract, &checks, &trusted)
-      .with_context(|| format!("invalid evidence contract for {}", obligation.id))?;
+    validate_contract_with_falsifiers(
+      &obligation.evidence_contract,
+      &checks,
+      &trusted,
+      &falsifiers,
+    )
+    .with_context(|| format!("invalid evidence contract for {}", obligation.id))?;
   }
   Ok(())
 }
 
+#[cfg(test)]
 fn validate_contract(
   contract: &EvidenceContract,
   checks: &BTreeSet<&str>,
   trusted: &BTreeSet<&str>,
+) -> Result<()> {
+  validate_contract_with_falsifiers(contract, checks, trusted, &BTreeSet::new())
+}
+
+fn validate_contract_with_falsifiers(
+  contract: &EvidenceContract,
+  checks: &BTreeSet<&str>,
+  trusted: &BTreeSet<&str>,
+  falsifiers: &BTreeSet<&str>,
 ) -> Result<()> {
   match contract {
     EvidenceContract::Artifact {
@@ -551,6 +575,13 @@ fn validate_contract(
       }
     }
     EvidenceContract::Artifact {
+      predicate: EvidencePredicate::FalsifierCheck { name },
+    } => {
+      if !falsifiers.contains(name.as_str()) {
+        bail!("falsifier check {name:?} is not controller-configured");
+      }
+    }
+    EvidenceContract::Artifact {
       predicate: EvidencePredicate::SourceInspection,
     } => {
       bail!(
@@ -562,7 +593,7 @@ fn validate_contract(
         bail!("composite evidence contract must not be empty");
       }
       for requirement in requirements {
-        validate_contract(requirement, checks, trusted)?;
+        validate_contract_with_falsifiers(requirement, checks, trusted, falsifiers)?;
       }
     }
     EvidenceContract::HumanAttestation { .. } => {

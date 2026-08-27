@@ -10,7 +10,8 @@ use sha2::{Digest, Sha256};
 use tokio::fs;
 
 use crate::{
-  model::WorkerRole, trusted_verifier::TrustedVerificationSpec, verification::VerificationSpec,
+  falsifier::FalsifierSpec, model::WorkerRole, trusted_verifier::TrustedVerificationSpec,
+  verification::VerificationSpec,
 };
 
 pub const TENET_DIR: &str = ".tenet";
@@ -286,6 +287,8 @@ pub struct VerificationConfig {
   pub checks: Vec<ProjectVerificationCheck>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub trusted_checks: Vec<TrustedVerificationSpec>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub falsifiers: Vec<FalsifierSpec>,
   #[serde(default = "default_verification_timeout_secs")]
   pub timeout_secs: u64,
   #[serde(default = "default_max_output_bytes")]
@@ -334,6 +337,8 @@ struct VerificationConfigWire {
   checks: Vec<ProjectVerificationCheck>,
   #[serde(default)]
   trusted_checks: Vec<TrustedVerificationSpec>,
+  #[serde(default)]
+  falsifiers: Vec<FalsifierSpec>,
   #[serde(default = "default_verification_timeout_secs")]
   timeout_secs: u64,
   #[serde(default = "default_max_output_bytes")]
@@ -349,6 +354,7 @@ impl<'de> Deserialize<'de> for VerificationConfig {
     let config = Self {
       checks: wire.checks,
       trusted_checks: wire.trusted_checks,
+      falsifiers: wire.falsifiers,
       timeout_secs: wire.timeout_secs,
       max_output_bytes: wire.max_output_bytes,
     };
@@ -362,6 +368,7 @@ impl Default for VerificationConfig {
     Self {
       checks: Vec::new(),
       trusted_checks: Vec::new(),
+      falsifiers: Vec::new(),
       timeout_secs: DEFAULT_VERIFICATION_TIMEOUT_SECS,
       max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
     }
@@ -383,6 +390,18 @@ impl VerificationConfig {
         .map_err(|error| anyhow::anyhow!("invalid trusted verifier {:?}: {error}", check.name))?;
       if !trusted_names.insert(check.name.as_str()) {
         anyhow::bail!("duplicate trusted verifier name {:?}", check.name);
+      }
+    }
+    let mut falsifier_names = BTreeSet::new();
+    for falsifier in &self.falsifiers {
+      falsifier
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid falsifier {:?}: {error}", falsifier.name()))?;
+      if !falsifier_names.insert(falsifier.name()) {
+        anyhow::bail!("duplicate falsifier name {:?}", falsifier.name());
+      }
+      if trusted_names.contains(falsifier.name()) {
+        anyhow::bail!("trusted verifier and falsifier names must be distinct");
       }
     }
     for check in &self.checks {

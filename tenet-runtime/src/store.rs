@@ -16,6 +16,7 @@ use tokio::fs;
 use tenet_domain::{
   config::{read_config, Config, TENET_DIR},
   evidence::EvidenceGraphState,
+  falsifier::{FalsificationExecutionRecord, FalsifierSpec},
   model::{
     CatalogApproval, CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
     RequirementCatalog, State,
@@ -210,7 +211,11 @@ pub async fn read_evidence_graph(
     .ok_or_else(|| anyhow!("cannot load evidence without an active catalog"))?;
   let config = read_config(cwd).await?;
   let graph = storage
-    .load_evidence_graph(&catalog, &config.verification.trusted_checks)
+    .load_evidence_graph(
+      &catalog,
+      &config.verification.trusted_checks,
+      &config.verification.falsifiers,
+    )
     .await?;
   if graph.specification_hash != expected.specification_hash
     || graph.requirements != expected.requirements
@@ -288,6 +293,23 @@ pub async fn record_trusted_execution(
     .record_trusted_execution(run_id, record, spec)
     .await
     .context("record controller-owned trusted execution")?;
+  Ok(())
+}
+pub async fn record_falsification(
+  cwd: &Path,
+  record: &FalsificationExecutionRecord,
+  spec: &FalsifierSpec,
+) -> Result<()> {
+  let storage = Storage::open(cwd).await?;
+  let state = storage.load_current_state().await?;
+  let run_id = state
+    .run_id
+    .as_deref()
+    .ok_or_else(|| anyhow!("cannot persist falsification without an active run"))?;
+  storage
+    .record_falsification(run_id, record, spec)
+    .await
+    .context("record controller-owned falsification")?;
   Ok(())
 }
 

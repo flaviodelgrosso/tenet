@@ -5659,6 +5659,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "globset",
+ "jsonschema",
  "proptest",
  "serde",
  "serde_json",

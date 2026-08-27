@@ -11,6 +11,7 @@ use tenet_domain::{
     EvidenceValidity, ProjectEvidenceProvenance, ProjectVerificationEvidence,
     SemanticAssessmentReport,
   },
+  falsifier::{FalsificationExecutionRecord, FalsifierResult, FalsifierSpec},
   ids::{EvidenceId, ObligationId, VerificationRunId},
   model::RequirementCatalog,
   proof::{
@@ -173,6 +174,63 @@ impl Storage {
       .map(|_| ())
       .map_err(StorageError::from_sqlx)
   }
+  /// Persists one admitted controller-owned falsification execution.
+  pub async fn record_falsification(
+    &self,
+    run_id: &str,
+    record: &FalsificationExecutionRecord,
+    spec: &FalsifierSpec,
+  ) -> Result<(), StorageError> {
+    spec
+      .validate()
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    if !record.can_issue_authority(spec) {
+      return Err(StorageError::IntegrityViolation(
+        "falsification record failed authority admission".into(),
+      ));
+    }
+    let result = match record.result {
+      FalsifierResult::CounterexampleFound => "counterexample_found",
+      FalsifierResult::NoCounterexampleFound => "no_counterexample_found",
+      FalsifierResult::InfrastructureFailure => {
+        return Err(StorageError::IntegrityViolation(
+          "infrastructure failure cannot issue falsification authority".into(),
+        ));
+      }
+    };
+    let authority_context_hash = self
+      .authority_context_hash(record.obligation_ids.iter())
+      .await?;
+    let spec_json = serde_json::to_string(spec)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let record_json = serde_json::to_string(record)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let authority_mac = authority_mac(&[
+      authority_context_hash.as_bytes(),
+      run_id.as_bytes(),
+      spec_json.as_bytes(),
+      record_json.as_bytes(),
+    ])?;
+    sqlx::query("INSERT INTO falsifier_executions(id, run_id, revision, falsifier_name, spec_hash, isolation_policy_hash, image_digest, input_hash, result, spec_json, record_json, authority_context_hash, authority_mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(record.id.to_string())
+      .bind(run_id)
+      .bind(&record.revision)
+      .bind(&record.falsifier_name)
+      .bind(&record.spec_hash)
+      .bind(&record.isolation_policy_hash)
+      .bind(&record.image_digest)
+      .bind(&record.admitted_input_hash)
+      .bind(result)
+      .bind(spec_json)
+      .bind(record_json)
+      .bind(authority_context_hash)
+      .bind(authority_mac)
+      .execute(&self.pool)
+      .await
+      .map(|_| ())
+      .map_err(StorageError::from_sqlx)
+  }
+
   /// Validates and atomically records advisory assessment judgments.
   pub async fn record_semantic_assessment(
     &self,
@@ -241,6 +299,7 @@ impl Storage {
     &self,
     catalog: &RequirementCatalog,
     trusted_specs: &[TrustedVerificationSpec],
+    falsifier_specs: &[FalsifierSpec],
   ) -> Result<EvidenceGraphState, StorageError> {
     let mut graph = empty_graph(catalog)?;
     for project in self.load_project_verifications().await? {
@@ -257,7 +316,8 @@ impl Storage {
         .establish_evidence(evidence)
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
     }
-    let (artifacts, trusted_authority_rejected) = self.load_artifacts(trusted_specs).await?;
+    let (artifacts, authority_rejected) =
+      self.load_artifacts(trusted_specs, falsifier_specs).await?;
     for artifact in artifacts {
       graph
         .establish_artifact(artifact)
@@ -279,7 +339,7 @@ impl Storage {
         &derivation.revision,
       );
       if reconstructed != *derivation {
-        if !trusted_authority_rejected {
+        if !authority_rejected {
           return Err(StorageError::IntegrityViolation(
             "persisted proof derivation is not reconstructible from authoritative artifacts".into(),
           ));
@@ -573,9 +633,69 @@ impl Storage {
     Ok((record, spec))
   }
 
+  async fn load_falsification(
+    &self,
+    id: VerificationRunId,
+  ) -> Result<(FalsificationExecutionRecord, FalsifierSpec), StorageError> {
+    let id_text = id.to_string();
+    let row = sqlx::query("SELECT run_id, revision, falsifier_name, spec_hash, isolation_policy_hash, image_digest, input_hash, result, spec_json, record_json, authority_context_hash, authority_mac FROM falsifier_executions WHERE id = ?")
+      .bind(&id_text)
+      .fetch_optional(&self.pool)
+      .await
+      .map_err(StorageError::from_sqlx)?
+      .ok_or_else(|| StorageError::IntegrityViolation(
+        "falsifier artifact references an unknown controller execution".into(),
+      ))?;
+    let run_id = row.get::<String, _>("run_id");
+    let spec_json = row.get::<String, _>("spec_json");
+    let record_json = row.get::<String, _>("record_json");
+    let spec: FalsifierSpec = serde_json::from_str(&spec_json)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let record: FalsificationExecutionRecord = serde_json::from_str(&record_json)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let authority_context_hash = self
+      .authority_context_hash(record.obligation_ids.iter())
+      .await?;
+    if authority_context_hash != row.get::<String, _>("authority_context_hash") {
+      return Err(StorageError::IntegrityViolation(
+        "falsifier authority context is stale".into(),
+      ));
+    }
+    verify_authority_mac(
+      &[
+        authority_context_hash.as_bytes(),
+        run_id.as_bytes(),
+        spec_json.as_bytes(),
+        record_json.as_bytes(),
+      ],
+      &row.get::<String, _>("authority_mac"),
+    )?;
+    let result = match record.result {
+      FalsifierResult::CounterexampleFound => "counterexample_found",
+      FalsifierResult::NoCounterexampleFound => "no_counterexample_found",
+      FalsifierResult::InfrastructureFailure => "infrastructure_failure",
+    };
+    let columns_match = record.id == id
+      && record.revision == row.get::<String, _>("revision")
+      && record.falsifier_name == row.get::<String, _>("falsifier_name")
+      && record.spec_hash == row.get::<String, _>("spec_hash")
+      && record.isolation_policy_hash == row.get::<String, _>("isolation_policy_hash")
+      && record.image_digest == row.get::<String, _>("image_digest")
+      && record.admitted_input_hash == row.get::<String, _>("input_hash")
+      && result == row.get::<String, _>("result")
+      && record.can_issue_authority(&spec);
+    if !columns_match {
+      return Err(StorageError::IntegrityViolation(
+        "falsifier execution columns disagree with controller record".into(),
+      ));
+    }
+    Ok((record, spec))
+  }
+
   async fn load_artifacts(
     &self,
     trusted_specs: &[TrustedVerificationSpec],
+    falsifier_specs: &[FalsifierSpec],
   ) -> Result<(Vec<EvidenceArtifact>, bool), StorageError> {
     let rows = sqlx::query(
       "SELECT id, run_id, revision, authority, validity, artifact_json, authority_context_hash, authority_mac FROM evidence_artifacts ORDER BY id",
@@ -584,7 +704,7 @@ impl Storage {
     .await
     .map_err(StorageError::from_sqlx)?;
     let mut artifacts = Vec::with_capacity(rows.len());
-    let mut trusted_authority_rejected = false;
+    let mut authority_rejected = false;
     for row in rows {
       let id = row.get::<String, _>("id");
       let artifact_json = row.get::<String, _>("artifact_json");
@@ -593,14 +713,17 @@ impl Storage {
       artifact
         .validate()
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
-      if artifact.provenance == ArtifactProvenance::ControllerTrustedVerifier {
+      if matches!(
+        artifact.provenance,
+        ArtifactProvenance::ControllerTrustedVerifier | ArtifactProvenance::ControllerFalsifier
+      ) {
         let Some(tag) = row.get::<Option<String>, _>("authority_mac") else {
-          trusted_authority_rejected = true;
+          authority_rejected = true;
           continue;
         };
         let Some(stored_context_hash) = row.get::<Option<String>, _>("authority_context_hash")
         else {
-          trusted_authority_rejected = true;
+          authority_rejected = true;
           continue;
         };
         let authority_context_hash = match self
@@ -609,7 +732,7 @@ impl Storage {
         {
           Ok(value) => value,
           Err(_) => {
-            trusted_authority_rejected = true;
+            authority_rejected = true;
             continue;
           }
         };
@@ -625,16 +748,16 @@ impl Storage {
           )
           .is_err()
           || self
-            .validate_artifact_issuance(&artifact, Some(trusted_specs))
+            .validate_artifact_issuance(&artifact, Some(trusted_specs), Some(falsifier_specs))
             .await
             .is_err()
         {
-          trusted_authority_rejected = true;
+          authority_rejected = true;
           continue;
         }
       } else {
         self
-          .validate_artifact_issuance(&artifact, Some(trusted_specs))
+          .validate_artifact_issuance(&artifact, Some(trusted_specs), Some(falsifier_specs))
           .await?;
       }
       let bindings: BTreeSet<_> = sqlx::query_scalar::<_, String>("SELECT obligation_id FROM artifact_obligations WHERE artifact_id = ? ORDER BY obligation_id")
@@ -652,13 +775,14 @@ impl Storage {
       }
       artifacts.push(artifact);
     }
-    Ok((artifacts, trusted_authority_rejected))
+    Ok((artifacts, authority_rejected))
   }
 
   async fn validate_artifact_issuance(
     &self,
     artifact: &EvidenceArtifact,
     trusted_specs: Option<&[TrustedVerificationSpec]>,
+    falsifier_specs: Option<&[FalsifierSpec]>,
   ) -> Result<(), StorageError> {
     match (&artifact.provenance, &artifact.kind) {
       (
@@ -768,6 +892,53 @@ impl Storage {
           }
         }
       }
+      (
+        ArtifactProvenance::ControllerFalsifier,
+        EvidenceArtifactKind::Falsification {
+          run_id,
+          falsifier_name,
+          spec_hash,
+          isolation_policy_hash,
+          execution_record_hash,
+          image_digest,
+          admitted_input_hash,
+          isolation_report,
+          protocol_result,
+          result,
+        },
+      ) => {
+        let (record, persisted_spec) = self.load_falsification(*run_id).await?;
+        let bindings: BTreeSet<_> = record.obligation_ids.iter().cloned().collect();
+        let matches_record = record.revision == artifact.revision
+          && record.falsifier_name == *falsifier_name
+          && record.spec_hash == *spec_hash
+          && record.isolation_policy_hash == *isolation_policy_hash
+          && record.record_hash().ok().as_deref() == Some(execution_record_hash.as_str())
+          && record.image_digest == *image_digest
+          && record.admitted_input_hash == *admitted_input_hash
+          && record.isolation_report == **isolation_report
+          && record.result == *protocol_result
+          && record.observation == *result
+          && bindings == artifact.obligation_ids
+          && record.can_issue_authority(&persisted_spec);
+        if !matches_record {
+          return Err(StorageError::IntegrityViolation(
+            "falsifier artifact disagrees with controller execution record".into(),
+          ));
+        }
+        if let Some(specs) = falsifier_specs {
+          let configured = specs.iter().find(|spec| spec.name() == falsifier_name);
+          if configured
+            .and_then(|spec| spec.fingerprint().ok())
+            .as_deref()
+            != Some(spec_hash.as_str())
+          {
+            return Err(StorageError::IntegrityViolation(
+              "falsifier artifact does not match the current controller registry".into(),
+            ));
+          }
+        }
+      }
       (ArtifactProvenance::ControllerHumanAttestation { .. }, _) => {
         return Err(StorageError::IntegrityViolation(
           "human attestations require a configured issuer registry".into(),
@@ -872,19 +1043,23 @@ impl Storage {
       artifact
         .validate()
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
-      self.validate_artifact_issuance(artifact, None).await?;
+      self
+        .validate_artifact_issuance(artifact, None, None)
+        .await?;
       let json = serde_json::to_string(artifact)
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
-      let authority_context_hash =
-        if artifact.provenance == ArtifactProvenance::ControllerTrustedVerifier {
-          Some(
-            self
-              .authority_context_hash(artifact.obligation_ids.iter())
-              .await?,
-          )
-        } else {
-          None
-        };
+      let authority_context_hash = if matches!(
+        artifact.provenance,
+        ArtifactProvenance::ControllerTrustedVerifier | ArtifactProvenance::ControllerFalsifier
+      ) {
+        Some(
+          self
+            .authority_context_hash(artifact.obligation_ids.iter())
+            .await?,
+        )
+      } else {
+        None
+      };
       let authority_mac = authority_context_hash
         .as_ref()
         .map(|context| authority_mac(&[context.as_bytes(), run_id.as_bytes(), json.as_bytes()]))

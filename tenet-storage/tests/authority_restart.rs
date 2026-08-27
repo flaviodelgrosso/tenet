@@ -139,7 +139,7 @@ async fn read_authority(repository: &Path, key: &[u8], should_validate: bool) {
     .expect("load catalog")
     .expect("active catalog");
   let graph = storage
-    .load_evidence_graph(&catalog, &[spec()])
+    .load_evidence_graph(&catalog, &[spec()], &[])
     .await
     .expect("load evidence graph");
   let proof = &graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")];

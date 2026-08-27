@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+  falsifier::{FalsificationExecutionRecord, FalsifierSpec},
   ids::{ArtifactId, CriterionId, EvidenceId, ObligationId, RequirementId, VerificationRunId},
   proof::{
     derive_proof_state, ArtifactAuthority, ArtifactObservation, ArtifactProvenance,
@@ -520,6 +521,61 @@ impl EvidenceGraphState {
         result: record.observation.clone(),
       },
       obligation_ids: observed_bindings,
+      validity: ArtifactValidity::Valid,
+      dependencies: DependencySurface::RepositoryWide,
+      compatible_revisions: BTreeSet::new(),
+    };
+    let id = artifact.id;
+    self.establish_artifact(artifact)?;
+    Ok(Some(id))
+  }
+  pub fn record_falsification(
+    &mut self,
+    record: &FalsificationExecutionRecord,
+    spec: &FalsifierSpec,
+  ) -> Result<Option<ArtifactId>, EvidenceGraphError> {
+    if !record.can_issue_authority(spec) {
+      return Ok(None);
+    }
+    let predicate = EvidencePredicate::FalsifierCheck {
+      name: spec.name().into(),
+    };
+    let authorized: BTreeSet<_> = self
+      .obligations
+      .values()
+      .filter(|obligation| contract_contains(&obligation.evidence_contract, &predicate))
+      .map(|obligation| obligation.id.clone())
+      .collect();
+    let observed: BTreeSet<_> = record.obligation_ids.iter().cloned().collect();
+    if observed.is_empty() || !observed.is_subset(&authorized) {
+      return Err(EvidenceGraphError::TrustedExecutionBindingMismatch);
+    }
+    let observation = record
+      .result
+      .authoritative_observation()
+      .ok_or(EvidenceGraphError::TrustedExecutionNotAuthoritative)?;
+    let artifact = EvidenceArtifact {
+      id: ArtifactId::new(),
+      revision: record.revision.clone(),
+      observed_at: record.finished_at,
+      authority: ArtifactAuthority::Authoritative,
+      provenance: ArtifactProvenance::ControllerFalsifier,
+      observation,
+      kind: EvidenceArtifactKind::Falsification {
+        run_id: record.id,
+        falsifier_name: record.falsifier_name.clone(),
+        spec_hash: record.spec_hash.clone(),
+        isolation_policy_hash: record.isolation_policy_hash.clone(),
+        execution_record_hash: record
+          .record_hash()
+          .map_err(|error| EvidenceGraphError::InvalidArtifact(error.to_string()))?,
+        image_digest: record.image_digest.clone(),
+        admitted_input_hash: record.admitted_input_hash.clone(),
+        isolation_report: Box::new(record.isolation_report.clone()),
+        protocol_result: record.result.clone(),
+        result: record.observation.clone(),
+      },
+      obligation_ids: observed,
       validity: ArtifactValidity::Valid,
       dependencies: DependencySurface::RepositoryWide,
       compatible_revisions: BTreeSet::new(),

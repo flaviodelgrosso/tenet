@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
+  falsifier::FalsifierResult,
   ids::{ArtifactId, ObligationId, VerificationRunId},
   trusted_verifier::IsolationCapabilityReport,
   verification::{VerificationAuthority, VerificationSpec},
@@ -33,6 +34,7 @@ impl Default for EvidenceContract {
 pub enum EvidencePredicate {
   SourceInspection,
   TrustedVerifierCheck { name: String },
+  FalsifierCheck { name: String },
   ProjectVerification,
   NamedProjectCheck { name: String },
 }
@@ -51,6 +53,7 @@ pub enum ArtifactProvenance {
   ControllerProjectVerification,
   ControllerConfiguredCheck,
   ControllerTrustedVerifier,
+  ControllerFalsifier,
   ControllerSourceInspection,
   ControllerHumanAttestation { attestor: String },
   AgentProposedExecution { worker_role: String },
@@ -62,6 +65,7 @@ pub enum ExecutionDomain {
   Worker,
   CandidatePublicVerification,
   TrustedVerifier,
+  Falsifier,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,6 +157,27 @@ pub enum EvidenceArtifactKind {
     execution_record_hash: String,
     #[serde(rename = "isolationReport")]
     isolation_report: Box<IsolationCapabilityReport>,
+    result: ExecutionObservation,
+  },
+  Falsification {
+    #[serde(rename = "verificationRunId")]
+    run_id: VerificationRunId,
+    #[serde(rename = "falsifierName")]
+    falsifier_name: String,
+    #[serde(rename = "specHash")]
+    spec_hash: String,
+    #[serde(rename = "isolationPolicyHash")]
+    isolation_policy_hash: String,
+    #[serde(rename = "executionRecordHash")]
+    execution_record_hash: String,
+    #[serde(rename = "imageDigest")]
+    image_digest: String,
+    #[serde(rename = "admittedInputHash")]
+    admitted_input_hash: String,
+    #[serde(rename = "isolationReport")]
+    isolation_report: Box<IsolationCapabilityReport>,
+    #[serde(rename = "protocolResult")]
+    protocol_result: FalsifierResult,
     result: ExecutionObservation,
   },
   ProjectVerification {
@@ -247,6 +272,35 @@ impl EvidenceArtifact {
           && isolation_report.input_archive_bytes <= isolation_report.max_input_archive_bytes
           && isolation_report.input_tree_bytes <= isolation_report.max_input_tree_bytes
           && isolation_report.input_entries <= isolation_report.max_input_entries
+          && result.exit_code.is_some()
+          && !result.timed_out
+          && self.compatible_revisions.is_empty()
+      }
+      (
+        ArtifactProvenance::ControllerFalsifier,
+        ArtifactAuthority::Authoritative,
+        EvidenceArtifactKind::Falsification {
+          falsifier_name,
+          spec_hash,
+          isolation_policy_hash,
+          execution_record_hash,
+          image_digest,
+          admitted_input_hash,
+          isolation_report,
+          protocol_result,
+          result,
+          ..
+        },
+        DependencySurface::RepositoryWide,
+      ) => {
+        !falsifier_name.trim().is_empty()
+          && !spec_hash.is_empty()
+          && !isolation_policy_hash.is_empty()
+          && !execution_record_hash.is_empty()
+          && !image_digest.is_empty()
+          && !admitted_input_hash.is_empty()
+          && !isolation_report.runtime_identity.trim().is_empty()
+          && protocol_result.authoritative_observation().is_some()
           && result.exit_code.is_some()
           && !result.timed_out
           && self.compatible_revisions.is_empty()
@@ -354,6 +408,10 @@ impl EvidenceArtifact {
         EvidenceArtifactKind::TrustedExecution { verifier_name, .. },
       ) => name == verifier_name,
       (
+        EvidencePredicate::FalsifierCheck { name },
+        EvidenceArtifactKind::Falsification { falsifier_name, .. },
+      ) => name == falsifier_name,
+      (
         EvidencePredicate::NamedProjectCheck { name },
         EvidenceArtifactKind::CommandExecution {
           check_name: Some(actual),
@@ -372,6 +430,13 @@ pub enum EvidenceAcquisitionKind {
     name: String,
     #[serde(rename = "specHash")]
     spec_hash: String,
+  },
+  FalsifierCheck {
+    name: String,
+    #[serde(rename = "specHash")]
+    spec_hash: String,
+    #[serde(default, rename = "canonicalInput")]
+    canonical_input: Option<String>,
   },
   InspectSource {
     path: String,
@@ -425,10 +490,10 @@ pub enum EvidenceRequestProposal {
     #[serde(rename = "endLine")]
     end_line: u32,
   },
-  Reproduce {
-    program: String,
+  RunFalsifierCheck {
+    name: String,
     #[serde(default)]
-    args: Vec<String>,
+    input: Option<serde_json::Value>,
   },
 }
 
@@ -758,6 +823,11 @@ fn expected_observation(kind: &EvidenceArtifactKind) -> ArtifactObservation {
         ArtifactObservation::Contradicts
       }
     }
+    EvidenceArtifactKind::Falsification {
+      protocol_result, ..
+    } => protocol_result
+      .authoritative_observation()
+      .unwrap_or(ArtifactObservation::Inconclusive),
     EvidenceArtifactKind::SourceSpan { .. } | EvidenceArtifactKind::HumanAttestation { .. } => {
       ArtifactObservation::Supports
     }

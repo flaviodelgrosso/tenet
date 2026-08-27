@@ -4,6 +4,7 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod evidence;
+pub mod falsifier;
 pub mod ids;
 pub mod model;
 pub mod proof;

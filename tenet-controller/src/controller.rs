@@ -21,6 +21,7 @@ use tenet_domain::{
     EvidenceGraphState, EvidencePolicy, ImplementationState, SemanticAssessmentProposal,
     SemanticAssessmentReport,
   },
+  falsifier::FalsificationExecutionRecord,
   model::{
     AgentReconciliationProposal, CompletedWorkUnit, Discovery, DiscoveryStatus, IntegrationPhase,
     Phase, ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus,
@@ -847,6 +848,7 @@ impl Controller {
         state,
         evidence_graph,
         &mut attempted_acquisitions,
+        Vec::new(),
       )
       .await?
     {
@@ -941,8 +943,31 @@ impl Controller {
       &verified_revision,
       &semantic_report,
       &context.config.verification.trusted_checks,
+      &context.config.verification.falsifiers,
       &attempted_acquisitions,
     )?;
+    if let Some(decision) = self
+      .acquire_missing_authoritative_evidence(
+        AcquisitionPass {
+          context,
+          catalog,
+          project_report: &project_report,
+          suite_hash: &suite_hash,
+          revision: &verified_revision,
+        },
+        state,
+        evidence_graph,
+        &mut attempted_acquisitions,
+        admitted_proposals.clone(),
+      )
+      .await?
+    {
+      return match decision::apply_completion_decision(state, &decision) {
+        decision::NextAction::Finish => Ok(Some(state.clone())),
+        decision::NextAction::Block(reason) => Ok(Some(self.block(context, state, &reason).await?)),
+        _ => bail!("admitted acquisition produced an invalid controller action"),
+      };
+    }
     evidence_graph::acquire_assessment_proposals(&self.cwd, evidence_graph, &admitted_proposals)
       .await?;
     let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
@@ -986,6 +1011,7 @@ impl Controller {
     state: &mut State,
     evidence_graph: &mut EvidenceGraphState,
     attempted: &mut BTreeSet<EvidenceAcquisitionIdentity>,
+    mut admitted: Vec<tenet_domain::proof::EvidenceAcquisitionRequest>,
   ) -> Result<Option<CompletionDecision>> {
     let AcquisitionPass {
       context,
@@ -1002,14 +1028,20 @@ impl Controller {
     let workspaces = WorkspaceManager::new(self.cwd.clone(), run_id);
     loop {
       evidence_graph.derive_proofs(revision);
-      let requests = evidence_graph::plan_missing_evidence(
-        evidence_graph,
-        revision,
-        &context.config.verification.trusted_checks,
-        attempted,
-      )?;
-      let Some(request) = requests.into_iter().next() else {
-        return Ok(None);
+      let request = if admitted.is_empty() {
+        let requests = evidence_graph::plan_missing_evidence(
+          evidence_graph,
+          revision,
+          &context.config.verification.trusted_checks,
+          &context.config.verification.falsifiers,
+          attempted,
+        )?;
+        let Some(request) = requests.into_iter().next() else {
+          return Ok(None);
+        };
+        request
+      } else {
+        admitted.remove(0)
       };
       let identity = request.identity();
       if !attempted.insert(identity) {
@@ -1059,6 +1091,63 @@ impl Controller {
           let record = execution.into_record();
           evidence_graph::record_trusted_execution(&self.cwd, evidence_graph, &record, spec)
             .await?;
+        }
+        EvidenceAcquisitionKind::FalsifierCheck {
+          name,
+          spec_hash,
+          canonical_input,
+        } => {
+          let Some(spec) = context
+            .config
+            .verification
+            .falsifiers
+            .iter()
+            .find(|spec| spec.name() == name)
+          else {
+            continue;
+          };
+          if spec.fingerprint()?.as_str() != spec_hash {
+            continue;
+          }
+          let input = canonical_input
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+          let execution_spec = spec
+            .execution_spec(input.as_ref())
+            .map_err(anyhow::Error::new)?;
+          let obligation_ids: Vec<_> = request.obligation_ids.iter().cloned().collect();
+          let execution = run_isolated_trusted_verifier(TrustedVerifierRequest {
+            repository: &self.cwd,
+            workspaces: &workspaces,
+            revision,
+            spec: &execution_spec,
+            obligation_ids: &obligation_ids,
+            max_output_bytes: context.config.verification.max_output_bytes,
+            runner: self.trusted_verifier.as_ref(),
+            cancel: &context.cancel,
+          })
+          .await;
+          let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) if context.cancel.is_cancelled() => return Err(anyhow::Error::new(error)),
+            Err(error) => {
+              context
+                .events
+                .emit(RunEvent::Message(format!(
+                  "Falsifier acquisition {name:?} failed without semantic evidence: {error}"
+                )))
+                .await?;
+              continue;
+            }
+          };
+          let record = FalsificationExecutionRecord::from_trusted_execution(
+            execution.into_record(),
+            spec,
+            input,
+          )
+          .map_err(anyhow::Error::new)?;
+          evidence_graph::record_falsification(&self.cwd, evidence_graph, &record, spec).await?;
         }
         EvidenceAcquisitionKind::InspectSource { .. } => continue,
       }

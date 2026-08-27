@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use chrono::{TimeZone, Utc};
 use tenet_domain::{
   evidence::{ObligationAssessmentResult, SemanticAssessmentReport},
+  falsifier::{FalsificationExecutionRecord, FalsifierProtocol, FalsifierSpec},
   ids::{ArtifactId, ObligationId, VerificationRunId},
   proof::{
     ArtifactAuthority, AssessmentJudgment, EvidenceContract, EvidencePredicate,
@@ -100,7 +101,7 @@ async fn artifact_and_derivation_survive_restart_with_provenance() {
     .await
     .expect("reopen storage");
   let loaded = reopened
-    .load_evidence_graph(&catalog, &[])
+    .load_evidence_graph(&catalog, &[], &[])
     .await
     .expect("load graph");
   assert_eq!(loaded.artifacts.get(&ids[0]), graph.artifacts.get(&ids[0]));
@@ -126,7 +127,7 @@ async fn stale_artifact_and_blocking_proof_survive_restart() {
     .expect("persist stale graph");
 
   let loaded = storage
-    .load_evidence_graph(&catalog, &[])
+    .load_evidence_graph(&catalog, &[], &[])
     .await
     .expect("load graph");
   assert_eq!(
@@ -256,6 +257,64 @@ fn trusted_record(
   }
 }
 
+#[tokio::test]
+async fn authenticated_falsifier_artifact_survives_restart() {
+  install_controller_authority_key("tenet-storage-tests", b"tenet-storage-test-authority")
+    .expect("install authority key");
+  let project = tempfile::tempdir().expect("temporary project");
+  let storage = Storage::open(project.path()).await.expect("open storage");
+  let mut catalog = support::catalog();
+  catalog.verification_obligations[0].evidence_contract = EvidenceContract::Artifact {
+    predicate: EvidencePredicate::FalsifierCheck {
+      name: "boundary-search".into(),
+    },
+  };
+  storage
+    .persist_catalog("spec.md", Utc::now(), &catalog)
+    .await
+    .expect("catalog");
+  storage.create_run("run-falsifier").await.expect("run");
+  let spec = FalsifierSpec {
+    execution: TrustedVerificationSpec {
+      name: "boundary-search".into(),
+      ..trusted_spec()
+    },
+    protocol: FalsifierProtocol::ExitCode,
+    input: None,
+  };
+  let execution_spec = spec.execution_spec(None).expect("execution spec");
+  let record = FalsificationExecutionRecord::from_trusted_execution(
+    trusted_record(&execution_spec, TrustedExecutionResult::Supports),
+    &spec,
+    None,
+  )
+  .expect("falsification record");
+  storage
+    .record_falsification("run-falsifier", &record, &spec)
+    .await
+    .expect("persist falsification");
+  let mut graph = support::empty_graph(&catalog);
+  graph
+    .record_falsification(&record, &spec)
+    .expect("issue artifact");
+  graph.derive_proofs("revision-1");
+  storage
+    .persist_evidence_graph("run-falsifier", &graph)
+    .await
+    .expect("persist graph");
+
+  let reopened = Storage::open(project.path()).await.expect("reopen");
+  let loaded = reopened
+    .load_evidence_graph(&catalog, &[], std::slice::from_ref(&spec))
+    .await
+    .expect("reload falsifier authority");
+
+  assert_eq!(
+    loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Proven
+  );
+}
+
 async fn prepared_trusted_storage() -> (
   tempfile::TempDir,
   Storage,
@@ -301,7 +360,7 @@ async fn trusted_execution_authority_survives_restart_and_revalidation() {
 
   let reopened = Storage::open(project.path()).await.expect("reopen");
   let loaded = reopened
-    .load_evidence_graph(&catalog, std::slice::from_ref(&spec))
+    .load_evidence_graph(&catalog, std::slice::from_ref(&spec), &[])
     .await
     .expect("revalidated graph");
 
@@ -356,7 +415,7 @@ async fn changed_controller_verifier_spec_rejects_persisted_authority() {
   changed.args.push("--changed".into());
 
   let loaded = storage
-    .load_evidence_graph(&catalog, &[changed])
+    .load_evidence_graph(&catalog, &[changed], &[])
     .await
     .expect("stale verifier authority is rejected without blocking reload");
 
@@ -401,7 +460,7 @@ async fn prior_catalog_authority_cannot_replay_for_a_reused_obligation_id() {
   pool.close().await;
 
   let loaded = storage
-    .load_evidence_graph(&changed_catalog, &[spec])
+    .load_evidence_graph(&changed_catalog, &[spec], &[])
     .await
     .expect("stale catalog authority is rejected without blocking reload");
 
@@ -453,7 +512,7 @@ async fn tampered_trusted_execution_record_fails_authentication() {
     .expect("tamper execution record");
   pool.close().await;
   let loaded = storage
-    .load_evidence_graph(&catalog, &[spec])
+    .load_evidence_graph(&catalog, &[spec], &[])
     .await
     .expect("tampered authority is rejected without blocking reload");
 

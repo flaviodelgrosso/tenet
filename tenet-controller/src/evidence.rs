@@ -14,6 +14,7 @@ use tenet_domain::{
     EvidenceGraphState, EvidencePolicy, EvidenceProjection, EvidenceValidity,
     SemanticAssessmentReport, VerificationState,
   },
+  falsifier::{FalsificationExecutionRecord, FalsifierSpec},
   ids::{ArtifactId, CriterionId, EvidenceId, RequirementId},
   model::RequirementCatalog,
   proof::{
@@ -49,6 +50,7 @@ pub fn plan_missing_evidence(
   graph: &EvidenceGraphState,
   revision: &str,
   trusted_specs: &[TrustedVerificationSpec],
+  falsifier_specs: &[FalsifierSpec],
   attempted: &BTreeSet<EvidenceAcquisitionIdentity>,
 ) -> Result<Vec<EvidenceAcquisitionRequest>> {
   let mut requests: Vec<EvidenceAcquisitionRequest> = Vec::new();
@@ -59,6 +61,7 @@ pub fn plan_missing_evidence(
       graph,
       revision,
       trusted_specs,
+      falsifier_specs,
       attempted,
     )?
     else {
@@ -90,6 +93,7 @@ fn next_acquirable_kind(
   graph: &EvidenceGraphState,
   revision: &str,
   trusted_specs: &[TrustedVerificationSpec],
+  falsifier_specs: &[FalsifierSpec],
   attempted: &BTreeSet<EvidenceAcquisitionIdentity>,
 ) -> Result<Option<EvidenceAcquisitionKind>> {
   let proof = derive_proof_state(obligation_id, contract, graph.artifacts.values(), revision);
@@ -113,6 +117,26 @@ fn next_acquirable_kind(
       };
       Ok((!attempted.contains(&identity)).then_some(kind))
     }
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::FalsifierCheck { name },
+    } => {
+      let Some(spec) = falsifier_specs
+        .iter()
+        .find(|spec| spec.name() == name && spec.input.is_none())
+      else {
+        return Ok(None);
+      };
+      let kind = EvidenceAcquisitionKind::FalsifierCheck {
+        name: name.clone(),
+        spec_hash: spec.fingerprint()?,
+        canonical_input: None,
+      };
+      let identity = EvidenceAcquisitionIdentity {
+        revision: revision.to_owned(),
+        kind: kind.clone(),
+      };
+      Ok((!attempted.contains(&identity)).then_some(kind))
+    }
     EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => {
       for requirement in requirements {
         if let Some(kind) = next_acquirable_kind(
@@ -121,6 +145,7 @@ fn next_acquirable_kind(
           graph,
           revision,
           trusted_specs,
+          falsifier_specs,
           attempted,
         )? {
           return Ok(Some(kind));
@@ -137,6 +162,7 @@ pub fn admit_assessment_proposals(
   revision: &str,
   report: &SemanticAssessmentReport,
   trusted_specs: &[TrustedVerificationSpec],
+  falsifier_specs: &[FalsifierSpec],
   attempted: &BTreeSet<EvidenceAcquisitionIdentity>,
 ) -> Result<Vec<EvidenceAcquisitionRequest>> {
   let mut admitted: Vec<EvidenceAcquisitionRequest> = Vec::new();
@@ -175,6 +201,23 @@ pub fn admit_assessment_proposals(
             spec_hash: spec.fingerprint()?,
           }
         }
+        EvidenceRequestProposal::RunFalsifierCheck { name, input } => {
+          let predicate = EvidencePredicate::FalsifierCheck { name: name.clone() };
+          if !contract_contains_predicate(&obligation.evidence_contract, &predicate) {
+            continue;
+          }
+          let Some(spec) = falsifier_specs.iter().find(|spec| spec.name() == name) else {
+            continue;
+          };
+          let Some(canonical_input) = admit_falsifier_input(spec, input.as_ref()) else {
+            continue;
+          };
+          EvidenceAcquisitionKind::FalsifierCheck {
+            name: name.clone(),
+            spec_hash: spec.fingerprint()?,
+            canonical_input,
+          }
+        }
         EvidenceRequestProposal::InspectSource {
           path,
           start_line,
@@ -184,8 +227,7 @@ pub fn admit_assessment_proposals(
           start_line: *start_line,
           end_line: *end_line,
         },
-        EvidenceRequestProposal::RunProjectCheck { .. }
-        | EvidenceRequestProposal::Reproduce { .. } => continue,
+        EvidenceRequestProposal::RunProjectCheck { .. } => continue,
       };
       let identity = EvidenceAcquisitionIdentity {
         revision: revision.to_owned(),
@@ -209,6 +251,23 @@ pub fn admit_assessment_proposals(
     }
   }
   Ok(admitted)
+}
+
+fn admit_falsifier_input(
+  spec: &FalsifierSpec,
+  input: Option<&serde_json::Value>,
+) -> Option<Option<String>> {
+  match (&spec.input, input) {
+    (None, None) => Some(None),
+    (Some(input_spec), Some(value)) => {
+      let validator = jsonschema::validator_for(&input_spec.schema).ok()?;
+      if !validator.is_valid(value) || spec.execution_spec(Some(value)).is_err() {
+        return None;
+      }
+      serde_json::to_string(value).ok().map(Some)
+    }
+    _ => None,
+  }
 }
 
 fn contract_contains_predicate(contract: &EvidenceContract, predicate: &EvidencePredicate) -> bool {
@@ -298,6 +357,20 @@ pub async fn record_trusted_execution(
   let artifact_id = graph
     .record_trusted_execution(record, spec)
     .context("issue controller trusted-verifier artifact")?;
+  graph.derive_proofs(&record.revision);
+  store::write_evidence_graph(cwd, graph).await?;
+  Ok(artifact_id)
+}
+pub async fn record_falsification(
+  cwd: &Path,
+  graph: &mut EvidenceGraphState,
+  record: &FalsificationExecutionRecord,
+  spec: &FalsifierSpec,
+) -> Result<Option<ArtifactId>> {
+  store::record_falsification(cwd, record, spec).await?;
+  let artifact_id = graph
+    .record_falsification(record, spec)
+    .context("issue controller falsifier artifact")?;
   graph.derive_proofs(&record.revision);
   store::write_evidence_graph(cwd, graph).await?;
   Ok(artifact_id)
@@ -609,7 +682,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn reproduce_proposal_is_deferred_without_execution_or_artifact() {
+  async fn unknown_falsifier_proposal_cannot_execute_or_issue_artifact() {
     use tenet_domain::{
       evidence::{AcceptanceCriterion, ObligationAssessmentResult, VerificationObligation},
       ids::{CriterionId, ObligationId, RequirementId},
@@ -647,17 +720,18 @@ mod tests {
         obligation_id: obligation_id.clone(),
         assessment: AssessmentJudgment::Insufficient {
           reason: "evidence absent".into(),
-          proposals: vec![EvidenceRequestProposal::Reproduce {
-            program: "touch".into(),
-            args: vec![marker.display().to_string()],
+          proposals: vec![EvidenceRequestProposal::RunFalsifierCheck {
+            name: "touch".into(),
+            input: Some(serde_json::json!({"path": marker})),
           }],
           gap_kind: GapKind::Evidence,
         },
       }],
     };
 
-    let admitted = admit_assessment_proposals(&graph, "revision", &report, &[], &BTreeSet::new())
-      .expect("admit proposals");
+    let admitted =
+      admit_assessment_proposals(&graph, "revision", &report, &[], &[], &BTreeSet::new())
+        .expect("admit proposals");
     let acquired = acquire_assessment_proposals(project.path(), &mut graph, &admitted)
       .await
       .expect("defer proposal");
@@ -734,6 +808,7 @@ mod tests {
       &graph,
       "revision",
       &[trusted_spec("boundary")],
+      &[],
       &BTreeSet::new(),
     )
     .expect("plan evidence");
@@ -751,12 +826,12 @@ mod tests {
       requirements: vec![trusted_contract("first"), trusted_contract("second")],
     }]);
     let specs = [trusted_spec("first"), trusted_spec("second")];
-    let first = plan_missing_evidence(&graph, "revision", &specs, &BTreeSet::new())
+    let first = plan_missing_evidence(&graph, "revision", &specs, &[], &BTreeSet::new())
       .expect("plan first branch")
       .remove(0);
     let attempted = BTreeSet::from([first.identity()]);
 
-    let second = plan_missing_evidence(&graph, "revision", &specs, &attempted)
+    let second = plan_missing_evidence(&graph, "revision", &specs, &[], &attempted)
       .expect("plan second branch")
       .remove(0);
 
@@ -773,6 +848,7 @@ mod tests {
       &graph,
       "revision",
       &[trusted_spec("shared")],
+      &[],
       &BTreeSet::new(),
     )
     .expect("plan shared evidence");
@@ -808,6 +884,7 @@ mod tests {
       "revision",
       &trusted_proposal("invented"),
       &[trusted_spec("invented")],
+      &[],
       &BTreeSet::new(),
     )
     .expect("evaluate proposal");
@@ -823,6 +900,7 @@ mod tests {
       "revision",
       &trusted_proposal("allowed"),
       &[trusted_spec("allowed")],
+      &[],
       &BTreeSet::new(),
     )
     .expect("evaluate proposal");
@@ -832,5 +910,115 @@ mod tests {
       &admitted[0].kind,
       EvidenceAcquisitionKind::TrustedVerifierCheck { name, .. } if name == "allowed"
     ));
+  }
+  fn structured_falsifier(name: &str) -> FalsifierSpec {
+    use tenet_domain::falsifier::{FalsifierProtocol, StructuredFalsifierInputSpec};
+
+    FalsifierSpec {
+      execution: trusted_spec(name),
+      protocol: FalsifierProtocol::ExitCode,
+      input: Some(StructuredFalsifierInputSpec {
+        schema: serde_json::json!({
+          "type": "object",
+          "required": ["seed"],
+          "properties": {"seed": {"type": "integer"}},
+          "additionalProperties": false
+        }),
+        argument: "--input-json".into(),
+        max_bytes: 128,
+      }),
+    }
+  }
+
+  fn falsifier_proposal(name: &str, input: serde_json::Value) -> SemanticAssessmentReport {
+    use tenet_domain::{
+      evidence::ObligationAssessmentResult,
+      ids::ObligationId,
+      proof::{AssessmentJudgment, GapKind},
+    };
+
+    SemanticAssessmentReport {
+      summary: "try bounded counterexample".into(),
+      assessments: vec![ObligationAssessmentResult {
+        obligation_id: ObligationId::from("REQ-001/AC-00/VO-01"),
+        assessment: AssessmentJudgment::Insufficient {
+          reason: "missing falsifier observation".into(),
+          proposals: vec![EvidenceRequestProposal::RunFalsifierCheck {
+            name: name.into(),
+            input: Some(input),
+          }],
+          gap_kind: GapKind::Evidence,
+        },
+      }],
+    }
+  }
+
+  #[test]
+  fn malformed_falsifier_input_is_rejected() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::FalsifierCheck {
+        name: "search".into(),
+      },
+    };
+    let graph = graph_with_contracts(vec![contract]);
+    let admitted = admit_assessment_proposals(
+      &graph,
+      "revision",
+      &falsifier_proposal("search", serde_json::json!({"seed": "not-an-integer"})),
+      &[],
+      &[structured_falsifier("search")],
+      &BTreeSet::new(),
+    )
+    .expect("evaluate malformed input");
+
+    assert!(admitted.is_empty());
+  }
+
+  #[test]
+  fn valid_falsifier_input_is_canonicalized_without_executable_fields() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::FalsifierCheck {
+        name: "search".into(),
+      },
+    };
+    let graph = graph_with_contracts(vec![contract]);
+    let admitted = admit_assessment_proposals(
+      &graph,
+      "revision",
+      &falsifier_proposal("search", serde_json::json!({"seed": 7})),
+      &[],
+      &[structured_falsifier("search")],
+      &BTreeSet::new(),
+    )
+    .expect("evaluate valid input");
+
+    assert!(matches!(
+      &admitted[0].kind,
+      EvidenceAcquisitionKind::FalsifierCheck {
+        name,
+        canonical_input: Some(input),
+        ..
+      } if name == "search" && input == "{\"seed\":7}"
+    ));
+  }
+  #[test]
+  fn falsifier_proposal_for_unrelated_contract_is_rejected() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::FalsifierCheck {
+        name: "allowed".into(),
+      },
+    };
+    let graph = graph_with_contracts(vec![contract]);
+    let admitted = admit_assessment_proposals(
+      &graph,
+      "revision",
+      &falsifier_proposal("unrelated", serde_json::json!({"seed": 7})),
+      &[],
+      &[structured_falsifier("unrelated")],
+      &BTreeSet::new(),
+    )
+    .expect("evaluate unrelated proposal");
+
+    assert!(admitted.is_empty());
   }
 }

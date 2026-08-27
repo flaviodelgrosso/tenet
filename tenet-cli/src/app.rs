@@ -251,7 +251,11 @@ impl App {
         .context("trusted evidence inspection requires controller authority identity")?;
     }
     let graph = storage
-      .load_evidence_graph(&catalog, &config.verification.trusted_checks)
+      .load_evidence_graph(
+        &catalog,
+        &config.verification.trusted_checks,
+        &config.verification.falsifiers,
+      )
       .await?;
     if let Some(requirement) = requirement {
       let evidence: Vec<_> = graph

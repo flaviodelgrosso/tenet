@@ -30,6 +30,7 @@ use tenet_domain::{
     AcceptanceCriterion, AgentObligationAssessment, ImplementationState,
     SemanticAssessmentProposal, VerificationObligation,
   },
+  falsifier::{FalsifierProtocol, FalsifierSpec},
   ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId, VerificationRunId},
   model::{
     AgentReconciliationProposal, AgentRequirementAssessment, AgentWorkUnit, ArchitectOutput,
@@ -3672,6 +3673,154 @@ async fn mismatched_resolved_image_digest_cannot_issue_authoritative_evidence() 
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
     ProofState::Contradicted
   );
+}
+
+fn falsifier_spec() -> FalsifierSpec {
+  FalsifierSpec {
+    execution: trusted_verification_spec_named("boundary-search"),
+    protocol: FalsifierProtocol::ExitCode,
+    input: None,
+  }
+}
+
+async fn configured_falsifier_controller(
+  repository: &TempRepo,
+  backend: Arc<FakeBackend>,
+  runner: Arc<dyn TrustedVerifierRunner>,
+) -> Controller {
+  store::install_controller_authority_key(
+    "tenet-controller-tests",
+    b"tenet-controller-test-authority",
+  )
+  .expect("install test authority identity");
+  let (_controller, _events) = configured_controller(repository, backend.clone(), 1).await;
+  let mut config = read_config(repository.path()).await.expect("read config");
+  config.verification.falsifiers = vec![falsifier_spec()];
+  fs::write(
+    repository.path().join("tenet.toml"),
+    toml::to_string_pretty(&config).expect("falsifier config"),
+  )
+  .await
+  .expect("write falsifier config");
+  run_git(repository.path(), &["add", "tenet.toml"]);
+  run_git(repository.path(), &["commit", "-m", "configure falsifier"]);
+  let mut catalog = store::read_catalog(repository.path())
+    .await
+    .expect("load catalog")
+    .expect("catalog");
+  catalog.verification_obligations[0].evidence_contract = EvidenceContract::Artifact {
+    predicate: EvidencePredicate::FalsifierCheck {
+      name: "boundary-search".into(),
+    },
+  };
+  store::write_catalog(repository.path(), &catalog)
+    .await
+    .expect("write falsifier catalog");
+  approve_active_catalog(repository.path()).await;
+  Controller::with_trusted_verifier(
+    repository.path().to_path_buf(),
+    backend,
+    EventSink::new(None),
+    runner,
+  )
+}
+
+#[tokio::test]
+async fn no_counterexample_falsifier_proves_only_its_contract_without_assessor() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let runner = Arc::new(FakeTrustedVerifier {
+    contradicts: false,
+    resolved_digest_matches: true,
+    calls: AtomicUsize::new(0),
+    names: Mutex::new(Vec::new()),
+  });
+  let controller =
+    configured_falsifier_controller(&repository, backend.clone(), runner.clone()).await;
+
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+
+  assert_eq!(state.status, RunStatus::Done);
+  assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn falsifier_counterexample_blocks_without_assessor_override() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let runner = Arc::new(FakeTrustedVerifier {
+    contradicts: true,
+    resolved_digest_matches: true,
+    calls: AtomicUsize::new(0),
+    names: Mutex::new(Vec::new()),
+  });
+  let controller =
+    configured_falsifier_controller(&repository, backend.clone(), runner.clone()).await;
+
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+
+  assert_eq!(state.status, RunStatus::Blocked);
+  assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn hybrid_verifier_and_falsifier_contract_requires_both_artifacts() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let runner = Arc::new(FakeTrustedVerifier {
+    contradicts: false,
+    resolved_digest_matches: true,
+    calls: AtomicUsize::new(0),
+    names: Mutex::new(Vec::new()),
+  });
+  let controller =
+    configured_falsifier_controller(&repository, backend.clone(), runner.clone()).await;
+  let mut config = read_config(repository.path()).await.expect("read config");
+  config.verification.trusted_checks = vec![trusted_verification_spec_named("machine-check")];
+  fs::write(
+    repository.path().join("tenet.toml"),
+    toml::to_string_pretty(&config).expect("hybrid config"),
+  )
+  .await
+  .expect("write hybrid config");
+  run_git(repository.path(), &["add", "tenet.toml"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "configure hybrid checks"],
+  );
+  let mut catalog = store::read_catalog(repository.path())
+    .await
+    .expect("load catalog")
+    .expect("catalog");
+  catalog.verification_obligations[0].evidence_contract = EvidenceContract::All {
+    requirements: vec![
+      EvidenceContract::Artifact {
+        predicate: EvidencePredicate::TrustedVerifierCheck {
+          name: "machine-check".into(),
+        },
+      },
+      EvidenceContract::Artifact {
+        predicate: EvidencePredicate::FalsifierCheck {
+          name: "boundary-search".into(),
+        },
+      },
+    ],
+  };
+  store::write_catalog(repository.path(), &catalog)
+    .await
+    .expect("write hybrid catalog");
+  approve_active_catalog(repository.path()).await;
+
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+
+  assert_eq!(state.status, RunStatus::Done);
+  assert_eq!(
+    runner.names.lock().expect("runner names").as_slice(),
+    &["machine-check", "boundary-search"]
+  );
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
