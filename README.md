@@ -107,11 +107,17 @@ A proposal binds claims and obligations to verifier IDs already present in repos
 tenet contract propose --file proposal.json --json
 ```
 
-Tenet returns a proposal ID and deterministic digest. A coding agent may prepare and submit this proposal, but must stop for operator admission.
+Tenet returns a proposal ID and deterministic digest. Entering `pending_approval` does not admit it.
 
-### 4. Admit the exact proposal
+### 4. Obtain human admission and persist it
 
-The operator admits the exact ID and digest:
+The coding agent must present the user with the exact pending proposal before requesting admission:
+
+- proposal ID and digest;
+- every requirement and obligation ID and statement; and
+- each obligation's verifier ID and authority mapping.
+
+The user must explicitly approve that exact ID and digest. The coding agent must neither self-approve nor infer approval from silence, a generic acknowledgement, or an earlier approval. After the user gives explicit approval, the coding agent—not the user—may persist it with:
 
 ```bash
 tenet contract approve \
@@ -120,7 +126,9 @@ tenet contract approve \
   --json
 ```
 
-Any content change produces a different digest and requires new admission. Admission writes `.tenet/contract.json`; commit it with `.tenet/tenet.toml`, the specification, and the generated Skill. Select that exact commit as the new authority revision before gating descendants that intentionally change the control plane.
+The command verifies the stored proposal ID, digest, and content, then revalidates the current specification and verification policy before writing `.tenet/contract.json`. A proposal-content change has a new digest and proposal ID; a specification or policy change makes the pending proposal stale. In either case, the earlier human approval is invalid: the agent must show the current proposal and request fresh explicit approval before it can run `approve`.
+
+Admission writes `.tenet/contract.json`; commit it with `.tenet/tenet.toml`, the specification, and the generated Skill. Select that exact commit as the new authority revision before gating descendants that intentionally change the control plane.
 
 Proposal/admission separation is a domain workflow boundary under the default same-user trust model, not a security sandbox.
 

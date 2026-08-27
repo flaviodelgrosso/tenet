@@ -248,13 +248,19 @@ fn generated_skill_is_portable_concise_and_not_authoritative() {
     .expect("read skill");
 
   assert!(skill.starts_with("---\nname: tenet\n"));
-  assert!(skill.contains("tenet-skill-version: \"1\""));
-  assert!(skill.contains("Never invoke `tenet contract approve` yourself"));
+  assert!(skill.contains("tenet-skill-version: \"2\""));
+  assert!(skill.contains("On `pending_approval`, show the user the exact proposal"));
+  assert!(skill.contains("every requirement and obligation ID and statement"));
+  assert!(skill.contains("verifier ID and authority mapping"));
+  assert!(skill.contains("Never self-approve, infer approval from silence"));
+  assert!(skill
+    .contains("user explicitly approves that exact ID and digest, run `tenet contract approve"));
+  assert!(skill.contains("proposal content, specification, policy, ID, or digest changes"));
   assert!(skill.contains("Never choose or advance A yourself"));
   assert!(skill
     .contains("tenet gate --authority-revision <authority-sha> --revision <candidate-sha> --json"));
   assert!(skill.contains("exact (A, R) pair"));
-  assert!(skill.lines().count() < 40);
+  assert!(skill.lines().count() < 45);
   for forbidden in [
     "Codex",
     "Claude",
@@ -925,7 +931,86 @@ fn approval_requires_the_exact_proposal_identity_and_digest() {
   assert_eq!(output.status.code(), Some(1));
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert!(error["message"].as_str().unwrap().contains("identity"));
+
+  let output = repository.tenet(&[
+    "contract",
+    "approve",
+    "--proposal",
+    proposed["proposalId"].as_str().unwrap(),
+    "--digest",
+    "sha256:wrong",
+    "--json",
+  ]);
+  assert_eq!(output.status.code(), Some(1));
+  let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+  assert!(error["message"].as_str().unwrap().contains("not found"));
   assert!(!repository.path().join(".tenet/contract.json").exists());
+}
+
+#[test]
+fn approval_revalidates_pending_proposals_after_specification_or_policy_changes() {
+  for mutation in ["specification", "policy"] {
+    let repository = Repository::new();
+    repository.init();
+    let status = repository.configure(&["/usr/bin/true"]);
+    let proposal = json!({
+      "schemaVersion": 1,
+      "specDigest": status["specDigest"],
+      "policyDigest": status["policyDigest"],
+      "requirements": [{
+        "id": "REQ-001",
+        "statement": "claim",
+        "obligations": [{
+          "id": "REQ-001/VO-001",
+          "statement": "oracle",
+          "evidenceContract": { "verifierId": "quality", "authority": "project" }
+        }]
+      }]
+    });
+    let proposal_path = repository.path().join("proposal.json");
+    fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+    let proposed = success_json(repository.tenet(&[
+      "contract",
+      "propose",
+      "--file",
+      proposal_path.to_str().unwrap(),
+      "--json",
+    ]));
+
+    match mutation {
+      "specification" => {
+        fs::write(repository.path().join("SPEC.md"), "# Changed behavior\n").unwrap()
+      }
+      "policy" => {
+        let policy_path = repository.path().join(".tenet/tenet.toml");
+        let policy = fs::read_to_string(&policy_path).unwrap();
+        fs::write(
+          &policy_path,
+          policy.replace("timeout_seconds = 10", "timeout_seconds = 11"),
+        )
+        .unwrap();
+      }
+      _ => unreachable!(),
+    }
+
+    let output = repository.tenet(&[
+      "contract",
+      "approve",
+      "--proposal",
+      proposed["proposalId"].as_str().unwrap(),
+      "--digest",
+      proposed["proposalDigest"].as_str().unwrap(),
+      "--json",
+    ]);
+    assert_eq!(
+      output.status.code(),
+      Some(1),
+      "{mutation} change admitted proposal"
+    );
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(error["message"].as_str().unwrap().contains("stale"));
+    assert!(!repository.path().join(".tenet/contract.json").exists());
+  }
 }
 
 #[test]
