@@ -13,6 +13,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
+use serde_json::json;
 use tokio::{
   fs,
   sync::{mpsc, Notify},
@@ -31,7 +32,7 @@ use tenet_domain::{
     AcceptanceCriterion, AgentObligationAssessment, ImplementationState,
     SemanticAssessmentProposal, VerificationObligation,
   },
-  falsifier::{FalsifierProtocol, FalsifierSpec},
+  falsifier::{FalsifierProtocol, FalsifierSpec, StructuredFalsifierInputSpec},
   human_attestation::{HumanAttestationBinding, HumanAttestationRecord, HumanAttestorSpec},
   ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId, VerificationRunId},
   model::{
@@ -43,7 +44,7 @@ use tenet_domain::{
   },
   proof::{
     statement_hash, AssessmentJudgment, DependencyPolicy, DependencySurface, EvidenceContract,
-    EvidencePredicate, ExecutionObservation, GapKind, ProofState,
+    EvidencePredicate, EvidenceRequestProposal, ExecutionObservation, GapKind, ProofState,
   },
   trusted_verifier::{
     CandidateFilesystemPolicy, ControlChannel, EnvironmentPolicy, GuestSecurityProfile,
@@ -303,6 +304,7 @@ enum BackendMode {
     role: tenet_domain::model::WorkerRole,
     commit: bool,
   },
+  DynamicFalsifierProposal,
 }
 
 struct FakeBackend {
@@ -836,6 +838,14 @@ impl AgentBackend for FakeBackend {
       BackendMode::SemanticGapThenRepair => AssessmentJudgment::Insufficient {
         reason: "implementation exists but authoritative evidence is unavailable".into(),
         proposals: Vec::new(),
+        gap_kind: GapKind::Evidence,
+      },
+      BackendMode::DynamicFalsifierProposal if satisfied => AssessmentJudgment::Insufficient {
+        reason: "configured falsifier needs assessor-selected input".into(),
+        proposals: vec![EvidenceRequestProposal::RunFalsifierCheck {
+          name: "boundary-search".into(),
+          input: Some(json!({"seed": 7})),
+        }],
         gap_kind: GapKind::Evidence,
       },
       mode if matches!(mode, BackendMode::IncompleteAssessment) || !satisfied => {
@@ -4073,10 +4083,23 @@ fn falsifier_spec() -> FalsifierSpec {
   }
 }
 
+fn dynamic_falsifier_spec() -> FalsifierSpec {
+  FalsifierSpec {
+    execution: trusted_verification_spec_named("boundary-search"),
+    protocol: FalsifierProtocol::ExitCode,
+    input: Some(StructuredFalsifierInputSpec {
+      schema: json!({"type": "object", "required": ["seed"]}),
+      argument: "--input-json".into(),
+      max_bytes: 128,
+    }),
+  }
+}
+
 async fn configured_falsifier_controller(
   repository: &TempRepo,
   backend: Arc<FakeBackend>,
   runner: Arc<dyn TrustedVerifierRunner>,
+  spec: FalsifierSpec,
 ) -> Controller {
   store::install_controller_authority_key(
     "tenet-controller-tests",
@@ -4085,7 +4108,7 @@ async fn configured_falsifier_controller(
   .expect("install test authority identity");
   let (_controller, _events) = configured_controller(repository, backend.clone(), 1).await;
   let mut config = read_config(repository.path()).await.expect("read config");
-  config.verification.falsifiers = vec![falsifier_spec()];
+  config.verification.falsifiers = vec![spec];
   fs::write(
     repository.path().join("tenet.toml"),
     toml::to_string_pretty(&config).expect("falsifier config"),
@@ -4125,8 +4148,13 @@ async fn no_counterexample_falsifier_proves_only_its_contract_without_assessor()
     calls: AtomicUsize::new(0),
     names: Mutex::new(Vec::new()),
   });
-  let controller =
-    configured_falsifier_controller(&repository, backend.clone(), runner.clone()).await;
+  let controller = configured_falsifier_controller(
+    &repository,
+    backend.clone(),
+    runner.clone(),
+    falsifier_spec(),
+  )
+  .await;
 
   let state = controller.run(CancellationToken::new()).await.expect("run");
 
@@ -4145,14 +4173,89 @@ async fn falsifier_counterexample_blocks_without_assessor_override() {
     calls: AtomicUsize::new(0),
     names: Mutex::new(Vec::new()),
   });
-  let controller =
-    configured_falsifier_controller(&repository, backend.clone(), runner.clone()).await;
+  let controller = configured_falsifier_controller(
+    &repository,
+    backend.clone(),
+    runner.clone(),
+    falsifier_spec(),
+  )
+  .await;
 
   let state = controller.run(CancellationToken::new()).await.expect("run");
 
   assert_eq!(state.status, RunStatus::Blocked);
   assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
   assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn assessor_selected_no_counterexample_cannot_prove_falsifier_contract() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::DynamicFalsifierProposal));
+  let runner = Arc::new(FakeTrustedVerifier {
+    contradicts: false,
+    resolved_digest_matches: true,
+    calls: AtomicUsize::new(0),
+    names: Mutex::new(Vec::new()),
+  });
+  let controller = configured_falsifier_controller(
+    &repository,
+    backend,
+    runner.clone(),
+    dynamic_falsifier_spec(),
+  )
+  .await;
+
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("catalog read")
+    .expect("catalog");
+  let graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("graph reload");
+
+  assert_eq!(state.status, RunStatus::Blocked);
+  assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+  assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Insufficient
+  );
+}
+
+#[tokio::test]
+async fn assessor_selected_counterexample_contradicts_falsifier_contract() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::DynamicFalsifierProposal));
+  let runner = Arc::new(FakeTrustedVerifier {
+    contradicts: true,
+    resolved_digest_matches: true,
+    calls: AtomicUsize::new(0),
+    names: Mutex::new(Vec::new()),
+  });
+  let controller = configured_falsifier_controller(
+    &repository,
+    backend,
+    runner.clone(),
+    dynamic_falsifier_spec(),
+  )
+  .await;
+
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("catalog read")
+    .expect("catalog");
+  let graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("graph reload");
+
+  assert_eq!(state.status, RunStatus::Blocked);
+  assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+  assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Contradicted
+  );
 }
 
 #[tokio::test]
@@ -4165,8 +4268,13 @@ async fn hybrid_verifier_and_falsifier_contract_requires_both_artifacts() {
     calls: AtomicUsize::new(0),
     names: Mutex::new(Vec::new()),
   });
-  let controller =
-    configured_falsifier_controller(&repository, backend.clone(), runner.clone()).await;
+  let controller = configured_falsifier_controller(
+    &repository,
+    backend.clone(),
+    runner.clone(),
+    falsifier_spec(),
+  )
+  .await;
   let mut config = read_config(repository.path()).await.expect("read config");
   config.verification.trusted_checks = vec![trusted_verification_spec_named("machine-check")];
   fs::write(
@@ -4245,5 +4353,39 @@ async fn trusted_verifier_infrastructure_failure_issues_no_semantic_artifact() {
   assert_ne!(
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
     ProofState::Contradicted
+  );
+}
+
+#[tokio::test]
+async fn falsifier_infrastructure_failure_issues_no_semantic_artifact() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let falsifier = Arc::new(UnavailableTrustedVerifier {
+    calls: AtomicUsize::new(0),
+  });
+  let controller =
+    configured_falsifier_controller(&repository, backend, falsifier.clone(), falsifier_spec())
+      .await;
+
+  controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("infrastructure failure must leave the obligation unproven");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("catalog read")
+    .expect("catalog");
+  let graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("graph reload");
+
+  assert!((1..=3).contains(&falsifier.calls.load(Ordering::SeqCst)));
+  assert!(!graph.artifacts.values().any(|artifact| matches!(
+    artifact.provenance,
+    tenet_domain::proof::ArtifactProvenance::ControllerFalsifier
+  )));
+  assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Insufficient
   );
 }

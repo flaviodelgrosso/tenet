@@ -109,9 +109,10 @@ pub enum FalsifierResult {
 }
 
 impl FalsifierResult {
-  pub fn authoritative_observation(&self) -> Option<ArtifactObservation> {
+  pub fn authoritative_observation(&self, has_dynamic_input: bool) -> Option<ArtifactObservation> {
     match self {
       Self::CounterexampleFound => Some(ArtifactObservation::Contradicts),
+      Self::NoCounterexampleFound if has_dynamic_input => Some(ArtifactObservation::Inconclusive),
       Self::NoCounterexampleFound => Some(ArtifactObservation::Supports),
       Self::InfrastructureFailure => None,
     }
@@ -370,6 +371,6 @@ mod tests {
       message: "sandbox unavailable".into(),
     });
 
-    assert_eq!(result.authoritative_observation(), None);
+    assert_eq!(result.authoritative_observation(false), None);
   }
 }

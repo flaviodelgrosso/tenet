@@ -2,9 +2,12 @@ use std::collections::BTreeMap;
 
 use chrono::{TimeZone, Utc};
 use ed25519_dalek::SigningKey;
+use serde_json::json;
 use tenet_domain::{
   evidence::{ObligationAssessmentResult, SemanticAssessmentReport},
-  falsifier::{FalsificationExecutionRecord, FalsifierProtocol, FalsifierSpec},
+  falsifier::{
+    FalsificationExecutionRecord, FalsifierProtocol, FalsifierSpec, StructuredFalsifierInputSpec,
+  },
   human_attestation::{HumanAttestationBinding, HumanAttestationRecord, HumanAttestorSpec},
   ids::{ArtifactId, ObligationId, VerificationRunId},
   proof::{
@@ -306,8 +309,10 @@ fn trusted_record(
   }
 }
 
-#[tokio::test]
-async fn authenticated_falsifier_artifact_survives_restart() {
+async fn persisted_falsifier_states(
+  result: TrustedExecutionResult,
+  input: Option<serde_json::Value>,
+) -> (ProofState, ProofState) {
   install_controller_authority_key("tenet-storage-tests", b"tenet-storage-test-authority")
     .expect("install authority key");
   let project = tempfile::tempdir().expect("temporary project");
@@ -329,13 +334,17 @@ async fn authenticated_falsifier_artifact_survives_restart() {
       ..trusted_spec()
     },
     protocol: FalsifierProtocol::ExitCode,
-    input: None,
+    input: input.as_ref().map(|_| StructuredFalsifierInputSpec {
+      schema: json!({"type": "object", "required": ["seed"]}),
+      argument: "--input-json".into(),
+      max_bytes: 128,
+    }),
   };
-  let execution_spec = spec.execution_spec(None).expect("execution spec");
+  let execution_spec = spec.execution_spec(input.as_ref()).expect("execution spec");
   let record = FalsificationExecutionRecord::from_trusted_execution(
-    trusted_record(&execution_spec, TrustedExecutionResult::Supports),
+    trusted_record(&execution_spec, result),
     &spec,
-    None,
+    input,
   )
   .expect("falsification record");
   storage
@@ -347,6 +356,7 @@ async fn authenticated_falsifier_artifact_survives_restart() {
     .record_falsification(&record, &spec, DependencySurface::RepositoryWide)
     .expect("issue artifact");
   graph.derive_proofs("revision-1");
+  let before_restart = graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state;
   storage
     .persist_evidence_graph("run-falsifier", &graph)
     .await
@@ -356,12 +366,35 @@ async fn authenticated_falsifier_artifact_survives_restart() {
   let loaded = reopened
     .load_evidence_graph(&catalog, &[], std::slice::from_ref(&spec), &[])
     .await
-    .expect("reload falsifier authority");
+    .expect("reload falsifier observation");
+  let after_restart = loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state;
+  (before_restart, after_restart)
+}
 
-  assert_eq!(
-    loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Proven
-  );
+#[tokio::test]
+async fn fixed_no_counterexample_is_proven_before_and_after_restart() {
+  let states = persisted_falsifier_states(TrustedExecutionResult::Supports, None).await;
+
+  assert_eq!(states, (ProofState::Proven, ProofState::Proven));
+}
+
+#[tokio::test]
+async fn dynamic_no_counterexample_is_non_proving_before_and_after_restart() {
+  let states =
+    persisted_falsifier_states(TrustedExecutionResult::Supports, Some(json!({"seed": 7}))).await;
+
+  assert_eq!(states, (ProofState::Insufficient, ProofState::Insufficient));
+}
+
+#[tokio::test]
+async fn dynamic_counterexample_is_contradicted_before_and_after_restart() {
+  let states = persisted_falsifier_states(
+    TrustedExecutionResult::Contradicts { exit_code: 1 },
+    Some(json!({"seed": 7})),
+  )
+  .await;
+
+  assert_eq!(states, (ProofState::Contradicted, ProofState::Contradicted));
 }
 
 async fn prepared_trusted_storage() -> (

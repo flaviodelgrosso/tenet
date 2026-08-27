@@ -565,7 +565,7 @@ impl EvidenceGraphState {
     }
     let observation = record
       .result
-      .authoritative_observation()
+      .authoritative_observation(record.admitted_input.is_some())
       .ok_or(EvidenceGraphError::TrustedExecutionNotAuthoritative)?;
     let artifact = EvidenceArtifact {
       id: ArtifactId::new(),
@@ -584,6 +584,7 @@ impl EvidenceGraphState {
           .map_err(|error| EvidenceGraphError::InvalidArtifact(error.to_string()))?,
         image_digest: record.image_digest.clone(),
         admitted_input_hash: record.admitted_input_hash.clone(),
+        has_dynamic_input: record.admitted_input.is_some(),
         isolation_report: Box::new(record.isolation_report.clone()),
         protocol_result: record.result.clone(),
         result: record.observation.clone(),

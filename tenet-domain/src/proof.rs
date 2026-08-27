@@ -258,6 +258,8 @@ pub enum EvidenceArtifactKind {
     image_digest: String,
     #[serde(rename = "admittedInputHash")]
     admitted_input_hash: String,
+    #[serde(rename = "hasDynamicInput")]
+    has_dynamic_input: bool,
     #[serde(rename = "isolationReport")]
     isolation_report: Box<IsolationCapabilityReport>,
     #[serde(rename = "protocolResult")]
@@ -378,6 +380,7 @@ impl EvidenceArtifact {
           execution_record_hash,
           image_digest,
           admitted_input_hash,
+          has_dynamic_input,
           isolation_report,
           protocol_result,
           result,
@@ -392,7 +395,9 @@ impl EvidenceArtifact {
           && !image_digest.is_empty()
           && !admitted_input_hash.is_empty()
           && !isolation_report.runtime_identity.trim().is_empty()
-          && protocol_result.authoritative_observation().is_some()
+          && protocol_result
+            .authoritative_observation(*has_dynamic_input)
+            .is_some()
           && result.exit_code.is_some()
           && !result.timed_out
           && valid_authoritative_dependencies(dependencies, &self.compatible_revisions)
@@ -942,9 +947,11 @@ fn expected_observation(kind: &EvidenceArtifactKind) -> ArtifactObservation {
       }
     }
     EvidenceArtifactKind::Falsification {
-      protocol_result, ..
+      protocol_result,
+      has_dynamic_input,
+      ..
     } => protocol_result
-      .authoritative_observation()
+      .authoritative_observation(*has_dynamic_input)
       .unwrap_or(ArtifactObservation::Inconclusive),
     EvidenceArtifactKind::SourceSpan { .. } | EvidenceArtifactKind::HumanAttestation { .. } => {
       ArtifactObservation::Supports

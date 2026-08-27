@@ -1090,6 +1090,7 @@ impl Storage {
           execution_record_hash,
           image_digest,
           admitted_input_hash,
+          has_dynamic_input,
           isolation_report,
           protocol_result,
           result,
@@ -1104,6 +1105,7 @@ impl Storage {
           && record.record_hash().ok().as_deref() == Some(execution_record_hash.as_str())
           && record.image_digest == *image_digest
           && record.admitted_input_hash == *admitted_input_hash
+          && record.admitted_input.is_some() == *has_dynamic_input
           && record.isolation_report == **isolation_report
           && record.result == *protocol_result
           && record.observation == *result
