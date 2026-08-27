@@ -28,7 +28,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
       - name: Run tests
-        run: cargo test --no-default-features --features all-static --workspace
+        run: cargo test --workspace --all-targets --all-features
 
   rustfmt:
     name: Rustfmt
