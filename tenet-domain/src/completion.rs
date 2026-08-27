@@ -33,19 +33,17 @@ pub enum Verdict {
 pub enum BlockerCode {
   RepositoryNotInitialized,
   ContractMissing,
-  ContractPendingApproval,
-  ContractStale,
   SpecificationChanged,
   PolicyChanged,
+  AuthorityRevisionNotAncestor,
+  AuthoritySurfaceChanged,
   VerifierNotConfigured,
   MissingEvidence,
   ContradictionObserved,
   EvidenceStale,
-  DirtyWorktree,
   VerifierFailed,
   VerifierInfrastructureError,
   VerifierInconclusive,
-  HumanAttestationRequired,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -68,6 +66,7 @@ pub struct ObligationResult {
 }
 
 pub struct DerivationContext<'a> {
+  pub authority_revision: &'a str,
   pub revision: &'a str,
   pub spec_digest: &'a str,
   pub contract_digest: &'a str,
@@ -131,7 +130,8 @@ pub fn derive_obligation_state(
   let mut saw_contradiction = false;
   let mut saw_inconclusive = false;
   for artifact in matching {
-    let binding_matches = artifact.revision == context.revision
+    let binding_matches = artifact.authority_revision == context.authority_revision
+      && artifact.revision == context.revision
       && artifact.spec_digest == context.spec_digest
       && artifact.contract_digest == context.contract_digest
       && artifact.policy_digest == context.policy_digest;

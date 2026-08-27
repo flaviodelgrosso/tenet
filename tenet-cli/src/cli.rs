@@ -48,8 +48,12 @@ pub enum Command {
     #[command(subcommand)]
     command: ContractCommand,
   },
-  /// Evaluate the admitted contract for one exact commit.
+  /// Evaluate one exact candidate commit under one exact authority commit.
   Gate {
+    /// Exact trusted commit defining specification, policy, and admitted contract.
+    #[arg(long)]
+    authority_revision: String,
+    /// Exact candidate commit containing the software to evaluate.
     #[arg(long)]
     revision: String,
     #[arg(long)]

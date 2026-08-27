@@ -11,19 +11,50 @@ use tenet_domain::{evidence::VerifierObservation, policy::VerifierSpec};
 
 pub fn run_verifier(checkout: &Path, verifier: &VerifierSpec) -> Result<VerifierObservation> {
   let executable = verifier.argv.first().context("verifier argv is empty")?;
+  let checkout = checkout
+    .canonicalize()
+    .context("canonicalize candidate checkout")?;
   let cwd = checkout.join(&verifier.cwd);
-  #[cfg(unix)]
-  use std::os::unix::process::CommandExt;
   let mut command = Command::new(executable);
   command
     .args(&verifier.argv[1..])
-    .current_dir(&cwd)
     .envs(&verifier.env)
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
   #[cfg(unix)]
-  command.process_group(0);
+  let cwd_handle = open_verifier_cwd(&checkout, &verifier.cwd)?;
+  #[cfg(unix)]
+  {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    let cwd_fd = cwd_handle.as_raw_fd();
+    // SAFETY: `fchdir` and `setpgid` are async-signal-safe. `cwd_handle` stays open until spawn
+    // returns, and the descriptor names a directory reached without following symlinks.
+    unsafe {
+      command.pre_exec(move || {
+        if libc::fchdir(cwd_fd) != 0 {
+          return Err(std::io::Error::last_os_error());
+        }
+        if libc::setpgid(0, 0) != 0 {
+          return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+      });
+    }
+  }
+  #[cfg(not(unix))]
+  {
+    let cwd = cwd
+      .canonicalize()
+      .with_context(|| format!("resolve verifier working directory `{}`", verifier.cwd))?;
+    if !cwd.starts_with(&checkout) {
+      anyhow::bail!(
+        "verifier working directory `{}` escapes the candidate checkout",
+        verifier.cwd
+      );
+    }
+    command.current_dir(cwd);
+  }
   let mut child = command
     .spawn()
     .with_context(|| format!("start verifier `{}` in {}", verifier.id, cwd.display()))?;
@@ -59,6 +90,46 @@ pub fn run_verifier(checkout: &Path, verifier: &VerifierSpec) -> Result<Verifier
     stderr,
     timed_out,
   })
+}
+
+#[cfg(unix)]
+fn open_verifier_cwd(checkout: &Path, relative: &str) -> Result<std::fs::File> {
+  use std::{
+    ffi::CString,
+    os::{fd::FromRawFd, unix::ffi::OsStrExt},
+    path::Component,
+  };
+
+  let mut directory = std::fs::File::open(checkout).context("open candidate checkout")?;
+  for component in Path::new(relative).components() {
+    let Component::Normal(name) = component else {
+      if component == Component::CurDir {
+        continue;
+      }
+      anyhow::bail!("verifier working directory must remain relative to the candidate checkout");
+    };
+    let name = CString::new(name.as_bytes()).context("verifier working directory contains NUL")?;
+    // SAFETY: `directory` is an open directory descriptor, `name` is NUL-terminated, and the
+    // returned descriptor is immediately owned by `File` when non-negative.
+    let descriptor = unsafe {
+      libc::openat(
+        std::os::fd::AsRawFd::as_raw_fd(&directory),
+        name.as_ptr(),
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+      )
+    };
+    if descriptor < 0 {
+      return Err(std::io::Error::last_os_error()).with_context(|| {
+        format!(
+          "securely open verifier working directory component {} inside candidate checkout",
+          name.to_string_lossy()
+        )
+      });
+    }
+    // SAFETY: `descriptor` is a fresh owned descriptor returned by successful `openat`.
+    directory = unsafe { std::fs::File::from_raw_fd(descriptor) };
+  }
+  Ok(directory)
 }
 
 fn terminate(child: &mut std::process::Child) -> std::io::Result<()> {

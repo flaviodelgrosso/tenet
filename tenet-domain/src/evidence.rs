@@ -9,9 +9,6 @@ pub enum ArtifactAuthority {
   AgentAssertion,
   AgentExploratoryExecution,
   TenetObservedProjectVerifier,
-  TenetObservedProtectedVerifier,
-  TrustedExternalVerifier,
-  HumanAttestation,
 }
 
 impl ArtifactAuthority {
@@ -21,9 +18,6 @@ impl ArtifactAuthority {
       (
         Self::TenetObservedProjectVerifier,
         VerifierAuthority::Project
-      ) | (
-        Self::TenetObservedProtectedVerifier,
-        VerifierAuthority::Protected
       )
     )
   }
@@ -34,8 +28,6 @@ impl ArtifactAuthority {
 pub enum ArtifactProvenance {
   AgentReported,
   TenetLocalVerifier,
-  TrustedExternal,
-  HumanProvided,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -73,6 +65,7 @@ pub struct VerifierObservation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvidenceArtifact {
   pub obligation_id: ObligationId,
+  pub authority_revision: String,
   pub revision: String,
   pub verifier_id: String,
   pub policy_digest: String,

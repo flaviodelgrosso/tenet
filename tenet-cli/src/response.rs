@@ -55,6 +55,7 @@ pub struct StatusResult {
   pub policy_digest: Option<String>,
   pub contract_state: ContractState,
   pub contract_digest: Option<String>,
+  pub last_gated_authority_revision: Option<String>,
   pub last_gated_revision: Option<String>,
   pub last_verdict: Option<Verdict>,
   pub unresolved_obligations: Vec<ObligationResult>,
@@ -64,6 +65,7 @@ pub struct StatusResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GateResult {
   pub schema_version: u32,
+  pub authority_revision: String,
   pub revision: String,
   pub spec_digest: String,
   pub contract_digest: String,

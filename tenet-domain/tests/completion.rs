@@ -47,6 +47,7 @@ fn fixture() -> (AdmittedContract, RepositoryConfig, EvidenceArtifact) {
   };
   let evidence = EvidenceArtifact {
     obligation_id: ObligationId("REQ-001/VO-001".into()),
+    authority_revision: "authority".into(),
     revision: "revision".into(),
     verifier_id: "quality".into(),
     policy_digest: "policy".into(),
@@ -71,6 +72,7 @@ fn derive(evidence: &[EvidenceArtifact]) -> tenet_domain::completion::Obligation
   let (contract, policy, _) = fixture();
   derive_obligation_state(
     &DerivationContext {
+      authority_revision: "authority",
       revision: "revision",
       spec_digest: "spec",
       contract_digest: "contract",
@@ -116,6 +118,9 @@ fn contradiction_overrides_support() {
 #[test]
 fn stale_and_mismatched_bindings_cannot_satisfy() {
   let (_, _, mut evidence) = fixture();
+  evidence.authority_revision = "other".into();
+  let authority = derive(&[evidence.clone()]);
+  evidence.authority_revision = "authority".into();
   evidence.revision = "other".into();
   let revision = derive(&[evidence.clone()]);
   evidence.revision = "revision".into();
@@ -124,6 +129,7 @@ fn stale_and_mismatched_bindings_cannot_satisfy() {
   evidence.spec_digest = "spec".into();
   evidence.policy_digest = "other".into();
   let policy = derive(&[evidence]);
+  assert_eq!(authority.state, ObligationState::Stale);
   assert_eq!(revision.state, ObligationState::Stale);
   assert_eq!(specification.state, ObligationState::Stale);
   assert_eq!(policy.state, ObligationState::Stale);

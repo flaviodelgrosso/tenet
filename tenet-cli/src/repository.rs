@@ -1,7 +1,9 @@
 use std::{
-  fs,
-  path::{Path, PathBuf},
-  process::Command,
+  collections::BTreeSet,
+  fs::{self, OpenOptions},
+  io::{BufRead, BufReader, Read, Write},
+  path::{Component, Path, PathBuf},
+  process::{Command, Stdio},
 };
 
 use anyhow::{bail, Context, Result};
@@ -26,17 +28,18 @@ metadata:
 
 # Tenet workflow
 
-Tenet determines whether an exact Git revision satisfies this repository's admitted completion contract. It does not perform the engineering.
+Tenet determines whether candidate revision R satisfies the admitted completion contract from authority revision A. It does not perform the engineering.
 
 1. Run `tenet status --json` and use only its current repository state.
-2. If the contract is missing, inspect the configured specification, obtain the proposal shape with `tenet contract schema --json`, and submit it with `tenet contract propose --file <path> --json`.
+2. If the contract is missing, inspect the configured specification, get the proposal shape with `tenet contract schema --json`, and submit it with `tenet contract propose --file <path> --json`.
 3. When approval is required, report the proposal ID and digest, stop, and ask the user to perform operator admission. Never invoke `tenet contract approve` yourself.
-4. Perform the engineering with your normal tools and workflow.
-5. Produce an immutable candidate commit and run `tenet gate --revision <sha> --json`.
-6. If the verdict is `not_done`, `inconclusive`, or `infrastructure_error`, inspect the typed blockers and `tenet evidence --revision <sha> --json`, then continue or report the blocker as appropriate.
-7. Declare completion only when Tenet returns `done` for the exact revision you report.
+4. Treat A as operator/CI-provided trust context. Never choose or advance A yourself; if none is provided, stop and ask the user.
+5. Perform the engineering normally and produce immutable candidate commit R.
+6. Run `tenet gate --authority-revision <authority-sha> --revision <candidate-sha> --json`.
+7. On a non-`done` verdict, inspect typed blockers and `tenet evidence --revision <candidate-sha> --json`, then continue or report the blocker.
+8. Declare completion only when Tenet returns `done` for the exact (A, R) pair you report.
 
-The CLI is the correctness boundary. Skill discovery and invocation syntax depend on the calling runtime and are optional convenience.
+Proposal/admission separation is a same-user workflow boundary, not a security sandbox. The CLI is authoritative; this optional Skill is not.
 "#;
 
 pub fn discover_root(cwd: &Path) -> Result<PathBuf> {
@@ -150,7 +153,13 @@ pub fn resolve_revision(root: &Path, revision: &str) -> Result<String> {
   }
   let expression = format!("{revision}^{{commit}}");
   let output = Command::new("git")
-    .args(["rev-parse", "--verify", "--end-of-options", &expression])
+    .args([
+      "--no-replace-objects",
+      "rev-parse",
+      "--verify",
+      "--end-of-options",
+      &expression,
+    ])
     .current_dir(root)
     .output()
     .context("resolve Git revision")?;
@@ -167,6 +176,376 @@ pub fn resolve_revision(root: &Path, revision: &str) -> Result<String> {
   Ok(resolved)
 }
 
+pub fn is_ancestor(root: &Path, ancestor: &str, revision: &str) -> Result<bool> {
+  let status = Command::new("git")
+    .args([
+      "--no-replace-objects",
+      "merge-base",
+      "--is-ancestor",
+      ancestor,
+      revision,
+    ])
+    .current_dir(root)
+    .status()
+    .context("check authority revision ancestry")?;
+  match status.code() {
+    Some(0) => Ok(true),
+    Some(1) => Ok(false),
+    _ => bail!("Git could not determine authority revision ancestry"),
+  }
+}
+
+pub fn read_revision_file(root: &Path, revision: &str, path: &str) -> Result<Option<Vec<u8>>> {
+  let entry = Command::new("git")
+    .args([
+      "--no-replace-objects",
+      "--literal-pathspecs",
+      "ls-tree",
+      "-z",
+      "--full-tree",
+      revision,
+      "--",
+      path,
+    ])
+    .current_dir(root)
+    .output()
+    .with_context(|| format!("inspect `{path}` at authority revision"))?;
+  if !entry.status.success() {
+    bail!(
+      "inspect `{path}` at authority revision: {}",
+      String::from_utf8_lossy(&entry.stderr).trim()
+    );
+  }
+  if entry.stdout.is_empty() {
+    return Ok(None);
+  }
+
+  let object = format!("{revision}:{path}");
+  let output = Command::new("git")
+    .args([
+      "--no-replace-objects",
+      "show",
+      "--no-ext-diff",
+      "--no-textconv",
+      &object,
+    ])
+    .current_dir(root)
+    .output()
+    .with_context(|| format!("read `{path}` at authority revision"))?;
+  if !output.status.success() {
+    bail!(
+      "read `{path}` at authority revision: {}",
+      String::from_utf8_lossy(&output.stderr).trim()
+    );
+  }
+  Ok(Some(output.stdout))
+}
+
+pub fn changed_paths(
+  root: &Path,
+  authority_revision: &str,
+  candidate_revision: &str,
+  paths: &[&str],
+) -> Result<Vec<String>> {
+  let mut changed = Vec::new();
+  for path in paths {
+    let status = Command::new("git")
+      .args([
+        "--literal-pathspecs",
+        "--no-replace-objects",
+        "diff",
+        "--quiet",
+        "--no-ext-diff",
+        authority_revision,
+        candidate_revision,
+        "--",
+        path,
+      ])
+      .current_dir(root)
+      .status()
+      .with_context(|| format!("compare authority-owned path `{path}`"))?;
+    match status.code() {
+      Some(0) => {}
+      Some(1) => changed.push((*path).to_owned()),
+      _ => bail!("Git could not compare authority-owned path `{path}`"),
+    }
+  }
+  Ok(changed)
+}
+
+const MAX_TREE_ENTRIES: usize = 1_000_000;
+const MAX_TREE_RECORD_BYTES: usize = 1024 * 1024;
+const MAX_DIRECTORY_PATH_BYTES: usize = 64 * 1024 * 1024;
+const MAX_SYMLINK_TARGET_BYTES: u64 = 4096;
+
+struct TreeEntry {
+  mode: String,
+  kind: String,
+  object: String,
+  path: PathBuf,
+}
+
+fn materialize_raw_tree(root: &Path, revision: &str, checkout: &Path) -> Result<()> {
+  let mut directories = BTreeSet::new();
+  let mut directory_path_bytes = 0_usize;
+  visit_tree(root, revision, |entry| {
+    let mut current = PathBuf::new();
+    let mut components = entry.path.components().peekable();
+    while let Some(component) = components.next() {
+      if components.peek().is_none() {
+        break;
+      }
+      current.push(component.as_os_str());
+      create_directory(
+        checkout,
+        &current,
+        &mut directories,
+        &mut directory_path_bytes,
+      )?;
+    }
+    match (entry.mode.as_str(), entry.kind.as_str()) {
+      ("100644" | "100755" | "120000", "blob") => Ok(()),
+      ("160000", "commit") => create_directory(
+        checkout,
+        &entry.path,
+        &mut directories,
+        &mut directory_path_bytes,
+      ),
+      (mode, kind) => {
+        bail!("unsupported candidate tree entry mode `{mode}` and type `{kind}`")
+      }
+    }
+  })?;
+
+  let mut child = Command::new("git")
+    .args(["--no-replace-objects", "cat-file", "--batch"])
+    .current_dir(root)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .context("start candidate blob reader")?;
+  let mut requests = child.stdin.take().context("open candidate blob input")?;
+  let mut responses = BufReader::new(child.stdout.take().context("open candidate blob output")?);
+  visit_tree(root, revision, |entry| {
+    if entry.kind == "commit" {
+      return Ok(());
+    }
+    writeln!(requests, "{}", entry.object)?;
+    requests.flush()?;
+    let mut header = String::new();
+    responses.read_line(&mut header)?;
+    let mut fields = header.split_whitespace();
+    let object = fields
+      .next()
+      .context("candidate blob response has no object ID")?;
+    let kind = fields
+      .next()
+      .context("candidate blob response has no type")?;
+    let size: u64 = fields
+      .next()
+      .context("candidate blob response has no size")?
+      .parse()
+      .context("candidate blob response has invalid size")?;
+    if object != entry.object || kind != "blob" || fields.next().is_some() {
+      bail!("candidate blob response does not match the requested object");
+    }
+    write_blob(&mut responses, size, checkout, &entry)?;
+    let mut terminator = [0_u8; 1];
+    responses.read_exact(&mut terminator)?;
+    if terminator != *b"\n" {
+      bail!("candidate blob response has an invalid terminator");
+    }
+    Ok(())
+  })?;
+  drop(requests);
+  let status = child.wait().context("finish candidate blob reader")?;
+  if !status.success() {
+    let mut stderr = String::new();
+    if let Some(mut stream) = child.stderr.take() {
+      stream.read_to_string(&mut stderr)?;
+    }
+    bail!("read candidate blobs: {}", stderr.trim());
+  }
+  Ok(())
+}
+
+fn visit_tree(
+  root: &Path,
+  revision: &str,
+  mut visit: impl FnMut(TreeEntry) -> Result<()>,
+) -> Result<()> {
+  let mut child = Command::new("git")
+    .args([
+      "--no-replace-objects",
+      "ls-tree",
+      "-r",
+      "-z",
+      "--full-tree",
+      revision,
+    ])
+    .current_dir(root)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .context("enumerate candidate tree")?;
+  let mut output = BufReader::new(child.stdout.take().context("open candidate tree output")?);
+  let mut count = 0;
+  loop {
+    let mut record = Vec::new();
+    let read = output
+      .by_ref()
+      .take((MAX_TREE_RECORD_BYTES + 1) as u64)
+      .read_until(0, &mut record)?;
+    if read == 0 {
+      break;
+    }
+    if record.last() != Some(&0) {
+      bail!("candidate tree entry exceeds the materialization limit");
+    }
+    record.pop();
+    count += 1;
+    if count > MAX_TREE_ENTRIES {
+      bail!("candidate tree exceeds the materialization entry limit");
+    }
+    visit(parse_tree_entry(&record)?)?;
+  }
+  let status = child.wait().context("finish candidate tree enumeration")?;
+  if !status.success() {
+    let mut stderr = String::new();
+    if let Some(mut stream) = child.stderr.take() {
+      stream.read_to_string(&mut stderr)?;
+    }
+    bail!("enumerate candidate tree: {}", stderr.trim());
+  }
+  Ok(())
+}
+
+fn parse_tree_entry(record: &[u8]) -> Result<TreeEntry> {
+  let separator = record
+    .iter()
+    .position(|byte| *byte == b'\t')
+    .context("candidate tree contains a malformed entry")?;
+  let metadata = std::str::from_utf8(&record[..separator])?;
+  let mut fields = metadata.split_whitespace();
+  let mode = fields.next().context("candidate tree entry has no mode")?;
+  let kind = fields.next().context("candidate tree entry has no type")?;
+  let object = fields
+    .next()
+    .context("candidate tree entry has no object ID")?;
+  if fields.next().is_some() {
+    bail!("candidate tree entry has unexpected metadata");
+  }
+  let path = git_path(record[separator + 1..].to_vec())?;
+  validate_materialized_path(&path)?;
+  Ok(TreeEntry {
+    mode: mode.to_owned(),
+    kind: kind.to_owned(),
+    object: object.to_owned(),
+    path,
+  })
+}
+
+fn create_directory(
+  checkout: &Path,
+  path: &Path,
+  directories: &mut BTreeSet<PathBuf>,
+  total_path_bytes: &mut usize,
+) -> Result<()> {
+  if directories.insert(path.to_path_buf()) {
+    *total_path_bytes = total_path_bytes
+      .checked_add(path.as_os_str().as_encoded_bytes().len())
+      .context("candidate directory metadata size overflow")?;
+    if *total_path_bytes > MAX_DIRECTORY_PATH_BYTES {
+      bail!("candidate directory metadata exceeds the materialization limit");
+    }
+    fs::create_dir(checkout.join(path)).with_context(|| {
+      format!(
+        "create unique candidate directory {}",
+        checkout.join(path).display()
+      )
+    })?;
+  }
+  Ok(())
+}
+
+fn validate_materialized_path(path: &Path) -> Result<()> {
+  let mut components = path.components();
+  let Some(Component::Normal(first)) = components.next() else {
+    bail!("candidate tree contains an invalid path");
+  };
+  if first.to_string_lossy().eq_ignore_ascii_case(".git")
+    || components.any(|component| !matches!(component, Component::Normal(_)))
+  {
+    bail!(
+      "candidate tree path `{}` is unsafe to materialize",
+      path.display()
+    );
+  }
+  Ok(())
+}
+
+fn write_blob(
+  responses: &mut impl Read,
+  size: u64,
+  checkout: &Path,
+  entry: &TreeEntry,
+) -> Result<()> {
+  let destination = checkout.join(&entry.path);
+  if entry.mode == "120000" {
+    if size > MAX_SYMLINK_TARGET_BYTES {
+      bail!("candidate symlink target exceeds the materialization limit");
+    }
+    let mut target = vec![0_u8; size as usize];
+    responses.read_exact(&mut target)?;
+    create_symlink(&target, &destination)?;
+    return Ok(());
+  }
+
+  let mut file = OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .open(&destination)
+    .with_context(|| format!("create unique candidate file {}", destination.display()))?;
+  let copied = std::io::copy(&mut responses.take(size), &mut file)?;
+  if copied != size {
+    bail!("candidate blob `{}` ended unexpectedly", entry.object);
+  }
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if entry.mode == "100755" { 0o755 } else { 0o644 };
+    file.set_permissions(fs::Permissions::from_mode(mode))?;
+  }
+  Ok(())
+}
+
+#[cfg(unix)]
+fn git_path(bytes: Vec<u8>) -> Result<PathBuf> {
+  use std::os::unix::ffi::OsStringExt;
+  Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+fn git_path(bytes: Vec<u8>) -> Result<PathBuf> {
+  Ok(PathBuf::from(String::from_utf8(bytes)?))
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &[u8], destination: &Path) -> Result<()> {
+  use std::os::unix::{ffi::OsStrExt, fs::symlink};
+  symlink(std::ffi::OsStr::from_bytes(target), destination)
+    .with_context(|| format!("create unique candidate symlink {}", destination.display()))
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &[u8], destination: &Path) -> Result<()> {
+  bail!(
+    "candidate symlink `{}` cannot be materialized on this platform",
+    destination.display()
+  )
+}
+
 pub struct MaterializedRevision {
   root: PathBuf,
   checkout: PathBuf,
@@ -178,23 +557,32 @@ impl MaterializedRevision {
     let temporary = tempfile::Builder::new().prefix("tenet-gate-").tempdir()?;
     let checkout = temporary.path().join("revision");
     let output = Command::new("git")
-      .args(["worktree", "add", "--detach", "--force"])
+      .args([
+        "--no-replace-objects",
+        "worktree",
+        "add",
+        "--no-checkout",
+        "--detach",
+        "--force",
+      ])
       .arg(&checkout)
       .arg(revision)
       .current_dir(root)
       .output()
-      .context("materialize exact revision")?;
+      .context("prepare exact candidate materialization")?;
     if !output.status.success() {
       bail!(
-        "materialize exact revision: {}",
+        "prepare exact candidate materialization: {}",
         String::from_utf8_lossy(&output.stderr).trim()
       );
     }
-    Ok(Self {
+    let materialized = Self {
       root: root.to_path_buf(),
       checkout,
       _temporary: temporary,
-    })
+    };
+    materialize_raw_tree(root, revision, materialized.path())?;
+    Ok(materialized)
   }
 
   pub fn path(&self) -> &Path {

@@ -8,7 +8,6 @@ use thiserror::Error;
 #[serde(rename_all = "snake_case")]
 pub enum VerifierAuthority {
   Project,
-  Protected,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

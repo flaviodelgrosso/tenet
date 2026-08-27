@@ -46,7 +46,7 @@ If you change Rust source, run `make fmt` and include only the formatting change
 
 1. Create a branch from the current default branch.
 2. Read the relevant code, tests, README sections, and completion-authority requirements before changing behavior.
-3. Preserve deterministic completion derivation, exact-revision binding, authority distinctions, and fail-closed evidence semantics.
+3. Preserve deterministic completion derivation, explicit authority/candidate revision binding, authority-surface immutability, and fail-closed evidence semantics.
 4. Add or update tests when a change introduces or alters observable behavior.
 5. Update documentation and examples when commands, configuration, or user-visible behavior changes.
 6. Run the applicable checks, preferably `make ci`.

@@ -15,12 +15,12 @@ use tenet_domain::{
   contract::{
     validate_proposal, AdmittedContract, ContractProposal, ProposalRecord, VerificationObligation,
   },
-  digest::canonical_digest,
+  digest::{bytes_digest, canonical_digest},
   evidence::{
     ArtifactAuthority, ArtifactProvenance, ArtifactValidity, DependencySurface, EvidenceArtifact,
     EvidenceEffect,
   },
-  policy::{VerificationPolicy, VerifierAuthority},
+  policy::{validate_policy, VerificationPolicy},
 };
 
 use crate::{
@@ -43,7 +43,11 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
     Command::Init { spec, json } => initialize(&cwd, &spec, json),
     Command::Status { json } => status(&cwd, json),
     Command::Contract { command } => contract(&cwd, command),
-    Command::Gate { revision, json } => gate(&cwd, &revision, json),
+    Command::Gate {
+      authority_revision,
+      revision,
+      json,
+    } => gate(&cwd, &authority_revision, &revision, json),
     Command::Evidence { revision, json } => evidence(&cwd, revision.as_deref(), json),
   }
 }
@@ -89,6 +93,7 @@ fn status(cwd: &Path, json: bool) -> Result<ExitCode> {
       policy_digest: None,
       contract_state: ContractState::Missing,
       contract_digest: None,
+      last_gated_authority_revision: None,
       last_gated_revision: None,
       last_verdict: None,
       unresolved_obligations: Vec::new(),
@@ -137,6 +142,7 @@ fn status(cwd: &Path, json: bool) -> Result<ExitCode> {
     policy_digest: Some(current_policy_digest),
     contract_state,
     contract_digest,
+    last_gated_authority_revision: last.map(|gate| gate.authority_revision.clone()),
     last_gated_revision: last.map(|gate| gate.revision.clone()),
     last_verdict: last.map(|gate| gate.verdict.clone()),
     unresolved_obligations,
@@ -253,58 +259,116 @@ fn approve(cwd: &Path, proposal_id: &str, digest: &str, json: bool) -> Result<Ex
   Ok(ExitCode::SUCCESS)
 }
 
-fn gate(cwd: &Path, revision: &str, json: bool) -> Result<ExitCode> {
+fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Result<ExitCode> {
   let root = discover_root(cwd)?;
-  let revision = repository::resolve_revision(&root, revision)?;
-  let materialized = MaterializedRevision::create(&root, &revision)?;
-  let checkout = materialized.path();
+  let authority_revision = repository::resolve_revision(&root, authority_revision)
+    .context("resolve authority revision")?;
+  let revision =
+    repository::resolve_revision(&root, revision).context("resolve candidate revision")?;
 
-  if !checkout.join(CONFIG_PATH).exists() {
+  if !repository::is_ancestor(&root, &authority_revision, &revision)? {
     let result = control_plane_gate(
+      authority_revision,
       revision,
-      BlockerCode::RepositoryNotInitialized,
-      "selected revision is not Tenet-enabled",
+      BlockerCode::AuthorityRevisionNotAncestor,
+      "authority revision is not an ancestor of the candidate revision",
     );
     return finish_gate(&root, result, Vec::new(), json);
   }
-  let policy = load_policy(checkout)?;
-  let spec_digest = specification_digest(checkout, &policy)?;
+
+  let Some(policy_bytes) = repository::read_revision_file(&root, &authority_revision, CONFIG_PATH)?
+  else {
+    let result = control_plane_gate(
+      authority_revision,
+      revision,
+      BlockerCode::RepositoryNotInitialized,
+      "authority revision is not Tenet-enabled",
+    );
+    return finish_gate(&root, result, Vec::new(), json);
+  };
+  let policy_text = String::from_utf8(policy_bytes).context("authority policy is not UTF-8")?;
+  let policy: VerificationPolicy =
+    toml::from_str(&policy_text).context("parse authority revision policy")?;
+  validate_policy(&policy).context("validate authority revision policy")?;
   let policy_digest = policy_digest(&policy)?;
-  let Some(contract) = load_contract_optional(checkout)? else {
+
+  let spec_bytes = repository::read_revision_file(&root, &authority_revision, &policy.spec_path)?
+    .with_context(|| {
+    format!(
+      "authority revision specification `{}` does not exist",
+      policy.spec_path
+    )
+  })?;
+  let spec_digest = bytes_digest(&spec_bytes);
+
+  let Some(contract_bytes) =
+    repository::read_revision_file(&root, &authority_revision, CONTRACT_PATH)?
+  else {
     let mut result = control_plane_gate(
+      authority_revision,
       revision,
       BlockerCode::ContractMissing,
-      "selected revision has no admitted completion contract",
+      "authority revision has no admitted completion contract",
     );
     result.spec_digest = spec_digest;
     result.policy_digest = policy_digest;
     return finish_gate(&root, result, Vec::new(), json);
   };
+  let contract: AdmittedContract =
+    serde_json::from_slice(&contract_bytes).context("parse authority revision contract")?;
   let contract_digest = canonical_digest(&contract)?;
+
   if contract.spec_digest != spec_digest {
     let result = mismatch_gate(
+      authority_revision,
       revision,
       spec_digest,
       contract_digest,
       policy_digest,
       BlockerCode::SpecificationChanged,
-      "specification digest differs from the admitted contract",
+      "authority specification digest differs from the admitted contract",
     );
     return finish_gate(&root, result, Vec::new(), json);
   }
   if contract.policy_digest != policy_digest {
     let result = mismatch_gate(
+      authority_revision,
       revision,
       spec_digest,
       contract_digest,
       policy_digest,
       BlockerCode::PolicyChanged,
-      "verification policy digest differs from the admitted contract",
+      "authority policy digest differs from the admitted contract",
     );
     return finish_gate(&root, result, Vec::new(), json);
   }
   validate_admitted_contract(&contract, &policy)?;
 
+  let changed_paths = repository::changed_paths(
+    &root,
+    &authority_revision,
+    &revision,
+    &[CONFIG_PATH, CONTRACT_PATH, &policy.spec_path],
+  )?;
+  if !changed_paths.is_empty() {
+    let message = format!(
+      "candidate changed authority-owned paths: {}; admit and select a new authority revision",
+      changed_paths.join(", ")
+    );
+    let result = mismatch_gate(
+      authority_revision,
+      revision,
+      spec_digest,
+      contract_digest,
+      policy_digest,
+      BlockerCode::AuthoritySurfaceChanged,
+      &message,
+    );
+    return finish_gate(&root, result, Vec::new(), json);
+  }
+
+  let materialized = MaterializedRevision::create(&root, &revision)?;
+  let checkout = materialized.path();
   let mut observations = BTreeMap::new();
   let mut infrastructure_errors = BTreeMap::new();
   for obligation in contract.obligations() {
@@ -339,6 +403,7 @@ fn gate(cwd: &Path, revision: &str, json: bool) -> Result<ExitCode> {
   let mut artifacts = Vec::new();
   let mut obligations = Vec::new();
   let context = DerivationContext {
+    authority_revision: &authority_revision,
     revision: &revision,
     spec_digest: &spec_digest,
     contract_digest: &contract_digest,
@@ -364,11 +429,6 @@ fn gate(cwd: &Path, revision: &str, json: bool) -> Result<ExitCode> {
       ));
       continue;
     }
-    let verifier = policy
-      .verifiers
-      .iter()
-      .find(|item| &item.id == verifier_id)
-      .context("validated verifier disappeared")?;
     let effect = match observation.exit_code {
       Some(0) => EvidenceEffect::Supports,
       Some(126) => EvidenceEffect::Inconclusive,
@@ -376,15 +436,13 @@ fn gate(cwd: &Path, revision: &str, json: bool) -> Result<ExitCode> {
     };
     artifacts.push(EvidenceArtifact {
       obligation_id: obligation.id.clone(),
+      authority_revision: authority_revision.clone(),
       revision: revision.clone(),
       verifier_id: verifier_id.clone(),
       policy_digest: policy_digest.clone(),
       spec_digest: spec_digest.clone(),
       contract_digest: contract_digest.clone(),
-      authority: match verifier.authority {
-        VerifierAuthority::Project => ArtifactAuthority::TenetObservedProjectVerifier,
-        VerifierAuthority::Protected => ArtifactAuthority::TenetObservedProtectedVerifier,
-      },
+      authority: ArtifactAuthority::TenetObservedProjectVerifier,
       provenance: ArtifactProvenance::TenetLocalVerifier,
       effect,
       validity: ArtifactValidity::Valid,
@@ -409,6 +467,7 @@ fn gate(cwd: &Path, revision: &str, json: bool) -> Result<ExitCode> {
     .collect();
   let result = GateResult {
     schema_version: 1,
+    authority_revision,
     revision,
     spec_digest,
     contract_digest,
@@ -463,7 +522,8 @@ fn finish_gate(
   audit.gates.push(result.clone());
   audit.save(root)?;
   print_value(&result, json, |value| {
-    println!("revision: {}", value.revision);
+    println!("authority revision: {}", value.authority_revision);
+    println!("candidate revision: {}", value.revision);
     println!("verdict: {:?}", value.verdict);
     println!("specification: {}", value.spec_digest);
     println!("contract: {}", value.contract_digest);
@@ -480,8 +540,14 @@ fn finish_gate(
   })
 }
 
-fn control_plane_gate(revision: String, code: BlockerCode, message: &str) -> GateResult {
+fn control_plane_gate(
+  authority_revision: String,
+  revision: String,
+  code: BlockerCode,
+  message: &str,
+) -> GateResult {
   mismatch_gate(
+    authority_revision,
     revision,
     String::new(),
     String::new(),
@@ -492,6 +558,7 @@ fn control_plane_gate(revision: String, code: BlockerCode, message: &str) -> Gat
 }
 
 fn mismatch_gate(
+  authority_revision: String,
   revision: String,
   spec_digest: String,
   contract_digest: String,
@@ -501,6 +568,7 @@ fn mismatch_gate(
 ) -> GateResult {
   GateResult {
     schema_version: 1,
+    authority_revision,
     revision,
     spec_digest,
     contract_digest,
@@ -600,7 +668,15 @@ fn print_status(result: &StatusResult, json: bool) -> Result<()> {
       println!("specification: {spec_digest}");
     }
     if let Some(last_revision) = &value.last_gated_revision {
-      println!("last gate: {} {:?}", last_revision, value.last_verdict);
+      println!(
+        "last gate: {} under {} {:?}",
+        last_revision,
+        value
+          .last_gated_authority_revision
+          .as_deref()
+          .unwrap_or("unknown authority"),
+        value.last_verdict
+      );
     }
     println!(
       "unresolved obligations: {}",
