@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{
   falsifier::{FalsificationExecutionRecord, FalsifierSpec},
   human_attestation::{HumanAttestationRecord, HumanAttestorSpec},
-  ids::{ArtifactId, CriterionId, EvidenceId, ObligationId, RequirementId, VerificationRunId},
+  ids::{ArtifactId, CriterionId, ObligationId, RequirementId, VerificationRunId},
   proof::{
     derive_proof_state, ArtifactAuthority, ArtifactObservation, ArtifactProvenance,
     ArtifactValidity, AssessmentJudgment, AssessmentRecord, DependencyPolicy, DependencySurface,
@@ -55,7 +55,7 @@ pub struct AcceptanceCriterion {
   pub mandatory: bool,
 }
 
-/// A semantic claim that must be established for an acceptance criterion.
+/// A semantic claim paired with a controller-admitted evidence policy.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationObligation {
@@ -71,75 +71,14 @@ pub struct VerificationObligation {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum EvidenceSource {
-  ProjectVerification,
-  SemanticAssessment,
-  AgentSuggestion,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
 pub enum EvidenceResult {
   Passed,
   Failed,
   Inconclusive,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "authority", rename_all = "snake_case")]
-pub enum EvidenceProvenance {
-  IndependentAssessment {
-    #[serde(rename = "workerId")]
-    worker_id: String,
-  },
-  AgentProposal {
-    #[serde(rename = "workerRole")]
-    worker_role: String,
-  },
-}
-
-impl EvidenceProvenance {
-  pub fn independent_assessment(worker_id: impl Into<String>) -> Self {
-    Self::IndependentAssessment {
-      worker_id: worker_id.into(),
-    }
-  }
-
-  pub fn agent_proposal(worker_role: impl Into<String>) -> Self {
-    Self::AgentProposal {
-      worker_role: worker_role.into(),
-    }
-  }
-
-  pub fn is_independent_assessment(&self) -> bool {
-    matches!(self, Self::IndependentAssessment { .. })
-  }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProjectEvidenceProvenance {
-  ControllerExecution,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum EvidenceValidity {
-  Valid,
-  Stale {
-    #[serde(rename = "invalidatedAt")]
-    invalidated_at: DateTime<Utc>,
-    #[serde(rename = "supersededByRevision")]
-    superseded_by_revision: String,
-  },
-}
-
-impl EvidenceValidity {
-  pub fn is_valid(&self) -> bool {
-    matches!(self, Self::Valid)
-  }
-}
-
+/// Historical record of a controller-executed project verification run.
+/// Completion evaluates the current run directly; obligation contracts use `EvidenceArtifact`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectVerificationEvidence {
@@ -153,30 +92,6 @@ pub struct ProjectVerificationEvidence {
   pub check_results: Vec<ProjectCheckResult>,
   #[serde(rename = "observedAt")]
   pub observed_at: DateTime<Utc>,
-  pub source: EvidenceSource,
-  pub provenance: ProjectEvidenceProvenance,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Evidence {
-  pub id: EvidenceId,
-  #[serde(rename = "requirementId")]
-  pub requirement_id: RequirementId,
-  #[serde(rename = "criterionId")]
-  pub criterion_id: CriterionId,
-  #[serde(rename = "obligationId")]
-  pub obligation_id: ObligationId,
-  pub source: EvidenceSource,
-  pub result: EvidenceResult,
-  pub revision: String,
-  #[serde(rename = "observedAt")]
-  pub observed_at: DateTime<Utc>,
-  pub provenance: EvidenceProvenance,
-  pub rationale: String,
-  #[serde(rename = "evidenceRefs")]
-  pub evidence_refs: Vec<String>,
-  pub validity: EvidenceValidity,
 }
 
 /// Agent-facing advisory judgment keyed by a controller-generated obligation handle.
@@ -214,56 +129,11 @@ pub struct SemanticAssessmentReport {
 #[derive(Debug, Clone, Copy)]
 pub struct EvidencePolicy<'a> {
   pub revision: &'a str,
-  pub suite_hash: &'a str,
 }
 
 impl<'a> EvidencePolicy<'a> {
-  pub fn new(revision: &'a str, suite_hash: &'a str) -> Self {
-    Self {
-      revision,
-      suite_hash,
-    }
-  }
-
-  fn project_passes(self, graph: &EvidenceGraphState) -> bool {
-    let mut saw_pass = false;
-    for evidence in graph.project_evidence.values().filter(|evidence| {
-      evidence.revision == self.revision
-        && evidence.suite_hash == self.suite_hash
-        && evidence.source == EvidenceSource::ProjectVerification
-        && evidence.provenance == ProjectEvidenceProvenance::ControllerExecution
-    }) {
-      if evidence.result != EvidenceResult::Passed {
-        return false;
-      }
-      saw_pass = true;
-    }
-    saw_pass
-  }
-
-  pub fn authorizes(self, graph: &EvidenceGraphState, evidence: &Evidence) -> bool {
-    self.project_passes(graph)
-      && evidence.revision == self.revision
-      && evidence.validity.is_valid()
-      && evidence.source == EvidenceSource::SemanticAssessment
-      && evidence.result == EvidenceResult::Passed
-      && evidence.provenance.is_independent_assessment()
-  }
-
-  pub fn blocks(self, evidence: &Evidence) -> bool {
-    evidence.revision == self.revision
-      && evidence.validity.is_valid()
-      && evidence.source == EvidenceSource::SemanticAssessment
-      && evidence.result == EvidenceResult::Failed
-      && evidence.provenance.is_independent_assessment()
-  }
-
-  pub fn is_uncertain(self, evidence: &Evidence) -> bool {
-    evidence.revision == self.revision
-      && evidence.validity.is_valid()
-      && evidence.source == EvidenceSource::SemanticAssessment
-      && evidence.result == EvidenceResult::Inconclusive
-      && evidence.provenance.is_independent_assessment()
+  pub fn new(revision: &'a str) -> Self {
+    Self { revision }
   }
 }
 
@@ -281,8 +151,6 @@ pub struct EvidenceGraphState {
   pub obligations: BTreeMap<ObligationId, VerificationObligation>,
   #[serde(default, rename = "projectEvidence")]
   pub project_evidence: BTreeMap<VerificationRunId, ProjectVerificationEvidence>,
-  #[serde(default)]
-  pub evidence: BTreeMap<EvidenceId, Evidence>,
   #[serde(default)]
   pub artifacts: BTreeMap<ArtifactId, EvidenceArtifact>,
   #[serde(default)]
@@ -303,7 +171,6 @@ impl EvidenceGraphState {
       criteria: BTreeMap::new(),
       obligations: BTreeMap::new(),
       project_evidence: BTreeMap::new(),
-      evidence: BTreeMap::new(),
       artifacts: BTreeMap::new(),
       assessments: Vec::new(),
       proof_derivations: BTreeMap::new(),
@@ -361,26 +228,6 @@ impl EvidenceGraphState {
     Ok(())
   }
 
-  pub fn establish_evidence(&mut self, evidence: Evidence) -> Result<(), EvidenceGraphError> {
-    let obligation = self
-      .obligations
-      .get(&evidence.obligation_id)
-      .ok_or_else(|| EvidenceGraphError::UnknownObligation(evidence.obligation_id.clone()))?;
-    let criterion = self
-      .criteria
-      .get(&evidence.criterion_id)
-      .ok_or_else(|| EvidenceGraphError::UnknownCriterion(evidence.criterion_id.clone()))?;
-    if obligation.criterion_id != evidence.criterion_id
-      || criterion.requirement_id != evidence.requirement_id
-    {
-      return Err(EvidenceGraphError::RelationshipMismatch(evidence.id));
-    }
-    if self.evidence.contains_key(&evidence.id) {
-      return Err(EvidenceGraphError::DuplicateEvidence);
-    }
-    self.evidence.insert(evidence.id, evidence);
-    Ok(())
-  }
   pub fn establish_artifact(
     &mut self,
     artifact: EvidenceArtifact,
@@ -725,8 +572,6 @@ impl EvidenceGraphState {
         },
         check_results: run.checks.clone(),
         observed_at: run.finished_at,
-        source: EvidenceSource::ProjectVerification,
-        provenance: ProjectEvidenceProvenance::ControllerExecution,
       },
     );
   }
@@ -753,24 +598,6 @@ impl EvidenceGraphState {
     )
   }
 
-  pub fn invalidate_where(
-    &mut self,
-    revision: &str,
-    invalidated_at: DateTime<Utc>,
-    mut affected: impl FnMut(&Evidence) -> bool,
-  ) -> Vec<EvidenceId> {
-    let mut invalidated = Vec::new();
-    for evidence in self.evidence.values_mut() {
-      if evidence.validity.is_valid() && evidence.revision != revision && affected(evidence) {
-        evidence.validity = EvidenceValidity::Stale {
-          invalidated_at,
-          superseded_by_revision: revision.to_owned(),
-        };
-        invalidated.push(evidence.id);
-      }
-    }
-    invalidated
-  }
   pub fn transition_artifacts(
     &mut self,
     revision: &str,
@@ -853,12 +680,6 @@ impl EvidenceGraphState {
           .map(|obligation| ObligationProjection {
             obligation: obligation.clone(),
             state: self.obligation_state(&obligation.id, policy),
-            evidence: self
-              .evidence
-              .values()
-              .filter(|evidence| evidence.obligation_id == obligation.id)
-              .cloned()
-              .collect(),
             artifacts: self
               .artifacts
               .values()
@@ -909,7 +730,7 @@ impl EvidenceGraphState {
   ) -> VerificationState {
     match self.proof_derivations.get(obligation_id) {
       Some(derivation) if derivation.revision == policy.revision => match derivation.state {
-        ProofState::Proven => VerificationState::Verified,
+        ProofState::ContractSatisfied => VerificationState::Verified,
         ProofState::Contradicted => VerificationState::Contradicted,
         ProofState::Insufficient => VerificationState::Unverified,
         ProofState::Stale => VerificationState::Stale,
@@ -1008,7 +829,6 @@ pub struct CriterionProjection {
 pub struct ObligationProjection {
   pub obligation: VerificationObligation,
   pub state: VerificationState,
-  pub evidence: Vec<Evidence>,
   pub artifacts: Vec<EvidenceArtifact>,
   pub proof: Option<ProofDerivation>,
 }
@@ -1025,8 +845,6 @@ pub enum EvidenceGraphError {
   DuplicateCriterion,
   #[error("duplicate verification obligation")]
   DuplicateObligation,
-  #[error("duplicate evidence id")]
-  DuplicateEvidence,
   #[error("duplicate evidence artifact id")]
   DuplicateArtifact,
   #[error("invalid evidence artifact: {0}")]
@@ -1041,8 +859,6 @@ pub enum EvidenceGraphError {
   MissingArtifactReference(ObligationId),
   #[error("artifact {0} is not bound to assessment obligation {1}")]
   ArtifactBindingMismatch(ArtifactId, ObligationId),
-  #[error("evidence {0} does not match its criterion and obligation relationships")]
-  RelationshipMismatch(EvidenceId),
   #[error("{0} has a blank description")]
   BlankDescription(String),
   #[error("semantic assessment summary must not be blank")]
@@ -1119,11 +935,11 @@ mod tests {
     }
   }
 
-  fn state(graph: &EvidenceGraphState, revision: &str, suite: &str) -> VerificationState {
+  fn state(graph: &EvidenceGraphState, revision: &str) -> VerificationState {
     graph
       .requirement_verification_state(
         &RequirementId::from("REQ-007"),
-        EvidencePolicy::new(revision, suite),
+        EvidencePolicy::new(revision),
       )
       .expect("state")
   }
@@ -1133,7 +949,7 @@ mod tests {
     let mut graph = graph();
     graph.record_project_verification(&project_run("abc", "suite", true));
 
-    assert_eq!(state(&graph, "abc", "suite"), VerificationState::Unverified);
+    assert_eq!(state(&graph, "abc"), VerificationState::Unverified);
   }
 
   #[test]
@@ -1163,29 +979,6 @@ mod tests {
   }
 
   #[test]
-  fn agent_suggestion_cannot_authorize_obligation() {
-    let mut graph = graph();
-    graph.record_project_verification(&project_run("abc", "suite", true));
-    graph
-      .establish_evidence(Evidence {
-        id: EvidenceId::new(),
-        requirement_id: RequirementId::from("REQ-007"),
-        criterion_id: CriterionId::from("REQ-007/AC-01"),
-        obligation_id: ObligationId::from("REQ-007/AC-01/VO-01"),
-        source: EvidenceSource::AgentSuggestion,
-        result: EvidenceResult::Passed,
-        revision: "abc".into(),
-        observed_at: now(),
-        provenance: EvidenceProvenance::agent_proposal("architect"),
-        rationale: "Run true".into(),
-        evidence_refs: Vec::new(),
-        validity: EvidenceValidity::Valid,
-      })
-      .expect("suggestion");
-
-    assert_eq!(state(&graph, "abc", "suite"), VerificationState::Unverified);
-  }
-  #[test]
   fn newer_same_revision_verification_supersedes_failed_artifacts() {
     let mut graph = graph();
     graph
@@ -1214,7 +1007,7 @@ mod tests {
     graph.derive_proofs("abc");
     assert_eq!(
       graph.proof_derivations[&ObligationId::from("REQ-007/AC-01/VO-01")].state,
-      ProofState::Proven
+      ProofState::ContractSatisfied
     );
     assert_eq!(
       graph

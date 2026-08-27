@@ -44,7 +44,7 @@ mod tests {
       .add_obligation(VerificationObligation {
         id: ObligationId::from("REQ-001/AC-01/VO-01"),
         criterion_id: CriterionId::from("REQ-001/AC-01"),
-        description: "Configured check proves behavior".into(),
+        description: "Configured check is the admitted evidence producer".into(),
         required: true,
         evidence_contract: EvidenceContract::Artifact {
           predicate: EvidencePredicate::NamedProjectCheck {

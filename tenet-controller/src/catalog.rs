@@ -492,6 +492,8 @@ pub fn validate(catalog: &RequirementCatalog) -> Result<()> {
   Ok(())
 }
 
+/// Admits only claim-to-producer mappings backed by controller configuration.
+/// Admission establishes producer identity and policy, not semantic adequacy of the producer.
 pub fn validate_evidence_contracts(catalog: &RequirementCatalog, config: &Config) -> Result<()> {
   let checks: BTreeSet<_> = config
     .verification
@@ -842,7 +844,7 @@ mod tests {
   }
 
   #[test]
-  fn generic_project_verification_cannot_prove_an_obligation() {
+  fn generic_project_verification_cannot_satisfy_an_obligation_contract() {
     let contract = EvidenceContract::Artifact {
       predicate: EvidencePredicate::ProjectVerification,
     };
@@ -860,7 +862,7 @@ mod tests {
     };
 
     let error = validate_contract(&contract, &BTreeSet::new(), &BTreeSet::new())
-      .expect_err("supporting source inspection cannot close a proof obligation");
+      .expect_err("supporting source inspection cannot satisfy an obligation contract");
     assert!(error.to_string().contains(
       "source inspection is supporting evidence and cannot satisfy an authoritative evidence contract"
     ));

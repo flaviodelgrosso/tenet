@@ -334,10 +334,8 @@ impl Controller {
         .iter()
         .map(|record| record.discovery.clone())
         .collect();
-      let evidence_for_worker = evidence_graph::projections(
-        &evidence_graph,
-        EvidencePolicy::new(&current_revision, &suite_hash),
-      )?;
+      let evidence_for_worker =
+        evidence_graph::projections(&evidence_graph, EvidencePolicy::new(&current_revision))?;
       let backend = self.backend.clone();
       let reconciliation = self
         .validated_read_only_proposal(
@@ -427,7 +425,7 @@ impl Controller {
       state.requirement_counts = requirement_counts(
         &catalog,
         &evidence_graph,
-        EvidencePolicy::new(&current_revision, &suite_hash),
+        EvidencePolicy::new(&current_revision),
       )?;
       state.requirement_counts.missing_implementation = reconciliation
         .requirements
@@ -888,9 +886,9 @@ impl Controller {
     }
 
     state.phase = Phase::Assessing;
-    state.last_summary = "Running independent semantic verification".into();
+    state.last_summary = "Running advisory semantic assessment".into();
     self.publish(&context.events, state).await?;
-    let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
+    let policy = EvidencePolicy::new(&verified_revision);
     let catalog_for_worker = decision::semantic_assessment_catalog(catalog);
     let project_for_worker = project_report.clone();
     let obligation_handles_for_worker = decision::semantic_assessment_handles(catalog);
@@ -977,7 +975,7 @@ impl Controller {
       &admitted_proposals,
     )
     .await?;
-    let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
+    let policy = EvidencePolicy::new(&verified_revision);
     state.requirement_counts = requirement_counts(catalog, evidence_graph, policy)?;
     apply_semantic_layers(&mut state.verification_layers, evidence_graph, policy);
     state.last_summary.clone_from(&semantic_report.summary);
@@ -1136,7 +1134,7 @@ impl Controller {
               context
                 .events
                 .emit(RunEvent::Message(format!(
-                  "Authoritative acquisition {name:?} failed without semantic evidence: {error}"
+                  "Authoritative acquisition {name:?} failed without issuing an artifact: {error}"
                 )))
                 .await?;
               continue;
@@ -1233,7 +1231,7 @@ impl Controller {
               context
                 .events
                 .emit(RunEvent::Message(format!(
-                  "Falsifier acquisition {name:?} failed without semantic evidence: {error}"
+                  "Falsifier acquisition {name:?} failed without issuing an artifact: {error}"
                 )))
                 .await?;
               continue;
@@ -1864,13 +1862,17 @@ fn requirement_counts(
           .unwrap_or(ProofState::Insufficient)
       })
       .collect();
-    if !states.is_empty() && states.iter().all(|state| *state == ProofState::Proven) {
+    if !states.is_empty()
+      && states
+        .iter()
+        .all(|state| *state == ProofState::ContractSatisfied)
+    {
       counts.verified += 1;
     } else if states.contains(&ProofState::Contradicted) {
       counts.contradicted += 1;
     } else if states.contains(&ProofState::Stale) {
       counts.stale += 1;
-    } else if states.contains(&ProofState::Proven) {
+    } else if states.contains(&ProofState::ContractSatisfied) {
       counts.partially_verified += 1;
     } else {
       counts.unverified += 1;
@@ -2029,7 +2031,7 @@ fn apply_semantic_layers(
   layers.semantic_obligations_total = states.len();
   layers.semantic_satisfied = states
     .iter()
-    .filter(|state| **state == ProofState::Proven)
+    .filter(|state| **state == ProofState::ContractSatisfied)
     .count();
   layers.semantic_gaps = states
     .iter()

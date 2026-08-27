@@ -14,6 +14,9 @@ use crate::{
   verification::{VerificationAuthority, VerificationSpec},
 };
 
+/// Controller-admitted evidence requirements for one verification obligation.
+/// Selecting a predicate is a policy decision: satisfaction establishes only that the
+/// configured producer met this contract, not that the producer is a complete semantic oracle.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EvidenceContract {
@@ -30,6 +33,7 @@ impl Default for EvidenceContract {
   }
 }
 
+/// A controller-admitted mapping from a claim to an evidence producer.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EvidencePredicate {
@@ -692,10 +696,24 @@ pub struct AssessmentRecord {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProofState {
-  Proven,
+  /// The obligation's configured evidence contract is satisfied by admitted evidence.
+  #[serde(alias = "proven")]
+  ContractSatisfied,
   Contradicted,
   Insufficient,
   Stale,
+}
+
+impl ProofState {
+  /// Stable serialized name used by persistence and external diagnostics.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::ContractSatisfied => "contract_satisfied",
+      Self::Contradicted => "contradicted",
+      Self::Insufficient => "insufficient",
+      Self::Stale => "stale",
+    }
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -790,7 +808,7 @@ fn evaluate(
         },
         |artifact| {
           (
-            ProofState::Proven,
+            ProofState::ContractSatisfied,
             ProofReason::HumanAttestation {
               artifact_id: artifact.id,
               statement: statement.clone(),
@@ -858,7 +876,7 @@ fn evaluate_predicate(
       && artifact.observation == ArtifactObservation::Supports
   }) {
     return (
-      ProofState::Proven,
+      ProofState::ContractSatisfied,
       ProofReason::Artifact {
         artifact_id: artifact.id,
         predicate: predicate.clone(),
@@ -895,8 +913,12 @@ fn combine_all(states: impl Iterator<Item = ProofState>) -> ProofState {
     ProofState::Contradicted
   } else if states.contains(&ProofState::Stale) {
     ProofState::Stale
-  } else if !states.is_empty() && states.iter().all(|state| *state == ProofState::Proven) {
-    ProofState::Proven
+  } else if !states.is_empty()
+    && states
+      .iter()
+      .all(|state| *state == ProofState::ContractSatisfied)
+  {
+    ProofState::ContractSatisfied
   } else {
     ProofState::Insufficient
   }
@@ -904,8 +926,8 @@ fn combine_all(states: impl Iterator<Item = ProofState>) -> ProofState {
 
 fn combine_any(states: impl Iterator<Item = ProofState>) -> ProofState {
   let states: Vec<_> = states.collect();
-  if states.contains(&ProofState::Proven) {
-    ProofState::Proven
+  if states.contains(&ProofState::ContractSatisfied) {
+    ProofState::ContractSatisfied
   } else if !states.is_empty()
     && states
       .iter()
@@ -975,6 +997,19 @@ mod tests {
     HostRepositoryMountPolicy, IsolationBoundary, NetworkPolicy, TrustedExecutionBackend,
     WritableStoragePolicy,
   };
+
+  #[test]
+  fn contract_satisfied_has_explicit_wire_name() {
+    assert_eq!(ProofState::ContractSatisfied.as_str(), "contract_satisfied");
+    assert_eq!(
+      serde_json::to_string(&ProofState::ContractSatisfied).unwrap(),
+      "\"contract_satisfied\""
+    );
+    assert_eq!(
+      serde_json::from_str::<ProofState>("\"proven\"").unwrap(),
+      ProofState::ContractSatisfied
+    );
+  }
 
   fn artifact(
     authority: ArtifactAuthority,
@@ -1155,7 +1190,7 @@ mod tests {
   }
 
   #[test]
-  fn advisory_agent_success_cannot_prove() {
+  fn advisory_agent_success_cannot_satisfy_contract() {
     let item = artifact(
       ArtifactAuthority::Advisory,
       "r1",
@@ -1174,7 +1209,7 @@ mod tests {
     assert_eq!(derivation.state, ProofState::Insufficient);
   }
   #[test]
-  fn supporting_source_inspection_cannot_prove_an_admissible_named_check_contract() {
+  fn supporting_source_inspection_cannot_satisfy_named_check_contract() {
     let item = source_inspection_artifact();
     let derivation = derive_proof_state(
       &ObligationId::from("VO-1"),
@@ -1191,7 +1226,7 @@ mod tests {
   }
 
   #[test]
-  fn authoritative_trusted_execution_proves_without_assessment() {
+  fn authoritative_trusted_execution_satisfies_contract_without_assessment() {
     let item = trusted_artifact("r1", ArtifactObservation::Supports, "behavior");
     let derivation = derive_proof_state(
       &ObligationId::from("VO-1"),
@@ -1203,7 +1238,7 @@ mod tests {
       [&item],
       "r1",
     );
-    assert_eq!(derivation.state, ProofState::Proven);
+    assert_eq!(derivation.state, ProofState::ContractSatisfied);
   }
 
   #[test]
@@ -1257,7 +1292,7 @@ mod tests {
   }
 
   #[test]
-  fn forged_trusted_observation_cannot_affect_proof() {
+  fn forged_trusted_observation_cannot_affect_contract_state() {
     let mut item = trusted_artifact("r1", ArtifactObservation::Supports, "behavior");
     item.observation = ArtifactObservation::Contradicts;
     let derivation = derive_proof_state(
@@ -1310,7 +1345,7 @@ mod tests {
       [&item],
       "r1",
     );
-    assert_eq!(matching.state, ProofState::Proven);
+    assert_eq!(matching.state, ProofState::ContractSatisfied);
     assert_eq!(different.state, ProofState::Insufficient);
   }
   #[test]
@@ -1330,7 +1365,7 @@ mod tests {
   }
 
   #[test]
-  fn generic_project_verification_artifact_cannot_prove_an_obligation() {
+  fn generic_project_verification_artifact_cannot_satisfy_an_obligation() {
     let mut item = artifact(
       ArtifactAuthority::Authoritative,
       "r1",
@@ -1388,7 +1423,7 @@ mod tests {
       "r1",
     );
     assert_eq!(first, second);
-    assert_eq!(first.state, ProofState::Proven);
+    assert_eq!(first.state, ProofState::ContractSatisfied);
   }
 
   #[test]
@@ -1485,11 +1520,11 @@ mod tests {
       ],
     };
     let derivation = derive_proof_state(&ObligationId::from("VO-1"), &contract, [&item], "r1");
-    assert_eq!(derivation.state, ProofState::Proven);
+    assert_eq!(derivation.state, ProofState::ContractSatisfied);
   }
 
   #[test]
-  fn any_proven_and_missing_is_proven_with_both_reasons() {
+  fn any_satisfied_and_missing_is_satisfied_with_both_reasons() {
     let item = artifact(
       ArtifactAuthority::Authoritative,
       "r1",
@@ -1510,7 +1545,7 @@ mod tests {
       ],
     };
     let derivation = derive_proof_state(&ObligationId::from("VO-1"), &contract, [&item], "r1");
-    assert_eq!(derivation.state, ProofState::Proven);
+    assert_eq!(derivation.state, ProofState::ContractSatisfied);
     assert!(matches!(
       derivation.reason,
       ProofReason::Any { reasons }

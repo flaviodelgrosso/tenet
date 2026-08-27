@@ -1362,7 +1362,7 @@ async fn directory_scope_is_retried_with_recursive_glob_feedback() {
 }
 
 #[tokio::test]
-async fn mechanical_proof_skips_assessment_scope_retry() {
+async fn mechanical_contract_satisfaction_skips_assessment_scope_retry() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(
     BackendMode::InvalidAssessmentScopeThenCorrect,
@@ -1463,7 +1463,7 @@ async fn contradictory_reconciliation_is_retried_with_targeted_feedback_and_corr
 }
 
 #[tokio::test]
-async fn mechanical_proof_does_not_require_assessment_retries() {
+async fn mechanical_contract_satisfaction_does_not_require_assessment_retries() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::InvalidAssessmentThenCorrect));
   let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
@@ -1579,10 +1579,10 @@ async fn diamond_executes_independent_units_in_parallel_and_integrates_by_id() {
   let head = git::head(repository.path()).await.expect("head");
   let derivation = &graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")];
   assert_eq!(derivation.revision, head);
-  assert_eq!(derivation.state, ProofState::Proven);
+  assert_eq!(derivation.state, ProofState::ContractSatisfied);
   let artifact_id = match &derivation.reason {
     tenet_domain::proof::ProofReason::Artifact { artifact_id, .. } => *artifact_id,
-    reason => panic!("expected artifact proof, got {reason:?}"),
+    reason => panic!("expected artifact contract derivation, got {reason:?}"),
   };
   assert_eq!(graph.artifacts[&artifact_id].revision, head);
 
@@ -3289,7 +3289,7 @@ async fn repair_budget_is_shared_across_empty_and_verification_recovery() {
 }
 
 #[tokio::test]
-async fn mechanical_proof_does_not_route_model_suspicion_to_repair() {
+async fn mechanical_contract_satisfaction_does_not_route_model_suspicion_to_repair() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::SemanticGapThenRepair));
   let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
@@ -3304,7 +3304,7 @@ async fn mechanical_proof_does_not_route_model_suspicion_to_repair() {
 }
 
 #[tokio::test]
-async fn incomplete_model_assessment_cannot_block_mechanical_proof_at_max_cycles() {
+async fn incomplete_model_assessment_cannot_block_mechanical_contract_satisfaction_at_max_cycles() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::IncompleteAssessment));
   let (controller, _) = configured_controller(&repository, backend, 2).await;
@@ -3454,7 +3454,7 @@ async fn orphan_evidence_before_journal_does_not_claim_completion() {
 }
 
 #[tokio::test]
-async fn mechanical_proof_skips_unneeded_assessor_workspace_cleanup() {
+async fn mechanical_contract_satisfaction_skips_unneeded_assessor_workspace_cleanup() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::CleanupFailure));
   let (controller, _) = configured_controller(&repository, backend.clone(), 2).await;
@@ -3471,7 +3471,7 @@ async fn mechanical_proof_skips_unneeded_assessor_workspace_cleanup() {
   assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
   assert_eq!(
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Proven
+    ProofState::ContractSatisfied
   );
 }
 
@@ -3674,7 +3674,7 @@ async fn configured_trusted_controller(
 }
 
 #[tokio::test]
-async fn trusted_verifier_pass_proves_and_completes_without_assessor() {
+async fn trusted_verifier_pass_satisfies_contract_and_completes_without_assessor() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
   let trusted = Arc::new(FakeTrustedVerifier {
@@ -3700,7 +3700,7 @@ async fn trusted_verifier_pass_proves_and_completes_without_assessor() {
   assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
   assert_eq!(
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Proven
+    ProofState::ContractSatisfied
   );
 }
 
@@ -3800,8 +3800,8 @@ async fn hybrid_machine_and_human_contract_completes_only_after_explicit_attesta
   .expect("record explicit human authority");
   assert_eq!(
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Proven,
-    "explicit attestation must complete the hybrid proof before resume"
+    ProofState::ContractSatisfied,
+    "explicit attestation must satisfy the hybrid contract before resume"
   );
   let completed = controller
     .run(CancellationToken::new())
@@ -3815,11 +3815,12 @@ async fn hybrid_machine_and_human_contract_completes_only_after_explicit_attesta
   assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
   assert_eq!(
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Proven
+    ProofState::ContractSatisfied
   );
 }
 #[tokio::test]
-async fn unchanged_scoped_dependencies_reuse_trusted_proof_without_execution_or_assessment() {
+async fn unchanged_scoped_dependencies_reuse_trusted_contract_satisfaction_without_execution_or_assessment(
+) {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
   let trusted = Arc::new(FakeTrustedVerifier {
@@ -3889,7 +3890,7 @@ async fn unchanged_scoped_dependencies_reuse_trusted_proof_without_execution_or_
   assert!(requests.is_empty());
   assert_eq!(
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Proven
+    ProofState::ContractSatisfied
   );
   assert_eq!(trusted.calls.load(Ordering::SeqCst), 1);
   assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
@@ -3940,7 +3941,7 @@ async fn unchanged_scoped_dependencies_reuse_trusted_proof_without_execution_or_
   assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
   assert_eq!(
     refreshed_graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Proven
+    ProofState::ContractSatisfied
   );
 }
 
@@ -4139,7 +4140,7 @@ async fn configured_falsifier_controller(
 }
 
 #[tokio::test]
-async fn no_counterexample_falsifier_proves_only_its_contract_without_assessor() {
+async fn no_counterexample_falsifier_satisfies_only_its_contract_without_assessor() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
   let runner = Arc::new(FakeTrustedVerifier {
@@ -4189,7 +4190,7 @@ async fn falsifier_counterexample_blocks_without_assessor_override() {
 }
 
 #[tokio::test]
-async fn assessor_selected_no_counterexample_cannot_prove_falsifier_contract() {
+async fn assessor_selected_no_counterexample_cannot_satisfy_falsifier_contract() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::DynamicFalsifierProposal));
   let runner = Arc::new(FakeTrustedVerifier {
@@ -4370,7 +4371,7 @@ async fn falsifier_infrastructure_failure_issues_no_semantic_artifact() {
   controller
     .run(CancellationToken::new())
     .await
-    .expect_err("infrastructure failure must leave the obligation unproven");
+    .expect_err("infrastructure failure must leave the evidence contract unsatisfied");
   let catalog = store::read_catalog(repository.path())
     .await
     .expect("catalog read")

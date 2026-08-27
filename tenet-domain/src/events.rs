@@ -12,8 +12,8 @@ use crate::model::{
   WorkExecution, WorkLease, WorkUnit, WorkerEvent,
 };
 use crate::{
-  evidence::{Evidence, SemanticAssessmentReport, VerificationState},
-  ids::{ArtifactId, CriterionId, EvidenceId, ObligationId, RequirementId},
+  evidence::{SemanticAssessmentReport, VerificationState},
+  ids::{ArtifactId, CriterionId, ObligationId, RequirementId},
   verification::ProjectVerificationRun,
 };
 
@@ -127,12 +127,6 @@ pub enum RunEvent {
   ProjectVerification(ProjectVerificationRun),
   SemanticAssessment(SemanticAssessmentReport),
   RepositoryChanges(Vec<RepositoryChange>),
-  EvidenceEstablished(Evidence),
-  EvidenceFailed(Evidence),
-  EvidenceInvalidated {
-    evidence_id: EvidenceId,
-    revision: String,
-  },
   ArtifactReused {
     artifact_id: ArtifactId,
     from_revision: String,
@@ -158,10 +152,6 @@ pub enum RunEvent {
     revision: String,
     previous: crate::proof::ProofState,
     current: crate::proof::ProofState,
-  },
-  EvidenceContradiction {
-    obligation_id: ObligationId,
-    evidence_ids: Vec<EvidenceId>,
   },
   CriterionVerificationChanged {
     criterion_id: CriterionId,
@@ -285,18 +275,6 @@ impl RunLogger {
       RunEvent::RepositoryChanges(v) => {
         serde_json::json!({"type":"repository_changes","value":v})
       }
-      RunEvent::EvidenceEstablished(v) => {
-        serde_json::json!({"type":"evidence_established","value":v})
-      }
-      RunEvent::EvidenceFailed(v) => {
-        serde_json::json!({"type":"evidence_failed","value":v})
-      }
-      RunEvent::EvidenceInvalidated {
-        evidence_id,
-        revision,
-      } => {
-        serde_json::json!({"type":"evidence_invalidated","evidenceId":evidence_id,"revision":revision})
-      }
       RunEvent::ArtifactReused {
         artifact_id,
         from_revision,
@@ -315,12 +293,6 @@ impl RunLogger {
         "artifactId":artifact_id,
         "revision":revision
       }),
-      RunEvent::EvidenceContradiction {
-        obligation_id,
-        evidence_ids,
-      } => {
-        serde_json::json!({"type":"evidence_contradiction","obligationId":obligation_id,"evidenceIds":evidence_ids})
-      }
       RunEvent::CriterionVerificationChanged {
         criterion_id,
         previous,
@@ -499,33 +471,6 @@ mod tests {
     assert!(!error.to_string().is_empty());
   }
 
-  #[tokio::test]
-  async fn evidence_invalidation_is_logged_as_structured_event() {
-    let directory = tempfile::tempdir().expect("temporary log directory");
-    let logger = Arc::new(
-      RunLogger::create(directory.path().to_path_buf())
-        .await
-        .expect("run logger"),
-    );
-    let sink = EventSink::new(None).with_logger(logger);
-    let evidence_id = EvidenceId::new();
-
-    sink
-      .emit(RunEvent::EvidenceInvalidated {
-        evidence_id,
-        revision: "abc123".into(),
-      })
-      .await
-      .expect("emit evidence event");
-
-    let text = tokio::fs::read_to_string(directory.path().join("events.jsonl"))
-      .await
-      .expect("read event log");
-    let value: serde_json::Value = serde_json::from_str(text.trim()).expect("event JSON");
-    assert_eq!(value["type"], "evidence_invalidated");
-    assert_eq!(value["evidenceId"], evidence_id.to_string());
-    assert_eq!(value["revision"], "abc123");
-  }
   #[tokio::test]
   async fn acquisition_lifecycle_is_logged_without_executable_payloads() {
     let directory = tempfile::tempdir().expect("temporary log directory");

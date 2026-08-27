@@ -11,12 +11,12 @@ use tenet_domain::{
   config::{CONFIG_FILE, TENET_DIR},
   events::{EventSink, EvidenceAcquisitionStage, EvidenceIssuer, RunEvent},
   evidence::{
-    EvidenceGraphState, EvidencePolicy, EvidenceProjection, EvidenceValidity,
-    SemanticAssessmentReport, VerificationState,
+    EvidenceGraphState, EvidencePolicy, EvidenceProjection, SemanticAssessmentReport,
+    VerificationState,
   },
   falsifier::{FalsificationExecutionRecord, FalsifierSpec},
   human_attestation::{HumanAttestationRecord, HumanAttestorSpec},
-  ids::{ArtifactId, CriterionId, EvidenceId, RequirementId},
+  ids::{ArtifactId, CriterionId, RequirementId},
   model::RequirementCatalog,
   proof::{
     derive_proof_state, ArtifactAuthority, ArtifactObservation, ArtifactProvenance,
@@ -98,7 +98,10 @@ fn next_acquirable_kind(
   attempted: &BTreeSet<EvidenceAcquisitionIdentity>,
 ) -> Result<Option<EvidenceAcquisitionKind>> {
   let proof = derive_proof_state(obligation_id, contract, graph.artifacts.values(), revision);
-  if matches!(proof.state, ProofState::Proven | ProofState::Contradicted) {
+  if matches!(
+    proof.state,
+    ProofState::ContractSatisfied | ProofState::Contradicted
+  ) {
     return Ok(None);
   }
   match contract {
@@ -193,7 +196,10 @@ pub fn admit_assessment_proposals(
       graph.artifacts.values(),
       revision,
     );
-    if matches!(proof.state, ProofState::Proven | ProofState::Contradicted) {
+    if matches!(
+      proof.state,
+      ProofState::ContractSatisfied | ProofState::Contradicted
+    ) {
       continue;
     }
     for proposal in item.assessment.proposals() {
@@ -208,7 +214,7 @@ pub fn admit_assessment_proposals(
           };
           let leaf = EvidenceContract::Artifact { predicate };
           if derive_proof_state(&obligation.id, &leaf, graph.artifacts.values(), revision).state
-            == ProofState::Proven
+            == ProofState::ContractSatisfied
           {
             continue;
           }
@@ -616,12 +622,11 @@ pub async fn invalidate(
   events: &EventSink,
   graph: &mut EvidenceGraphState,
   revision: &str,
-  suite_hash: &str,
+  _suite_hash: &str,
 ) -> Result<()> {
-  let policy = EvidencePolicy::new(revision, suite_hash);
+  let policy = EvidencePolicy::new(revision);
   let requirement_before = verification_states(graph, policy)?;
   let criterion_before = criterion_states(graph, policy)?;
-  let invalidated = graph.invalidate_where(revision, Utc::now(), |_| true);
   let transitioning_artifacts: Vec<_> = graph
     .artifacts
     .values()
@@ -640,18 +645,10 @@ pub async fn invalidate(
     None
   };
   graph.transition_artifacts(revision, repository_blobs.as_ref());
-  if invalidated.is_empty() && !artifact_transition_needed {
+  if !artifact_transition_needed {
     return Ok(());
   }
   store::write_evidence_graph(cwd, graph).await?;
-  for evidence_id in invalidated {
-    events
-      .emit(RunEvent::EvidenceInvalidated {
-        evidence_id,
-        revision: revision.to_owned(),
-      })
-      .await?;
-  }
   for (artifact_id, from_revision) in transitioning_artifacts {
     let artifact = graph
       .artifacts
@@ -674,7 +671,7 @@ pub async fn invalidate(
   emit_transitions(
     events,
     graph,
-    EvidencePolicy::new(revision, suite_hash),
+    EvidencePolicy::new(revision),
     requirement_before,
     criterion_before,
   )
@@ -721,11 +718,6 @@ async fn emit_transitions(
   Ok(())
 }
 
-pub fn stale_evidence(graph: &EvidenceGraphState) -> impl Iterator<Item = EvidenceId> + '_ {
-  graph.evidence.values().filter_map(|evidence| {
-    matches!(evidence.validity, EvidenceValidity::Stale { .. }).then_some(evidence.id)
-  })
-}
 #[cfg(test)]
 mod tests {
   use super::*;

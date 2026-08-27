@@ -14,6 +14,7 @@ use tenet_acp::acp::AcpRuntime;
 use tenet_controller::{catalog, controller::manual_verify, evidence, AgentBackend};
 use tenet_domain::{
   config::read_config,
+  evidence::EvidencePolicy,
   human_attestation::{HumanAttestationBinding, HumanAttestationRecord},
   ids::ObligationId,
   model::{CatalogApproval, RunStatus},
@@ -283,12 +284,11 @@ impl App {
       )
       .await?;
     if let Some(requirement) = requirement {
-      let evidence: Vec<_> = graph
-        .evidence
-        .values()
-        .filter(|item| item.requirement_id.as_str() == requirement)
-        .collect();
-      println!("{}", serde_json::to_string_pretty(&evidence)?);
+      let revision = tenet_runtime::git::head(&self.cwd).await?;
+      let projection = graph
+        .projection(&requirement.into(), EvidencePolicy::new(&revision))
+        .context("unknown requirement")?;
+      println!("{}", serde_json::to_string_pretty(&projection)?);
     } else {
       println!("{}", serde_json::to_string_pretty(&graph)?);
     }

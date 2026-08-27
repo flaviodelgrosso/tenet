@@ -68,7 +68,7 @@ pub(crate) enum Command {
     #[command(subcommand)]
     command: RequirementsCommand,
   },
-  /// Export semantic and project evidence.
+  /// Export admitted evidence artifacts and advisory assessments.
   Evidence {
     #[command(subcommand)]
     command: EvidenceCommand,

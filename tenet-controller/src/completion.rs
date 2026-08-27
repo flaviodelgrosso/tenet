@@ -41,11 +41,13 @@ impl std::fmt::Display for CompletionBlocker {
       Self::CriterionUnverified(id) => {
         write!(formatter, "acceptance criterion {id} is not verified")
       }
-      Self::ProofContradicted(id) => write!(formatter, "authoritative proof contradicts {id}"),
-      Self::ProofInsufficient(id) => {
-        write!(formatter, "authoritative proof is insufficient for {id}")
+      Self::ProofContradicted(id) => {
+        write!(formatter, "evidence contract for {id} is contradicted")
       }
-      Self::ProofStale(id) => write!(formatter, "authoritative proof is stale for {id}"),
+      Self::ProofInsufficient(id) => {
+        write!(formatter, "evidence contract for {id} is not satisfied")
+      }
+      Self::ProofStale(id) => write!(formatter, "evidence contract for {id} is stale"),
       Self::HumanAttestationRequired(id) => {
         write!(
           formatter,
@@ -111,13 +113,14 @@ impl CompletionPolicy {
       blockers.insert(CompletionBlocker::ProjectVerificationStale);
     }
 
-    let obligation_proven = |obligation_id: &ObligationId| {
+    let obligation_contract_satisfied = |obligation_id: &ObligationId| {
       context
         .evidence
         .proof_derivations
         .get(obligation_id)
         .is_some_and(|derivation| {
-          derivation.revision == context.current_revision && derivation.state == ProofState::Proven
+          derivation.revision == context.current_revision
+            && derivation.state == ProofState::ContractSatisfied
         })
     };
     for requirement in context
@@ -126,7 +129,7 @@ impl CompletionPolicy {
       .iter()
       .filter(|requirement| requirement.required)
     {
-      let proven = context
+      let contracts_satisfied = context
         .catalog
         .acceptance_criteria
         .iter()
@@ -140,8 +143,8 @@ impl CompletionPolicy {
               obligation.criterion_id == criterion.id && obligation.required
             })
         })
-        .all(|obligation| obligation_proven(&obligation.id));
-      if !proven {
+        .all(|obligation| obligation_contract_satisfied(&obligation.id));
+      if !contracts_satisfied {
         blockers.insert(CompletionBlocker::RequirementUnverified(
           requirement.id.clone(),
         ));
@@ -153,13 +156,13 @@ impl CompletionPolicy {
       .iter()
       .filter(|criterion| criterion.mandatory)
     {
-      let proven = context
+      let contracts_satisfied = context
         .catalog
         .verification_obligations
         .iter()
         .filter(|obligation| obligation.criterion_id == criterion.id && obligation.required)
-        .all(|obligation| obligation_proven(&obligation.id));
-      if !proven {
+        .all(|obligation| obligation_contract_satisfied(&obligation.id));
+      if !contracts_satisfied {
         blockers.insert(CompletionBlocker::CriterionUnverified(criterion.id.clone()));
       }
     }
@@ -172,7 +175,7 @@ impl CompletionPolicy {
       match context.evidence.proof_derivations.get(&obligation.id) {
         Some(derivation) if derivation.revision == context.current_revision => {
           match derivation.state {
-            ProofState::Proven => {}
+            ProofState::ContractSatisfied => {}
             ProofState::Contradicted => {
               blockers.insert(CompletionBlocker::ProofContradicted(obligation.id.clone()));
             }
@@ -243,7 +246,7 @@ fn human_requirement(
     revision,
   )
   .state;
-  if state == ProofState::Proven {
+  if state == ProofState::ContractSatisfied {
     return HumanRequirement::Satisfied;
   }
   if state == ProofState::Contradicted {
@@ -312,7 +315,9 @@ mod tests {
     evidence::{AcceptanceCriterion, VerificationObligation},
     ids::{CriterionId, ObligationId, RequirementId, VerificationRunId},
     model::Requirement,
-    proof::{AssessmentJudgment, EvidenceContract, EvidencePredicate},
+    proof::{
+      ArtifactAuthority, AssessmentJudgment, EvidenceContract, EvidencePredicate, ProofState,
+    },
     verification::{CommandResult, ProjectCheckResult, VerificationSpec},
     worker::{derive_normative_fragments, CatalogCoverage},
   };
@@ -385,7 +390,6 @@ mod tests {
 
   fn decision_with_contract(
     project_passed: bool,
-    _outcome: Option<AssessmentJudgment>,
     contract: EvidenceContract,
   ) -> CompletionDecision {
     let mut catalog = catalog();
@@ -407,10 +411,9 @@ mod tests {
     })
   }
 
-  fn decision(project_passed: bool, outcome: Option<AssessmentJudgment>) -> CompletionDecision {
+  fn decision(project_passed: bool) -> CompletionDecision {
     decision_with_contract(
       project_passed,
-      outcome,
       EvidenceContract::Artifact {
         predicate: EvidencePredicate::NamedProjectCheck {
           name: "quality".into(),
@@ -420,72 +423,120 @@ mod tests {
   }
 
   #[test]
-  fn mechanical_project_proof_needs_no_assessor() {
-    assert_eq!(decision(true, None), CompletionDecision::Done);
-  }
+  fn configured_project_check_satisfies_contract_without_assessor() {
+    let catalog = catalog();
+    let project = project(true);
+    let mut graph = crate::evidence::graph_from_catalog(&catalog).expect("graph");
+    graph.record_project_verification(&project);
+    graph.record_project_artifacts(&project).expect("artifacts");
+    graph.derive_proofs("abc");
 
-  #[test]
-  fn project_pass_and_semantic_satisfaction_yield_done() {
     assert_eq!(
-      decision(
-        true,
-        Some(AssessmentJudgment::Supported {
-          artifact_ids: Vec::new(),
-          rationale: "Satisfied".into(),
-        })
-      ),
-      CompletionDecision::Done
+      graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+      ProofState::ContractSatisfied
     );
+    assert_eq!(decision(true), CompletionDecision::Done);
   }
 
   #[test]
-  fn semantic_satisfaction_does_not_override_project_failure() {
+  fn supported_assessment_cannot_change_authority_contract_state_or_completion() {
+    let mut catalog = catalog();
+    catalog.verification_obligations[0].evidence_contract = EvidenceContract::All {
+      requirements: vec![
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "quality".into(),
+          },
+        },
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::TrustedVerifierCheck {
+            name: "expiry-boundary".into(),
+          },
+        },
+      ],
+    };
+    let project = project(true);
+    let mut graph = crate::evidence::graph_from_catalog(&catalog).expect("graph");
+    let artifact_ids = graph.record_project_artifacts(&project).expect("artifacts");
+    graph.derive_proofs("abc");
+    let before = graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state;
+    let authority_before = graph.artifacts[&artifact_ids[0]].authority;
+
+    graph
+      .record_assessment_judgments(
+        "abc",
+        project.finished_at,
+        "assessor",
+        vec![(
+          ObligationId::from("REQ-001/AC-01/VO-01"),
+          AssessmentJudgment::Supported {
+            artifact_ids,
+            rationale: "Model says the claim is supported".into(),
+          },
+        )],
+      )
+      .expect("record advisory assessment");
+    graph.derive_proofs("abc");
+
+    assert_eq!(before, ProofState::Insufficient);
+    assert_eq!(
+      graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+      before
+    );
+    assert_eq!(
+      graph.artifacts.values().next().unwrap().authority,
+      authority_before
+    );
+    assert_eq!(authority_before, ArtifactAuthority::Authoritative);
     assert!(matches!(
-      decision(
-        false,
-        Some(AssessmentJudgment::Supported {
-          artifact_ids: Vec::new(),
-          rationale: "Satisfied".into(),
-        })
-      ),
+      CompletionPolicy.evaluate(&CompletionContext {
+        catalog: &catalog,
+        evidence: &graph,
+        project_verification: &project,
+        current_suite_hash: "suite",
+        current_revision: "abc",
+        repository_clean: true,
+        has_active_leases: false,
+        has_pending_integrations: false,
+      }),
       CompletionDecision::NotReady(blockers)
-        if blockers.contains(&CompletionBlocker::ProjectVerificationFailed)
+        if blockers.contains(&CompletionBlocker::ProofInsufficient(
+          ObligationId::from("REQ-001/AC-01/VO-01")
+        ))
     ));
   }
 
   #[test]
-  fn unconfirmed_model_suspicion_does_not_create_contradiction() {
-    assert_eq!(
-      decision(
-        true,
-        Some(AssessmentJudgment::Contradicted {
-          artifact_ids: Vec::new(),
-          rationale: "Suspected behavior".into(),
-          proposals: Vec::new(),
-        })
-      ),
-      CompletionDecision::Done
-    );
-  }
+  fn revision_mismatched_evidence_cannot_satisfy_completion() {
+    let catalog = catalog();
+    let old_project = project(true);
+    let mut graph = crate::evidence::graph_from_catalog(&catalog).expect("graph");
+    graph
+      .record_project_artifacts(&old_project)
+      .expect("artifacts");
+    graph.transition_artifacts("def", None);
+    let mut current_project = project(true);
+    current_project.run_id = VerificationRunId::new();
+    current_project.revision = "def".into();
+    current_project.checks.clear();
 
-  #[test]
-  fn semantic_support_cannot_satisfy_trusted_verifier_contract() {
-    let decision = decision_with_contract(
-      true,
-      Some(AssessmentJudgment::Supported {
-        artifact_ids: Vec::new(),
-        rationale: "Model says supported".into(),
-      }),
-      EvidenceContract::Artifact {
-        predicate: EvidencePredicate::TrustedVerifierCheck {
-          name: "expiry-boundary".into(),
-        },
-      },
+    assert_eq!(
+      graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+      ProofState::Stale
     );
     assert!(matches!(
-      decision,
+      CompletionPolicy.evaluate(&CompletionContext {
+        catalog: &catalog,
+        evidence: &graph,
+        project_verification: &current_project,
+        current_suite_hash: "suite",
+        current_revision: "def",
+        repository_clean: true,
+        has_active_leases: false,
+        has_pending_integrations: false,
+      }),
       CompletionDecision::NotReady(blockers)
-        if blockers.contains(&CompletionBlocker::ProofInsufficient(
+        if blockers.contains(&CompletionBlocker::ProofStale(
           ObligationId::from("REQ-001/AC-01/VO-01")
         ))
     ));
@@ -496,7 +547,6 @@ mod tests {
     assert!(matches!(
       decision_with_contract(
         true,
-        None,
         EvidenceContract::HumanAttestation {
           statement: "Product approval".into()
         }
@@ -541,7 +591,6 @@ mod tests {
   fn unresolved_machine_alternative_does_not_require_human_attestation() {
     let decision = decision_with_contract(
       true,
-      None,
       EvidenceContract::Any {
         requirements: vec![
           EvidenceContract::HumanAttestation {

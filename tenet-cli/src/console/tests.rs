@@ -7,11 +7,8 @@ use super::{
 use chrono::Utc;
 use tenet_domain::{
   events::{CompletionGate, CompletionGateItem, CompletionGateOutcome, RunEvent},
-  evidence::{
-    Evidence, EvidenceProvenance, EvidenceResult, EvidenceSource, EvidenceValidity,
-    ObligationAssessmentResult, SemanticAssessmentReport,
-  },
-  ids::{CriterionId, EvidenceId, ObligationId, RequirementId, VerificationRunId},
+  evidence::{ObligationAssessmentResult, SemanticAssessmentReport},
+  ids::{ArtifactId, ObligationId, VerificationRunId},
   model::{
     Phase, RepairProgress, RepositoryChange, RunStatus, State, WorkScope, WorkUnit, WorkerEvent,
     WorkerRole,
@@ -331,21 +328,17 @@ fn semantic_gap_and_uncertainty_are_distinct() {
 }
 
 #[test]
-fn stale_evidence_has_warning_semantics() {
-  let output = render(
-    InformationMode::Default,
-    &[ConsoleEvent::StaleEvidence {
-      at: "12:35:00".into(),
-      evidence_id: "EV-12".into(),
-      revision: "49eab13ffff".into(),
-    }],
-  );
+fn stale_artifact_has_warning_semantics() {
+  let mut presenter = ConsolePresenter::new(3);
+  let events = presenter.present(&RunEvent::ArtifactBecameStale {
+    artifact_id: ArtifactId::new(),
+    revision: "49eab13ffff".into(),
+  });
+  let output = render(InformationMode::Default, &events);
 
   assert!(output.contains("! STALE"), "{output}");
-  assert!(
-    output.contains("repository advanced to 49eab13"),
-    "{output}"
-  );
+  assert!(output.contains("artifact is not authoritative"), "{output}");
+  assert!(output.contains("49eab13ffff"), "{output}");
 }
 
 #[test]
@@ -582,43 +575,4 @@ fn advisory_failure_drives_repair_reason() {
 
   assert!(output.contains("WU-003 · attempt 1/3"), "{output}");
   assert!(output.contains("token expiry assertion failed"), "{output}");
-}
-
-#[test]
-fn semantic_evidence_does_not_repeat_assessment_findings() {
-  let obligation_id = ObligationId::from("REQ-003/AC-02/VO-01");
-  let report = SemanticAssessmentReport {
-    summary: "gap".into(),
-    assessments: vec![ObligationAssessmentResult {
-      obligation_id: obligation_id.clone(),
-      assessment: AssessmentJudgment::Insufficient {
-        reason: "expiry not established".into(),
-        proposals: Vec::new(),
-        gap_kind: GapKind::Implementation,
-      },
-    }],
-  };
-  let evidence = Evidence {
-    id: EvidenceId::new(),
-    requirement_id: RequirementId::from("REQ-003"),
-    criterion_id: CriterionId::from("REQ-003/AC-02"),
-    obligation_id,
-    source: EvidenceSource::SemanticAssessment,
-    result: EvidenceResult::Failed,
-    revision: "abc1234".into(),
-    observed_at: Utc::now(),
-    provenance: EvidenceProvenance::independent_assessment("assessor"),
-    rationale: "expiry not established".into(),
-    evidence_refs: Vec::new(),
-    validity: EvidenceValidity::Valid,
-  };
-  let mut presenter = ConsolePresenter::new(3);
-  let assessment_events = presenter.present(&RunEvent::SemanticAssessment(report));
-  let evidence_events = presenter.present(&RunEvent::EvidenceFailed(evidence));
-
-  let assessment_output = render(InformationMode::Default, &assessment_events);
-  let evidence_output = render(InformationMode::Default, &evidence_events);
-
-  assert_eq!(assessment_output.matches("INSUFFICIENT").count(), 1);
-  assert!(evidence_output.is_empty(), "{evidence_output}");
 }

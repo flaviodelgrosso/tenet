@@ -7,17 +7,15 @@ use sqlx::Row;
 
 use tenet_domain::{
   evidence::{
-    Evidence, EvidenceGraphState, EvidenceProvenance, EvidenceResult, EvidenceSource,
-    EvidenceValidity, ProjectEvidenceProvenance, ProjectVerificationEvidence,
-    SemanticAssessmentReport,
+    EvidenceGraphState, EvidenceResult, ProjectVerificationEvidence, SemanticAssessmentReport,
   },
   falsifier::{FalsificationExecutionRecord, FalsifierResult, FalsifierSpec},
   human_attestation::{HumanAttestationRecord, HumanAttestorSpec, HumanSignatureAlgorithm},
-  ids::{EvidenceId, HumanAttestationId, ObligationId, VerificationRunId},
+  ids::{HumanAttestationId, ObligationId, VerificationRunId},
   model::RequirementCatalog,
   proof::{
     derive_proof_state, ArtifactAuthority, ArtifactProvenance, ArtifactValidity, EvidenceArtifact,
-    EvidenceArtifactKind, ProofDerivation, ProofState,
+    EvidenceArtifactKind, ProofDerivation,
   },
   trusted_verifier::{TrustedExecutionRecord, TrustedExecutionResult, TrustedVerificationSpec},
   verification::{CommandResult, ProjectCheckResult, ProjectVerificationRun, VerificationSpec},
@@ -296,7 +294,7 @@ impl Storage {
     observed_at: DateTime<Utc>,
     worker_id: &str,
     report: &SemanticAssessmentReport,
-  ) -> Result<Vec<EvidenceId>, StorageError> {
+  ) -> Result<(), StorageError> {
     let catalog = self.load_active_catalog().await?.ok_or_else(|| {
       StorageError::UnexpectedCardinality("semantic assessment requires an active catalog".into())
     })?;
@@ -316,42 +314,10 @@ impl Storage {
       .commit()
       .await
       .map_err(StorageError::from_sqlx)?;
-    Ok(Vec::new())
+    Ok(())
   }
 
-  /// Conservatively marks valid semantic evidence from older revisions stale.
-  pub async fn invalidate_evidence_for_revision(
-    &self,
-    run_id: &str,
-    revision: &str,
-    invalidated_at: DateTime<Utc>,
-  ) -> Result<u64, StorageError> {
-    sqlx::query("UPDATE semantic_evidence SET validity = 'stale', invalidated_at = ?, superseded_by_revision = ? WHERE run_id = ? AND validity = 'valid' AND revision <> ?")
-      .bind(invalidated_at.to_rfc3339())
-      .bind(revision)
-      .bind(run_id)
-      .bind(revision)
-      .execute(&self.pool)
-      .await
-      .map(|result| result.rows_affected())
-      .map_err(StorageError::from_sqlx)
-  }
-
-  /// Loads only valid semantic evidence for one obligation at one revision.
-  pub async fn load_obligation_evidence(
-    &self,
-    obligation_id: &ObligationId,
-    revision: &str,
-  ) -> Result<Vec<Evidence>, StorageError> {
-    self
-      .load_evidence_rows(
-        "SELECT id, requirement_id, criterion_id, obligation_id, source, result, revision, observed_at, provenance_kind, worker_id, worker_role, rationale, validity, invalidated_at, superseded_by_revision FROM semantic_evidence WHERE obligation_id = ? AND revision = ? AND validity = 'valid' ORDER BY observed_at, id",
-        Some((obligation_id.as_str(), revision)),
-      )
-      .await
-  }
-
-  /// Reconstructs the domain evidence graph while preserving EvidencePolicy behavior.
+  /// Reconstructs the evidence graph from admitted artifacts and advisory assessments.
   pub async fn load_evidence_graph(
     &self,
     catalog: &RequirementCatalog,
@@ -364,17 +330,6 @@ impl Storage {
       self.load_project_verifications().await?;
     for project in project_verifications {
       graph.project_evidence.insert(project.run_id, project);
-    }
-    for evidence in self
-      .load_evidence_rows(
-        "SELECT id, requirement_id, criterion_id, obligation_id, source, result, revision, observed_at, provenance_kind, worker_id, worker_role, rationale, validity, invalidated_at, superseded_by_revision FROM semantic_evidence ORDER BY observed_at, id",
-        None,
-      )
-      .await?
-    {
-      graph
-        .establish_evidence(evidence)
-        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
     }
     let (artifacts, artifact_authority_rejected) = self
       .load_artifacts(trusted_specs, falsifier_specs, human_attestors)
@@ -441,42 +396,6 @@ impl Storage {
           .await?;
       }
     }
-    let mut transaction = self.pool.begin().await.map_err(StorageError::from_sqlx)?;
-    for evidence in graph.evidence.values() {
-      let exists =
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM semantic_evidence WHERE id = ?")
-          .bind(evidence.id.to_string())
-          .fetch_one(&mut *transaction)
-          .await
-          .map_err(StorageError::from_sqlx)?;
-      if exists == 0 {
-        insert_evidence(&mut transaction, run_id, evidence).await?;
-      } else {
-        let (validity, invalidated_at, superseded_by_revision) = match &evidence.validity {
-          EvidenceValidity::Valid => ("valid", None, None),
-          EvidenceValidity::Stale {
-            invalidated_at,
-            superseded_by_revision,
-          } => (
-            "stale",
-            Some(invalidated_at.to_rfc3339()),
-            Some(superseded_by_revision.clone()),
-          ),
-        };
-        sqlx::query("UPDATE semantic_evidence SET validity = ?, invalidated_at = ?, superseded_by_revision = ? WHERE id = ?")
-          .bind(validity)
-          .bind(invalidated_at)
-          .bind(superseded_by_revision)
-          .bind(evidence.id.to_string())
-          .execute(&mut *transaction)
-          .await
-          .map_err(StorageError::from_sqlx)?;
-      }
-    }
-    transaction
-      .commit()
-      .await
-      .map_err(StorageError::from_sqlx)?;
     self.persist_proof_state(run_id, graph).await
   }
 
@@ -556,8 +475,6 @@ impl Storage {
         },
         check_results: run.checks,
         observed_at: run.finished_at,
-        source: EvidenceSource::ProjectVerification,
-        provenance: ProjectEvidenceProvenance::ControllerExecution,
       });
     }
     Ok((evidence, authority_rejected))
@@ -612,57 +529,6 @@ impl Storage {
     Ok(checks)
   }
 
-  async fn load_evidence_rows(
-    &self,
-    query: &'static str,
-    bindings: Option<(&str, &str)>,
-  ) -> Result<Vec<Evidence>, StorageError> {
-    let rows = match bindings {
-      Some((first, second)) => {
-        sqlx::query(query)
-          .bind(first)
-          .bind(second)
-          .fetch_all(&self.pool)
-          .await
-      }
-      None => sqlx::query(query).fetch_all(&self.pool).await,
-    }
-    .map_err(StorageError::from_sqlx)?;
-    let mut evidence = Vec::with_capacity(rows.len());
-    for row in rows {
-      let id_text = row.get::<String, _>("id");
-      let references = sqlx::query_scalar::<_, String>(
-        "SELECT reference FROM evidence_refs WHERE evidence_id = ? ORDER BY ordinal",
-      )
-      .bind(&id_text)
-      .fetch_all(&self.pool)
-      .await
-      .map_err(StorageError::from_sqlx)?;
-      evidence.push(Evidence {
-        id: parse_uuid_id(&id_text)?,
-        requirement_id: row.get::<String, _>("requirement_id").into(),
-        criterion_id: row.get::<String, _>("criterion_id").into(),
-        obligation_id: row.get::<String, _>("obligation_id").into(),
-        source: parse_source(&row.get::<String, _>("source"))?,
-        result: parse_result(&row.get::<String, _>("result"))?,
-        revision: row.get("revision"),
-        observed_at: parse_timestamp(&row.get::<String, _>("observed_at"))?,
-        provenance: parse_provenance(
-          &row.get::<String, _>("provenance_kind"),
-          row.get("worker_id"),
-          row.get("worker_role"),
-        )?,
-        rationale: row.get("rationale"),
-        evidence_refs: references,
-        validity: parse_validity(
-          &row.get::<String, _>("validity"),
-          row.get("invalidated_at"),
-          row.get("superseded_by_revision"),
-        )?,
-      });
-    }
-    Ok(evidence)
-  }
   async fn load_trusted_execution(
     &self,
     id: VerificationRunId,
@@ -1324,7 +1190,7 @@ impl Storage {
       let json = serde_json::to_string(derivation)
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
       sqlx::query("INSERT INTO proof_derivations(run_id, obligation_id, revision, state, derivation_json, derived_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(run_id, obligation_id, revision) DO UPDATE SET state = excluded.state, derivation_json = excluded.derivation_json, derived_at = excluded.derived_at")
-        .bind(run_id).bind(derivation.obligation_id.as_str()).bind(&derivation.revision).bind(proof_state_name(derivation.state)).bind(json).bind(Utc::now().to_rfc3339())
+        .bind(run_id).bind(derivation.obligation_id.as_str()).bind(&derivation.revision).bind(derivation.state.as_str()).bind(json).bind(Utc::now().to_rfc3339())
         .execute(&mut *transaction).await.map_err(StorageError::from_sqlx)?;
     }
     transaction.commit().await.map_err(StorageError::from_sqlx)
@@ -1343,71 +1209,6 @@ fn artifact_validity_name(validity: &ArtifactValidity) -> &'static str {
     ArtifactValidity::Valid => "valid",
     ArtifactValidity::Stale { .. } => "stale",
   }
-}
-
-fn proof_state_name(state: ProofState) -> &'static str {
-  match state {
-    ProofState::Proven => "proven",
-    ProofState::Contradicted => "contradicted",
-    ProofState::Insufficient => "insufficient",
-    ProofState::Stale => "stale",
-  }
-}
-
-pub(crate) async fn insert_evidence(
-  transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-  run_id: &str,
-  evidence: &Evidence,
-) -> Result<(), StorageError> {
-  let (provenance_kind, worker_id, worker_role) = match &evidence.provenance {
-    EvidenceProvenance::IndependentAssessment { worker_id } => {
-      ("independent_assessment", Some(worker_id.as_str()), None)
-    }
-    EvidenceProvenance::AgentProposal { worker_role } => {
-      ("agent_proposal", None, Some(worker_role.as_str()))
-    }
-  };
-  let (validity, invalidated_at, superseded_by_revision) = match &evidence.validity {
-    EvidenceValidity::Valid => ("valid", None, None),
-    EvidenceValidity::Stale {
-      invalidated_at,
-      superseded_by_revision,
-    } => (
-      "stale",
-      Some(invalidated_at.to_rfc3339()),
-      Some(superseded_by_revision.clone()),
-    ),
-  };
-  sqlx::query("INSERT INTO semantic_evidence(id, run_id, requirement_id, criterion_id, obligation_id, source, result, revision, observed_at, provenance_kind, worker_id, worker_role, rationale, validity, invalidated_at, superseded_by_revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-    .bind(evidence.id.to_string())
-    .bind(run_id)
-    .bind(evidence.requirement_id.as_str())
-    .bind(evidence.criterion_id.as_str())
-    .bind(evidence.obligation_id.as_str())
-    .bind(source_name(evidence.source))
-    .bind(result_name(evidence.result))
-    .bind(&evidence.revision)
-    .bind(evidence.observed_at.to_rfc3339())
-    .bind(provenance_kind)
-    .bind(worker_id)
-    .bind(worker_role)
-    .bind(&evidence.rationale)
-    .bind(validity)
-    .bind(invalidated_at)
-    .bind(superseded_by_revision)
-    .execute(&mut **transaction)
-    .await
-    .map_err(StorageError::from_sqlx)?;
-  for (ordinal, reference) in evidence.evidence_refs.iter().enumerate() {
-    sqlx::query("INSERT INTO evidence_refs(evidence_id, ordinal, reference) VALUES (?, ?, ?)")
-      .bind(evidence.id.to_string())
-      .bind(ordinal as i64)
-      .bind(reference)
-      .execute(&mut **transaction)
-      .await
-      .map_err(StorageError::from_sqlx)?;
-  }
-  Ok(())
 }
 
 fn empty_graph(catalog: &RequirementCatalog) -> Result<EvidenceGraphState, StorageError> {
@@ -1437,79 +1238,6 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, StorageError> {
   DateTime::parse_from_rfc3339(value)
     .map(|value| value.with_timezone(&Utc))
     .map_err(|error| StorageError::IntegrityViolation(error.to_string()))
-}
-
-fn source_name(value: EvidenceSource) -> &'static str {
-  match value {
-    EvidenceSource::ProjectVerification => "project_verification",
-    EvidenceSource::SemanticAssessment => "semantic_assessment",
-    EvidenceSource::AgentSuggestion => "agent_suggestion",
-  }
-}
-
-fn parse_source(value: &str) -> Result<EvidenceSource, StorageError> {
-  match value {
-    "project_verification" => Ok(EvidenceSource::ProjectVerification),
-    "semantic_assessment" => Ok(EvidenceSource::SemanticAssessment),
-    "agent_suggestion" => Ok(EvidenceSource::AgentSuggestion),
-    other => Err(StorageError::IntegrityViolation(format!(
-      "unknown evidence source {other}"
-    ))),
-  }
-}
-
-fn result_name(value: EvidenceResult) -> &'static str {
-  match value {
-    EvidenceResult::Passed => "passed",
-    EvidenceResult::Failed => "failed",
-    EvidenceResult::Inconclusive => "inconclusive",
-  }
-}
-
-fn parse_result(value: &str) -> Result<EvidenceResult, StorageError> {
-  match value {
-    "passed" => Ok(EvidenceResult::Passed),
-    "failed" => Ok(EvidenceResult::Failed),
-    "inconclusive" => Ok(EvidenceResult::Inconclusive),
-    other => Err(StorageError::IntegrityViolation(format!(
-      "unknown evidence result {other}"
-    ))),
-  }
-}
-
-fn parse_provenance(
-  kind: &str,
-  worker_id: Option<String>,
-  worker_role: Option<String>,
-) -> Result<EvidenceProvenance, StorageError> {
-  match (kind, worker_id, worker_role) {
-    ("independent_assessment", Some(worker_id), None) => {
-      Ok(EvidenceProvenance::independent_assessment(worker_id))
-    }
-    ("agent_proposal", None, Some(worker_role)) => {
-      Ok(EvidenceProvenance::agent_proposal(worker_role))
-    }
-    _ => Err(StorageError::IntegrityViolation(
-      "invalid evidence provenance columns".into(),
-    )),
-  }
-}
-
-fn parse_validity(
-  validity: &str,
-  invalidated_at: Option<String>,
-  superseded_by_revision: Option<String>,
-) -> Result<EvidenceValidity, StorageError> {
-  match (validity, invalidated_at, superseded_by_revision) {
-    ("valid", None, None) => Ok(EvidenceValidity::Valid),
-    ("stale", Some(invalidated_at), Some(superseded_by_revision)) => Ok(EvidenceValidity::Stale {
-      invalidated_at: parse_timestamp(&invalidated_at)?,
-      superseded_by_revision,
-    }),
-    _ => Err(StorageError::IntegrityViolation(
-      "invalid evidence validity columns".into(),
-    )),
-  }
 }
 
 fn authority_mac(parts: &[&[u8]]) -> Result<String, StorageError> {

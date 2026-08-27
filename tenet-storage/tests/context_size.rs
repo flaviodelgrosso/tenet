@@ -156,10 +156,6 @@ async fn implement_and_repair_contexts_are_at_least_thirty_percent_smaller_witho
     )
     .await
     .expect("historical evidence");
-  storage
-    .invalidate_evidence_for_revision("run-1", "revision-2", Utc::now())
-    .await
-    .expect("invalidate evidence");
   let current_assessments = catalog
     .verification_obligations
     .iter()

@@ -176,10 +176,10 @@ controller-run project verification               │
                     deterministic EvidenceContract
                                        │
                      ┌─────────────────┼─────────────────┐
-                  PROVEN          INSUFFICIENT      CONTRADICTED
-                     │                 │                 │
-                     ▼                 ▼                 ▼
-                   DONE?       acquire/adjudicate      BLOCKED
+             CONTRACT SATISFIED      INSUFFICIENT      CONTRADICTED
+                     │                    │                 │
+                     ▼                    ▼                 ▼
+                   DONE?          acquire/adjudicate      BLOCKED
 ```
 
 The repository evolves. The plan is allowed to evolve with it. The specification and controller-owned evidence remain the reference points.
@@ -207,9 +207,9 @@ required verification obligations with explicit EvidenceContracts
         +
 controller-issued, revision-compatible authoritative artifacts satisfy every contract
         +
-deterministically derived ProofState::Proven for every required obligation
+deterministically derived ProofState::ContractSatisfied for every required obligation
         +
-advisory model support, suspicion, or prose has no proof authority
+advisory model support, suspicion, or prose has no evidence-contract authority
         +
 no remaining work from current reconciliation
         +
@@ -224,13 +224,15 @@ state and evidence are persisted successfully
 DONE(R)
 ```
 
-`DONE` does **not** mean mathematically proven correct. It means:
+`DONE` does **not** mean mathematically or universally proven correct. It means:
 
 > **every required obligation's explicit evidence contract is satisfied by controller-owned authoritative artifacts at the canonical revision, and every independent controller safety gate passes.**
 
-That distinction matters. A bad specification or weak evidence contract can still describe or prove the wrong thing. Advisory model judgments cannot bridge missing evidence, select a trusted executable, mint human authority, or narrow dependency scope.
+Tenet provides controller-owned, revision-bound evidence and deterministic completion decisions. It guarantees that declared evidence requirements were satisfied by admitted evidence producers; the semantic adequacy of those evidence requirements remains an explicit trust assumption.
 
-Tenet does not remove uncertainty from software engineering — it tries to make that uncertainty **explicit, revision-bound, inspectable, and harder to hand-wave away**.
+That distinction is load-bearing. Mapping a claim to a project check, trusted verifier, falsifier, or attestation is a controller-admitted policy decision. Tenet authenticates and enforces that mapping, but does not establish that the selected producer is a complete oracle for the claim. A bad specification or weak evidence contract can therefore satisfy the wrong proxy. Advisory model judgments cannot bridge missing evidence, select a trusted executable, mint human authority, or narrow dependency scope.
+
+Tenet does not remove uncertainty from software engineering — it makes that uncertainty **explicit, revision-bound, inspectable, and harder to hand-wave away**.
 
 ---
 
@@ -259,11 +261,11 @@ Artifact(FalsifierCheck("expiry-boundary-search"))
 HumanAttestation("Manual UX review confirms the expiry interaction")
 ```
 
-`NamedProjectCheck` binds a public project check from `verification.checks`. It runs in a disposable Git worktree. This protects canonical repository mutation, but it is not a security sandbox.
+`NamedProjectCheck` binds a public project check from `verification.checks`. Selecting that check for an obligation is admitted controller policy. A passing check satisfies the named contract; Tenet does not infer that the check completely captures the obligation's semantics. It runs in a disposable Git worktree. This protects canonical repository mutation, but it is not a security sandbox.
 
-`TrustedVerifierCheck` binds a check from `verification.trusted_checks`. Its specification is controller configuration: a digest-pinned image, structured program and argument vector, repository-relative working directory, explicit environment, timeout, fixed no-network isolation policy, guest resource bounds, host archive/tree byte limits, and an input-entry limit. Agent output cannot create or modify this specification, select the image, add mounts, pass environment, or grant authority.
+`TrustedVerifierCheck` similarly binds a check from `verification.trusted_checks` by admitted controller policy. Its specification is controller configuration: a digest-pinned image, structured program and argument vector, repository-relative working directory, explicit environment, timeout, fixed no-network isolation policy, guest resource bounds, host archive/tree byte limits, and an input-entry limit. Agent output cannot create or modify this specification, select the image, add mounts, pass environment, grant authority, or change the obligation mapping. Passing establishes contract satisfaction, not verifier adequacy.
 
-`FalsifierCheck` binds a controller-configured bounded search using the same Microsandbox boundary. The assessor may propose schema-validated input data, but never the image, executable, arguments, environment, network, resource limits, isolation policy, or obligation bindings. For a controller-fixed execution with no assessor-proposed input, exit `0` authoritatively supports the contract. With assessor-proposed input, exit `0` is inconclusive and cannot prove the contract. Exit `1` records authoritative counterevidence in either case. Infrastructure failure records neither.
+`FalsifierCheck` binds a controller-configured bounded search using the same Microsandbox boundary. The assessor may propose schema-validated input data, but never the image, executable, arguments, environment, network, resource limits, isolation policy, or obligation bindings. For a controller-fixed execution with no assessor-proposed input, exit `0` authoritatively supports the contract. With assessor-proposed input, exit `0` is inconclusive and cannot satisfy the contract. Exit `1` records authoritative counterevidence in either case. Infrastructure failure records neither.
 
 `HumanAttestation` remains pending until an explicit `tenet evidence attest` invocation signs the exact statement, obligation, catalog, revision, timestamp, attestor identity, public key, and dependency snapshot with the configured Ed25519 identity. Autonomous workers and microVM guests never receive the private key.
 
@@ -275,7 +277,7 @@ Before verifier execution, Tenet normalizes the runtime-resolved OCI manifest di
 
 After admitted execution, the controller authenticates every authoritative issuer record and artifact with an HMAC key derived from an independently supplied Tenet controller-authority key and a stable operator-assigned repository authority namespace. This includes public project checks, trusted verifiers, falsifiers, human-attestation artifacts, and cross-revision compatibility transitions. The sandbox backend and human signer never own or receive the controller identity. Artifact authentication binds the active catalog hash and serialized definitions of every bound obligation; issuer authentication binds the complete controller-observed execution payload. Reload accepts authority only when the tags, persisted issuer record, catalog context, current revision or admitted compatible revision, and current issuer configuration all agree.
 
-The exit-code protocol is controller-defined: exit `0` supports a trusted-verifier claim or a controller-fixed falsifier claim, while exit `1` is the sole semantic contradiction status. A falsifier execution with assessor-proposed input can use exit `0` only as an inconclusive observation. Other statuses—including crash and signal conventions—are infrastructure failures and issue no semantic artifact. Timeouts, isolation failures, and cleanup failures likewise are not contradictions. Deterministic proof evaluation requires a current, valid, authoritative artifact from exactly the named verifier. No positive assessor verdict is required.
+The exit-code protocol is controller-defined: exit `0` supports a trusted-verifier contract or a controller-fixed falsifier contract, while exit `1` is the sole contradiction status. A falsifier execution with assessor-proposed input can use exit `0` only as an inconclusive observation. Other statuses—including crash and signal conventions—are infrastructure failures and issue no authoritative artifact. Timeouts, isolation failures, and cleanup failures likewise are not contradictions. Deterministic contract evaluation requires a current, valid, authoritative artifact from exactly the named verifier. No positive assessor verdict is required. This evaluation establishes only that the admitted producer satisfied the declared evidence requirement.
 
 The authority classes are:
 
@@ -286,7 +288,7 @@ The authority classes are:
 
 On repository transitions, repository-wide authority becomes stale. A trusted verifier, falsifier, or human attestor may instead declare controller-owned path globs. Tenet materializes the exact matching Git object IDs at issuance; reuse is allowed only when the complete expanded path/object set is unchanged and the catalog, contract, issuer identity, image, protocol, isolation policy, and specification fingerprints remain valid. Changed, added, removed, unknown, or malformed dependencies fail closed and trigger reacquisition when a mechanical issuer exists.
 
-**The model proposes and interprets. The controller configures, executes, admits, persists, and proves.**
+**The model proposes and interprets. The controller configures, executes, admits, persists, and derives contract satisfaction.**
 
 
 ---
@@ -361,7 +363,7 @@ A worker receives bounded work and an explicit repository scope, in an isolated 
 
 The candidate is committed first. Public project verification runs against clean disposable checkouts of that exact revision. Configured named checks can issue obligation-bound public verification artifacts when an evidence contract names them exactly.
 
-The controller then derives proof gaps and acquires only the exact missing configured trusted-verifier or falsifier leaves. Each admitted execution uses the local Microsandbox boundary, persists its issuer record, immediately re-derives proof, and stops as soon as deterministic proof or contradiction decides the contract. Human leaves remain explicit external actions. Assessor-proposed executables never enter this path.
+The controller then derives contract gaps and acquires only the exact missing configured trusted-verifier or falsifier leaves. Each admitted execution uses the local Microsandbox boundary, persists its issuer record, immediately re-derives contract state, and stops as soon as deterministic satisfaction or contradiction decides the contract. Human leaves remain explicit external actions. Assessor-proposed executables never enter this path.
 
 ### 5 · Repair
 
@@ -373,7 +375,7 @@ A verified candidate is integrated through the controller rather than being allo
 
 ### 7 · Residual advisory adjudication
 
-Tenet calls Assess only for residual uncertainty after controller-owned acquisition. Assess may propose observations, structured falsifier inputs, and source inspections, but its judgments cannot directly mutate `ProofState`. Mechanically complete contracts finish without positive LLM authorization; authoritative contradiction blocks without assessor override.
+Tenet calls Assess only for residual uncertainty after controller-owned acquisition. Assess may propose observations, structured falsifier inputs, and source inspections, but its judgments cannot directly mutate `ProofState`, alter verifier authority, or satisfy a contract. Mechanically complete contracts finish without positive LLM authorization; authoritative contradiction blocks without assessor override.
 
 ---
 
@@ -663,6 +665,8 @@ Tenet is split into Rust crates with deliberate dependency boundaries.
 | **`tenet-cli`**        | Console presentation, application composition, and command-line entry point                                                                                           |
 
 The dependency direction is deliberate: the runtime does not own completion semantics, ACP does not own controller policy, and the model adapter is replaceable.
+
+The claim-to-verifier mapping is part of controller policy, not a discovered truth. The controller guarantees admitted producer identity, authority, revision binding, evidence integrity, deterministic contract evaluation, and completion gating. Whether a configured check or verifier is semantically adequate for its claim remains an explicit operator trust assumption.
 
 ---
 

@@ -168,15 +168,6 @@ fn main() {
     let start = Instant::now();
     for _ in 0..ITERATIONS {
       storage
-        .invalidate_evidence_for_revision("benchmark-run", "revision-2", Utc::now())
-        .await
-        .expect("invalidate evidence");
-    }
-    println!("invalidate_evidence={:?}", elapsed_per_iteration(start));
-
-    let start = Instant::now();
-    for _ in 0..ITERATIONS {
-      storage
         .load_evidence_graph(&catalog, &[], &[], &[])
         .await
         .expect("completion evidence facts");

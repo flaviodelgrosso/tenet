@@ -113,7 +113,7 @@ async fn existing_database_migrates_to_review_required_lifecycle() {
 }
 
 #[tokio::test]
-async fn proof_contract_migration_invalidates_legacy_active_catalog() {
+async fn evidence_contract_migration_invalidates_legacy_active_catalog() {
   let project = tempfile::tempdir().expect("temporary project");
   let state_directory = project.path().join(".tenet");
   tokio::fs::create_dir(&state_directory)
@@ -195,6 +195,83 @@ async fn proof_contract_migration_invalidates_legacy_active_catalog() {
     .await
     .expect("load approval")
     .is_none());
+}
+
+#[tokio::test]
+async fn contract_satisfied_migration_converts_legacy_proof_rows() {
+  let project = tempfile::tempdir().expect("temporary project");
+  let state_directory = project.path().join(".tenet");
+  tokio::fs::create_dir(&state_directory)
+    .await
+    .expect("state directory");
+  let database_path = state_directory.join("tenet.db");
+  let pool = SqlitePoolOptions::new()
+    .connect_with(
+      SqliteConnectOptions::from_str("sqlite::memory:")
+        .expect("sqlite options")
+        .filename(&database_path)
+        .in_memory(false)
+        .create_if_missing(true)
+        .foreign_keys(true),
+    )
+    .await
+    .expect("open legacy database");
+  let legacy_migrations = tempfile::tempdir().expect("migration directory");
+  for (name, contents) in [
+    (
+      "20260820000000_initial.sql",
+      include_str!("../migrations/20260820000000_initial.sql"),
+    ),
+    (
+      "20260825000000_catalog_approval.sql",
+      include_str!("../migrations/20260825000000_catalog_approval.sql"),
+    ),
+    (
+      "20260825010000_deferred_repair_attempts.sql",
+      include_str!("../migrations/20260825010000_deferred_repair_attempts.sql"),
+    ),
+    (
+      "20260826000000_proof_artifacts.sql",
+      include_str!("../migrations/20260826000000_proof_artifacts.sql"),
+    ),
+  ] {
+    tokio::fs::write(legacy_migrations.path().join(name), contents)
+      .await
+      .expect("write legacy migration");
+  }
+  sqlx::migrate::Migrator::new(legacy_migrations.path())
+    .await
+    .expect("load legacy migrations")
+    .run(&pool)
+    .await
+    .expect("apply legacy migrations");
+  for statement in [
+    "INSERT INTO runs(id, status, phase, cycle, stagnation_count, last_summary, updated_at) VALUES ('legacy-run', 'running', 'verifying', 0, 0, 'legacy', '2026-08-26T10:00:00Z')",
+    "INSERT INTO specification_snapshots(hash, source_path, observed_at) VALUES ('spec', 'spec.md', '2026-08-26T10:00:00Z')",
+    "INSERT INTO requirements(id, spec_hash, ordinal, title, description, required) VALUES ('REQ-001', 'spec', 0, 'Legacy', 'Legacy requirement', 1)",
+    "INSERT INTO acceptance_criteria(id, requirement_id, ordinal, description, mandatory) VALUES ('REQ-001/AC-01', 'REQ-001', 0, 'Legacy criterion', 1)",
+    "INSERT INTO verification_obligations(id, criterion_id, ordinal, description, required) VALUES ('REQ-001/AC-01/VO-01', 'REQ-001/AC-01', 0, 'Legacy obligation', 1)",
+    r#"INSERT INTO proof_derivations(run_id, obligation_id, revision, state, derivation_json, derived_at) VALUES ('legacy-run', 'REQ-001/AC-01/VO-01', 'revision-1', 'proven', '{"obligationId":"REQ-001/AC-01/VO-01","revision":"revision-1","state":"proven","reason":{"result":"missing","requirement":"legacy"}}', '2026-08-26T10:00:00Z')"#,
+  ] {
+    sqlx::query(statement)
+      .execute(&pool)
+      .await
+      .expect("seed legacy proof");
+  }
+  drop(pool);
+
+  let storage = Storage::open(project.path())
+    .await
+    .expect("apply contract-satisfied migration");
+  let row = sqlx::query(
+    "SELECT state, json_extract(derivation_json, '$.state') AS json_state FROM proof_derivations",
+  )
+  .fetch_one(storage.pool())
+  .await
+  .expect("load migrated proof");
+
+  assert_eq!(row.get::<String, _>("state"), "contract_satisfied");
+  assert_eq!(row.get::<String, _>("json_state"), "contract_satisfied");
 }
 
 #[tokio::test]

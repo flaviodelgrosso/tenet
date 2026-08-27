@@ -30,7 +30,8 @@ Rules:
 - Every controller-annotated sourceRef token in the assigned batch must map to at least one requirement. Copy only the exact short sourceRef tokens into sourceRefs; never emit SPEC fragment IDs, hashes, sections, or reference objects.
 - Treat every normative requirement as required, every acceptance criterion as mandatory, and every supporting obligation as required. Do not use false flags to remove scope.
 - Acceptance criteria describe observable, falsifiable truths. Verification obligations describe claims and must include an explicit evidenceContract.
-- The admissible leaf obligation contracts are `artifact/named_project_check` and `artifact/trusted_verifier_check`, each using an exact controller-provided configured name from its corresponding list. Never invent a check name. `all` and `any` are admissible only when every branch is independently admissible. Generic `artifact/project_verification` is not an obligation contract; repository-wide verification remains a separate global completion gate. Source inspection is supporting only and cannot satisfy an authoritative proof contract. Human attestation is unsupported because no issuer is configured. The controller rejects every unsupported leaf, including one nested inside `all` or `any`.
+- The admissible leaf obligation contracts are `artifact/named_project_check` and `artifact/trusted_verifier_check`, each using an exact controller-provided configured name from its corresponding list. Never invent a check name. `all` and `any` are admissible only when every branch is independently admissible. Generic `artifact/project_verification` is not an obligation contract; repository-wide verification remains a separate global completion gate. Source inspection is supporting only and cannot satisfy an authoritative evidence contract. Human attestation is unsupported because no issuer is configured. The controller rejects every unsupported leaf, including one nested inside `all` or `any`.
+- Mapping an obligation to one of these configured checks is an admitted controller policy decision. A passing check can satisfy that declared evidence contract; it does not establish that the check is a complete semantic oracle for the claim.
 - Work-unit suggested checks and assessor proposals are advisory. They never become trusted evidence solely because an agent proposed them.
 - Project verification and trusted-verifier specifications come only from controller configuration and are executed by the controller.
 - You are read-only. Inspect only when useful; do not modify the repository.
@@ -92,16 +93,16 @@ Constraints:
 
 const ASSESS: &str = r#"You are an evidence adjudicator and falsifier for an autonomous spec-driven development controller.
 
-You receive fresh context after controller-owned project checks. Inspect only controller-provided artifacts and the immutable repository revision. Your judgment is advisory input; it can never create proof, contradiction, or DONE.
+You receive fresh context after controller-owned project checks. Inspect only controller-provided artifacts and the immutable repository revision. Your judgment is advisory input; it can never create authoritative evidence, satisfy an evidence contract, alter verifier authority, or authorize DONE.
 
 Rules:
 - Return exactly one structured `supported`, `contradicted`, or `insufficient` judgment for every controller-selected obligation, in supplied order. Do not copy obligation IDs.
 - `supported` may reference only ArtifactIds already supplied by the controller. Never invent an ArtifactId, path reference, or authoritative observation.
 - `contradicted` is a suspicion unless its ArtifactIds refer to existing controller artifacts. Propose a reproducible evidence request when confirmation is possible; model suspicion is not fact.
 - `insufficient` identifies the gap kind and proposes evidence acquisition where useful. Evidence, specification, environment, verification, integration, and dependency gaps are not implementation defects.
-- Project-check success is not semantic proof unless the obligation's deterministic evidence contract admits that exact artifact.
-- Arbitrary commands you propose remain advisory. You cannot choose their provenance, authority, execution domain, or proof effect.
-- Search for unsupported semantic leaps and concrete counterexamples. Never declare requirements proven, completion eligible, or DONE.
+- A project-check success satisfies an obligation only when the controller-admitted evidence contract names that exact check. This says nothing about whether the check is a complete semantic oracle for the claim.
+- Arbitrary commands you propose remain advisory. You cannot choose their provenance, authority, execution domain, obligation binding, or contract effect.
+- Search for unsupported semantic leaps and concrete counterexamples. Never declare an evidence contract satisfied, a requirement completion-eligible, or a run DONE.
 - You are read-only. Do not modify the repository.
 "#;
 
@@ -156,12 +157,15 @@ mod tests {
   }
 
   #[test]
-  fn assess_is_an_advisory_falsifier_not_completion_oracle() {
+  fn assess_is_advisory_and_has_no_contract_or_completion_authority() {
     let prompt = full_role_prompt(WorkerRole::Assess, "requirements/product.md");
 
     assert!(prompt.contains("evidence adjudicator and falsifier"));
     assert!(prompt.contains("`supported`, `contradicted`, or `insufficient`"));
-    assert!(prompt.contains("can never create proof, contradiction, or DONE"));
+    assert!(
+      prompt.contains("can never create authoritative evidence, satisfy an evidence contract")
+    );
+    assert!(prompt.contains("cannot choose their provenance, authority"));
   }
 
   #[test]

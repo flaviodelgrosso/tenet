@@ -952,12 +952,12 @@ mod tests {
     let report = materialize_semantic_assessment(
       &catalog(),
       SemanticAssessmentProposal {
-        summary: "Satisfied".into(),
+        summary: "Advisory support".into(),
         assessments: vec![AgentObligationAssessment {
           obligation_handle: "O001".into(),
           judgment: AssessmentJudgment::Supported {
             artifact_ids: Vec::new(),
-            rationale: "Verified by inspection".into(),
+            rationale: "Supported by inspection".into(),
           },
         }],
       },

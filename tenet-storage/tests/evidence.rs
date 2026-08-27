@@ -114,7 +114,7 @@ async fn artifact_and_derivation_survive_restart_with_provenance() {
   assert_eq!(loaded.artifacts.get(&ids[0]), graph.artifacts.get(&ids[0]));
   assert_eq!(
     loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Proven
+    ProofState::ContractSatisfied
   );
   assert_eq!(loaded.proof_derivations, graph.proof_derivations);
 }
@@ -164,7 +164,7 @@ async fn tampered_project_verification_record_cannot_mint_configured_check_autho
 }
 
 #[tokio::test]
-async fn stale_artifact_and_blocking_proof_survive_restart() {
+async fn stale_artifact_and_blocking_contract_state_survive_restart() {
   let (_project, storage, catalog) = prepared_storage().await;
   let project = project_run("revision-1");
   let mut graph = support::empty_graph(&catalog);
@@ -372,14 +372,17 @@ async fn persisted_falsifier_states(
 }
 
 #[tokio::test]
-async fn fixed_no_counterexample_is_proven_before_and_after_restart() {
+async fn fixed_no_counterexample_satisfies_contract_before_and_after_restart() {
   let states = persisted_falsifier_states(TrustedExecutionResult::Supports, None).await;
 
-  assert_eq!(states, (ProofState::Proven, ProofState::Proven));
+  assert_eq!(
+    states,
+    (ProofState::ContractSatisfied, ProofState::ContractSatisfied,)
+  );
 }
 
 #[tokio::test]
-async fn dynamic_no_counterexample_is_non_proving_before_and_after_restart() {
+async fn dynamic_no_counterexample_does_not_satisfy_contract_before_or_after_restart() {
   let states =
     persisted_falsifier_states(TrustedExecutionResult::Supports, Some(json!({"seed": 7}))).await;
 
@@ -452,7 +455,7 @@ async fn trusted_execution_authority_survives_restart_and_revalidation() {
   );
   assert_eq!(
     loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Proven
+    ProofState::ContractSatisfied
   );
 }
 
@@ -625,7 +628,7 @@ fn changed_controller_authority_identity_is_rejected() {
 }
 
 #[tokio::test]
-async fn authenticated_human_attestation_survives_restart_and_proves_exact_contract() {
+async fn authenticated_human_attestation_survives_restart_and_satisfies_exact_contract() {
   install_controller_authority_key("tenet-storage-tests", b"tenet-storage-test-authority")
     .expect("install authority key");
   let project = tempfile::tempdir().expect("temporary project");
@@ -696,7 +699,7 @@ async fn authenticated_human_attestation_survives_restart_and_proves_exact_contr
     .expect("reload authenticated human authority");
   assert_eq!(
     loaded.proof_derivations[&obligation_id].state,
-    ProofState::Proven
+    ProofState::ContractSatisfied
   );
   let unknown_attestor = reopened
     .load_evidence_graph(&catalog, &[], &[], &[])

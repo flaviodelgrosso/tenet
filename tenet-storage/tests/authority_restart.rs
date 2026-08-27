@@ -148,10 +148,10 @@ async fn read_authority(repository: &Path, key: &[u8], should_validate: bool) {
   let proof = &graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")];
   if should_validate {
     assert_eq!(graph.artifacts.len(), 1);
-    assert_eq!(proof.state, ProofState::Proven);
+    assert_eq!(proof.state, ProofState::ContractSatisfied);
   } else {
     assert!(graph.artifacts.is_empty());
-    assert_ne!(proof.state, ProofState::Proven);
+    assert_ne!(proof.state, ProofState::ContractSatisfied);
   }
 }
 
