@@ -25,7 +25,7 @@ name: tenet
 description: Use when the user explicitly asks to use Tenet, invokes the Tenet workflow, or requests implementation or completion under this repository's Tenet contract.
 compatibility: Requires the tenet CLI and Git.
 metadata:
-  tenet-skill-version: "2"
+  tenet-skill-version: "3"
 ---
 
 # Tenet workflow
@@ -34,7 +34,7 @@ Tenet determines whether candidate revision R satisfies the admitted completion 
 
 1. Run `tenet status --json` and use only its current repository state.
 2. If the contract is missing, inspect the configured specification, get the proposal shape with `tenet contract schema --json`, and submit it with `tenet contract propose --file <path> --json`.
-3. On `pending_approval`, show the user the exact proposal: its ID and digest; every requirement and obligation ID and statement; and every obligation's verifier ID and authority mapping. Request an explicit approval naming that exact ID and digest.
+3. On `pending_approval`, show the user the exact proposal: its ID and digest; every requirement and obligation ID and statement; every primary verifier mapping; and every oracle-assurance ID, criterion, verifier, and authority mapping. Request an explicit approval naming that exact ID and digest.
 4. Never self-approve, infer approval from silence, a generic acknowledgement, or a prior approval. Only after the user explicitly approves that exact ID and digest, run `tenet contract approve --proposal <id> --digest <digest> --json`.
 5. If the proposal content, specification, policy, ID, or digest changes before admission—or the CLI rejects the approval as stale or mismatched—treat the approval as invalid. Show the current proposal and request fresh explicit approval; never retry admission using the prior approval.
 6. Treat A as operator/CI-provided trust context. Never choose or advance A yourself; if none is provided, stop and ask the user.
@@ -343,6 +343,41 @@ pub fn revision_directory_object(root: &Path, revision: &str, path: &str) -> Res
   let entry = parse_tree_entry(record)?;
   if entry.path != Path::new(path) || entry.mode != "040000" || entry.kind != "tree" {
     bail!("authority oracle bundle `{path}` must be a Git tree");
+  }
+  Ok(entry.object)
+}
+
+pub fn revision_executable_object(root: &Path, revision: &str, path: &str) -> Result<String> {
+  let output = Command::new("git")
+    .args([
+      "--no-replace-objects",
+      "--literal-pathspecs",
+      "ls-tree",
+      "-z",
+      "--full-tree",
+      revision,
+      "--",
+      path,
+    ])
+    .current_dir(root)
+    .output()
+    .with_context(|| format!("inspect authority oracle executable `{path}`"))?;
+  if !output.status.success() {
+    bail!(
+      "inspect authority oracle executable `{path}`: {}",
+      String::from_utf8_lossy(&output.stderr).trim()
+    );
+  }
+  let record = output
+    .stdout
+    .strip_suffix(&[0])
+    .with_context(|| format!("authority oracle executable `{path}` does not exist"))?;
+  if record.contains(&0) {
+    bail!("authority oracle executable `{path}` is ambiguous");
+  }
+  let entry = parse_tree_entry(record)?;
+  if entry.path != Path::new(path) || entry.mode != "100755" || entry.kind != "blob" {
+    bail!("authority oracle executable `{path}` must be an executable Git file");
   }
   Ok(entry.object)
 }

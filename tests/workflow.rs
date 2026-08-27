@@ -94,7 +94,7 @@ impl Repository {
 
   fn propose_and_approve_with_authority(&self, status: &Value, authority: &str) -> Value {
     let proposal = json!({
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "specDigest": status["specDigest"],
       "policyDigest": status["policyDigest"],
       "requirements": [{
@@ -103,11 +103,11 @@ impl Repository {
         "obligations": [{
           "id": "REQ-001/VO-001",
           "statement": "The configured verifier succeeds",
-          "evidenceContract": { "verifierId": "quality", "authority": authority }
+          "evidenceContract": { "claim": { "verifierId": "quality", "authority": authority } }
         }, {
           "id": "REQ-001/VO-002",
           "statement": "The configured verifier confirms the candidate",
-          "evidenceContract": { "verifierId": "quality", "authority": authority }
+          "evidenceContract": { "claim": { "verifierId": "quality", "authority": authority } }
         }]
       }]
     });
@@ -265,10 +265,11 @@ fn generated_skill_is_portable_concise_and_not_authoritative() {
     .expect("read skill");
 
   assert!(skill.starts_with("---\nname: tenet\n"));
-  assert!(skill.contains("tenet-skill-version: \"2\""));
+  assert!(skill.contains("tenet-skill-version: \"3\""));
   assert!(skill.contains("On `pending_approval`, show the user the exact proposal"));
   assert!(skill.contains("every requirement and obligation ID and statement"));
-  assert!(skill.contains("verifier ID and authority mapping"));
+  assert!(skill.contains("every primary verifier mapping"));
+  assert!(skill.contains("every oracle-assurance ID, criterion, verifier, and authority mapping"));
   assert!(skill.contains("Never self-approve, infer approval from silence"));
   assert!(skill
     .contains("user explicitly approves that exact ID and digest, run `tenet contract approve"));
@@ -310,7 +311,7 @@ fn proposal_cannot_introduce_an_unknown_verifier() {
   repository.init();
   let status = repository.configure(&["/usr/bin/true"]);
   let proposal = json!({
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -319,7 +320,7 @@ fn proposal_cannot_introduce_an_unknown_verifier() {
       "obligations": [{
         "id": "REQ-001/VO-001",
         "statement": "oracle",
-        "evidenceContract": { "verifierId": "agent-selected-shell", "authority": "project" }
+        "evidenceContract": { "claim": { "verifierId": "agent-selected-shell", "authority": "project" } }
       }]
     }]
   });
@@ -350,7 +351,7 @@ fn proposal_rejects_verifier_authority_mismatch() {
   repository.init();
   let status = repository.configure(&["/usr/bin/true"]);
   let proposal = json!({
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -359,7 +360,7 @@ fn proposal_rejects_verifier_authority_mismatch() {
       "obligations": [{
         "id": "REQ-001/VO-001",
         "statement": "oracle",
-        "evidenceContract": { "verifierId": "quality", "authority": "authority_snapshot" }
+        "evidenceContract": { "claim": { "verifierId": "quality", "authority": "authority_snapshot" } }
       }]
     }]
   });
@@ -402,6 +403,26 @@ fn exact_revision_gate_returns_done_and_explains_persisted_evidence() {
     evidence["artifacts"][0]["provenance"],
     "tenet_local_verifier"
   );
+  assert_eq!(evidence["artifacts"][0]["evidenceKind"], "claim");
+  assert_eq!(
+    evidence["artifacts"][0]["execution"]["environmentMode"],
+    "ambient"
+  );
+  assert_eq!(
+    evidence["artifacts"][0]["execution"]["runnerIdentity"],
+    "tenet.local_process_runner.v1"
+  );
+  for field in [
+    "tenetVersion",
+    "os",
+    "architecture",
+    "executionEnvironmentIdentity",
+  ] {
+    assert!(!evidence["artifacts"][0]["execution"][field]
+      .as_str()
+      .unwrap()
+      .is_empty());
+  }
   let status = success_json(repository.tenet(&["status", "--json"]));
   assert_eq!(status["lastGatedAuthorityRevision"], revision);
 }
@@ -602,6 +623,11 @@ fn authority_snapshot_oracle_runs_from_authority_and_records_git_identity() {
     authority_revision
   );
   assert_eq!(artifact["oracleIdentity"]["bundlePath"], "oracles/quality");
+  assert_eq!(artifact["oracleIdentity"]["verifierId"], "quality");
+  assert!(artifact["oracleIdentity"]["definitionDigest"]
+    .as_str()
+    .unwrap()
+    .starts_with("sha256:"));
   let object = git_output(
     repository.path(),
     &[
@@ -610,6 +636,17 @@ fn authority_snapshot_oracle_runs_from_authority_and_records_git_identity() {
     ],
   );
   assert_eq!(artifact["oracleIdentity"]["bundleObjectId"], object.trim());
+  let executable = git_output(
+    repository.path(),
+    &[
+      "rev-parse",
+      &format!("{authority_revision}:oracles/quality/verify"),
+    ],
+  );
+  assert_eq!(
+    artifact["oracleIdentity"]["executableObjectId"],
+    executable.trim()
+  );
 }
 
 #[cfg(unix)]
@@ -658,7 +695,7 @@ authority = "project"
   .unwrap();
   let status = success_json(repository.tenet(&["status", "--json"]));
   let proposal = json!({
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -667,11 +704,11 @@ authority = "project"
       "obligations": [{
         "id": "REQ-001/VO-001",
         "statement": "first verifier runs",
-        "evidenceContract": { "verifierId": "contaminator", "authority": "project" }
+        "evidenceContract": { "claim": { "verifierId": "contaminator", "authority": "project" } }
       }, {
         "id": "REQ-001/VO-002",
         "statement": "second verifier sees a fresh tree",
-        "evidenceContract": { "verifierId": "observer", "authority": "project" }
+        "evidenceContract": { "claim": { "verifierId": "observer", "authority": "project" } }
       }]
     }]
   });
@@ -913,7 +950,7 @@ fn approval_requires_the_exact_proposal_identity_and_digest() {
   repository.init();
   let status = repository.configure(&["/usr/bin/true"]);
   let proposal = json!({
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -922,7 +959,7 @@ fn approval_requires_the_exact_proposal_identity_and_digest() {
       "obligations": [{
         "id": "REQ-001/VO-001",
         "statement": "oracle",
-        "evidenceContract": { "verifierId": "quality", "authority": "project" }
+        "evidenceContract": { "claim": { "verifierId": "quality", "authority": "project" } }
       }]
     }]
   });
@@ -971,7 +1008,7 @@ fn approval_revalidates_pending_proposals_after_specification_or_policy_changes(
     repository.init();
     let status = repository.configure(&["/usr/bin/true"]);
     let proposal = json!({
-      "schemaVersion": 1,
+      "schemaVersion": 2,
       "specDigest": status["specDigest"],
       "policyDigest": status["policyDigest"],
       "requirements": [{
@@ -980,7 +1017,7 @@ fn approval_revalidates_pending_proposals_after_specification_or_policy_changes(
         "obligations": [{
           "id": "REQ-001/VO-001",
           "statement": "oracle",
-          "evidenceContract": { "verifierId": "quality", "authority": "project" }
+          "evidenceContract": { "claim": { "verifierId": "quality", "authority": "project" } }
         }]
       }]
     });
@@ -1075,4 +1112,454 @@ fn verifier_timeout_terminates_the_process_group_and_returns_infrastructure_erro
   let gate = failure_json(repository.gate(&revision, &revision), 4);
   assert_eq!(gate["verdict"], "infrastructure_error");
   assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn project_verifier_cannot_be_admitted_as_oracle_assurance() {
+  let repository = Repository::new();
+  repository.init();
+  fs::write(
+    repository.path().join(".tenet/tenet.toml"),
+    r#"version = 1
+spec_path = "SPEC.md"
+
+[[verifiers]]
+id = "quality"
+argv = ["/usr/bin/true"]
+authority = "project"
+
+[[verifiers]]
+id = "candidate-assurance"
+argv = ["/usr/bin/true"]
+authority = "project"
+"#,
+  )
+  .unwrap();
+  let status = success_json(repository.tenet(&["status", "--json"]));
+  let proposal = json!({
+    "schemaVersion": 2,
+    "specDigest": status["specDigest"],
+    "policyDigest": status["policyDigest"],
+    "requirements": [{
+      "id": "REQ-001",
+      "statement": "claim",
+      "obligations": [{
+        "id": "REQ-001/VO-001",
+        "statement": "quality passes",
+        "evidenceContract": {
+          "claim": { "verifierId": "quality", "authority": "project" },
+          "assurances": [{
+            "id": "ASSURE-001",
+            "criterion": "the primary oracle rejects a seeded defect",
+            "verifierId": "candidate-assurance",
+            "authority": "project"
+          }]
+        }
+      }]
+    }]
+  });
+  let path = repository.path().join("project-assurance.json");
+  fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+
+  let output = repository.tenet(&[
+    "contract",
+    "propose",
+    "--file",
+    path.to_str().unwrap(),
+    "--json",
+  ]);
+  assert!(!output.status.success());
+  let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+  assert!(error["message"]
+    .as_str()
+    .unwrap()
+    .contains("authority_snapshot"));
+}
+
+#[test]
+fn oracle_cannot_admit_itself_as_assurance() {
+  let repository = Repository::new();
+  repository.init();
+  fs::write(
+    repository.path().join(".tenet/tenet.toml"),
+    r#"version = 1
+spec_path = "SPEC.md"
+
+[[verifiers]]
+id = "snapshot-quality"
+argv = ["quality/verify"]
+authority = "authority_snapshot"
+oracle_path = "./oracles"
+
+[[verifiers]]
+id = "same-oracle-assurance"
+argv = ["verify"]
+authority = "authority_snapshot"
+oracle_path = "oracles/quality/"
+"#,
+  )
+  .unwrap();
+  let status = success_json(repository.tenet(&["status", "--json"]));
+  let proposal = json!({
+    "schemaVersion": 2,
+    "specDigest": status["specDigest"],
+    "policyDigest": status["policyDigest"],
+    "requirements": [{
+      "id": "REQ-001",
+      "statement": "claim",
+      "obligations": [{
+        "id": "REQ-001/VO-001",
+        "statement": "quality passes",
+        "evidenceContract": {
+          "claim": { "verifierId": "snapshot-quality", "authority": "authority_snapshot" },
+          "assurances": [{
+            "id": "ASSURE-001",
+            "criterion": "the primary oracle rejects a seeded defect",
+            "verifierId": "same-oracle-assurance",
+            "authority": "authority_snapshot"
+          }]
+        }
+      }]
+    }]
+  });
+  let path = repository.path().join("self-assurance.json");
+  fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+
+  let output = repository.tenet(&[
+    "contract",
+    "propose",
+    "--file",
+    path.to_str().unwrap(),
+    "--json",
+  ]);
+  assert!(!output.status.success());
+  let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+  assert!(error["message"]
+    .as_str()
+    .unwrap()
+    .contains("cannot use the primary oracle"));
+}
+
+#[test]
+fn nested_assurance_contract_is_rejected() {
+  let repository = Repository::new();
+  repository.init();
+  let status = repository.configure(&["/usr/bin/true"]);
+  let proposal = json!({
+    "schemaVersion": 2,
+    "specDigest": status["specDigest"],
+    "policyDigest": status["policyDigest"],
+    "requirements": [{
+      "id": "REQ-001",
+      "statement": "claim",
+      "obligations": [{
+        "id": "REQ-001/VO-001",
+        "statement": "quality passes",
+        "evidenceContract": {
+          "claim": { "verifierId": "quality", "authority": "project" },
+          "assurances": [{
+            "id": "ASSURE-001",
+            "criterion": "criterion",
+            "verifierId": "quality",
+            "authority": "project",
+            "assurances": []
+          }]
+        }
+      }]
+    }]
+  });
+  let path = repository.path().join("nested-assurance.json");
+  fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+
+  let output = repository.tenet(&[
+    "contract",
+    "propose",
+    "--file",
+    path.to_str().unwrap(),
+    "--json",
+  ]);
+  assert!(!output.status.success());
+  let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+  assert!(error["message"].as_str().unwrap().contains("unknown field"));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_required_assurance_blocks_done_and_records_distinct_evidence() {
+  let repository = Repository::new();
+  repository.init();
+  write_executable(
+    &repository.path().join("oracles/assurance/verify"),
+    "#!/bin/sh\nexit 1\n",
+  );
+  fs::write(
+    repository.path().join(".tenet/tenet.toml"),
+    r#"version = 1
+spec_path = "SPEC.md"
+
+[[verifiers]]
+id = "quality"
+argv = ["/usr/bin/true"]
+authority = "project"
+
+[[verifiers]]
+id = "mutation-assurance"
+argv = ["verify"]
+authority = "authority_snapshot"
+oracle_path = "oracles/assurance"
+"#,
+  )
+  .unwrap();
+  let status = success_json(repository.tenet(&["status", "--json"]));
+  let proposal = json!({
+    "schemaVersion": 2,
+    "specDigest": status["specDigest"],
+    "policyDigest": status["policyDigest"],
+    "requirements": [{
+      "id": "REQ-001",
+      "statement": "claim",
+      "obligations": [{
+        "id": "REQ-001/VO-001",
+        "statement": "quality passes",
+        "evidenceContract": {
+          "claim": { "verifierId": "quality", "authority": "project" },
+          "assurances": [{
+            "id": "ASSURE-001",
+            "criterion": "the primary oracle rejects a seeded defect",
+            "verifierId": "mutation-assurance",
+            "authority": "authority_snapshot"
+          }]
+        }
+      }]
+    }]
+  });
+  let path = repository.path().join("assurance.json");
+  fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+  let proposed = success_json(repository.tenet(&[
+    "contract",
+    "propose",
+    "--file",
+    path.to_str().unwrap(),
+    "--json",
+  ]));
+  success_json(repository.tenet(&[
+    "contract",
+    "approve",
+    "--proposal",
+    proposed["proposalId"].as_str().unwrap(),
+    "--digest",
+    proposed["proposalDigest"].as_str().unwrap(),
+    "--json",
+  ]));
+  let revision = repository.commit("admit assured contract");
+
+  let gate = failure_json(repository.gate(&revision, &revision), 2);
+  assert_eq!(gate["verdict"], "not_done");
+  assert_eq!(gate["obligations"][0]["state"], "unverifiable");
+  assert_eq!(gate["blockers"][0]["code"], "oracle_assurance_failed");
+  let evidence = success_json(repository.tenet(&["evidence", "--revision", &revision, "--json"]));
+  assert_eq!(evidence["artifacts"][0]["evidenceKind"], "claim");
+  assert_eq!(evidence["artifacts"][1]["evidenceKind"], "oracle_assurance");
+  assert_eq!(
+    evidence["artifacts"][1]["qualifiedOracleIdentity"]["authority"],
+    "project"
+  );
+  assert_eq!(
+    evidence["artifacts"][1]["qualifiedOracleIdentity"]["verifierId"],
+    "quality"
+  );
+  assert_eq!(
+    evidence["artifacts"][1]["qualifiedOracleIdentity"]["candidateRevision"],
+    revision
+  );
+}
+
+#[test]
+fn declared_environment_clears_inherited_variables_and_has_stable_identity() {
+  let repository = Repository::new();
+  repository.init();
+  fs::write(
+    repository.path().join(".tenet/tenet.toml"),
+    r#"version = 1
+spec_path = "SPEC.md"
+
+[[verifiers]]
+id = "quality"
+argv = ["/bin/sh", "-c", "test -z \"$HOME\" && test \"$ONLY_DECLARED\" = yes && test -n \"$TENET_AUTHORITY_REVISION\" && test -n \"$TENET_CANDIDATE_REVISION\""]
+authority = "project"
+environment_mode = "declared"
+env = { ONLY_DECLARED = "yes" }
+"#,
+  )
+  .unwrap();
+  let status = success_json(repository.tenet(&["status", "--json"]));
+  repository.propose_and_approve(&status);
+  let revision = repository.commit("admit declared environment verifier");
+
+  success_json(repository.gate(&revision, &revision));
+  success_json(repository.gate(&revision, &revision));
+  let evidence = success_json(repository.tenet(&["evidence", "--revision", &revision, "--json"]));
+  assert_eq!(
+    evidence["artifacts"][0]["execution"]["environmentMode"],
+    "declared"
+  );
+  assert_eq!(
+    evidence["artifacts"][0]["execution"]["executionEnvironmentIdentity"],
+    evidence["artifacts"][2]["execution"]["executionEnvironmentIdentity"]
+  );
+}
+
+#[test]
+fn missing_assurance_bundle_returns_typed_infrastructure_verdict() {
+  let repository = Repository::new();
+  repository.init();
+  fs::write(
+    repository.path().join(".tenet/tenet.toml"),
+    r#"version = 1
+spec_path = "SPEC.md"
+
+[[verifiers]]
+id = "quality"
+argv = ["/usr/bin/true"]
+authority = "project"
+
+[[verifiers]]
+id = "missing-assurance"
+argv = ["verify"]
+authority = "authority_snapshot"
+oracle_path = "oracles/missing"
+"#,
+  )
+  .unwrap();
+  let status = success_json(repository.tenet(&["status", "--json"]));
+  let proposal = json!({
+    "schemaVersion": 2,
+    "specDigest": status["specDigest"],
+    "policyDigest": status["policyDigest"],
+    "requirements": [{
+      "id": "REQ-001",
+      "statement": "claim",
+      "obligations": [{
+        "id": "REQ-001/VO-001",
+        "statement": "quality passes",
+        "evidenceContract": {
+          "claim": { "verifierId": "quality", "authority": "project" },
+          "assurances": [{
+            "id": "ASSURE-001",
+            "criterion": "the primary oracle rejects a seeded defect",
+            "verifierId": "missing-assurance",
+            "authority": "authority_snapshot"
+          }]
+        }
+      }]
+    }]
+  });
+  let path = repository.path().join("missing-assurance.json");
+  fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+  let proposed = success_json(repository.tenet(&[
+    "contract",
+    "propose",
+    "--file",
+    path.to_str().unwrap(),
+    "--json",
+  ]));
+  success_json(repository.tenet(&[
+    "contract",
+    "approve",
+    "--proposal",
+    proposed["proposalId"].as_str().unwrap(),
+    "--digest",
+    proposed["proposalDigest"].as_str().unwrap(),
+    "--json",
+  ]));
+  let revision = repository.commit("admit missing assurance bundle");
+
+  let gate = failure_json(repository.gate(&revision, &revision), 4);
+  assert_eq!(gate["verdict"], "infrastructure_error");
+  assert_eq!(gate["obligations"][0]["state"], "infrastructure_error");
+  assert_eq!(gate["blockers"][0]["code"], "verifier_infrastructure_error");
+  assert_eq!(gate["blockers"][0]["verifierId"], "missing-assurance");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_primary_executable_cannot_self_assure_done() {
+  use std::os::unix::fs::symlink;
+
+  let repository = Repository::new();
+  repository.init();
+  write_executable(
+    &repository.path().join("oracles/quality/verify"),
+    "#!/bin/sh\nexit 0\n",
+  );
+  symlink("quality", repository.path().join("oracles/quality-link")).unwrap();
+  fs::write(
+    repository.path().join(".tenet/tenet.toml"),
+    r#"version = 1
+spec_path = "SPEC.md"
+
+[[verifiers]]
+id = "snapshot-quality"
+argv = ["quality-link/verify"]
+authority = "authority_snapshot"
+oracle_path = "oracles"
+
+[[verifiers]]
+id = "same-executable-assurance"
+argv = ["verify"]
+authority = "authority_snapshot"
+oracle_path = "oracles/quality"
+"#,
+  )
+  .unwrap();
+  let status = success_json(repository.tenet(&["status", "--json"]));
+  let proposal = json!({
+    "schemaVersion": 2,
+    "specDigest": status["specDigest"],
+    "policyDigest": status["policyDigest"],
+    "requirements": [{
+      "id": "REQ-001",
+      "statement": "claim",
+      "obligations": [{
+        "id": "REQ-001/VO-001",
+        "statement": "quality passes",
+        "evidenceContract": {
+          "claim": {
+            "verifierId": "snapshot-quality",
+            "authority": "authority_snapshot"
+          },
+          "assurances": [{
+            "id": "ASSURE-001",
+            "criterion": "the primary oracle rejects a seeded defect",
+            "verifierId": "same-executable-assurance",
+            "authority": "authority_snapshot"
+          }]
+        }
+      }]
+    }]
+  });
+  let path = repository.path().join("symlink-assurance.json");
+  fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
+  let proposed = success_json(repository.tenet(&[
+    "contract",
+    "propose",
+    "--file",
+    path.to_str().unwrap(),
+    "--json",
+  ]));
+  success_json(repository.tenet(&[
+    "contract",
+    "approve",
+    "--proposal",
+    proposed["proposalId"].as_str().unwrap(),
+    "--digest",
+    proposed["proposalDigest"].as_str().unwrap(),
+    "--json",
+  ]));
+  let revision = repository.commit("admit symlinked primary oracle");
+
+  let gate = failure_json(repository.gate(&revision, &revision), 4);
+  assert_eq!(gate["verdict"], "infrastructure_error");
+  assert_eq!(gate["obligations"][0]["state"], "infrastructure_error");
+  assert_eq!(gate["blockers"][0]["verifierId"], "snapshot-quality");
 }

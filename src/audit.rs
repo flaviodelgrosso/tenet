@@ -6,7 +6,7 @@ use tenet_domain::evidence::EvidenceArtifact;
 
 use crate::{repository::atomic_write, response::GateResult};
 
-const AUDIT_SCHEMA_VERSION: u32 = 2;
+const AUDIT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

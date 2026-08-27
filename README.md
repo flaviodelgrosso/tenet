@@ -66,6 +66,15 @@ max_output_bytes = 65536
 authority = "project"
 ```
 
+`environment_mode` defaults to `"ambient"`, which preserves the inherited process environment and overlays `env` plus Tenet-defined revision inputs. Set `environment_mode = "declared"` to clear the inherited environment before supplying only the verifier's configured `env` values and Tenet-defined inputs:
+
+```toml
+environment_mode = "declared"
+env = { PATH = "/usr/bin:/bin", CHECK_PROFILE = "release" }
+```
+
+Declared mode gives stronger, explicit environment provenance. It is not hermetic: Tenet does not isolate the filesystem, network, toolchain, kernel, host, or other processes.
+
 An authority-snapshot verifier keeps its executable and assets in a repository directory owned by A:
 
 ```toml
@@ -79,7 +88,7 @@ authority = "authority_snapshot"
 oracle_path = ".tenet/oracles/acceptance"
 ```
 
-For `authority_snapshot`, `oracle_path` must name a Git tree and `argv[0]` and `cwd` are relative to that bundle. Tenet materializes the bundle from A, runs the A-owned executable with the bundle as its execution root, and exposes the independent fresh candidate tree through `TENET_CANDIDATE_ROOT`. The executable must be a file that resolves inside the bundle. Oracle scripts should read or execute candidate content only through `TENET_CANDIDATE_ROOT`; relative helpers and assets resolve from the A-owned bundle.
+For `authority_snapshot`, `oracle_path` must name a Git tree and `argv[0]` and `cwd` are relative to that bundle. Tenet materializes the bundle from A, runs the A-owned executable with the bundle as its execution root, and exposes the independent fresh candidate tree through `TENET_CANDIDATE_ROOT`. The configured executable path must directly name an executable Git file; symlink traversal is rejected so two verifier definitions cannot alias the same executable that way. Oracle scripts should read or execute candidate content only through `TENET_CANDIDATE_ROOT`; relative helpers and assets resolve from the A-owned bundle.
 
 Verifier commands are structured argument arrays, not shell strings. Final gating reads each command definition from authority revision A, executes every distinct verifier against its own temporary materialization of candidate revision R, captures bounded output, and enforces the configured timeout.
 
@@ -92,6 +101,29 @@ Verifier exit semantics:
 - timeout, launch failure, or termination without an exit code: infrastructure error.
 
 `authority = "project"` identifies a repository-owned check executed from R, so candidate content may influence both implementation and oracle. `authority = "authority_snapshot"` identifies an oracle bundle loaded from A and executed with R only as explicit candidate input. It establishes provenance and candidate independence of the admitted oracle bundle; it does not establish oracle adequacy, protected execution, semantic correctness, or complete coverage of the associated claim.
+
+An obligation may require explicit assurance of its primary oracle. Each assurance entry names one criterion and an independent `authority_snapshot` verifier:
+
+```json
+{
+  "evidenceContract": {
+    "claim": {
+      "verifierId": "quality",
+      "authority": "project"
+    },
+    "assurances": [
+      {
+        "id": "ASSURE-001",
+        "criterion": "the primary oracle rejects the admitted seeded defect set",
+        "verifierId": "mutation-assurance",
+        "authority": "authority_snapshot"
+      }
+    ]
+  }
+}
+```
+
+The primary verifier produces claim evidence. Every listed assurance verifier must separately support its stated criterion for the exact primary `OracleIdentity`. Assurance is one level only: project verifiers cannot provide it, an oracle cannot assure itself, and an assurance entry cannot require further assurance. This is a fixed all-required contract, not a weighted or `any_of` rule system.
 
 ### 3. Propose a completion contract
 
@@ -114,8 +146,9 @@ Tenet returns a proposal ID and deterministic digest. Entering `pending_approval
 The coding agent must present the user with the exact pending proposal before requesting admission:
 
 - proposal ID and digest;
-- every requirement and obligation ID and statement; and
-- each obligation's verifier ID and authority mapping.
+- every requirement and obligation ID and statement;
+- every obligation's primary verifier ID and authority mapping; and
+- every assurance ID, criterion, verifier ID, and authority mapping.
 
 The user must explicitly approve that exact ID and digest. The coding agent must neither self-approve nor infer approval from silence, a generic acknowledgement, or an earlier approval. After the user gives explicit approval, the coding agent—not the user—may persist it with:
 
@@ -173,28 +206,33 @@ The semantic chain is deliberately small:
 Specification
   -> Requirement or claim
     -> Verification obligation
-      -> Evidence contract (configured verifier ID and required authority)
+      -> Claim evidence contract (one primary oracle)
+        -> Required oracle-assurance contracts (zero or more independent criteria)
 ```
 
-Evidence mechanically binds:
+Claim evidence mechanically binds:
 
 - obligation ID;
 - exact authority Git revision;
 - exact candidate Git revision;
-- verifier identity, required authority, and observed authority classification;
-- oracle identity, including A and the authority-snapshot bundle's Git tree object ID when applicable;
+- primary verifier identity, required authority, and observed authority classification;
+- primary oracle identity: project identities include the verifier, its definition digest, and exact candidate revision; authority-snapshot identities include the verifier, definition digest, A, bundle path and tree object ID, and executable blob object ID;
 - specification, contract, and policy digests from the authority revision;
 - supporting, contradicting, or inconclusive effect;
 - repository-wide dependency surface;
-- validity and captured observation.
+- validity, captured observation, and execution provenance.
 
-Repository-wide freshness is conservative: evidence from another authority revision, candidate revision, control-plane digest, verifier authority, or oracle identity cannot satisfy an obligation. Gate execution reruns required verifiers rather than relying on cache reuse; local history is audit data only.
+Oracle-assurance evidence is a separate artifact kind. It additionally binds the assurance ID and criterion to the exact primary `OracleIdentity` it qualifies. It supports only that admitted criterion about that oracle; it is never direct evidence for the software claim and never establishes universal oracle adequacy.
 
-Authoritative contradiction wins over unrelated supporting evidence for the same obligation. Missing, stale, unverified, or contradictory evidence cannot produce `DONE`.
+Every verifier-produced artifact records the local-process runner identity, Tenet version, OS, architecture, ambient or declared environment mode, and a deterministic execution-environment identity. That identity hashes canonicalized inputs Tenet knows or controls, including the mode, configured verifier environment, command definition, revisions, authority, and oracle identity. It deliberately does not identify or attest to the complete host environment.
+
+Repository-wide freshness is conservative: evidence from another authority revision, candidate revision, control-plane digest, verifier authority, or oracle identity cannot satisfy an obligation. Assurance for an earlier primary oracle identity is stale. Gate execution reruns required verifiers rather than relying on cache reuse; local history is audit data only.
+
+Primary contradiction falsifies the obligation. Primary support satisfies it only when every required assurance supports its admitted criterion. Missing or failed assurance makes the obligation unverifiable; inconclusive assurance propagates an inconclusive result; assurance runner failure propagates infrastructure error. Assurance contradiction does not become contradiction of the software claim.
 
 ## Claim-to-oracle honesty
 
-Verifier mapping and required authority are admitted contract semantics. A project verifier proves only that the admitted project check produced the observed result against R. An authority-snapshot verifier additionally proves that the executed oracle bundle came from A and that R could not replace that committed bundle while retaining A. Neither mode proves that a passing generic test suite is a sufficient semantic oracle, that coverage is complete, or that the associated claim is universally correct. Operator review of claim-to-evidence mappings remains part of the trust model.
+Verifier mapping and required authority are admitted contract semantics. A project verifier proves only that the admitted project check produced the observed result against R. An authority-snapshot verifier additionally proves that the executed oracle bundle came from A and that R could not replace that committed bundle while retaining A. Oracle-assurance evidence proves only that its independent admitted verifier supported its explicitly named criterion for the exact qualified oracle identity. Neither execution mode, verifier authority, nor assurance proves that a generic test suite is a sufficient semantic oracle, that coverage is complete, that execution is hermetic, or that the associated software claim is universally correct. Operator review of claim-to-evidence and assurance mappings remains part of the trust model.
 
 ## Threat model
 

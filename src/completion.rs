@@ -5,8 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
   contract::{AdmittedContract, ObligationId},
-  evidence::{ArtifactValidity, EvidenceArtifact, EvidenceEffect, OracleIdentity},
-  policy::VerificationPolicy,
+  evidence::{
+    ArtifactProvenance, ArtifactValidity, EvidenceArtifact, EvidenceEffect, OracleIdentity,
+    VerifierEvidence,
+  },
+  policy::{VerificationPolicy, VerifierAuthority},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -46,6 +49,9 @@ pub enum BlockerCode {
   VerifierFailed,
   VerifierInfrastructureError,
   VerifierInconclusive,
+  OracleAssuranceMissing,
+  OracleAssuranceFailed,
+  OracleAssuranceStale,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -76,6 +82,7 @@ pub struct DerivationContext<'a> {
   pub contract: &'a AdmittedContract,
   pub policy: &'a VerificationPolicy,
   pub oracle_identities: &'a BTreeMap<String, OracleIdentity>,
+  pub infrastructure_errors: &'a BTreeMap<String, String>,
 }
 
 pub fn derive_obligation_state(
@@ -96,61 +103,257 @@ pub fn derive_obligation_state(
       "obligation is not present in the admitted contract",
     );
   };
-  let verifier_id = &obligation.evidence_contract.verifier_id;
-  let Some(verifier) = context
+  let claim = &obligation.evidence_contract.claim;
+  let Some(primary_oracle) = configured_oracle(context, &claim.verifier_id, claim.authority) else {
+    if let Some(message) = context.infrastructure_errors.get(&claim.verifier_id) {
+      return result(
+        obligation_id,
+        ObligationState::InfrastructureError,
+        BlockerCode::VerifierInfrastructureError,
+        Some(&claim.verifier_id),
+        message,
+      );
+    }
+    return result(
+      obligation_id,
+      ObligationState::Unverifiable,
+      BlockerCode::VerifierNotConfigured,
+      Some(&claim.verifier_id),
+      "admitted primary verifier is absent, mismatched, or has no oracle identity",
+    );
+  };
+
+  let primary = evaluate_claim(context, obligation_id, claim, primary_oracle, evidence);
+  if primary == EvidenceEvaluation::Contradicts {
+    return result(
+      obligation_id,
+      ObligationState::Contradicted,
+      BlockerCode::ContradictionObserved,
+      Some(&claim.verifier_id),
+      "primary oracle evidence contradicts the obligation",
+    );
+  }
+  for assurance in &obligation.evidence_contract.assurances {
+    if let Some(message) = context.infrastructure_errors.get(&assurance.verifier_id) {
+      return result(
+        obligation_id,
+        ObligationState::InfrastructureError,
+        BlockerCode::VerifierInfrastructureError,
+        Some(&assurance.verifier_id),
+        message,
+      );
+    }
+  }
+  if let Some(message) = context.infrastructure_errors.get(&claim.verifier_id) {
+    return result(
+      obligation_id,
+      ObligationState::InfrastructureError,
+      BlockerCode::VerifierInfrastructureError,
+      Some(&claim.verifier_id),
+      message,
+    );
+  }
+  match primary {
+    EvidenceEvaluation::Supports => {}
+    EvidenceEvaluation::Stale => {
+      return result(
+        obligation_id,
+        ObligationState::Stale,
+        BlockerCode::EvidenceStale,
+        Some(&claim.verifier_id),
+        "primary evidence is bound to different authority inputs",
+      );
+    }
+    EvidenceEvaluation::Inconclusive => {
+      return result(
+        obligation_id,
+        ObligationState::Inconclusive,
+        BlockerCode::VerifierInconclusive,
+        Some(&claim.verifier_id),
+        "primary oracle observation was inconclusive",
+      );
+    }
+    EvidenceEvaluation::Missing => {
+      return result(
+        obligation_id,
+        ObligationState::MissingEvidence,
+        BlockerCode::MissingEvidence,
+        Some(&claim.verifier_id),
+        "no admissible primary claim observation exists",
+      );
+    }
+    EvidenceEvaluation::Contradicts => unreachable!(),
+  }
+
+  let mut stale_assurance = None;
+  let mut failed_assurance = None;
+  let mut inconclusive_assurance = None;
+  for assurance in &obligation.evidence_contract.assurances {
+    let Some(assurance_oracle) =
+      configured_oracle(context, &assurance.verifier_id, assurance.authority)
+    else {
+      return result(
+        obligation_id,
+        ObligationState::Unverifiable,
+        BlockerCode::VerifierNotConfigured,
+        Some(&assurance.verifier_id),
+        "admitted assurance verifier is absent, mismatched, or has no oracle identity",
+      );
+    };
+    match evaluate_assurance(
+      context,
+      obligation_id,
+      assurance,
+      assurance_oracle,
+      primary_oracle,
+      evidence,
+    ) {
+      EvidenceEvaluation::Supports => {}
+      EvidenceEvaluation::Stale => stale_assurance = Some(assurance),
+      EvidenceEvaluation::Contradicts | EvidenceEvaluation::Missing => {
+        failed_assurance = Some(assurance)
+      }
+      EvidenceEvaluation::Inconclusive => inconclusive_assurance = Some(assurance),
+    }
+  }
+  if let Some(assurance) = stale_assurance {
+    return result(
+      obligation_id,
+      ObligationState::Stale,
+      BlockerCode::OracleAssuranceStale,
+      Some(&assurance.verifier_id),
+      "oracle-assurance evidence does not qualify the current primary oracle identity",
+    );
+  }
+  if let Some(assurance) = failed_assurance {
+    return result(
+      obligation_id,
+      ObligationState::Unverifiable,
+      if evidence.iter().any(|artifact| {
+        matches!(artifact, EvidenceArtifact::OracleAssurance { assurance_id, evidence, .. }
+          if assurance_id == &assurance.id && evidence.verifier_id == assurance.verifier_id)
+      }) {
+        BlockerCode::OracleAssuranceFailed
+      } else {
+        BlockerCode::OracleAssuranceMissing
+      },
+      Some(&assurance.verifier_id),
+      "required oracle-assurance support is missing or failed",
+    );
+  }
+  if let Some(assurance) = inconclusive_assurance {
+    return result(
+      obligation_id,
+      ObligationState::Inconclusive,
+      BlockerCode::VerifierInconclusive,
+      Some(&assurance.verifier_id),
+      "required oracle-assurance observation was inconclusive",
+    );
+  }
+  ObligationResult {
+    obligation_id: obligation_id.clone(),
+    state: ObligationState::ContractSatisfied,
+    blockers: Vec::new(),
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvidenceEvaluation {
+  Supports,
+  Contradicts,
+  Inconclusive,
+  Stale,
+  Missing,
+}
+
+fn configured_oracle<'a>(
+  context: &'a DerivationContext<'_>,
+  verifier_id: &str,
+  authority: VerifierAuthority,
+) -> Option<&'a OracleIdentity> {
+  context
     .policy
     .verifiers
     .iter()
-    .find(|item| &item.id == verifier_id)
-  else {
-    return result(
-      obligation_id,
-      ObligationState::Unverifiable,
-      BlockerCode::VerifierNotConfigured,
-      Some(verifier_id),
-      "admitted verifier is absent from policy",
-    );
-  };
-  if verifier.authority != obligation.evidence_contract.authority {
-    return result(
-      obligation_id,
-      ObligationState::Unverifiable,
-      BlockerCode::VerifierNotConfigured,
-      Some(verifier_id),
-      "admitted verifier authority differs from the evidence contract",
-    );
-  }
-  let Some(oracle_identity) = context.oracle_identities.get(verifier_id) else {
-    return result(
-      obligation_id,
-      ObligationState::Unverifiable,
-      BlockerCode::VerifierNotConfigured,
-      Some(verifier_id),
-      "admitted verifier has no resolved oracle identity",
-    );
-  };
+    .find(|item| item.id == verifier_id && item.authority == authority)?;
+  context.oracle_identities.get(verifier_id)
+}
 
-  let matching: Vec<&EvidenceArtifact> = evidence
-    .iter()
-    .filter(|artifact| {
-      artifact.obligation_id == *obligation_id && artifact.verifier_id == *verifier_id
-    })
-    .collect();
-  if matching.is_empty() {
-    return result(
-      obligation_id,
-      ObligationState::MissingEvidence,
-      BlockerCode::MissingEvidence,
-      Some(verifier_id),
-      "no admissible observation exists",
-    );
-  }
+fn evaluate_claim(
+  context: &DerivationContext<'_>,
+  obligation_id: &ObligationId,
+  claim: &crate::contract::ClaimEvidenceContract,
+  oracle_identity: &OracleIdentity,
+  artifacts: &[EvidenceArtifact],
+) -> EvidenceEvaluation {
+  evaluate(
+    context,
+    artifacts.iter().filter_map(|artifact| match artifact {
+      EvidenceArtifact::Claim { evidence }
+        if evidence.obligation_id == *obligation_id
+          && evidence.verifier_id == claim.verifier_id =>
+      {
+        Some(evidence)
+      }
+      _ => None,
+    }),
+    claim.authority,
+    oracle_identity,
+  )
+}
 
+fn evaluate_assurance(
+  context: &DerivationContext<'_>,
+  obligation_id: &ObligationId,
+  assurance: &crate::contract::OracleAssuranceContract,
+  assurance_oracle: &OracleIdentity,
+  qualified_oracle: &OracleIdentity,
+  artifacts: &[EvidenceArtifact],
+) -> EvidenceEvaluation {
+  let mut qualification_stale = false;
+  let evaluation = evaluate(
+    context,
+    artifacts.iter().filter_map(|artifact| match artifact {
+      EvidenceArtifact::OracleAssurance {
+        assurance_id,
+        assurance_criterion,
+        qualified_oracle_identity,
+        evidence,
+      } if evidence.obligation_id == *obligation_id
+        && evidence.verifier_id == assurance.verifier_id
+        && assurance_id == &assurance.id
+        && assurance_criterion == &assurance.criterion =>
+      {
+        if qualified_oracle_identity == qualified_oracle {
+          Some(evidence)
+        } else {
+          qualification_stale = true;
+          None
+        }
+      }
+      _ => None,
+    }),
+    assurance.authority,
+    assurance_oracle,
+  );
+  if qualification_stale && evaluation == EvidenceEvaluation::Missing {
+    EvidenceEvaluation::Stale
+  } else {
+    evaluation
+  }
+}
+
+fn evaluate<'a>(
+  context: &DerivationContext<'_>,
+  artifacts: impl Iterator<Item = &'a VerifierEvidence>,
+  authority: VerifierAuthority,
+  oracle_identity: &OracleIdentity,
+) -> EvidenceEvaluation {
   let mut saw_stale = false;
   let mut saw_support = false;
   let mut saw_contradiction = false;
   let mut saw_inconclusive = false;
-  for artifact in matching {
+  for artifact in artifacts {
     let binding_matches = artifact.authority_revision == context.authority_revision
       && artifact.revision == context.revision
       && artifact.spec_digest == context.spec_digest
@@ -162,10 +365,8 @@ pub fn derive_obligation_state(
       continue;
     }
     if artifact.validity != ArtifactValidity::Valid
-      || artifact.provenance != crate::evidence::ArtifactProvenance::TenetLocalVerifier
-      || !artifact
-        .authority
-        .admits(obligation.evidence_contract.authority)
+      || artifact.provenance != ArtifactProvenance::TenetLocalVerifier
+      || !artifact.authority.admits(authority)
     {
       continue;
     }
@@ -175,48 +376,17 @@ pub fn derive_obligation_state(
       EvidenceEffect::Inconclusive => saw_inconclusive = true,
     }
   }
-
   if saw_contradiction {
-    return result(
-      obligation_id,
-      ObligationState::Contradicted,
-      BlockerCode::ContradictionObserved,
-      Some(verifier_id),
-      "authoritative evidence contradicts the obligation",
-    );
+    EvidenceEvaluation::Contradicts
+  } else if saw_support {
+    EvidenceEvaluation::Supports
+  } else if saw_stale {
+    EvidenceEvaluation::Stale
+  } else if saw_inconclusive {
+    EvidenceEvaluation::Inconclusive
+  } else {
+    EvidenceEvaluation::Missing
   }
-  if saw_support {
-    return ObligationResult {
-      obligation_id: obligation_id.clone(),
-      state: ObligationState::ContractSatisfied,
-      blockers: Vec::new(),
-    };
-  }
-  if saw_stale {
-    return result(
-      obligation_id,
-      ObligationState::Stale,
-      BlockerCode::EvidenceStale,
-      Some(verifier_id),
-      "available evidence is bound to different authority inputs",
-    );
-  }
-  if saw_inconclusive {
-    return result(
-      obligation_id,
-      ObligationState::Inconclusive,
-      BlockerCode::VerifierInconclusive,
-      Some(verifier_id),
-      "authoritative observation was inconclusive",
-    );
-  }
-  result(
-    obligation_id,
-    ObligationState::MissingEvidence,
-    BlockerCode::MissingEvidence,
-    Some(verifier_id),
-    "available observations are not admitted by the evidence contract",
-  )
 }
 
 pub fn derive_completion(obligations: &[ObligationResult]) -> Verdict {

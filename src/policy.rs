@@ -10,6 +10,13 @@ pub enum VerifierAuthority {
   Project,
   AuthoritySnapshot,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvironmentMode {
+  #[default]
+  Ambient,
+  Declared,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -33,9 +40,22 @@ pub struct VerifierSpec {
   pub max_output_bytes: usize,
   #[serde(default)]
   pub env: BTreeMap<String, String>,
+  #[serde(default)]
+  pub environment_mode: EnvironmentMode,
   pub authority: VerifierAuthority,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub oracle_path: Option<String>,
+}
+impl VerifierSpec {
+  pub fn oracle_executable_path(&self) -> Option<std::path::PathBuf> {
+    let normalize = |value: &str| {
+      std::path::Path::new(value)
+        .components()
+        .filter(|component| *component != std::path::Component::CurDir)
+        .collect::<std::path::PathBuf>()
+    };
+    Some(normalize(self.oracle_path.as_deref()?).join(normalize(self.argv.first()?)))
+  }
 }
 
 pub type VerificationPolicy = RepositoryConfig;

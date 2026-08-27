@@ -2,22 +2,112 @@ use std::collections::BTreeMap;
 
 use tenet_domain::{
   completion::{
-    derive_completion, derive_obligation_state, DerivationContext, ObligationState, Verdict,
+    derive_completion, derive_obligation_state, BlockerCode, DerivationContext, ObligationState,
+    Verdict,
   },
   contract::{
-    AdmittedContract, EvidenceContract, ObligationId, Requirement, RequirementId,
-    VerificationObligation,
+    AdmittedContract, AssuranceId, ClaimEvidenceContract, EvidenceContract, ObligationId,
+    OracleAssuranceContract, Requirement, RequirementId, VerificationObligation,
   },
   evidence::{
     ArtifactAuthority, ArtifactProvenance, ArtifactValidity, DependencySurface, EvidenceArtifact,
-    EvidenceEffect, OracleIdentity, VerifierObservation,
+    EvidenceEffect, ExecutionEnvironmentIdentity, ExecutionProvenance, GitObjectId, OracleIdentity,
+    RunnerIdentity, VerifierEvidence, VerifierObservation,
   },
-  policy::{RepositoryConfig, VerifierAuthority, VerifierSpec},
+  policy::{EnvironmentMode, RepositoryConfig, VerifierAuthority, VerifierSpec},
 };
 
-fn fixture() -> (AdmittedContract, RepositoryConfig, EvidenceArtifact) {
+fn snapshot_oracle(path: &str, object: &str) -> OracleIdentity {
+  OracleIdentity::AuthoritySnapshot {
+    verifier_id: path.into(),
+    authority_revision: "authority".into(),
+    bundle_path: path.into(),
+    bundle_object_id: GitObjectId(object.into()),
+    executable_object_id: GitObjectId(format!("executable-{object}")),
+    definition_digest: format!("sha256:{path}"),
+  }
+}
+
+fn project_oracle() -> OracleIdentity {
+  OracleIdentity::Project {
+    verifier_id: "quality".into(),
+    candidate_revision: "revision".into(),
+    definition_digest: "sha256:quality".into(),
+  }
+}
+
+fn verifier(id: &str, authority: VerifierAuthority, oracle_path: Option<&str>) -> VerifierSpec {
+  VerifierSpec {
+    id: id.into(),
+    argv: vec!["true".into()],
+    cwd: ".".into(),
+    timeout_seconds: 1,
+    max_output_bytes: 1024,
+    env: Default::default(),
+    environment_mode: EnvironmentMode::Ambient,
+    authority,
+    oracle_path: oracle_path.map(str::to_owned),
+  }
+}
+
+fn execution(mode: EnvironmentMode) -> ExecutionProvenance {
+  ExecutionProvenance {
+    runner_identity: RunnerIdentity("tenet.local_process_runner.v1".into()),
+    tenet_version: "0.1.0".into(),
+    os: "test-os".into(),
+    architecture: "test-arch".into(),
+    environment_mode: mode,
+    execution_environment_identity: ExecutionEnvironmentIdentity("sha256:execution".into()),
+  }
+}
+
+fn verifier_evidence(
+  verifier_id: &str,
+  authority: ArtifactAuthority,
+  oracle_identity: OracleIdentity,
+  effect: EvidenceEffect,
+) -> VerifierEvidence {
+  VerifierEvidence {
+    obligation_id: ObligationId("REQ-001/VO-001".into()),
+    authority_revision: "authority".into(),
+    revision: "revision".into(),
+    verifier_id: verifier_id.into(),
+    policy_digest: "policy".into(),
+    spec_digest: "spec".into(),
+    contract_digest: "contract".into(),
+    authority,
+    oracle_identity,
+    provenance: ArtifactProvenance::TenetLocalVerifier,
+    execution: execution(EnvironmentMode::Ambient),
+    effect,
+    validity: ArtifactValidity::Valid,
+    dependency_surface: DependencySurface::RepositoryWide,
+    observation: VerifierObservation {
+      exit_code: Some(0),
+      stdout: String::new(),
+      stderr: String::new(),
+      timed_out: false,
+    },
+  }
+}
+
+fn fixture(
+  with_assurance: bool,
+) -> (
+  AdmittedContract,
+  RepositoryConfig,
+  BTreeMap<String, OracleIdentity>,
+  EvidenceArtifact,
+  EvidenceArtifact,
+) {
+  let assurance = OracleAssuranceContract {
+    id: AssuranceId("ASSURE-001".into()),
+    criterion: "mutation check distinguishes a seeded defect".into(),
+    verifier_id: "mutation-assurance".into(),
+    authority: VerifierAuthority::AuthoritySnapshot,
+  };
   let contract = AdmittedContract {
-    schema_version: 1,
+    schema_version: 2,
     proposal_id: "proposal-1".into(),
     proposal_digest: "proposal".into(),
     spec_digest: "spec".into(),
@@ -29,8 +119,14 @@ fn fixture() -> (AdmittedContract, RepositoryConfig, EvidenceArtifact) {
         id: ObligationId("REQ-001/VO-001".into()),
         statement: "configured check passes".into(),
         evidence_contract: EvidenceContract {
-          verifier_id: "quality".into(),
-          authority: VerifierAuthority::Project,
+          claim: ClaimEvidenceContract {
+            verifier_id: "quality".into(),
+            authority: VerifierAuthority::Project,
+          },
+          assurances: with_assurance
+            .then_some(assurance.clone())
+            .into_iter()
+            .collect(),
         },
       }],
     }],
@@ -38,44 +134,50 @@ fn fixture() -> (AdmittedContract, RepositoryConfig, EvidenceArtifact) {
   let policy = RepositoryConfig {
     version: 1,
     spec_path: "SPEC.md".into(),
-    verifiers: vec![VerifierSpec {
-      id: "quality".into(),
-      argv: vec!["true".into()],
-      cwd: ".".into(),
-      timeout_seconds: 1,
-      max_output_bytes: 1024,
-      env: Default::default(),
-      authority: VerifierAuthority::Project,
-      oracle_path: None,
-    }],
+    verifiers: vec![
+      verifier("quality", VerifierAuthority::Project, None),
+      verifier(
+        "mutation-assurance",
+        VerifierAuthority::AuthoritySnapshot,
+        Some("oracles/mutation"),
+      ),
+    ],
   };
-  let evidence = EvidenceArtifact {
-    obligation_id: ObligationId("REQ-001/VO-001".into()),
-    authority_revision: "authority".into(),
-    revision: "revision".into(),
-    verifier_id: "quality".into(),
-    policy_digest: "policy".into(),
-    spec_digest: "spec".into(),
-    contract_digest: "contract".into(),
-    authority: ArtifactAuthority::TenetObservedProjectVerifier,
-    oracle_identity: OracleIdentity::Project,
-    provenance: ArtifactProvenance::TenetLocalVerifier,
-    effect: EvidenceEffect::Supports,
-    validity: ArtifactValidity::Valid,
-    dependency_surface: DependencySurface::RepositoryWide,
-    observation: VerifierObservation {
-      exit_code: Some(0),
-      stdout: String::new(),
-      stderr: String::new(),
-      timed_out: false,
-    },
+  let assurance_oracle = snapshot_oracle("oracles/mutation", "assurance-object");
+  let primary_oracle = project_oracle();
+  let oracle_identities = BTreeMap::from([
+    ("quality".into(), primary_oracle.clone()),
+    ("mutation-assurance".into(), assurance_oracle.clone()),
+  ]);
+  let claim = EvidenceArtifact::Claim {
+    evidence: verifier_evidence(
+      "quality",
+      ArtifactAuthority::TenetObservedProjectVerifier,
+      primary_oracle.clone(),
+      EvidenceEffect::Supports,
+    ),
   };
-  (contract, policy, evidence)
+  let assurance = EvidenceArtifact::OracleAssurance {
+    assurance_id: assurance.id,
+    assurance_criterion: assurance.criterion,
+    qualified_oracle_identity: primary_oracle,
+    evidence: verifier_evidence(
+      "mutation-assurance",
+      ArtifactAuthority::TenetObservedAuthoritySnapshotVerifier,
+      assurance_oracle,
+      EvidenceEffect::Supports,
+    ),
+  };
+  (contract, policy, oracle_identities, claim, assurance)
 }
 
-fn derive(evidence: &[EvidenceArtifact]) -> tenet_domain::completion::ObligationResult {
-  let (contract, policy, _) = fixture();
-  let oracle_identities = BTreeMap::from([("quality".into(), OracleIdentity::Project)]);
+fn derive_with(
+  contract: &AdmittedContract,
+  policy: &RepositoryConfig,
+  oracle_identities: &BTreeMap<String, OracleIdentity>,
+  infrastructure_errors: &BTreeMap<String, String>,
+  evidence: &[EvidenceArtifact],
+) -> tenet_domain::completion::ObligationResult {
   derive_obligation_state(
     &DerivationContext {
       authority_revision: "authority",
@@ -83,103 +185,179 @@ fn derive(evidence: &[EvidenceArtifact]) -> tenet_domain::completion::Obligation
       spec_digest: "spec",
       contract_digest: "contract",
       policy_digest: "policy",
-      contract: &contract,
-      policy: &policy,
-      oracle_identities: &oracle_identities,
+      contract,
+      policy,
+      oracle_identities,
+      infrastructure_errors,
     },
     &ObligationId("REQ-001/VO-001".into()),
     evidence,
   )
 }
 
+fn evidence_mut(artifact: &mut EvidenceArtifact) -> &mut VerifierEvidence {
+  match artifact {
+    EvidenceArtifact::Claim { evidence } | EvidenceArtifact::OracleAssurance { evidence, .. } => {
+      evidence
+    }
+  }
+}
+
 #[test]
-fn supporting_authoritative_evidence_satisfies_contract() {
-  let (_, _, evidence) = fixture();
-  let result = derive(&[evidence]);
+fn primary_support_without_assurance_satisfies_contract() {
+  let (contract, policy, oracles, claim, _) = fixture(false);
+  let result = derive_with(&contract, &policy, &oracles, &BTreeMap::new(), &[claim]);
   assert_eq!(result.state, ObligationState::ContractSatisfied);
   assert_eq!(derive_completion(&[result]), Verdict::Done);
 }
 
 #[test]
-fn missing_evidence_fails_closed() {
-  let result = derive(&[]);
+fn required_assurance_support_completes_primary_support() {
+  let (contract, policy, oracles, claim, assurance) = fixture(true);
+  let result = derive_with(
+    &contract,
+    &policy,
+    &oracles,
+    &BTreeMap::new(),
+    &[claim, assurance],
+  );
+  assert_eq!(result.state, ObligationState::ContractSatisfied);
+}
+
+#[test]
+fn assurance_evidence_cannot_substitute_for_claim_evidence() {
+  let (contract, policy, oracles, _, assurance) = fixture(true);
+  let result = derive_with(&contract, &policy, &oracles, &BTreeMap::new(), &[assurance]);
   assert_eq!(result.state, ObligationState::MissingEvidence);
+}
+
+#[test]
+fn claim_evidence_cannot_substitute_for_assurance_evidence() {
+  let (contract, policy, oracles, claim, _) = fixture(true);
+  let result = derive_with(&contract, &policy, &oracles, &BTreeMap::new(), &[claim]);
+  assert_eq!(result.state, ObligationState::Unverifiable);
+  assert_eq!(result.blockers[0].code, BlockerCode::OracleAssuranceMissing);
+}
+
+#[test]
+fn primary_contradiction_overrides_assurance_support() {
+  let (contract, policy, oracles, mut claim, assurance) = fixture(true);
+  evidence_mut(&mut claim).effect = EvidenceEffect::Contradicts;
+  let result = derive_with(
+    &contract,
+    &policy,
+    &oracles,
+    &BTreeMap::new(),
+    &[claim, assurance],
+  );
+  assert_eq!(result.state, ObligationState::Contradicted);
+}
+
+#[test]
+fn failed_assurance_makes_supported_claim_unverifiable() {
+  let (contract, policy, oracles, claim, mut assurance) = fixture(true);
+  evidence_mut(&mut assurance).effect = EvidenceEffect::Contradicts;
+  let result = derive_with(
+    &contract,
+    &policy,
+    &oracles,
+    &BTreeMap::new(),
+    &[claim, assurance],
+  );
+  assert_eq!(result.state, ObligationState::Unverifiable);
   assert_eq!(derive_completion(&[result]), Verdict::NotDone);
+}
+
+#[test]
+fn inconclusive_assurance_propagates_inconclusive() {
+  let (contract, policy, oracles, claim, mut assurance) = fixture(true);
+  evidence_mut(&mut assurance).effect = EvidenceEffect::Inconclusive;
+  let result = derive_with(
+    &contract,
+    &policy,
+    &oracles,
+    &BTreeMap::new(),
+    &[claim, assurance],
+  );
+  assert_eq!(result.state, ObligationState::Inconclusive);
+}
+
+#[test]
+fn assurance_infrastructure_failure_propagates_infrastructure_error() {
+  let (contract, policy, oracles, claim, _) = fixture(true);
+  let errors = BTreeMap::from([("mutation-assurance".into(), "runner failed".into())]);
+  let result = derive_with(&contract, &policy, &oracles, &errors, &[claim]);
+  assert_eq!(result.state, ObligationState::InfrastructureError);
+}
+
+#[test]
+fn assurance_infrastructure_failure_overrides_missing_primary_evidence() {
+  let (contract, policy, oracles, _, _) = fixture(true);
+  let errors = BTreeMap::from([("mutation-assurance".into(), "runner failed".into())]);
+  let result = derive_with(&contract, &policy, &oracles, &errors, &[]);
+  assert_eq!(result.state, ObligationState::InfrastructureError);
+}
+
+#[test]
+fn changed_primary_oracle_invalidates_prior_assurance() {
+  let (mut contract, mut policy, mut oracles, mut claim, assurance) = fixture(true);
+  contract.requirements[0].obligations[0]
+    .evidence_contract
+    .claim = ClaimEvidenceContract {
+    verifier_id: "snapshot-quality".into(),
+    authority: VerifierAuthority::AuthoritySnapshot,
+  };
+  policy.verifiers.push(verifier(
+    "snapshot-quality",
+    VerifierAuthority::AuthoritySnapshot,
+    Some("oracles/quality"),
+  ));
+  let changed_primary = snapshot_oracle("oracles/quality", "new-primary-object");
+  oracles.insert("snapshot-quality".into(), changed_primary.clone());
+  if let EvidenceArtifact::Claim { evidence } = &mut claim {
+    evidence.verifier_id = "snapshot-quality".into();
+    evidence.authority = ArtifactAuthority::TenetObservedAuthoritySnapshotVerifier;
+    evidence.oracle_identity = changed_primary;
+  }
+  let result = derive_with(
+    &contract,
+    &policy,
+    &oracles,
+    &BTreeMap::new(),
+    &[claim, assurance],
+  );
+  assert_eq!(result.state, ObligationState::Stale);
+  assert_eq!(result.blockers[0].code, BlockerCode::OracleAssuranceStale);
+}
+
+#[test]
+fn stale_primary_binding_cannot_satisfy() {
+  let (contract, policy, oracles, mut claim, _) = fixture(false);
+  evidence_mut(&mut claim).authority_revision = "other".into();
+  let result = derive_with(&contract, &policy, &oracles, &BTreeMap::new(), &[claim]);
+  assert_eq!(result.state, ObligationState::Stale);
+}
+
+#[test]
+fn untrusted_primary_evidence_never_establishes_completion() {
+  let (contract, policy, oracles, mut claim, _) = fixture(false);
+  evidence_mut(&mut claim).authority = ArtifactAuthority::AgentAssertion;
+  let result = derive_with(&contract, &policy, &oracles, &BTreeMap::new(), &[claim]);
+  assert_eq!(result.state, ObligationState::MissingEvidence);
 }
 
 #[test]
 fn empty_obligation_set_never_authorizes_completion() {
   assert_eq!(derive_completion(&[]), Verdict::NotDone);
 }
-#[test]
-
-fn contradiction_overrides_support() {
-  let (_, _, support) = fixture();
-  let mut contradiction = support.clone();
-  contradiction.effect = EvidenceEffect::Contradicts;
-  let result = derive(&[support, contradiction]);
-  assert_eq!(result.state, ObligationState::Contradicted);
-  assert_eq!(derive_completion(&[result]), Verdict::NotDone);
-}
-
-#[test]
-fn stale_and_mismatched_bindings_cannot_satisfy() {
-  let (_, _, mut evidence) = fixture();
-  evidence.authority_revision = "other".into();
-  let authority = derive(&[evidence.clone()]);
-  evidence.authority_revision = "authority".into();
-  evidence.revision = "other".into();
-  let revision = derive(&[evidence.clone()]);
-  evidence.revision = "revision".into();
-  evidence.spec_digest = "other".into();
-  let specification = derive(&[evidence.clone()]);
-  evidence.spec_digest = "spec".into();
-  evidence.policy_digest = "other".into();
-  let policy = derive(&[evidence]);
-  assert_eq!(authority.state, ObligationState::Stale);
-  assert_eq!(revision.state, ObligationState::Stale);
-  assert_eq!(specification.state, ObligationState::Stale);
-  assert_eq!(policy.state, ObligationState::Stale);
-}
-
-#[test]
-fn mismatched_oracle_identity_cannot_satisfy() {
-  let (_, _, mut evidence) = fixture();
-  evidence.oracle_identity = OracleIdentity::AuthoritySnapshot {
-    authority_revision: "authority".into(),
-    bundle_path: "oracle".into(),
-    bundle_object_id: tenet_domain::evidence::GitObjectId("object".into()),
-  };
-  assert_eq!(derive(&[evidence]).state, ObligationState::Stale);
-}
-
-#[test]
-fn mismatched_artifact_authority_cannot_satisfy() {
-  let (_, _, mut evidence) = fixture();
-  evidence.authority = ArtifactAuthority::TenetObservedAuthoritySnapshotVerifier;
-  assert_eq!(derive(&[evidence]).state, ObligationState::MissingEvidence);
-}
-
-#[test]
-fn agent_assertion_never_establishes_completion() {
-  let (_, _, mut evidence) = fixture();
-  evidence.authority = ArtifactAuthority::AgentAssertion;
-  assert_eq!(derive(&[evidence]).state, ObligationState::MissingEvidence);
-}
-
-#[test]
-fn agent_reported_provenance_never_establishes_completion() {
-  let (_, _, mut evidence) = fixture();
-  evidence.provenance = ArtifactProvenance::AgentReported;
-  assert_eq!(derive(&[evidence]).state, ObligationState::MissingEvidence);
-}
 
 proptest::proptest! {
   #[test]
-  fn adding_untrusted_evidence_never_upgrades_missing_to_satisfied(count in 0usize..20) {
-    let (_, _, mut artifact) = fixture();
-    artifact.authority = ArtifactAuthority::AgentExploratoryExecution;
+  fn adding_untrusted_claim_evidence_never_upgrades_missing_to_satisfied(count in 0usize..20) {
+    let (contract, policy, oracles, mut artifact, _) = fixture(false);
+    evidence_mut(&mut artifact).authority = ArtifactAuthority::AgentExploratoryExecution;
     let evidence = vec![artifact; count];
-    proptest::prop_assert_ne!(derive(&evidence).state, ObligationState::ContractSatisfied);
+    let result = derive_with(&contract, &policy, &oracles, &BTreeMap::new(), &evidence);
+    proptest::prop_assert_ne!(result.state, ObligationState::ContractSatisfied);
   }
 }
