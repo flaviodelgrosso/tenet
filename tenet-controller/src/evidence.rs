@@ -21,6 +21,7 @@ use tenet_domain::{
     DependencySurface, EvidenceArtifact, EvidenceArtifactKind, EvidenceContract, EvidencePredicate,
     EvidenceRequestProposal,
   },
+  trusted_verifier::{TrustedExecutionRecord, TrustedVerificationSpec},
   verification::ProjectVerificationRun,
 };
 
@@ -110,6 +111,20 @@ pub async fn record_project_verification(
     .context("record controller-issued project evidence artifacts")?;
   graph.derive_proofs(&report.revision);
   store::write_evidence_graph(cwd, graph).await
+}
+pub async fn record_trusted_execution(
+  cwd: &Path,
+  graph: &mut EvidenceGraphState,
+  record: &TrustedExecutionRecord,
+  spec: &TrustedVerificationSpec,
+) -> Result<Option<ArtifactId>> {
+  store::record_trusted_execution(cwd, record, spec).await?;
+  let artifact_id = graph
+    .record_trusted_execution(record, spec)
+    .context("issue controller trusted-verifier artifact")?;
+  graph.derive_proofs(&record.revision);
+  store::write_evidence_graph(cwd, graph).await?;
+  Ok(artifact_id)
 }
 
 pub async fn establish_semantic_assessment(

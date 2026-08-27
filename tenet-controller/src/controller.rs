@@ -26,7 +26,7 @@ use tenet_domain::{
     Phase, ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus,
     State, VerificationLayers, VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
   },
-  proof::{AssessmentJudgment, GapKind, ProofState},
+  proof::{AssessmentJudgment, EvidenceContract, EvidencePredicate, GapKind, ProofState},
   verification::ProjectVerificationRun,
 };
 
@@ -37,6 +37,10 @@ use tenet_runtime::{
   integration::{IntegrationOutcome, Integrator},
   scheduler::{CandidateExecutor, ExecutionUpdate, Scheduler},
   store::{self, RunLock},
+  trusted_verifier::{
+    run_isolated_trusted_verifier, MicrosandboxTrustedVerifier, TrustedVerifierRequest,
+    TrustedVerifierRunner,
+  },
   verifier,
   workspace::WorkspaceManager,
 };
@@ -50,6 +54,7 @@ use crate::{
 };
 
 pub struct Controller {
+  trusted_verifier: Arc<dyn TrustedVerifierRunner>,
   cwd: PathBuf,
   backend: Arc<dyn AgentBackend>,
   events: EventSink,
@@ -85,13 +90,27 @@ impl CandidateExecutor for ScheduledAgent {
     }
   }
 }
-
 impl Controller {
   pub fn new(cwd: PathBuf, backend: Arc<dyn AgentBackend>, events: EventSink) -> Self {
+    Self::with_trusted_verifier(
+      cwd,
+      backend,
+      events,
+      Arc::new(MicrosandboxTrustedVerifier::default()),
+    )
+  }
+
+  pub fn with_trusted_verifier(
+    cwd: PathBuf,
+    backend: Arc<dyn AgentBackend>,
+    events: EventSink,
+    trusted_verifier: Arc<dyn TrustedVerifierRunner>,
+  ) -> Self {
     Self {
       cwd,
       backend,
       events,
+      trusted_verifier,
     }
   }
 
@@ -806,6 +825,44 @@ impl Controller {
           .await?,
       ));
     }
+    if !context.config.verification.trusted_checks.is_empty() {
+      state.last_summary = "Running controller-owned trusted verification".into();
+      self.publish(&context.events, state).await?;
+      let run_id = context
+        .runtime_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("trusted verification run id is unavailable")?;
+      let workspaces = WorkspaceManager::new(self.cwd.clone(), run_id);
+      let runner = self.trusted_verifier.as_ref();
+      for spec in &context.config.verification.trusted_checks {
+        let obligation_ids: Vec<_> = catalog
+          .verification_obligations
+          .iter()
+          .filter(|obligation| {
+            contract_contains_trusted_verifier(&obligation.evidence_contract, &spec.name)
+          })
+          .map(|obligation| obligation.id.clone())
+          .collect();
+        if obligation_ids.is_empty() {
+          continue;
+        }
+        let execution = run_isolated_trusted_verifier(TrustedVerifierRequest {
+          repository: &self.cwd,
+          workspaces: &workspaces,
+          revision: &verified_revision,
+          spec,
+          obligation_ids: &obligation_ids,
+          max_output_bytes: context.config.verification.max_output_bytes,
+          runner,
+          cancel: &context.cancel,
+        })
+        .await
+        .map_err(anyhow::Error::new)?;
+        let record = execution.into_record();
+        evidence_graph::record_trusted_execution(&self.cwd, evidence_graph, &record, spec).await?;
+      }
+    }
     let mechanical_decision = self
       .evaluate_and_publish_completion_gate(
         context,
@@ -820,6 +877,16 @@ impl Controller {
       return match decision::apply_completion_decision(state, &mechanical_decision) {
         decision::NextAction::Finish => Ok(Some(state.clone())),
         _ => bail!("mechanical completion policy returned an invalid action"),
+      };
+    }
+    if matches!(
+      &mechanical_decision,
+      CompletionDecision::NotReady(blockers)
+        if blockers.iter().any(|blocker| matches!(blocker, CompletionBlocker::ProofContradicted(_)))
+    ) {
+      return match decision::apply_completion_decision(state, &mechanical_decision) {
+        decision::NextAction::Block(reason) => Ok(Some(self.block(context, state, &reason).await?)),
+        _ => bail!("trusted contradiction produced an invalid controller action"),
       };
     }
 
@@ -997,6 +1064,14 @@ impl Controller {
       .map(|check| check.name.as_str())
       .collect::<Vec<_>>()
       .join(", ");
+    let configured_trusted_verifier_names = context
+      .config
+      .verification
+      .trusted_checks
+      .iter()
+      .map(|check| check.name.as_str())
+      .collect::<Vec<_>>()
+      .join(", ");
     for batch in architect_batches {
       let completion_budget =
         CompletionBudget::from_retries(context.config.agent.completion_retries);
@@ -1004,8 +1079,10 @@ impl Controller {
       let mut attempt = 0;
       let candidate = loop {
         let base_architect_spec = format!(
-          "{}\nController-configured project check names available to evidence contracts: [{}].",
-          batch.annotated_specification, configured_check_names
+          "{}\nController-configured project check names available to `named_project_check` contracts: [{}].\nController-configured trusted verifier names available to `trusted_verifier_check` contracts: [{}].",
+          batch.annotated_specification,
+          configured_check_names,
+          configured_trusted_verifier_names
         );
         let architect_spec = match &feedback {
         Some(feedback) => format!(
@@ -1536,6 +1613,18 @@ fn completion_gate(
     earned: matches!(decision, CompletionDecision::Done),
     items,
     blockers: blockers.iter().map(ToString::to_string).collect(),
+  }
+}
+
+fn contract_contains_trusted_verifier(contract: &EvidenceContract, name: &str) -> bool {
+  match contract {
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::TrustedVerifierCheck { name: expected },
+    } => expected == name,
+    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => requirements
+      .iter()
+      .any(|requirement| contract_contains_trusted_verifier(requirement, name)),
+    _ => false,
   }
 }
 

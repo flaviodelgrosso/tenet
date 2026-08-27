@@ -30,7 +30,7 @@ use tenet_domain::{
     AcceptanceCriterion, AgentObligationAssessment, ImplementationState,
     SemanticAssessmentProposal, VerificationObligation,
   },
-  ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId},
+  ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId, VerificationRunId},
   model::{
     AgentReconciliationProposal, AgentRequirementAssessment, AgentWorkUnit, ArchitectOutput,
     ArchitectRequirement, CandidateCheck, CatalogApproval, CompletedWorkUnit, Discovery,
@@ -38,7 +38,17 @@ use tenet_domain::{
     ReconcileResult, Requirement, RequirementCatalog, RunStatus, State, VerificationReport,
     WorkExecution, WorkLease, WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
-  proof::{AssessmentJudgment, EvidenceContract, EvidencePredicate, GapKind, ProofState},
+  proof::{
+    AssessmentJudgment, EvidenceContract, EvidencePredicate, ExecutionObservation, GapKind,
+    ProofState,
+  },
+  trusted_verifier::{
+    CandidateFilesystemPolicy, ControlChannel, EnvironmentPolicy, GuestSecurityProfile,
+    HostRepositoryMountPolicy, IsolationBoundary, IsolationCapabilityReport, NetworkPolicy,
+    TrustedExecutionBackend, TrustedExecutionRecord, TrustedExecutionResult,
+    TrustedIsolationPolicy, TrustedResourcePolicy, TrustedVerificationSpec,
+    TrustedVerifierProtocol, WritableStoragePolicy,
+  },
   verification::ProjectVerificationRun,
   worker::{derive_normative_fragments, CatalogCoverage},
 };
@@ -47,6 +57,7 @@ use tenet_runtime::{
   git,
   integration::{IntegrationOutcome, Integrator},
   store,
+  trusted_verifier::{TrustedVerifierError, TrustedVerifierExecution, TrustedVerifierRunner},
   workspace::WorkspaceManager,
 };
 
@@ -3301,5 +3312,323 @@ async fn mechanical_proof_skips_unneeded_assessor_workspace_cleanup() {
   assert_eq!(
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
     ProofState::Proven
+  );
+}
+
+fn trusted_verification_spec() -> TrustedVerificationSpec {
+  TrustedVerificationSpec {
+    name: "expiry-boundary".into(),
+    backend: TrustedExecutionBackend::Microsandbox,
+    image: format!("example/verifier@sha256:{}", "a".repeat(64)),
+    program: "verify".into(),
+    args: Vec::new(),
+    working_directory: ".".into(),
+    environment: BTreeMap::new(),
+    timeout_secs: 30,
+    isolation: TrustedIsolationPolicy::default(),
+    resources: TrustedResourcePolicy::default(),
+    protocol: TrustedVerifierProtocol::ExitCode,
+  }
+}
+
+struct FakeTrustedVerifier {
+  contradicts: bool,
+  resolved_digest_matches: bool,
+  calls: AtomicUsize,
+}
+
+#[async_trait]
+impl TrustedVerifierRunner for FakeTrustedVerifier {
+  async fn execute(
+    &self,
+    candidate: &Path,
+    revision: &str,
+    spec: &TrustedVerificationSpec,
+    obligation_ids: &[ObligationId],
+    _max_output_bytes: usize,
+    _cancel: &CancellationToken,
+  ) -> std::result::Result<TrustedVerifierExecution, TrustedVerifierError> {
+    self.calls.fetch_add(1, Ordering::SeqCst);
+    let mounted_revision = git::head(candidate)
+      .await
+      .map_err(|error| TrustedVerifierError::IsolationUnavailable(error.to_string()))?;
+    if mounted_revision != revision {
+      return Err(TrustedVerifierError::IsolationUnavailable(
+        "fake backend observed wrong immutable revision".into(),
+      ));
+    }
+    let exit_code = i32::from(self.contradicts);
+    let result = if self.contradicts {
+      TrustedExecutionResult::Contradicts { exit_code }
+    } else {
+      TrustedExecutionResult::Supports
+    };
+    let now = Utc::now();
+    let record = TrustedExecutionRecord {
+      id: VerificationRunId::new(),
+      revision: revision.into(),
+      input_materialization_hash: "test-archive-hash".into(),
+      verifier_name: spec.name.clone(),
+      spec_hash: spec
+        .fingerprint()
+        .map_err(|error| TrustedVerifierError::InvalidTrustedVerifierSpec(error.to_string()))?,
+      isolation_policy_hash: spec
+        .isolation_policy_hash()
+        .map_err(|error| TrustedVerifierError::InvalidTrustedVerifierSpec(error.to_string()))?,
+      isolation_report: Some(IsolationCapabilityReport {
+        backend: TrustedExecutionBackend::Microsandbox,
+        backend_version: "test-microsandbox-sdk".into(),
+        runtime_identity: "test-local-runtime".into(),
+        boundary: IsolationBoundary::HardwareVirtualizedMicroVm,
+        image: spec.image.clone(),
+        resolved_image_digest: format!(
+          "sha256:{}",
+          if self.resolved_digest_matches {
+            "a"
+          } else {
+            "b"
+          }
+          .repeat(64)
+        ),
+        input_revision: revision.into(),
+        input_materialization_hash: "test-archive-hash".into(),
+        input_archive_bytes: 1024,
+        input_tree_bytes: 512,
+        input_entries: 2,
+        candidate_filesystem: CandidateFilesystemPolicy::PrivateWritable,
+        host_repository_mounts: HostRepositoryMountPolicy::None,
+        writable_storage: WritableStoragePolicy::DisposableSandboxPrivate,
+        network: NetworkPolicy::Disabled,
+        environment: EnvironmentPolicy::ExplicitOnly,
+        guest_security_profile: GuestSecurityProfile::Restricted,
+        guest_user: "65532".into(),
+        unprivileged_user: true,
+        control_channel: ControlChannel::LocalHostDriven,
+        memory_mib: spec.resources.memory_mib,
+        vcpus: spec.resources.vcpus,
+        process_limit: spec.resources.process_limit,
+        writable_root_mib: spec.resources.writable_root_mib,
+        max_input_archive_bytes: spec.resources.max_input_archive_bytes,
+        max_input_tree_bytes: spec.resources.max_input_tree_bytes,
+        max_input_entries: spec.resources.max_input_entries,
+        execution_timeout_secs: spec.timeout_secs,
+        sandbox_lifetime_secs: spec.timeout_secs + 30,
+      }),
+      started_at: now,
+      finished_at: now,
+      result,
+      observation: ExecutionObservation {
+        command: spec.fingerprint().expect("spec fingerprint"),
+        exit_code: Some(exit_code),
+        timed_out: false,
+        duration_ms: 1,
+        stdout: String::new(),
+        stderr: String::new(),
+      },
+      obligation_ids: obligation_ids.to_vec(),
+    };
+    Ok(if self.contradicts {
+      TrustedVerifierExecution::TrustedVerifierObservedContradiction(record)
+    } else {
+      TrustedVerifierExecution::Supports(record)
+    })
+  }
+}
+
+struct UnavailableTrustedVerifier;
+
+#[async_trait]
+impl TrustedVerifierRunner for UnavailableTrustedVerifier {
+  async fn execute(
+    &self,
+    _candidate: &Path,
+    _revision: &str,
+    _spec: &TrustedVerificationSpec,
+    _obligation_ids: &[ObligationId],
+    _max_output_bytes: usize,
+    _cancel: &CancellationToken,
+  ) -> std::result::Result<TrustedVerifierExecution, TrustedVerifierError> {
+    Err(TrustedVerifierError::TrustedVerifierInfrastructureFailure(
+      "microVM startup failed".into(),
+    ))
+  }
+}
+
+async fn configured_trusted_controller(
+  repository: &TempRepo,
+  backend: Arc<FakeBackend>,
+  trusted: Arc<dyn TrustedVerifierRunner>,
+) -> Controller {
+  store::install_controller_authority_key(
+    "tenet-controller-tests",
+    b"tenet-controller-test-authority",
+  )
+  .expect("install test authority identity");
+  let (_default_controller, _events) = configured_controller(repository, backend.clone(), 1).await;
+  let mut config = read_config(repository.path()).await.expect("read config");
+  config.verification.trusted_checks = vec![trusted_verification_spec()];
+  fs::write(
+    repository.path().join("tenet.toml"),
+    toml::to_string_pretty(&config).expect("trusted config"),
+  )
+  .await
+  .expect("write trusted config");
+  run_git(repository.path(), &["add", "tenet.toml"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "configure trusted verifier"],
+  );
+  let mut catalog = store::read_catalog(repository.path())
+    .await
+    .expect("load catalog")
+    .expect("catalog");
+  catalog.verification_obligations[0].evidence_contract = EvidenceContract::Artifact {
+    predicate: EvidencePredicate::TrustedVerifierCheck {
+      name: "expiry-boundary".into(),
+    },
+  };
+  store::write_catalog(repository.path(), &catalog)
+    .await
+    .expect("write trusted catalog");
+  approve_active_catalog(repository.path()).await;
+  Controller::with_trusted_verifier(
+    repository.path().to_path_buf(),
+    backend,
+    EventSink::new(None),
+    trusted,
+  )
+}
+
+#[tokio::test]
+async fn trusted_verifier_pass_proves_and_completes_without_assessor() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let trusted = Arc::new(FakeTrustedVerifier {
+    contradicts: false,
+    calls: AtomicUsize::new(0),
+    resolved_digest_matches: true,
+  });
+  let controller =
+    configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
+
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("catalog read")
+    .expect("catalog");
+  let graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("trusted graph reload");
+
+  assert_eq!(state.status, RunStatus::Done);
+  assert_eq!(trusted.calls.load(Ordering::SeqCst), 1);
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+  assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Proven
+  );
+}
+
+#[tokio::test]
+async fn trusted_verifier_assertion_failure_contradicts_and_blocks_without_assessor() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let trusted = Arc::new(FakeTrustedVerifier {
+    contradicts: true,
+    calls: AtomicUsize::new(0),
+    resolved_digest_matches: true,
+  });
+  let controller =
+    configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
+
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("catalog read")
+    .expect("catalog");
+  let graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("trusted graph reload");
+
+  assert_eq!(state.status, RunStatus::Blocked);
+  assert_eq!(trusted.calls.load(Ordering::SeqCst), 1);
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+  assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Contradicted
+  );
+}
+
+#[tokio::test]
+async fn mismatched_resolved_image_digest_cannot_issue_authoritative_evidence() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let trusted = Arc::new(FakeTrustedVerifier {
+    contradicts: false,
+    resolved_digest_matches: false,
+    calls: AtomicUsize::new(0),
+  });
+  let controller =
+    configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
+
+  let error = controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("digest mismatch must fail authority admission");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("catalog read")
+    .expect("catalog");
+  let graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("graph reload");
+
+  let error_chain = format!("{error:#}");
+  assert!(
+    error_chain.contains("trusted execution record failed authority admission"),
+    "unexpected failure: {error_chain}"
+  );
+  assert!(!graph.artifacts.values().any(|artifact| matches!(
+    artifact.provenance,
+    tenet_domain::proof::ArtifactProvenance::ControllerTrustedVerifier
+  )));
+  assert_ne!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Contradicted
+  );
+}
+
+#[tokio::test]
+async fn trusted_verifier_infrastructure_failure_issues_no_semantic_artifact() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let controller = configured_trusted_controller(
+    &repository,
+    backend.clone(),
+    Arc::new(UnavailableTrustedVerifier),
+  )
+  .await;
+
+  let error = controller
+    .run(CancellationToken::new())
+    .await
+    .expect_err("infrastructure failure must fail closed");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("catalog read")
+    .expect("catalog");
+  let graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("graph reload");
+
+  assert!(error.to_string().contains("microVM startup failed"));
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+  assert!(!graph.artifacts.values().any(|artifact| matches!(
+    artifact.provenance,
+    tenet_domain::proof::ArtifactProvenance::ControllerTrustedVerifier
+  )));
+  assert_ne!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Contradicted
   );
 }

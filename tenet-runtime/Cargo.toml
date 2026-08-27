@@ -11,6 +11,7 @@ async-trait.workspace = true
 globset.workspace = true
 chrono.workspace = true
 libc.workspace = true
+microsandbox.workspace = true
 tenet-domain = { path = "../tenet-domain" }
 tenet-storage = { path = "../tenet-storage" }
 petgraph.workspace = true
@@ -18,10 +19,12 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
+tempfile = "3"
+tar.workspace = true
 tokio-util.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
 toml.workspace = true
 proptest.workspace = true

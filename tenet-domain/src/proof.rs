@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use crate::{
   ids::{ArtifactId, ObligationId, VerificationRunId},
+  trusted_verifier::IsolationCapabilityReport,
   verification::{VerificationAuthority, VerificationSpec},
 };
 
@@ -31,7 +32,7 @@ impl Default for EvidenceContract {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EvidencePredicate {
   SourceInspection,
-  ExecutableEvidence,
+  TrustedVerifierCheck { name: String },
   ProjectVerification,
   NamedProjectCheck { name: String },
 }
@@ -139,6 +140,21 @@ pub enum EvidenceArtifactKind {
     #[serde(rename = "executionAuthority")]
     execution_authority: VerificationAuthority,
   },
+  TrustedExecution {
+    #[serde(rename = "verificationRunId")]
+    run_id: VerificationRunId,
+    #[serde(rename = "verifierName")]
+    verifier_name: String,
+    #[serde(rename = "specHash")]
+    spec_hash: String,
+    #[serde(rename = "isolationPolicyHash")]
+    isolation_policy_hash: String,
+    #[serde(rename = "executionRecordHash")]
+    execution_record_hash: String,
+    #[serde(rename = "isolationReport")]
+    isolation_report: Box<IsolationCapabilityReport>,
+    result: ExecutionObservation,
+  },
   ProjectVerification {
     #[serde(rename = "verificationRunId")]
     run_id: VerificationRunId,
@@ -201,13 +217,40 @@ impl EvidenceArtifact {
       (
         ArtifactProvenance::ControllerTrustedVerifier,
         ArtifactAuthority::Authoritative,
-        EvidenceArtifactKind::CommandExecution {
-          domain: ExecutionDomain::TrustedVerifier,
-          execution_authority: VerificationAuthority::ControllerDerived,
+        EvidenceArtifactKind::TrustedExecution {
+          verifier_name,
+          spec_hash,
+          isolation_policy_hash,
+          execution_record_hash,
+          isolation_report,
+          result,
           ..
         },
         DependencySurface::RepositoryWide,
-      ) => self.compatible_revisions.is_empty(),
+      ) => {
+        !verifier_name.trim().is_empty()
+          && !spec_hash.is_empty()
+          && !isolation_policy_hash.is_empty()
+          && !execution_record_hash.is_empty()
+          && !isolation_report.backend_version.trim().is_empty()
+          && !isolation_report.runtime_identity.trim().is_empty()
+          && !isolation_report.image.trim().is_empty()
+          && !isolation_report.resolved_image_digest.trim().is_empty()
+          && !isolation_report.input_revision.trim().is_empty()
+          && !isolation_report
+            .input_materialization_hash
+            .trim()
+            .is_empty()
+          && isolation_report.max_input_archive_bytes > 0
+          && isolation_report.max_input_tree_bytes > 0
+          && isolation_report.max_input_entries > 0
+          && isolation_report.input_archive_bytes <= isolation_report.max_input_archive_bytes
+          && isolation_report.input_tree_bytes <= isolation_report.max_input_tree_bytes
+          && isolation_report.input_entries <= isolation_report.max_input_entries
+          && result.exit_code.is_some()
+          && !result.timed_out
+          && self.compatible_revisions.is_empty()
+      }
       (
         ArtifactProvenance::ControllerSourceInspection,
         ArtifactAuthority::Supporting,
@@ -306,9 +349,10 @@ impl EvidenceArtifact {
   pub fn matches(&self, predicate: &EvidencePredicate) -> bool {
     match (predicate, &self.kind) {
       (EvidencePredicate::SourceInspection, EvidenceArtifactKind::SourceSpan { .. }) => true,
-      (EvidencePredicate::ExecutableEvidence, EvidenceArtifactKind::CommandExecution { .. }) => {
-        true
-      }
+      (
+        EvidencePredicate::TrustedVerifierCheck { name },
+        EvidenceArtifactKind::TrustedExecution { verifier_name, .. },
+      ) => name == verifier_name,
       (
         EvidencePredicate::NamedProjectCheck { name },
         EvidenceArtifactKind::CommandExecution {
@@ -659,7 +703,8 @@ fn expected_observation(kind: &EvidenceArtifactKind) -> ArtifactObservation {
         ArtifactObservation::Contradicts
       }
     }
-    EvidenceArtifactKind::CommandExecution { result, .. } => {
+    EvidenceArtifactKind::CommandExecution { result, .. }
+    | EvidenceArtifactKind::TrustedExecution { result, .. } => {
       if result.exit_code == Some(0) && !result.timed_out {
         ArtifactObservation::Supports
       } else {
@@ -683,6 +728,11 @@ pub enum ArtifactValidationError {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::trusted_verifier::{
+    CandidateFilesystemPolicy, ControlChannel, EnvironmentPolicy, GuestSecurityProfile,
+    HostRepositoryMountPolicy, IsolationBoundary, NetworkPolicy, TrustedExecutionBackend,
+    WritableStoragePolicy,
+  };
 
   fn artifact(
     authority: ArtifactAuthority,
@@ -744,6 +794,75 @@ mod tests {
       compatible_revisions: BTreeSet::new(),
     }
   }
+  fn trusted_artifact(
+    revision: &str,
+    observation: ArtifactObservation,
+    verifier_name: &str,
+  ) -> EvidenceArtifact {
+    let result = ExecutionObservation {
+      command: "trusted-spec".into(),
+      exit_code: Some(if observation == ArtifactObservation::Supports {
+        0
+      } else {
+        1
+      }),
+      timed_out: false,
+      duration_ms: 1,
+      stdout: String::new(),
+      stderr: String::new(),
+    };
+    EvidenceArtifact {
+      id: ArtifactId::new(),
+      revision: revision.into(),
+      observed_at: Utc::now(),
+      authority: ArtifactAuthority::Authoritative,
+      provenance: ArtifactProvenance::ControllerTrustedVerifier,
+      observation,
+      kind: EvidenceArtifactKind::TrustedExecution {
+        run_id: VerificationRunId::new(),
+        verifier_name: verifier_name.into(),
+        spec_hash: "spec-hash".into(),
+        isolation_policy_hash: "policy-hash".into(),
+        execution_record_hash: "record-hash".into(),
+        isolation_report: Box::new(IsolationCapabilityReport {
+          backend: TrustedExecutionBackend::Microsandbox,
+          backend_version: "microsandbox-rust-sdk/0.6.15".into(),
+          runtime_identity: "local-msb/sdk-protocol-compatible".into(),
+          boundary: IsolationBoundary::HardwareVirtualizedMicroVm,
+          image: format!("example/verifier@sha256:{}", "a".repeat(64)),
+          resolved_image_digest: format!("sha256:{}", "a".repeat(64)),
+          input_revision: revision.into(),
+          input_materialization_hash: "archive-hash".into(),
+          input_archive_bytes: 1024,
+          input_tree_bytes: 512,
+          input_entries: 2,
+          candidate_filesystem: CandidateFilesystemPolicy::PrivateWritable,
+          host_repository_mounts: HostRepositoryMountPolicy::None,
+          writable_storage: WritableStoragePolicy::DisposableSandboxPrivate,
+          network: NetworkPolicy::Disabled,
+          environment: EnvironmentPolicy::ExplicitOnly,
+          guest_security_profile: GuestSecurityProfile::Restricted,
+          guest_user: "65532".into(),
+          unprivileged_user: true,
+          control_channel: ControlChannel::LocalHostDriven,
+          memory_mib: 1024,
+          vcpus: 1,
+          process_limit: 256,
+          writable_root_mib: 4096,
+          max_input_archive_bytes: 536_870_912,
+          max_input_tree_bytes: 268_435_456,
+          max_input_entries: 100_000,
+          execution_timeout_secs: 30,
+          sandbox_lifetime_secs: 60,
+        }),
+        result,
+      },
+      obligation_ids: [ObligationId::from("VO-1")].into(),
+      validity: ArtifactValidity::Valid,
+      dependencies: DependencySurface::RepositoryWide,
+      compatible_revisions: BTreeSet::new(),
+    }
+  }
   fn source_inspection_artifact() -> EvidenceArtifact {
     EvidenceArtifact {
       id: ArtifactId::new(),
@@ -798,7 +917,9 @@ mod tests {
     let derivation = derive_proof_state(
       &ObligationId::from("VO-1"),
       &EvidenceContract::Artifact {
-        predicate: EvidencePredicate::ExecutableEvidence,
+        predicate: EvidencePredicate::TrustedVerifierCheck {
+          name: "behavior".into(),
+        },
       },
       [&item],
       "r1",
@@ -823,16 +944,14 @@ mod tests {
   }
 
   #[test]
-  fn authoritative_execution_proves_without_assessment() {
-    let item = artifact(
-      ArtifactAuthority::Authoritative,
-      "r1",
-      ArtifactObservation::Supports,
-    );
+  fn authoritative_trusted_execution_proves_without_assessment() {
+    let item = trusted_artifact("r1", ArtifactObservation::Supports, "behavior");
     let derivation = derive_proof_state(
       &ObligationId::from("VO-1"),
       &EvidenceContract::Artifact {
-        predicate: EvidencePredicate::ExecutableEvidence,
+        predicate: EvidencePredicate::TrustedVerifierCheck {
+          name: "behavior".into(),
+        },
       },
       [&item],
       "r1",
@@ -841,16 +960,30 @@ mod tests {
   }
 
   #[test]
-  fn stale_revision_fails_closed() {
-    let item = artifact(
-      ArtifactAuthority::Authoritative,
-      "r1",
-      ArtifactObservation::Supports,
-    );
+  fn wrong_trusted_verifier_name_cannot_satisfy_contract() {
+    let item = trusted_artifact("r1", ArtifactObservation::Supports, "different-verifier");
     let derivation = derive_proof_state(
       &ObligationId::from("VO-1"),
       &EvidenceContract::Artifact {
-        predicate: EvidencePredicate::ExecutableEvidence,
+        predicate: EvidencePredicate::TrustedVerifierCheck {
+          name: "behavior".into(),
+        },
+      },
+      [&item],
+      "r1",
+    );
+
+    assert_eq!(derivation.state, ProofState::Insufficient);
+  }
+  #[test]
+  fn stale_trusted_revision_fails_closed() {
+    let item = trusted_artifact("r1", ArtifactObservation::Supports, "behavior");
+    let derivation = derive_proof_state(
+      &ObligationId::from("VO-1"),
+      &EvidenceContract::Artifact {
+        predicate: EvidencePredicate::TrustedVerifierCheck {
+          name: "behavior".into(),
+        },
       },
       [&item],
       "r2",
@@ -877,17 +1010,15 @@ mod tests {
   }
 
   #[test]
-  fn forged_observation_cannot_affect_proof() {
-    let mut item = artifact(
-      ArtifactAuthority::Authoritative,
-      "r1",
-      ArtifactObservation::Supports,
-    );
+  fn forged_trusted_observation_cannot_affect_proof() {
+    let mut item = trusted_artifact("r1", ArtifactObservation::Supports, "behavior");
     item.observation = ArtifactObservation::Contradicts;
     let derivation = derive_proof_state(
       &ObligationId::from("VO-1"),
       &EvidenceContract::Artifact {
-        predicate: EvidencePredicate::ExecutableEvidence,
+        predicate: EvidencePredicate::TrustedVerifierCheck {
+          name: "behavior".into(),
+        },
       },
       [&item],
       "r1",
@@ -936,16 +1067,14 @@ mod tests {
     assert_eq!(different.state, ProofState::Insufficient);
   }
   #[test]
-  fn confirmed_authoritative_counterexample_contradicts() {
-    let item = artifact(
-      ArtifactAuthority::Authoritative,
-      "r1",
-      ArtifactObservation::Contradicts,
-    );
+  fn confirmed_trusted_counterexample_contradicts() {
+    let item = trusted_artifact("r1", ArtifactObservation::Contradicts, "behavior");
     let derivation = derive_proof_state(
       &ObligationId::from("VO-1"),
       &EvidenceContract::Artifact {
-        predicate: EvidencePredicate::ExecutableEvidence,
+        predicate: EvidencePredicate::TrustedVerifierCheck {
+          name: "behavior".into(),
+        },
       },
       [&item],
       "r1",
@@ -979,7 +1108,8 @@ mod tests {
 
   #[test]
   fn all_contract_records_each_artifact_reason() {
-    let item = artifact(
+    let trusted = trusted_artifact("r1", ArtifactObservation::Supports, "trusted-behavior");
+    let project = artifact(
       ArtifactAuthority::Authoritative,
       "r1",
       ArtifactObservation::Supports,
@@ -987,7 +1117,9 @@ mod tests {
     let contract = EvidenceContract::All {
       requirements: vec![
         EvidenceContract::Artifact {
-          predicate: EvidencePredicate::ExecutableEvidence,
+          predicate: EvidencePredicate::TrustedVerifierCheck {
+            name: "trusted-behavior".into(),
+          },
         },
         EvidenceContract::Artifact {
           predicate: EvidencePredicate::NamedProjectCheck {
@@ -996,8 +1128,18 @@ mod tests {
         },
       ],
     };
-    let first = derive_proof_state(&ObligationId::from("VO-1"), &contract, [&item], "r1");
-    let second = derive_proof_state(&ObligationId::from("VO-1"), &contract, [&item], "r1");
+    let first = derive_proof_state(
+      &ObligationId::from("VO-1"),
+      &contract,
+      [&trusted, &project],
+      "r1",
+    );
+    let second = derive_proof_state(
+      &ObligationId::from("VO-1"),
+      &contract,
+      [&trusted, &project],
+      "r1",
+    );
     assert_eq!(first, second);
     assert_eq!(first.state, ProofState::Proven);
   }

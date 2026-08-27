@@ -368,7 +368,7 @@ mod tests {
   }
 
   #[test]
-  fn semantic_support_cannot_satisfy_executable_contract() {
+  fn semantic_support_cannot_satisfy_trusted_verifier_contract() {
     let decision = decision_with_contract(
       true,
       Some(AssessmentJudgment::Supported {
@@ -376,7 +376,9 @@ mod tests {
         rationale: "Model says supported".into(),
       }),
       EvidenceContract::Artifact {
-        predicate: EvidencePredicate::ExecutableEvidence,
+        predicate: EvidencePredicate::TrustedVerifierCheck {
+          name: "expiry-boundary".into(),
+        },
       },
     );
     assert!(matches!(

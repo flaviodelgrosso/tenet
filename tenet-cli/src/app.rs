@@ -5,7 +5,10 @@ use chrono::Utc;
 use clap::Parser;
 use tenet_acp::acp::AcpRuntime;
 use tenet_controller::{catalog, controller::manual_verify, AgentBackend};
-use tenet_domain::model::{CatalogApproval, RunStatus};
+use tenet_domain::{
+  config::read_config,
+  model::{CatalogApproval, RunStatus},
+};
 use tenet_runtime::store;
 use tenet_storage::{DatabaseHealth, Storage};
 
@@ -242,7 +245,14 @@ impl App {
       .load_active_catalog()
       .await?
       .context("no active requirement catalog")?;
-    let graph = storage.load_evidence_graph(&catalog).await?;
+    let config = read_config(&self.cwd).await?;
+    if storage.has_trusted_authority().await? {
+      store::bootstrap_controller_authority_identity()
+        .context("trusted evidence inspection requires controller authority identity")?;
+    }
+    let graph = storage
+      .load_evidence_graph(&catalog, &config.verification.trusted_checks)
+      .await?;
     if let Some(requirement) = requirement {
       let evidence: Vec<_> = graph
         .evidence

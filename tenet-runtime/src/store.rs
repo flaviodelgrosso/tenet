@@ -1,7 +1,9 @@
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, RawFd};
 use std::{
   fmt::Write as _,
   fs::OpenOptions,
-  io::Write,
+  io::{Read, Write},
   path::{Path, PathBuf},
   process::Command,
 };
@@ -18,9 +20,91 @@ use tenet_domain::{
     CatalogApproval, CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
     RequirementCatalog, State,
   },
+  trusted_verifier::{TrustedExecutionRecord, TrustedVerificationSpec},
   verification::ProjectVerificationRun,
 };
 use tenet_storage::Storage;
+const AUTHORITY_NAMESPACE_ENV: &str = "TENET_CONTROLLER_AUTHORITY_NAMESPACE";
+const AUTHORITY_KEY_FD_ENV: &str = "TENET_CONTROLLER_AUTHORITY_KEY_FD";
+const MAX_AUTHORITY_KEY_BYTES: u64 = 1024 * 1024;
+
+struct ControllerAuthorityIdentity {
+  namespace: String,
+  key_material: Vec<u8>,
+}
+
+impl ControllerAuthorityIdentity {
+  fn from_environment() -> Result<Self> {
+    let namespace = std::env::var(AUTHORITY_NAMESPACE_ENV)
+      .with_context(|| format!("{AUTHORITY_NAMESPACE_ENV} is required for trusted authority"))?;
+    std::env::remove_var(AUTHORITY_NAMESPACE_ENV);
+    if namespace.trim().is_empty() {
+      anyhow::bail!("{AUTHORITY_NAMESPACE_ENV} must not be blank");
+    }
+    let descriptor = std::env::var(AUTHORITY_KEY_FD_ENV)
+      .with_context(|| format!("{AUTHORITY_KEY_FD_ENV} is required for trusted authority"))?;
+    std::env::remove_var(AUTHORITY_KEY_FD_ENV);
+    let descriptor = descriptor.parse::<i64>().with_context(|| {
+      format!("{AUTHORITY_KEY_FD_ENV} must contain an inherited file descriptor")
+    })?;
+    let key_material = read_authority_key(descriptor)?;
+    if key_material.is_empty() {
+      anyhow::bail!("controller authority key must not be empty");
+    }
+    Ok(Self {
+      namespace,
+      key_material,
+    })
+  }
+
+  fn install(mut self) -> Result<()> {
+    let result = install_controller_authority_key(&self.namespace, &self.key_material);
+    self.key_material.fill(0);
+    result
+  }
+}
+
+#[cfg(unix)]
+fn read_authority_key(descriptor: i64) -> Result<Vec<u8>> {
+  let descriptor = RawFd::try_from(descriptor)
+    .context("controller authority key file descriptor is outside the supported range")?;
+  if descriptor < 0 {
+    anyhow::bail!("controller authority key file descriptor must not be negative");
+  }
+  // SAFETY: ownership of this inherited descriptor is transferred by the launcher contract.
+  let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+  let mut key = Vec::new();
+  Read::by_ref(&mut file)
+    .take(MAX_AUTHORITY_KEY_BYTES + 1)
+    .read_to_end(&mut key)
+    .context("read controller authority key file descriptor")?;
+  if key.len() as u64 > MAX_AUTHORITY_KEY_BYTES {
+    key.fill(0);
+    anyhow::bail!("controller authority key exceeds {MAX_AUTHORITY_KEY_BYTES} bytes");
+  }
+  Ok(key)
+}
+
+#[cfg(not(unix))]
+fn read_authority_key(_descriptor: i64) -> Result<Vec<u8>> {
+  anyhow::bail!("inherited controller authority key descriptors require a Unix host")
+}
+
+pub fn bootstrap_controller_authority_identity() -> Result<()> {
+  ControllerAuthorityIdentity::from_environment()?.install()
+}
+
+pub async fn trusted_authority_identity_required(cwd: &Path) -> Result<bool> {
+  Ok(Storage::open(cwd).await?.has_trusted_authority().await?)
+}
+
+pub fn install_controller_authority_key(
+  authority_namespace: &str,
+  key_material: &[u8],
+) -> Result<()> {
+  tenet_storage::install_controller_authority_key(authority_namespace, key_material)
+    .context("install controller authority identity")
+}
 
 pub async fn ensure_layout(cwd: &Path) -> Result<()> {
   fs::create_dir_all(cwd.join(TENET_DIR).join("runs")).await?;
@@ -124,7 +208,10 @@ pub async fn read_evidence_graph(
     .load_active_catalog()
     .await?
     .ok_or_else(|| anyhow!("cannot load evidence without an active catalog"))?;
-  let graph = storage.load_evidence_graph(&catalog).await?;
+  let config = read_config(cwd).await?;
+  let graph = storage
+    .load_evidence_graph(&catalog, &config.verification.trusted_checks)
+    .await?;
   if graph.specification_hash != expected.specification_hash
     || graph.requirements != expected.requirements
     || graph.required_requirements != expected.required_requirements
@@ -184,6 +271,23 @@ pub async fn record_manual_verification(
     .record_project_verification(run_id, report)
     .await
     .context("record project verification")?;
+  Ok(())
+}
+pub async fn record_trusted_execution(
+  cwd: &Path,
+  record: &TrustedExecutionRecord,
+  spec: &TrustedVerificationSpec,
+) -> Result<()> {
+  let storage = Storage::open(cwd).await?;
+  let state = storage.load_current_state().await?;
+  let run_id = state
+    .run_id
+    .as_deref()
+    .ok_or_else(|| anyhow!("cannot persist trusted execution without an active run"))?;
+  storage
+    .record_trusted_execution(run_id, record, spec)
+    .await
+    .context("record controller-owned trusted execution")?;
   Ok(())
 }
 

@@ -167,8 +167,70 @@
         "timeout_secs": {
           "type": "integer",
           "minimum": 1,
+          "maximum": 3600,
           "description": "Optional timeout override for this check."
         }
+      }
+    },
+    "trustedIsolationPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "boundary": { "type": "string", "const": "hardware_virtualized_micro_vm", "default": "hardware_virtualized_micro_vm" },
+        "candidate_filesystem": { "type": "string", "const": "private_writable", "default": "private_writable" },
+        "host_repository_mounts": { "type": "string", "const": "none", "default": "none" },
+        "writable_storage": { "type": "string", "const": "disposable_sandbox_private", "default": "disposable_sandbox_private" },
+        "network": { "type": "string", "const": "disabled", "default": "disabled" },
+        "environment": { "type": "string", "const": "explicit_only", "default": "explicit_only" },
+        "guest_security_profile": { "type": "string", "const": "restricted", "default": "restricted" },
+        "control_channel": { "type": "string", "const": "local_host_driven", "default": "local_host_driven" }
+      }
+    },
+    "trustedResourcePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "memory_mib": { "type": "integer", "minimum": 128, "maximum": 16384, "default": 1024 },
+        "vcpus": { "type": "integer", "minimum": 1, "maximum": 16, "default": 1 },
+        "process_limit": { "type": "integer", "minimum": 1, "maximum": 4096, "default": 256 },
+        "writable_root_mib": { "type": "integer", "minimum": 1, "maximum": 16384, "default": 4096 },
+        "max_input_archive_bytes": { "type": "integer", "minimum": 1, "maximum": 1073741824, "default": 536870912 },
+        "max_input_tree_bytes": { "type": "integer", "minimum": 1, "maximum": 1073741824, "default": 268435456 },
+        "max_input_entries": { "type": "integer", "minimum": 1, "maximum": 250000, "default": 100000 }
+      }
+    },
+    "trustedVerificationSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "backend", "image", "program"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+        "backend": { "type": "string", "const": "microsandbox" },
+        "image": {
+          "type": "string",
+          "pattern": "^.+@sha256:[0-9A-Fa-f]{64}$",
+          "description": "Controller-selected immutable verifier image reference."
+        },
+        "program": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+        "args": { "$ref": "#/$defs/stringList", "default": [] },
+        "working_directory": { "type": "string", "minLength": 1, "default": "." },
+        "environment": {
+          "type": "object",
+          "default": {},
+          "propertyNames": {
+            "minLength": 1,
+            "allOf": [
+              { "not": { "enum": ["HOME", "PATH", "TMPDIR", "USER"] } },
+              { "not": { "pattern": "^MSB_" } },
+              { "not": { "pattern": "=" } }
+            ]
+          },
+          "additionalProperties": { "type": "string" }
+        },
+        "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 300 },
+        "isolation": { "$ref": "#/$defs/trustedIsolationPolicy" },
+        "resources": { "$ref": "#/$defs/trustedResourcePolicy" },
+        "protocol": { "type": "string", "const": "exit_code", "default": "exit_code" }
       }
     },
     "verificationConfig": {
@@ -183,15 +245,23 @@
           "default": [],
           "description": "Mandatory project verification checks executed in declaration order with fail-fast behavior."
         },
+        "trusted_checks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/trustedVerificationSpec" },
+          "default": [],
+          "description": "Named controller-owned checks executed only through enforced trusted isolation."
+        },
         "timeout_secs": {
           "type": "integer",
           "minimum": 1,
+          "maximum": 3600,
           "default": 300,
           "description": "Default maximum duration of each project verification check."
         },
         "max_output_bytes": {
           "type": "integer",
           "minimum": 0,
+          "maximum": 16777216,
           "default": 65536,
           "description": "Output bytes retained from each project verification check."
         }

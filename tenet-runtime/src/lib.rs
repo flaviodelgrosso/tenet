@@ -7,5 +7,6 @@ pub mod integration;
 mod protection;
 pub mod scheduler;
 pub mod store;
+pub mod trusted_verifier;
 pub mod verifier;
 pub mod workspace;
