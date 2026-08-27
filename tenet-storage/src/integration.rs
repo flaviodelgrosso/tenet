@@ -59,6 +59,43 @@ impl Storage {
     require_one(result.rows_affected(), "prepared integration transaction")
   }
 
+  /// Rebinds an unfinished transaction to freshly authenticated recovery verification.
+  pub async fn replace_integration_verification(
+    &self,
+    transaction: &IntegrationTransaction,
+    verification_run_id: VerificationRunId,
+    verification_hash: &str,
+    updated_at: &str,
+  ) -> Result<(), StorageError> {
+    let previous_verification_run_id = transaction.verification_run_id.to_string();
+    let verification_run_id = verification_run_id.to_string();
+    let mut database = self.pool.begin().await.map_err(StorageError::from_sqlx)?;
+    let result = sqlx::query("UPDATE integration_transactions SET verification_run_id = ?, verification_hash = ?, updated_at = ? WHERE id = ? AND run_id = ? AND phase IN ('prepared', 'git_committed') AND verification_run_id = ? AND verification_hash = ?")
+      .bind(&verification_run_id)
+      .bind(verification_hash)
+      .bind(updated_at)
+      .bind(&transaction.id)
+      .bind(&transaction.run_id)
+      .bind(&previous_verification_run_id)
+      .bind(&transaction.verification_hash)
+      .execute(&mut *database)
+      .await
+      .map_err(StorageError::from_sqlx)?;
+    require_one(
+      result.rows_affected(),
+      "unfinished integration verification binding",
+    )?;
+    sqlx::query("UPDATE completed_work_units SET verification_run_id = ? WHERE run_id = ? AND work_unit_id = ? AND verification_run_id = ?")
+      .bind(&verification_run_id)
+      .bind(&transaction.run_id)
+      .bind(&transaction.work_unit.id)
+      .bind(&previous_verification_run_id)
+      .execute(&mut *database)
+      .await
+      .map_err(StorageError::from_sqlx)?;
+    database.commit().await.map_err(StorageError::from_sqlx)
+  }
+
   /// Atomically records completed work and closes a Git-committed integration transaction.
   pub async fn complete_integration(
     &self,

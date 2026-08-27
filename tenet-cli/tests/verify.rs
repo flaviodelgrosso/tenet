@@ -1,6 +1,6 @@
 use std::{
   path::{Path, PathBuf},
-  process::Command,
+  process::{Command, Stdio},
   sync::atomic::{AtomicU64, Ordering},
   time::{SystemTime, UNIX_EPOCH},
 };
@@ -62,15 +62,32 @@ fn base_config(verification: &str) -> String {
   )
 }
 
+fn tenet_verify(repository: &TempRepo) -> Command {
+  let key_path = repository.path().with_extension("controller-authority-key");
+  std::fs::write(&key_path, b"tenet-cli-verify-test-authority")
+    .expect("write controller authority fixture");
+  let key = std::fs::File::open(&key_path).expect("open controller authority fixture");
+  std::fs::remove_file(key_path).expect("unlink controller authority fixture");
+  let mut command = Command::new(env!("CARGO_BIN_EXE_tenet"));
+  command
+    .env(
+      "TENET_CONTROLLER_AUTHORITY_NAMESPACE",
+      "tenet-cli-verify-tests",
+    )
+    .env("TENET_CONTROLLER_AUTHORITY_KEY_FD", "0")
+    .stdin(Stdio::from(key))
+    .args(["verify", "--cwd"])
+    .arg(repository.path());
+  command
+}
+
 #[test]
 fn verify_reports_each_configured_project_check_without_catalog() {
   let repository = TempRepo::new(&base_config(
     "[verification]\n[[verification.checks]]\nname = \"tracked file\"\ncommand = [\"sh\", \"-c\", \"test -f README.txt\"]\n",
   ));
 
-  let output = Command::new(env!("CARGO_BIN_EXE_tenet"))
-    .args(["verify", "--cwd"])
-    .arg(repository.path())
+  let output = tenet_verify(&repository)
     .output()
     .expect("run tenet verify");
   let stdout = String::from_utf8_lossy(&output.stdout);
@@ -89,9 +106,7 @@ fn verify_reports_each_configured_project_check_without_catalog() {
 fn verify_fails_clearly_without_project_checks() {
   let repository = TempRepo::new(&base_config(""));
 
-  let output = Command::new(env!("CARGO_BIN_EXE_tenet"))
-    .args(["verify", "--cwd"])
-    .arg(repository.path())
+  let output = tenet_verify(&repository)
     .output()
     .expect("run tenet verify");
   let stderr = String::from_utf8_lossy(&output.stderr);

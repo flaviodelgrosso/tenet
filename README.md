@@ -170,14 +170,16 @@ controller-run project verification               │
                          final project checks at R
                                        │
                                        ▼
-                    fresh independent semantic Assess
-                         (obligation by obligation)
+                  controller-issued EvidenceArtifacts
+                                       │
+                                       ▼
+                    deterministic EvidenceContract
                                        │
                      ┌─────────────────┼─────────────────┐
-                   GAP             UNCERTAIN         SATISFIED
+                  PROVEN          INSUFFICIENT      CONTRADICTED
                      │                 │                 │
                      ▼                 ▼                 ▼
-                Reconcile          BLOCKED           DONE?
+                   DONE?       acquire/adjudicate      BLOCKED
 ```
 
 The repository evolves. The plan is allowed to evolve with it. The specification and controller-owned evidence remain the reference points.
@@ -201,13 +203,13 @@ valid requirement catalog
         +
 mandatory acceptance criteria
         +
-required semantic verification obligations
+required verification obligations with explicit EvidenceContracts
         +
-project-owner-configured deterministic suite passes at revision R
+controller-issued, revision-compatible authoritative artifacts satisfy every contract
         +
-every required obligation has current independent semantic satisfaction at R
+deterministically derived ProofState::Proven for every required obligation
         +
-no current semantic gap, uncertainty, or contradictory evidence
+advisory model support, suspicion, or prose has no proof authority
         +
 no remaining work from current reconciliation
         +
@@ -224,9 +226,9 @@ DONE(R)
 
 `DONE` does **not** mean mathematically proven correct. It means:
 
-> **the repository satisfied the specification through the evidence and assessment mechanisms available to this run.**
+> **every required obligation's explicit evidence contract is satisfied by controller-owned authoritative artifacts at the canonical revision, and every independent controller safety gate passes.**
 
-That distinction matters. A bad specification can still produce the wrong software. Weak tests can still produce weak evidence. An agent can still miss something.
+That distinction matters. A bad specification or weak evidence contract can still describe or prove the wrong thing. Advisory model judgments cannot bridge missing evidence, select a trusted executable, mint human authority, or narrow dependency scope.
 
 Tenet does not remove uncertainty from software engineering — it tries to make that uncertainty **explicit, revision-bound, inspectable, and harder to hand-wave away**.
 
@@ -248,34 +250,44 @@ AC-003-01
 A token is accepted before expiry and rejected after expiry.
 ```
 
-A verification obligation is a semantic claim about that criterion:
+A verification obligation is a claim paired with an explicit evidence contract. Tenet supports explicit authoritative leaves that may be composed with deterministic `All` / `Any` contracts:
 
-```
-VO-003-01
-Demonstrate token expiration semantics.
-```
-
-An executable check is configured separately. For example, a project-configured check or an agent-proposed advisory check may be:
-
-```
-cargo test password_reset_expiry
+```text
+Artifact(NamedProjectCheck("password-reset-expiry"))
+Artifact(TrustedVerifierCheck("private-expiry-boundary"))
+Artifact(FalsifierCheck("expiry-boundary-search"))
+HumanAttestation("Manual UX review confirms the expiry interaction")
 ```
 
-Tenet's authoritative record of a controller-executed project check is closer to:
+`NamedProjectCheck` binds a public project check from `verification.checks`. It runs in a disposable Git worktree. This protects canonical repository mutation, but it is not a security sandbox.
 
-```
-revision:     abc123...
-program:      cargo
-arguments:    test password_reset_expiry
-exit_code:    0
-observed_by:  controller
-```
+`TrustedVerifierCheck` binds a check from `verification.trusted_checks`. Its specification is controller configuration: a digest-pinned image, structured program and argument vector, repository-relative working directory, explicit environment, timeout, fixed no-network isolation policy, guest resource bounds, host archive/tree byte limits, and an input-entry limit. Agent output cannot create or modify this specification, select the image, add mounts, pass environment, or grant authority.
 
-That result is revision-bound project-verification evidence. It is not an executable binding for `VO-003-01`, and it does not by itself establish the generated semantic obligation. Semantic obligations are assessed separately.
+`FalsifierCheck` binds a controller-configured bounded search using the same Microsandbox boundary. The assessor may propose schema-validated input data, but never the image, executable, arguments, environment, network, resource limits, isolation policy, or obligation bindings. For a controller-fixed execution with no assessor-proposed input, exit `0` authoritatively supports the contract. With assessor-proposed input, exit `0` is inconclusive and cannot prove the contract. Exit `1` records authoritative counterevidence in either case. Infrastructure failure records neither.
 
-If a later change touches the dependency scope supporting that evidence, Tenet can mark it stale and require verification again.
+`HumanAttestation` remains pending until an explicit `tenet evidence attest` invocation signs the exact statement, obligation, catalog, revision, timestamp, attestor identity, public key, and dependency snapshot with the configured Ed25519 identity. Autonomous workers and microVM guests never receive the private key.
 
-**The model proposes. The controller observes.**
+Controller-owned ceilings reject configuration above 16 GiB guest memory, 16 vCPUs, 4,096 processes, 16 GiB writable root storage, 1 GiB archive input, 1 GiB expanded file content, 250,000 input entries, a one-hour verifier lifetime, or 16 MiB of retained output. These are admission ceilings, not defaults; lower per-verifier limits remain fingerprinted authority policy.
+
+The Microsandbox backend materializes the exact requested Git revision directly from raw tree and blob objects, without applying `.gitattributes` export transformations, rejects gitlinks and controller-owned `.tenet` content, hashes the deterministic raw-object archive, and copies that export into `/workspace` in a disposable local microVM. Raw object materialization keeps path-scoped dependency object IDs identical to the bytes and file presence supplied to the verifier. The guest workspace is private and writable, while the canonical repository is never mounted or exposed to the guest. Tenet uses the typed Microsandbox SDK rather than invoking or parsing the `msb` CLI or constructing shell commands. Through that SDK it requests a digest-pinned OCI image, hardware-virtualized microVM boundary, disabled networking, the restricted guest profile, a numeric non-root user, explicit CPU and memory limits, a process limit, a bounded sandbox lifetime, no secrets, no vsock, and no volumes. It validates the resulting capability report before any semantic result can become authoritative.
+
+Before verifier execution, Tenet normalizes the runtime-resolved OCI manifest digest and requires it to equal the SHA-256 digest pinned in the controller-owned image reference. The capability report repeats this comparison at authority admission, including after persistence reload; malformed, unsupported, or mismatched digests are infrastructure failures and cannot issue semantic evidence.
+
+After admitted execution, the controller authenticates every authoritative issuer record and artifact with an HMAC key derived from an independently supplied Tenet controller-authority key and a stable operator-assigned repository authority namespace. This includes public project checks, trusted verifiers, falsifiers, human-attestation artifacts, and cross-revision compatibility transitions. The sandbox backend and human signer never own or receive the controller identity. Artifact authentication binds the active catalog hash and serialized definitions of every bound obligation; issuer authentication binds the complete controller-observed execution payload. Reload accepts authority only when the tags, persisted issuer record, catalog context, current revision or admitted compatible revision, and current issuer configuration all agree.
+
+The exit-code protocol is controller-defined: exit `0` supports a trusted-verifier claim or a controller-fixed falsifier claim, while exit `1` is the sole semantic contradiction status. A falsifier execution with assessor-proposed input can use exit `0` only as an inconclusive observation. Other statuses—including crash and signal conventions—are infrastructure failures and issue no semantic artifact. Timeouts, isolation failures, and cleanup failures likewise are not contradictions. Deterministic proof evaluation requires a current, valid, authoritative artifact from exactly the named verifier. No positive assessor verdict is required.
+
+The authority classes are:
+
+- **Authoritative:** exact controller-configured `NamedProjectCheck`, `TrustedVerifierCheck`, `FalsifierCheck`, and authenticated `HumanAttestation` contracts.
+- **Supporting:** controller-owned immutable source inspection; it cannot satisfy an authoritative obligation contract.
+- **Advisory only:** assessor judgments, counterexample proposals, and legacy reproduction requests. Proposals are admitted against controller configuration before any authoritative execution.
+- **Rejected:** generic executable/project-verification obligation contracts, unknown issuers, unsigned attestations, arbitrary obligation bindings, and model-declared dependency scopes.
+
+On repository transitions, repository-wide authority becomes stale. A trusted verifier, falsifier, or human attestor may instead declare controller-owned path globs. Tenet materializes the exact matching Git object IDs at issuance; reuse is allowed only when the complete expanded path/object set is unchanged and the catalog, contract, issuer identity, image, protocol, isolation policy, and specification fingerprints remain valid. Changed, added, removed, unknown, or malformed dependencies fail closed and trigger reacquisition when a mechanical issuer exists.
+
+**The model proposes and interprets. The controller configures, executes, admits, persists, and proves.**
+
 
 ---
 
@@ -347,19 +359,21 @@ A worker receives bounded work and an explicit repository scope, in an isolated 
 
 ### 4 · Verify
 
-The candidate is committed first; project verification then runs against clean disposable checkouts of that candidate revision (for example `cargo test`, `make ci`, or `./scripts/acceptance.sh`). Project-configured checks are controller-authorized and mandatory; they run in declaration order and fail fast. Agent-proposed checks remain advisory. Project-suite results are persisted with their revision and configuration fingerprint, but are not treated as evidence for generated semantic obligations.
+The candidate is committed first. Public project verification runs against clean disposable checkouts of that exact revision. Configured named checks can issue obligation-bound public verification artifacts when an evidence contract names them exactly.
+
+The controller then derives proof gaps and acquires only the exact missing configured trusted-verifier or falsifier leaves. Each admitted execution uses the local Microsandbox boundary, persists its issuer record, immediately re-derives proof, and stops as soon as deterministic proof or contradiction decides the contract. Human leaves remain explicit external actions. Assessor-proposed executables never enter this path.
 
 ### 5 · Repair
 
-A failed advisory verification attempt becomes structured input to a new Repair worker: candidate repository + verification command + exit code + stdout + stderr. Repairs are bounded — Tenet prefers an explicit blocked state over infinite retry. Mandatory project-suite failures at integration are reported as project verification failures with their structured check results; Tenet does not call them regressions without a passing baseline comparison.
+A failed advisory verification attempt becomes structured input to a new Repair worker. Trusted-verifier infrastructure failures never route to product repair. Repairs are bounded—Tenet prefers an explicit blocked state over infinite retry.
 
 ### 6 · Integrate
 
-A verified candidate is integrated through the controller rather than being allowed to mutate canonical state directly. Tenet maintains a durable integration journal around canonical advancement — if interruption occurs, startup reconciles the journal against the actual Git revision rather than guessing whether the operation succeeded. After integration, the repository is reconciled again: yesterday's plan is not automatically trusted after today's code change.
+A verified candidate is integrated through the controller rather than being allowed to mutate canonical state directly. Tenet maintains a durable integration journal around canonical advancement. After integration, the repository is reconciled again.
 
-### 7 · Assess
+### 7 · Residual advisory adjudication
 
-Once the project verification suite passes and requirement evidence policy is satisfied, a fresh skeptical worker searches for concrete implementation or evidence gaps. Assess can **veto** completion by proposing a specific gap — it cannot authorize completion. The controller remains the final authority.
+Tenet calls Assess only for residual uncertainty after controller-owned acquisition. Assess may propose observations, structured falsifier inputs, and source inspections, but its judgments cannot directly mutate `ProofState`. Mechanically complete contracts finish without positive LLM authorization; authoritative contradiction blocks without assessor override.
 
 ---
 
@@ -379,9 +393,11 @@ Tenet treats agent execution and canonical repository state as separate concerns
 
 > **Git worktree isolation is not a security sandbox.**
 
-Worktrees protect canonical repository state from uncontrolled mutations. They do **not** inherently isolate a coding agent from the host environment. Depending on the configured agent/runtime, a worker may still inherit access to the filesystem outside the repository, network, environment variables, credentials, local services, processes, Docker, SSH configuration, and cloud tooling.
+Coding agents still run under the configured ACP runtime and may inherit host filesystem, network, process, environment, credential, Docker, SSH, or cloud access. Tenet does not claim arbitrary worker execution is safe on a sensitive host.
 
-Tenet does not currently claim that arbitrary coding-agent execution is safe on a sensitive host. Use appropriate external sandboxing and credential isolation when the threat model requires it.
+Trusted verification is a separate boundary. It uses local Microsandbox microVMs with their own guest Linux kernel and host hardware virtualization. Tenet does not use Microsandbox Cloud and never falls back to host, Docker, Podman, an ordinary worktree, or another execution path. Each verifier receives only an exact controller-exported Git revision in its disposable private guest filesystem. Networking is explicitly disabled; no canonical repository path, `.tenet` state, user home, SSH/cloud credential path, host environment, secret, vsock, or volume is exposed. The verifier runs as the configured numeric non-root guest user under Microsandbox's restricted security profile with explicit CPU, memory, process, root-disk, execution-time, and sandbox-lifetime limits.
+
+Microsandbox is a beta dependency isolated behind `tenet-runtime::TrustedVerifierRunner`. Tenet records the pinned Rust SDK version and SHA-256 identities of the resolved local `msb` and `libkrunfw` runtime files, rejecting an execution if those files change before cleanup completes. The local `msb` binary version remains unreported because the SDK does not expose it through the typed runtime API; file digests bind the observed host runtime but do not authenticate its publisher. The capability report records controller-requested and controller-observed runtime properties; it is not cryptographic remote attestation. Tenet does not claim confidential computing, hardware attestation, verifier-image signature/provenance verification, or protection against a microVM/hypervisor escape. Digest pinning establishes immutable OCI layer identity, not publisher provenance. Git submodules and network-dependent authoritative verifiers are unsupported.
 
 ---
 
@@ -465,7 +481,7 @@ Tenet also supports custom ACP commands through `tenet.toml`.
 
 ### 5. Configure verification
 
-Declare one or more deterministic commands that the project owner trusts. Commands are structured as an executable followed by arguments; Tenet does not invoke a shell.
+Public project checks, isolated trusted verifiers, bounded falsifiers, and human identities are controller-owned configuration. No model-provided shell string or dependency scope enters an authoritative path.
 
 ```toml
 [verification]
@@ -476,15 +492,46 @@ max_output_bytes = 65536
 name = "tests"
 command = ["./test"]
 
-[[verification.checks]]
-name = "quality"
-command = ["./quality"]
+[[verification.trusted_checks]]
+name = "expiry-boundary"
+backend = "microsandbox"
+image = "registry.example/expiry-verifier@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+program = "verify-expiry"
+args = ["--assert-boundary"]
 working_directory = "."
-environment = { CI = "true" }
-timeout_secs = 600
+timeout_secs = 120
+environment = { CI = "true", CARGO_TARGET_DIR = "/tmp/target" }
+resources = { memory_mib = 1024, vcpus = 1, process_limit = 256, writable_root_mib = 4096, max_input_archive_bytes = 536870912, max_input_tree_bytes = 268435456, max_input_entries = 100000 }
+dependencies = { policy = "paths", patterns = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"] }
+
+[[verification.human_attestors]]
+id = "alice"
+publicKey = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+dependencies = { policy = "repository_wide" }
 ```
 
-Every configured check is mandatory. Tenet executes checks in declaration order with fail-fast behavior, each in a clean disposable workspace at the target revision. Names are diagnostic only. Configuration never refers to generated requirement, criterion, or obligation IDs. Complex pipelines belong behind one project-owned command.
+Every authoritative project-check, trusted-verifier, falsifier, and human artifact—including controller-admitted cross-revision compatibility—is authenticated with the controller-authority identity. The human signature remains a separate proof of explicit human action; the controller key cannot mint it. `tenet run` always requires the stable controller namespace and key descriptor; `tenet evidence dump` and `tenet evidence attest` require the same identity whenever authoritative state exists or is created.
+
+Every `verification.checks` entry is a mandatory public project gate and runs in declaration order with fail-fast behavior. Trusted verifier and falsifier names are unique, images must be immutable OCI digest references, the production backend is `microsandbox`, and network access is disabled. Missing runtime support, timeouts, cleanup failures, malformed falsifier results, and other infrastructure failures stop acquisition without issuing semantic evidence. `dependencies` defaults to `repository_wide`; path policies are trusted only from this configuration.
+
+The controller-authority identity is a Tenet launch input independent of Microsandbox. Supply a stable namespace and an already-open descriptor containing secret key material:
+
+```bash
+TENET_CONTROLLER_AUTHORITY_NAMESPACE=production-password-service \
+TENET_CONTROLLER_AUTHORITY_KEY_FD=3 \
+tenet run 3<tenet-controller-authority.key
+```
+
+Tenet reads and closes the descriptor, removes both environment names before agent work, derives the persistence authentication key in memory, and never serializes the supplied key or namespace into `tenet.toml`, SQLite, a worker workspace, a subprocess argument, the microVM, or a verifier environment. The namespace is not secret, but it must remain stable and unique to this repository authority boundary. A missing or changed identity fails closed whenever authoritative state is created or validated. `tenet evidence dump` requires the same identity when authoritative evidence exists and returns an explicit error without it.
+
+Run the real backend acceptance test on a supported hardware-virtualization host before release. It starts a local microVM from an architecture-matched pinned Alpine manifest, verifies that the runtime-resolved manifest digest equals the controller-authorized digest, and checks the exact exported revision, non-root UID, absent planted host secret, unavailable outbound guest network, private writable workspace, authoritative-capable execution record, unchanged canonical repository, and confirmed sandbox cleanup:
+
+```bash
+TENET_MICROSANDBOX_PLANTED_SECRET=must-not-enter-guest \
+cargo test -p tenet-runtime trusted_verifier::tests::local_microsandbox_acceptance_establishes_the_real_boundary -- --ignored --exact
+```
+
+An ignored or skipped result is not evidence that the Microsandbox boundary works.
 
 ### 6. Run
 
@@ -521,6 +568,7 @@ max_repair_attempts = 3
 
 [verification]
 checks = []
+trusted_checks = []
 timeout_secs = 300
 max_output_bytes = 65536
 
@@ -542,7 +590,7 @@ additional_protected_paths = [
 ]
 ```
 
-Advanced controller, agent, verification, and execution settings are documented in [`schemas/config.schema.json`](schemas/config.schema.json). Verification defaults are written explicitly so the empty `checks` list is visible; replace it with at least one trusted check before running Tenet.
+Advanced controller, agent, verification, and execution settings are documented in [`schemas/config.schema.json`](schemas/config.schema.json). Replace the empty public `checks` list with at least one mandatory project check before running Tenet. Add `trusted_checks` only for obligations that require the isolated verifier boundary.
 
 `agent.completion_retries = N` permits at most `N + 1` model completions per Architect batch, Reconcile operation, or Assess operation—not across the entire multi-batch Architect phase. Structured-output correction and controller semantic-validation retries consume that same per-operation budget. `max_repair_attempts = N` permits at most `N` total Repair worker invocations for a work unit across both empty-implementation recovery and candidate-verification recovery.
 
@@ -578,6 +626,10 @@ tenet state dump --json
 tenet requirements dump --json
 tenet evidence dump --json
 tenet evidence dump --json --requirement REQ-001
+
+# Explicitly sign one pending human contract; FD 3 is controller authority and FD 7 is the human Ed25519 key
+TENET_CONTROLLER_AUTHORITY_NAMESPACE=production-password-service TENET_CONTROLLER_AUTHORITY_KEY_FD=3 tenet evidence attest --obligation REQ-001/AC-01/VO-01 --statement "Manual UX review confirms the expiry interaction" --attestor alice --signing-key-fd 7 3<controller.key 7<attestor.key
+tenet run
 tenet roadmap dump --json
 
 # Manage ACP agents

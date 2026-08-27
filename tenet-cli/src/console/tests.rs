@@ -9,13 +9,14 @@ use tenet_domain::{
   events::{CompletionGate, CompletionGateItem, CompletionGateOutcome, RunEvent},
   evidence::{
     Evidence, EvidenceProvenance, EvidenceResult, EvidenceSource, EvidenceValidity,
-    ObligationAssessment, ObligationAssessmentResult, SemanticAssessmentReport,
+    ObligationAssessmentResult, SemanticAssessmentReport,
   },
   ids::{CriterionId, EvidenceId, ObligationId, RequirementId, VerificationRunId},
   model::{
     Phase, RepairProgress, RepositoryChange, RunStatus, State, WorkScope, WorkUnit, WorkerEvent,
     WorkerRole,
   },
+  proof::{AssessmentJudgment, GapKind},
   verification::{
     CommandResult, ProjectCheckResult, ProjectVerificationRun, VerificationReport, VerificationSpec,
   },
@@ -300,15 +301,18 @@ fn semantic_gap_and_uncertainty_are_distinct() {
     assessments: vec![
       ObligationAssessmentResult {
         obligation_id: ObligationId::from("REQ-003/AC-02/VO-01"),
-        assessment: ObligationAssessment::Gap {
-          description: "Required 15-minute expiry is not established".into(),
+        assessment: AssessmentJudgment::Insufficient {
+          reason: "Required 15-minute expiry is not established".into(),
+          proposals: Vec::new(),
+          gap_kind: GapKind::Implementation,
         },
       },
       ObligationAssessmentResult {
         obligation_id: ObligationId::from("REQ-006/AC-01/VO-02"),
-        assessment: ObligationAssessment::Uncertain {
+        assessment: AssessmentJudgment::Insufficient {
           reason: "Specification is ambiguous about retries".into(),
-          specification_ambiguous: true,
+          proposals: Vec::new(),
+          gap_kind: GapKind::Specification,
         },
       },
     ],
@@ -321,8 +325,7 @@ fn semantic_gap_and_uncertainty_are_distinct() {
     }],
   );
 
-  assert!(output.contains("x GAP"), "{output}");
-  assert!(output.contains("! UNCERTAIN"), "{output}");
+  assert_eq!(output.matches("! INSUFFICIENT").count(), 2, "{output}");
   assert!(output.contains("REQ-003/AC-02/VO-01"), "{output}");
   assert!(output.contains("REQ-006/AC-01/VO-02"), "{output}");
 }
@@ -588,8 +591,10 @@ fn semantic_evidence_does_not_repeat_assessment_findings() {
     summary: "gap".into(),
     assessments: vec![ObligationAssessmentResult {
       obligation_id: obligation_id.clone(),
-      assessment: ObligationAssessment::Gap {
-        description: "expiry not established".into(),
+      assessment: AssessmentJudgment::Insufficient {
+        reason: "expiry not established".into(),
+        proposals: Vec::new(),
+        gap_kind: GapKind::Implementation,
       },
     }],
   };
@@ -614,6 +619,6 @@ fn semantic_evidence_does_not_repeat_assessment_findings() {
   let assessment_output = render(InformationMode::Default, &assessment_events);
   let evidence_output = render(InformationMode::Default, &evidence_events);
 
-  assert_eq!(assessment_output.matches("GAP").count(), 1);
+  assert_eq!(assessment_output.matches("INSUFFICIENT").count(), 1);
   assert!(evidence_output.is_empty(), "{evidence_output}");
 }

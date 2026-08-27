@@ -1,11 +1,10 @@
 use std::collections::BTreeSet;
 
 use tenet_domain::{
-  evidence::{
-    EvidenceGraphState, EvidencePolicy, EvidenceResult, EvidenceSource, VerificationState,
-  },
+  evidence::EvidenceGraphState,
   ids::{CriterionId, ObligationId, RequirementId, SpecFragmentId},
   model::RequirementCatalog,
+  proof::{derive_proof_state, EvidenceContract, ProofState},
   verification::ProjectVerificationRun,
 };
 
@@ -14,8 +13,10 @@ pub enum CompletionBlocker {
   SpecificationCoverageIncomplete(Vec<SpecFragmentId>),
   RequirementUnverified(RequirementId),
   CriterionUnverified(CriterionId),
-  SemanticGap(ObligationId),
-  SemanticUncertain(ObligationId),
+  ProofContradicted(ObligationId),
+  ProofInsufficient(ObligationId),
+  ProofStale(ObligationId),
+  HumanAttestationRequired(ObligationId),
   ProjectVerificationFailed,
   ProjectVerificationStale,
   RepositoryChangedAfterVerification,
@@ -40,9 +41,16 @@ impl std::fmt::Display for CompletionBlocker {
       Self::CriterionUnverified(id) => {
         write!(formatter, "acceptance criterion {id} is not verified")
       }
-      Self::SemanticGap(id) => write!(formatter, "semantic assessment found a gap for {id}"),
-      Self::SemanticUncertain(id) => {
-        write!(formatter, "semantic assessment is uncertain for {id}")
+      Self::ProofContradicted(id) => write!(formatter, "authoritative proof contradicts {id}"),
+      Self::ProofInsufficient(id) => {
+        write!(formatter, "authoritative proof is insufficient for {id}")
+      }
+      Self::ProofStale(id) => write!(formatter, "authoritative proof is stale for {id}"),
+      Self::HumanAttestationRequired(id) => {
+        write!(
+          formatter,
+          "obligation {id} requires explicit authenticated human attestation"
+        )
       }
       Self::ProjectVerificationFailed => formatter.write_str("project verification failed"),
       Self::ProjectVerificationStale => {
@@ -103,18 +111,37 @@ impl CompletionPolicy {
       blockers.insert(CompletionBlocker::ProjectVerificationStale);
     }
 
-    let policy = EvidencePolicy::new(context.current_revision, context.current_suite_hash);
+    let obligation_proven = |obligation_id: &ObligationId| {
+      context
+        .evidence
+        .proof_derivations
+        .get(obligation_id)
+        .is_some_and(|derivation| {
+          derivation.revision == context.current_revision && derivation.state == ProofState::Proven
+        })
+    };
     for requirement in context
       .catalog
       .requirements
       .iter()
       .filter(|requirement| requirement.required)
     {
-      if context
-        .evidence
-        .requirement_verification_state(&requirement.id, policy)
-        != Ok(VerificationState::Verified)
-      {
+      let proven = context
+        .catalog
+        .acceptance_criteria
+        .iter()
+        .filter(|criterion| criterion.requirement_id == requirement.id && criterion.mandatory)
+        .flat_map(|criterion| {
+          context
+            .catalog
+            .verification_obligations
+            .iter()
+            .filter(move |obligation| {
+              obligation.criterion_id == criterion.id && obligation.required
+            })
+        })
+        .all(|obligation| obligation_proven(&obligation.id));
+      if !proven {
         blockers.insert(CompletionBlocker::RequirementUnverified(
           requirement.id.clone(),
         ));
@@ -126,11 +153,13 @@ impl CompletionPolicy {
       .iter()
       .filter(|criterion| criterion.mandatory)
     {
-      if context
-        .evidence
-        .criterion_verification_state(&criterion.id, policy)
-        != Ok(VerificationState::Verified)
-      {
+      let proven = context
+        .catalog
+        .verification_obligations
+        .iter()
+        .filter(|obligation| obligation.criterion_id == criterion.id && obligation.required)
+        .all(|obligation| obligation_proven(&obligation.id));
+      if !proven {
         blockers.insert(CompletionBlocker::CriterionUnverified(criterion.id.clone()));
       }
     }
@@ -140,20 +169,34 @@ impl CompletionPolicy {
       .iter()
       .filter(|obligation| obligation.required)
     {
-      for evidence in context.evidence.evidence.values().filter(|evidence| {
-        evidence.obligation_id == obligation.id
-          && evidence.revision == context.current_revision
-          && evidence.validity.is_valid()
-          && evidence.source == EvidenceSource::SemanticAssessment
-      }) {
-        match evidence.result {
-          EvidenceResult::Failed => {
-            blockers.insert(CompletionBlocker::SemanticGap(obligation.id.clone()));
+      match context.evidence.proof_derivations.get(&obligation.id) {
+        Some(derivation) if derivation.revision == context.current_revision => {
+          match derivation.state {
+            ProofState::Proven => {}
+            ProofState::Contradicted => {
+              blockers.insert(CompletionBlocker::ProofContradicted(obligation.id.clone()));
+            }
+            ProofState::Insufficient => {
+              blockers.insert(CompletionBlocker::ProofInsufficient(obligation.id.clone()));
+              if human_requirement(
+                &obligation.evidence_contract,
+                &obligation.id,
+                context.evidence,
+                context.current_revision,
+              ) == HumanRequirement::Required
+              {
+                blockers.insert(CompletionBlocker::HumanAttestationRequired(
+                  obligation.id.clone(),
+                ));
+              }
+            }
+            ProofState::Stale => {
+              blockers.insert(CompletionBlocker::ProofStale(obligation.id.clone()));
+            }
           }
-          EvidenceResult::Inconclusive => {
-            blockers.insert(CompletionBlocker::SemanticUncertain(obligation.id.clone()));
-          }
-          EvidenceResult::Passed => {}
+        }
+        _ => {
+          blockers.insert(CompletionBlocker::ProofInsufficient(obligation.id.clone()));
         }
       }
     }
@@ -179,16 +222,97 @@ impl CompletionPolicy {
   }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HumanRequirement {
+  Satisfied,
+  CanProceedWithoutHuman,
+  Required,
+  Impossible,
+}
+
+fn human_requirement(
+  contract: &EvidenceContract,
+  obligation_id: &ObligationId,
+  evidence: &EvidenceGraphState,
+  revision: &str,
+) -> HumanRequirement {
+  let state = derive_proof_state(
+    obligation_id,
+    contract,
+    evidence.artifacts.values(),
+    revision,
+  )
+  .state;
+  if state == ProofState::Proven {
+    return HumanRequirement::Satisfied;
+  }
+  if state == ProofState::Contradicted {
+    return HumanRequirement::Impossible;
+  }
+  match contract {
+    EvidenceContract::HumanAttestation { .. } => HumanRequirement::Required,
+    EvidenceContract::Artifact { .. } => HumanRequirement::CanProceedWithoutHuman,
+    EvidenceContract::All { requirements } => {
+      let (all_satisfied, impossible, required) = requirements.iter().fold(
+        (true, false, false),
+        |(all_satisfied, impossible, required), requirement| match human_requirement(
+          requirement,
+          obligation_id,
+          evidence,
+          revision,
+        ) {
+          HumanRequirement::Satisfied => (all_satisfied, impossible, required),
+          HumanRequirement::CanProceedWithoutHuman => (false, impossible, required),
+          HumanRequirement::Required => (false, impossible, true),
+          HumanRequirement::Impossible => (false, true, required),
+        },
+      );
+      if impossible {
+        HumanRequirement::Impossible
+      } else if required {
+        HumanRequirement::Required
+      } else if all_satisfied {
+        HumanRequirement::Satisfied
+      } else {
+        HumanRequirement::CanProceedWithoutHuman
+      }
+    }
+    EvidenceContract::Any { requirements } => {
+      let (satisfied, can_proceed, required) = requirements.iter().fold(
+        (false, false, false),
+        |(satisfied, can_proceed, required), requirement| match human_requirement(
+          requirement,
+          obligation_id,
+          evidence,
+          revision,
+        ) {
+          HumanRequirement::Satisfied => (true, can_proceed, required),
+          HumanRequirement::CanProceedWithoutHuman => (satisfied, true, required),
+          HumanRequirement::Required => (satisfied, can_proceed, true),
+          HumanRequirement::Impossible => (satisfied, can_proceed, required),
+        },
+      );
+      if satisfied {
+        HumanRequirement::Satisfied
+      } else if can_proceed {
+        HumanRequirement::CanProceedWithoutHuman
+      } else if required {
+        HumanRequirement::Required
+      } else {
+        HumanRequirement::Impossible
+      }
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use chrono::{TimeZone, Utc};
   use tenet_domain::{
-    evidence::{
-      AcceptanceCriterion, ObligationAssessment, ObligationAssessmentResult,
-      SemanticAssessmentReport, VerificationObligation,
-    },
+    evidence::{AcceptanceCriterion, VerificationObligation},
     ids::{CriterionId, ObligationId, RequirementId, VerificationRunId},
     model::Requirement,
+    proof::{AssessmentJudgment, EvidenceContract, EvidencePredicate},
     verification::{CommandResult, ProjectCheckResult, VerificationSpec},
     worker::{derive_normative_fragments, CatalogCoverage},
   };
@@ -220,6 +344,11 @@ mod tests {
         criterion_id: CriterionId::from("REQ-001/AC-01"),
         description: "Behavior is present".into(),
         required: true,
+        evidence_contract: EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "quality".into(),
+          },
+        },
       }],
     }
   }
@@ -254,26 +383,18 @@ mod tests {
     }
   }
 
-  fn semantic(outcome: ObligationAssessment) -> SemanticAssessmentReport {
-    SemanticAssessmentReport {
-      summary: "assessment".into(),
-      assessments: vec![ObligationAssessmentResult {
-        obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
-        assessment: outcome,
-      }],
-    }
-  }
-
-  fn decision(project_passed: bool, outcome: Option<ObligationAssessment>) -> CompletionDecision {
-    let catalog = catalog();
+  fn decision_with_contract(
+    project_passed: bool,
+    _outcome: Option<AssessmentJudgment>,
+    contract: EvidenceContract,
+  ) -> CompletionDecision {
+    let mut catalog = catalog();
+    catalog.verification_obligations[0].evidence_contract = contract;
     let project = project(project_passed);
     let mut graph = crate::evidence::graph_from_catalog(&catalog).expect("graph");
     graph.record_project_verification(&project);
-    if let Some(outcome) = outcome {
-      graph
-        .record_semantic_assessment("abc", project.finished_at, "assess", &semantic(outcome))
-        .expect("assessment");
-    }
+    graph.record_project_artifacts(&project).expect("artifacts");
+    graph.derive_proofs("abc");
     CompletionPolicy.evaluate(&CompletionContext {
       catalog: &catalog,
       evidence: &graph,
@@ -286,12 +407,21 @@ mod tests {
     })
   }
 
+  fn decision(project_passed: bool, outcome: Option<AssessmentJudgment>) -> CompletionDecision {
+    decision_with_contract(
+      project_passed,
+      outcome,
+      EvidenceContract::Artifact {
+        predicate: EvidencePredicate::NamedProjectCheck {
+          name: "quality".into(),
+        },
+      },
+    )
+  }
+
   #[test]
-  fn final_completion_requires_both_layers() {
-    assert!(matches!(
-      decision(true, None),
-      CompletionDecision::NotReady(_)
-    ));
+  fn mechanical_project_proof_needs_no_assessor() {
+    assert_eq!(decision(true, None), CompletionDecision::Done);
   }
 
   #[test]
@@ -299,9 +429,9 @@ mod tests {
     assert_eq!(
       decision(
         true,
-        Some(ObligationAssessment::Satisfied {
+        Some(AssessmentJudgment::Supported {
+          artifact_ids: Vec::new(),
           rationale: "Satisfied".into(),
-          evidence_refs: Vec::new(),
         })
       ),
       CompletionDecision::Done
@@ -313,9 +443,9 @@ mod tests {
     assert!(matches!(
       decision(
         false,
-        Some(ObligationAssessment::Satisfied {
+        Some(AssessmentJudgment::Supported {
+          artifact_ids: Vec::new(),
           rationale: "Satisfied".into(),
-          evidence_refs: Vec::new(),
         })
       ),
       CompletionDecision::NotReady(blockers)
@@ -324,35 +454,112 @@ mod tests {
   }
 
   #[test]
-  fn semantic_gap_blocks_completion_when_project_passes() {
-    assert!(matches!(
+  fn unconfirmed_model_suspicion_does_not_create_contradiction() {
+    assert_eq!(
       decision(
         true,
-        Some(ObligationAssessment::Gap {
-          description: "Missing behavior".into(),
+        Some(AssessmentJudgment::Contradicted {
+          artifact_ids: Vec::new(),
+          rationale: "Suspected behavior".into(),
+          proposals: Vec::new(),
         })
       ),
+      CompletionDecision::Done
+    );
+  }
+
+  #[test]
+  fn semantic_support_cannot_satisfy_trusted_verifier_contract() {
+    let decision = decision_with_contract(
+      true,
+      Some(AssessmentJudgment::Supported {
+        artifact_ids: Vec::new(),
+        rationale: "Model says supported".into(),
+      }),
+      EvidenceContract::Artifact {
+        predicate: EvidencePredicate::TrustedVerifierCheck {
+          name: "expiry-boundary".into(),
+        },
+      },
+    );
+    assert!(matches!(
+      decision,
       CompletionDecision::NotReady(blockers)
-        if blockers.contains(&CompletionBlocker::SemanticGap(
+        if blockers.contains(&CompletionBlocker::ProofInsufficient(
           ObligationId::from("REQ-001/AC-01/VO-01")
         ))
     ));
   }
 
   #[test]
-  fn semantic_uncertainty_blocks_completion() {
+  fn missing_human_attestation_blocks_completion() {
     assert!(matches!(
-      decision(
+      decision_with_contract(
         true,
-        Some(ObligationAssessment::Uncertain {
-          reason: "Specification ambiguous".into(),
-          specification_ambiguous: true,
-        })
+        None,
+        EvidenceContract::HumanAttestation {
+          statement: "Product approval".into()
+        }
       ),
+      CompletionDecision::NotReady(_)
+    ));
+  }
+  #[test]
+  fn confirmed_authoritative_counterexample_blocks_completion() {
+    let mut catalog = catalog();
+    catalog.verification_obligations[0].evidence_contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck {
+        name: "quality".into(),
+      },
+    };
+    let mut project = project(true);
+    project.checks[0].result.exit_code = Some(1);
+    let mut graph = crate::evidence::graph_from_catalog(&catalog).expect("graph");
+    graph.record_project_verification(&project);
+    graph.record_project_artifacts(&project).expect("artifacts");
+    graph.derive_proofs("abc");
+    let decision = CompletionPolicy.evaluate(&CompletionContext {
+      catalog: &catalog,
+      evidence: &graph,
+      project_verification: &project,
+
+      current_suite_hash: "suite",
+      current_revision: "abc",
+      repository_clean: true,
+      has_active_leases: false,
+      has_pending_integrations: false,
+    });
+    assert!(matches!(
+      decision,
       CompletionDecision::NotReady(blockers)
-        if blockers.contains(&CompletionBlocker::SemanticUncertain(
+        if blockers.contains(&CompletionBlocker::ProofContradicted(
           ObligationId::from("REQ-001/AC-01/VO-01")
         ))
     ));
+  }
+  #[test]
+  fn unresolved_machine_alternative_does_not_require_human_attestation() {
+    let decision = decision_with_contract(
+      true,
+      None,
+      EvidenceContract::Any {
+        requirements: vec![
+          EvidenceContract::HumanAttestation {
+            statement: "Manual review".into(),
+          },
+          EvidenceContract::Artifact {
+            predicate: EvidencePredicate::TrustedVerifierCheck {
+              name: "machine".into(),
+            },
+          },
+        ],
+      },
+    );
+    let CompletionDecision::NotReady(blockers) = decision else {
+      panic!("missing machine evidence must block");
+    };
+    assert!(!blockers
+      .iter()
+      .any(|blocker| matches!(blocker, CompletionBlocker::HumanAttestationRequired(_))));
   }
 }

@@ -12,6 +12,7 @@ use tenet_domain::{
   evidence::{AcceptanceCriterion, VerificationObligation},
   ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId, SpecFragmentId},
   model::{ArchitectOutput, Requirement, RequirementCatalog},
+  proof::{EvidenceContract, EvidencePredicate},
   worker::{derive_normative_fragments, CatalogCoverage, SpecFragment},
 };
 
@@ -30,6 +31,14 @@ pub async fn inspect(cwd: &Path, config: &Config) -> Result<Inspection> {
   if let Some(catalog) = &cached {
     validate(catalog).context("cached requirement catalog is structurally invalid")?;
     if catalog.spec_hash == specification_hash {
+      if validate_evidence_contracts(catalog, config).is_err() {
+        return Ok(Inspection {
+          specification,
+          specification_hash,
+          authoritative: None,
+          had_cached_catalog: true,
+        });
+      }
       validate_coverage(catalog, &specification)
         .context("cached requirement catalog coverage is invalid")?;
       return Ok(Inspection {
@@ -372,6 +381,7 @@ fn merge_batches(
         criterion_id,
         description: obligation.description,
         required: true,
+        evidence_contract: obligation.evidence_contract,
       });
     }
   }
@@ -482,6 +492,136 @@ pub fn validate(catalog: &RequirementCatalog) -> Result<()> {
   Ok(())
 }
 
+pub fn validate_evidence_contracts(catalog: &RequirementCatalog, config: &Config) -> Result<()> {
+  let checks: BTreeSet<_> = config
+    .verification
+    .checks
+    .iter()
+    .map(|check| check.name.as_str())
+    .collect();
+  for check in &config.verification.trusted_checks {
+    check.validate().with_context(|| {
+      format!(
+        "invalid controller-configured trusted verifier {:?}",
+        check.name
+      )
+    })?;
+  }
+  let trusted: BTreeSet<_> = config
+    .verification
+    .trusted_checks
+    .iter()
+    .map(|check| check.name.as_str())
+    .collect();
+  if trusted.len() != config.verification.trusted_checks.len() {
+    bail!("trusted verifier names must be unique");
+  }
+  let falsifiers: BTreeSet<_> = config
+    .verification
+    .falsifiers
+    .iter()
+    .map(|spec| spec.name())
+    .collect();
+  if falsifiers.len() != config.verification.falsifiers.len() {
+    bail!("falsifier names must be unique");
+  }
+  let attestors: BTreeSet<_> = config
+    .verification
+    .human_attestors
+    .iter()
+    .map(|attestor| attestor.id.as_str())
+    .collect();
+  for obligation in &catalog.verification_obligations {
+    validate_contract_with_falsifiers(
+      &obligation.evidence_contract,
+      &checks,
+      &trusted,
+      &falsifiers,
+      &attestors,
+    )
+    .with_context(|| format!("invalid evidence contract for {}", obligation.id))?;
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+fn validate_contract(
+  contract: &EvidenceContract,
+  checks: &BTreeSet<&str>,
+  trusted: &BTreeSet<&str>,
+) -> Result<()> {
+  validate_contract_with_falsifiers(
+    contract,
+    checks,
+    trusted,
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+  )
+}
+
+fn validate_contract_with_falsifiers(
+  contract: &EvidenceContract,
+  checks: &BTreeSet<&str>,
+  trusted: &BTreeSet<&str>,
+  falsifiers: &BTreeSet<&str>,
+  attestors: &BTreeSet<&str>,
+) -> Result<()> {
+  match contract {
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck { name },
+    } => {
+      if !checks.contains(name.as_str()) {
+        bail!("named project check {name:?} is not controller-configured");
+      }
+    }
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::ProjectVerification,
+    } => {
+      bail!(
+        "generic project verification is a global completion gate, not an obligation evidence contract"
+      );
+    }
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::TrustedVerifierCheck { name },
+    } => {
+      if !trusted.contains(name.as_str()) {
+        bail!("trusted verifier check {name:?} is not controller-configured");
+      }
+    }
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::FalsifierCheck { name },
+    } => {
+      if !falsifiers.contains(name.as_str()) {
+        bail!("falsifier check {name:?} is not controller-configured");
+      }
+    }
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::SourceInspection,
+    } => {
+      bail!(
+        "source inspection is supporting evidence and cannot satisfy an authoritative evidence contract"
+      );
+    }
+    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => {
+      if requirements.is_empty() {
+        bail!("composite evidence contract must not be empty");
+      }
+      for requirement in requirements {
+        validate_contract_with_falsifiers(requirement, checks, trusted, falsifiers, attestors)?;
+      }
+    }
+    EvidenceContract::HumanAttestation { statement } => {
+      if statement.trim().is_empty() {
+        bail!("human attestation statement must not be blank");
+      }
+      if attestors.is_empty() {
+        bail!("human attestation requires a configured controller issuer");
+      }
+    }
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests {
   use tenet_domain::{
@@ -526,6 +666,7 @@ mod tests {
         criterion_id: criterion.id.clone(),
         description: "Establish the assigned behavior".into(),
         required: true,
+        evidence_contract: Default::default(),
       })
       .collect();
     ArchitectOutput {
@@ -651,6 +792,165 @@ mod tests {
     assert!(catalog.coverage.is_complete());
     assert_eq!(catalog.coverage.normative_fragments.len(), 200);
     validate_derived_coverage(&catalog).expect("validate global coverage");
+  }
+
+  #[test]
+  fn configured_named_project_check_is_admitted() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck {
+        name: "quality".into(),
+      },
+    };
+
+    validate_contract(&contract, &BTreeSet::from(["quality"]), &BTreeSet::new())
+      .expect("configured named check has an authoritative controller issuer");
+  }
+
+  #[test]
+  fn composites_of_configured_named_checks_are_admitted_recursively() {
+    let named_check = || EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck {
+        name: "quality".into(),
+      },
+    };
+    let contract = EvidenceContract::All {
+      requirements: vec![
+        named_check(),
+        EvidenceContract::Any {
+          requirements: vec![named_check()],
+        },
+      ],
+    };
+
+    validate_contract(&contract, &BTreeSet::from(["quality"]), &BTreeSet::new())
+      .expect("every composite branch has an authoritative controller issuer");
+  }
+
+  #[test]
+  fn unknown_named_project_check_is_rejected() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::NamedProjectCheck {
+        name: "unknown".into(),
+      },
+    };
+
+    let error = validate_contract(&contract, &BTreeSet::from(["quality"]), &BTreeSet::new())
+      .expect_err("unknown named check has no controller issuer");
+    assert!(error
+      .to_string()
+      .contains("named project check \"unknown\" is not controller-configured"));
+  }
+
+  #[test]
+  fn generic_project_verification_cannot_prove_an_obligation() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::ProjectVerification,
+    };
+    let error = validate_contract(&contract, &BTreeSet::new(), &BTreeSet::new())
+      .expect_err("project verification remains an independent completion gate");
+    assert!(error
+      .to_string()
+      .contains("global completion gate, not an obligation evidence contract"));
+  }
+
+  #[test]
+  fn source_inspection_cannot_be_an_authoritative_contract() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::SourceInspection,
+    };
+
+    let error = validate_contract(&contract, &BTreeSet::new(), &BTreeSet::new())
+      .expect_err("supporting source inspection cannot close a proof obligation");
+    assert!(error.to_string().contains(
+      "source inspection is supporting evidence and cannot satisfy an authoritative evidence contract"
+    ));
+  }
+
+  #[test]
+  fn unknown_trusted_verifier_contract_is_rejected() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::TrustedVerifierCheck {
+        name: "unknown".into(),
+      },
+    };
+    let error = validate_contract(&contract, &BTreeSet::new(), &BTreeSet::new())
+      .expect_err("unknown trusted verifier has no controller issuer");
+
+    assert!(error
+      .to_string()
+      .contains("trusted verifier check \"unknown\" is not controller-configured"));
+  }
+
+  #[test]
+  fn configured_trusted_verifier_contract_is_admitted() {
+    let contract = EvidenceContract::Artifact {
+      predicate: EvidencePredicate::TrustedVerifierCheck {
+        name: "expiry-boundary".into(),
+      },
+    };
+
+    validate_contract(
+      &contract,
+      &BTreeSet::new(),
+      &BTreeSet::from(["expiry-boundary"]),
+    )
+    .expect("configured trusted verifier has a controller issuer");
+  }
+
+  #[test]
+  fn human_attestation_requires_a_controller_issuer() {
+    let contract = EvidenceContract::HumanAttestation {
+      statement: "Release approved".into(),
+    };
+    let error = validate_contract(&contract, &BTreeSet::new(), &BTreeSet::new())
+      .expect_err("human attestation has no configured issuer");
+    assert!(error
+      .to_string()
+      .contains("human attestation requires a configured controller issuer"));
+  }
+
+  #[test]
+  fn all_rejects_an_unsupported_source_inspection_branch() {
+    let contract = EvidenceContract::All {
+      requirements: vec![
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "quality".into(),
+          },
+        },
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::SourceInspection,
+        },
+      ],
+    };
+
+    let error = validate_contract(&contract, &BTreeSet::from(["quality"]), &BTreeSet::new())
+      .expect_err("every all branch must have an authoritative issuer");
+    assert!(error
+      .to_string()
+      .contains("source inspection is supporting evidence"));
+  }
+
+  #[test]
+  fn any_rejects_an_unsupported_branch_even_when_another_branch_is_valid() {
+    let contract = EvidenceContract::Any {
+      requirements: vec![
+        EvidenceContract::Artifact {
+          predicate: EvidencePredicate::NamedProjectCheck {
+            name: "quality".into(),
+          },
+        },
+        EvidenceContract::HumanAttestation {
+          statement: "Release approved".into(),
+        },
+      ],
+    };
+
+    let error = validate_contract(&contract, &BTreeSet::from(["quality"]), &BTreeSet::new())
+      .expect_err("every any branch must have an authoritative issuer");
+    assert!(error
+      .to_string()
+      .contains("human attestation requires a configured controller issuer"));
   }
 
   #[test]

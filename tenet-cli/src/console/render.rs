@@ -548,25 +548,25 @@ impl<W: Write> ConsoleRenderer<W> {
     let satisfied = report
       .assessments
       .iter()
-      .filter(|item| matches!(item.assessment, ObligationAssessment::Satisfied { .. }))
+      .filter(|item| matches!(item.assessment, AssessmentJudgment::Supported { .. }))
       .count();
     for item in &report.assessments {
       match &item.assessment {
-        ObligationAssessment::Gap { description } => self.entry(
+        AssessmentJudgment::Contradicted { rationale, .. } => self.entry(
           at,
           Tone::Failure,
-          "GAP",
+          "SUSPECTED",
           item.obligation_id.as_ref(),
-          &wrap_text(description, 68),
+          &wrap_text(rationale, 68),
         )?,
-        ObligationAssessment::Uncertain { reason, .. } => self.entry(
+        AssessmentJudgment::Insufficient { reason, .. } => self.entry(
           at,
           Tone::Warning,
-          "UNCERTAIN",
+          "INSUFFICIENT",
           item.obligation_id.as_ref(),
           &wrap_text(reason, 68),
         )?,
-        ObligationAssessment::Satisfied { .. } => {}
+        AssessmentJudgment::Supported { .. } => {}
       }
     }
     self.entry(

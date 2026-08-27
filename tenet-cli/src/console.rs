@@ -8,13 +8,12 @@ use anyhow::Result;
 use colored::Colorize;
 use tenet_domain::{
   events::{CompletionGate, CompletionGateOutcome, RunEvent},
-  evidence::{
-    Evidence, EvidenceResult, EvidenceSource, ObligationAssessment, SemanticAssessmentReport,
-  },
+  evidence::{Evidence, EvidenceResult, EvidenceSource, SemanticAssessmentReport},
   model::{
     Phase, RepositoryChange, RunStatus, State, WorkExecution, WorkLease, WorkUnit, WorkerEvent,
     WorkerRole,
   },
+  proof::AssessmentJudgment,
   verification::{ProjectVerificationRun, VerificationReport},
 };
 
@@ -481,7 +480,7 @@ impl ConsolePresenter {
           report
             .assessments
             .iter()
-            .filter(|item| !matches!(item.assessment, ObligationAssessment::Satisfied { .. }))
+            .filter(|item| !matches!(item.assessment, AssessmentJudgment::Supported { .. }))
             .map(|item| item.obligation_id.to_string()),
         );
         vec![ConsoleEvent::SemanticAssessment {
@@ -525,6 +524,63 @@ impl ConsolePresenter {
         at: now(),
         evidence_id: evidence_id.to_string(),
         revision: revision.clone(),
+      }],
+      RunEvent::ArtifactReused {
+        artifact_id,
+        from_revision,
+        to_revision,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "EVIDENCE".into(),
+        summary: format!("artifact {artifact_id} reused"),
+        detail: format!("unchanged declared dependencies · {from_revision} -> {to_revision}"),
+      }],
+      RunEvent::ArtifactBecameStale {
+        artifact_id,
+        revision,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "EVIDENCE".into(),
+        summary: format!("artifact {artifact_id} became stale"),
+        detail: format!("declared dependencies changed at {revision}"),
+      }],
+      RunEvent::EvidenceAcquisition {
+        stage,
+        revision,
+        issuer,
+        obligation_ids,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "ACQUIRE".into(),
+        summary: format!("{stage:?} {issuer:?}"),
+        detail: format!(
+          "revision {revision} · {} obligation(s)",
+          obligation_ids.len()
+        ),
+      }],
+      RunEvent::ArtifactIssued {
+        artifact_id,
+        revision,
+        obligation_ids,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "EVIDENCE".into(),
+        summary: format!("artifact {artifact_id} issued"),
+        detail: format!(
+          "revision {revision} · {} obligation(s)",
+          obligation_ids.len()
+        ),
+      }],
+      RunEvent::ObligationProofChanged {
+        obligation_id,
+        revision,
+        previous,
+        current,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "PROOF".into(),
+        summary: format!("{obligation_id}: {previous:?} -> {current:?}"),
+        detail: format!("revision {revision}"),
       }],
       RunEvent::EvidenceContradiction {
         obligation_id,

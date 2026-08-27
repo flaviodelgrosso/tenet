@@ -15,16 +15,22 @@ use uuid::Uuid;
 use tenet_domain::{
   config::{config_path, ensure_config, read_config, TENET_DIR},
   events::{
-    CompletionGate, CompletionGateItem, CompletionGateOutcome, EventSink, RunEvent, RunLogger,
+    CompletionGate, CompletionGateItem, CompletionGateOutcome, EventSink, EvidenceAcquisitionStage,
+    EvidenceIssuer, RunEvent, RunLogger,
   },
   evidence::{
-    EvidenceGraphState, EvidencePolicy, ImplementationState, ObligationAssessment,
-    SemanticAssessmentProposal, SemanticAssessmentReport, VerificationState,
+    EvidenceGraphState, EvidencePolicy, ImplementationState, SemanticAssessmentProposal,
+    SemanticAssessmentReport,
   },
+  falsifier::FalsificationExecutionRecord,
   model::{
     AgentReconciliationProposal, CompletedWorkUnit, Discovery, DiscoveryStatus, IntegrationPhase,
     Phase, ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus,
     State, VerificationLayers, VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
+  },
+  proof::{
+    AssessmentJudgment, EvidenceAcquisitionIdentity, EvidenceAcquisitionKind,
+    EvidenceAcquisitionRequest, GapKind, ProofState,
   },
   verification::ProjectVerificationRun,
 };
@@ -36,6 +42,10 @@ use tenet_runtime::{
   integration::{IntegrationOutcome, Integrator},
   scheduler::{CandidateExecutor, ExecutionUpdate, Scheduler},
   store::{self, RunLock},
+  trusted_verifier::{
+    run_isolated_trusted_verifier, MicrosandboxTrustedVerifier, TrustedVerifierRequest,
+    TrustedVerifierRunner,
+  },
   verifier,
   workspace::WorkspaceManager,
 };
@@ -49,6 +59,7 @@ use crate::{
 };
 
 pub struct Controller {
+  trusted_verifier: Arc<dyn TrustedVerifierRunner>,
   cwd: PathBuf,
   backend: Arc<dyn AgentBackend>,
   events: EventSink,
@@ -56,6 +67,13 @@ pub struct Controller {
 
 struct ScheduledAgent {
   backend: Arc<dyn AgentBackend>,
+}
+struct AcquisitionPass<'a> {
+  context: &'a BackendContext,
+  catalog: &'a RequirementCatalog,
+  project_report: &'a ProjectVerificationRun,
+  suite_hash: &'a str,
+  revision: &'a str,
 }
 
 #[async_trait]
@@ -84,13 +102,27 @@ impl CandidateExecutor for ScheduledAgent {
     }
   }
 }
-
 impl Controller {
   pub fn new(cwd: PathBuf, backend: Arc<dyn AgentBackend>, events: EventSink) -> Self {
+    Self::with_trusted_verifier(
+      cwd,
+      backend,
+      events,
+      Arc::new(MicrosandboxTrustedVerifier::default()),
+    )
+  }
+
+  pub fn with_trusted_verifier(
+    cwd: PathBuf,
+    backend: Arc<dyn AgentBackend>,
+    events: EventSink,
+    trusted_verifier: Arc<dyn TrustedVerifierRunner>,
+  ) -> Self {
     Self {
       cwd,
       backend,
       events,
+      trusted_verifier,
     }
   }
 
@@ -246,10 +278,6 @@ impl Controller {
   }
 
   async fn run_inner(&self, context: &BackendContext, state: &mut State) -> Result<State> {
-    let mut catalog = self.ensure_catalog(context, state).await?;
-    if !store::catalog_is_approved(&self.cwd, &catalog).await? {
-      return self.review_required(context, state, &catalog).await;
-    }
     if context.config.verification.checks.is_empty() {
       return self
         .block(
@@ -258,6 +286,10 @@ impl Controller {
           "No trusted project verification checks are configured.\n\nConfigure at least one:\n\n[[verification.checks]]\nname = \"project verification\"\ncommand = [\"./verify\"]",
         )
         .await;
+    }
+    let mut catalog = self.ensure_catalog(context, state).await?;
+    if !store::catalog_is_approved(&self.cwd, &catalog).await? {
+      return self.review_required(context, state, &catalog).await;
     }
     let mut evidence_graph = evidence_graph::load(&self.cwd, &catalog).await?;
     store::write_evidence_graph(&self.cwd, &evidence_graph).await?;
@@ -805,6 +837,55 @@ impl Controller {
           .await?,
       ));
     }
+    let mut attempted_acquisitions = BTreeSet::new();
+    if let Some(decision) = self
+      .acquire_missing_authoritative_evidence(
+        AcquisitionPass {
+          context,
+          catalog,
+          project_report: &project_report,
+          suite_hash: &suite_hash,
+          revision: &verified_revision,
+        },
+        state,
+        evidence_graph,
+        &mut attempted_acquisitions,
+        Vec::new(),
+      )
+      .await?
+    {
+      return match decision::apply_completion_decision(state, &decision) {
+        decision::NextAction::Finish => Ok(Some(state.clone())),
+        decision::NextAction::Block(reason) => Ok(Some(self.block(context, state, &reason).await?)),
+        _ => bail!("authoritative acquisition produced an invalid controller action"),
+      };
+    }
+    let mechanical_decision = self
+      .evaluate_and_publish_completion_gate(
+        context,
+        state,
+        catalog,
+        evidence_graph,
+        &project_report,
+        &suite_hash,
+      )
+      .await?;
+    if mechanical_decision == CompletionDecision::Done {
+      return match decision::apply_completion_decision(state, &mechanical_decision) {
+        decision::NextAction::Finish => Ok(Some(state.clone())),
+        _ => bail!("mechanical completion policy returned an invalid action"),
+      };
+    }
+    if matches!(
+      &mechanical_decision,
+      CompletionDecision::NotReady(blockers)
+        if blockers.iter().any(|blocker| matches!(blocker, CompletionBlocker::ProofContradicted(_)))
+    ) {
+      return match decision::apply_completion_decision(state, &mechanical_decision) {
+        decision::NextAction::Block(reason) => Ok(Some(self.block(context, state, &reason).await?)),
+        _ => bail!("trusted contradiction produced an invalid controller action"),
+      };
+    }
 
     state.phase = Phase::Assessing;
     state.last_summary = "Running independent semantic verification".into();
@@ -819,6 +900,7 @@ impl Controller {
       .validated_semantic_assessment(
         context,
         catalog,
+        evidence_graph,
         &verified_revision,
         move |inspection_context, feedback| {
           let backend = backend.clone();
@@ -858,60 +940,59 @@ impl Controller {
       &semantic_report,
     )
     .await?;
+    let admitted_proposals = evidence_graph::admit_assessment_proposals(
+      evidence_graph,
+      &verified_revision,
+      &semantic_report,
+      &context.config.verification.trusted_checks,
+      &context.config.verification.falsifiers,
+      &attempted_acquisitions,
+    )?;
+    if let Some(decision) = self
+      .acquire_missing_authoritative_evidence(
+        AcquisitionPass {
+          context,
+          catalog,
+          project_report: &project_report,
+          suite_hash: &suite_hash,
+          revision: &verified_revision,
+        },
+        state,
+        evidence_graph,
+        &mut attempted_acquisitions,
+        admitted_proposals.clone(),
+      )
+      .await?
+    {
+      return match decision::apply_completion_decision(state, &decision) {
+        decision::NextAction::Finish => Ok(Some(state.clone())),
+        decision::NextAction::Block(reason) => Ok(Some(self.block(context, state, &reason).await?)),
+        _ => bail!("admitted acquisition produced an invalid controller action"),
+      };
+    }
+    evidence_graph::acquire_assessment_proposals(
+      &self.cwd,
+      evidence_graph,
+      &context.events,
+      &admitted_proposals,
+    )
+    .await?;
     let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
     state.requirement_counts = requirement_counts(catalog, evidence_graph, policy)?;
     apply_semantic_layers(&mut state.verification_layers, evidence_graph, policy);
     state.last_summary.clone_from(&semantic_report.summary);
 
-    let gaps: Vec<_> = semantic_report
-      .assessments
-      .iter()
-      .filter_map(|assessment| match &assessment.assessment {
-        ObligationAssessment::Gap { description } => Some(WorkerDiscovery {
-          discovery: Discovery::VerificationBlocker {
-            description: format!("{}: {description}", assessment.obligation_id),
-          },
-          role: tenet_domain::model::WorkerRole::Assess,
-        }),
-        ObligationAssessment::Satisfied { .. } | ObligationAssessment::Uncertain { .. } => None,
-      })
-      .collect();
-    if !gaps.is_empty() {
+    let implementation_gaps = implementation_gap_discoveries(&semantic_report);
+    if !implementation_gaps.is_empty() {
       decision::record_discoveries(
         state,
         &catalog.spec_hash,
         &verified_revision,
-        "semantic-assessment",
-        &gaps,
+        "semantic-adjudication",
+        &implementation_gaps,
       )?;
       self.publish(&context.events, state).await?;
       return Ok(None);
-    }
-    if semantic_report.assessments.iter().any(|assessment| {
-      matches!(
-        assessment.assessment,
-        ObligationAssessment::Uncertain { .. }
-      )
-    }) {
-      self
-        .evaluate_and_publish_completion_gate(
-          context,
-          state,
-          catalog,
-          evidence_graph,
-          &project_report,
-          &suite_hash,
-        )
-        .await?;
-      return Ok(Some(
-        self
-          .block(
-            context,
-            state,
-            "Independent semantic verification is uncertain; specification clarification or stronger evidence is required",
-          )
-          .await?,
-      ));
     }
 
     let decision = self
@@ -928,6 +1009,314 @@ impl Controller {
       decision::NextAction::Finish => Ok(Some(state.clone())),
       decision::NextAction::Block(reason) => Ok(Some(self.block(context, state, &reason).await?)),
       _ => bail!("completion policy returned an action invalid for this driver step"),
+    }
+  }
+
+  async fn acquire_missing_authoritative_evidence(
+    &self,
+    pass: AcquisitionPass<'_>,
+    state: &mut State,
+    evidence_graph: &mut EvidenceGraphState,
+    attempted: &mut BTreeSet<EvidenceAcquisitionIdentity>,
+    mut admitted: Vec<tenet_domain::proof::EvidenceAcquisitionRequest>,
+  ) -> Result<Option<CompletionDecision>> {
+    let AcquisitionPass {
+      context,
+      catalog,
+      project_report,
+      suite_hash,
+      revision,
+    } = pass;
+    let run_id = context
+      .runtime_dir
+      .file_name()
+      .and_then(|value| value.to_str())
+      .context("trusted verification run id is unavailable")?;
+    let workspaces = WorkspaceManager::new(self.cwd.clone(), run_id);
+    loop {
+      evidence_graph.derive_proofs(revision);
+      let request = if admitted.is_empty() {
+        let requests = evidence_graph::plan_missing_evidence(
+          evidence_graph,
+          revision,
+          &context.config.verification.trusted_checks,
+          &context.config.verification.falsifiers,
+          attempted,
+        )?;
+        let Some(request) = requests.into_iter().next() else {
+          return Ok(None);
+        };
+        request
+      } else {
+        admitted.remove(0)
+      };
+      let identity = request.identity();
+      if !attempted.insert(identity) {
+        continue;
+      }
+      let proof_before: BTreeMap<_, _> = request
+        .obligation_ids
+        .iter()
+        .map(|obligation_id| {
+          let state = evidence_graph
+            .proof_derivations
+            .get(obligation_id)
+            .map(|derivation| derivation.state)
+            .unwrap_or(ProofState::Insufficient);
+          (obligation_id.clone(), state)
+        })
+        .collect();
+      emit_acquisition_event(
+        &context.events,
+        EvidenceAcquisitionStage::GapDetected,
+        &request,
+      )
+      .await?;
+      emit_acquisition_event(&context.events, EvidenceAcquisitionStage::Planned, &request).await?;
+      state.last_summary = "Acquiring controller-authorized evidence".into();
+      self.publish(&context.events, state).await?;
+      match &request.kind {
+        EvidenceAcquisitionKind::TrustedVerifierCheck { name, spec_hash } => {
+          let Some(spec) = context
+            .config
+            .verification
+            .trusted_checks
+            .iter()
+            .find(|spec| spec.name == *name)
+          else {
+            emit_acquisition_event(
+              &context.events,
+              EvidenceAcquisitionStage::Rejected,
+              &request,
+            )
+            .await?;
+            continue;
+          };
+          if spec.fingerprint()?.as_str() != spec_hash {
+            emit_acquisition_event(
+              &context.events,
+              EvidenceAcquisitionStage::Rejected,
+              &request,
+            )
+            .await?;
+            continue;
+          }
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::Admitted,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::IssuerSelected,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(&context.events, EvidenceAcquisitionStage::Started, &request)
+            .await?;
+          let obligation_ids: Vec<_> = request.obligation_ids.iter().cloned().collect();
+          let execution = run_isolated_trusted_verifier(TrustedVerifierRequest {
+            repository: &self.cwd,
+            workspaces: &workspaces,
+            revision,
+            spec,
+            obligation_ids: &obligation_ids,
+            max_output_bytes: context.config.verification.max_output_bytes,
+            runner: self.trusted_verifier.as_ref(),
+            cancel: &context.cancel,
+          })
+          .await;
+          let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) if context.cancel.is_cancelled() => return Err(anyhow::Error::new(error)),
+            Err(error) => {
+              emit_acquisition_event(&context.events, EvidenceAcquisitionStage::Failed, &request)
+                .await?;
+              context
+                .events
+                .emit(RunEvent::Message(format!(
+                  "Authoritative acquisition {name:?} failed without semantic evidence: {error}"
+                )))
+                .await?;
+              continue;
+            }
+          };
+          let record = execution.into_record();
+          let artifact_id =
+            evidence_graph::record_trusted_execution(&self.cwd, evidence_graph, &record, spec)
+              .await?
+              .context("admitted trusted verifier did not issue an artifact")?;
+          context
+            .events
+            .emit(RunEvent::ArtifactIssued {
+              artifact_id,
+              revision: revision.to_owned(),
+              obligation_ids: request.obligation_ids.iter().cloned().collect(),
+            })
+            .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::Completed,
+            &request,
+          )
+          .await?;
+        }
+        EvidenceAcquisitionKind::FalsifierCheck {
+          name,
+          spec_hash,
+          canonical_input,
+        } => {
+          let Some(spec) = context
+            .config
+            .verification
+            .falsifiers
+            .iter()
+            .find(|spec| spec.name() == name)
+          else {
+            emit_acquisition_event(
+              &context.events,
+              EvidenceAcquisitionStage::Rejected,
+              &request,
+            )
+            .await?;
+            continue;
+          };
+          if spec.fingerprint()?.as_str() != spec_hash {
+            emit_acquisition_event(
+              &context.events,
+              EvidenceAcquisitionStage::Rejected,
+              &request,
+            )
+            .await?;
+            continue;
+          }
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::Admitted,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::IssuerSelected,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(&context.events, EvidenceAcquisitionStage::Started, &request)
+            .await?;
+          let input = canonical_input
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+          let execution_spec = spec
+            .execution_spec(input.as_ref())
+            .map_err(anyhow::Error::new)?;
+          let obligation_ids: Vec<_> = request.obligation_ids.iter().cloned().collect();
+          let execution = run_isolated_trusted_verifier(TrustedVerifierRequest {
+            repository: &self.cwd,
+            workspaces: &workspaces,
+            revision,
+            spec: &execution_spec,
+            obligation_ids: &obligation_ids,
+            max_output_bytes: context.config.verification.max_output_bytes,
+            runner: self.trusted_verifier.as_ref(),
+            cancel: &context.cancel,
+          })
+          .await;
+          let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) if context.cancel.is_cancelled() => return Err(anyhow::Error::new(error)),
+            Err(error) => {
+              emit_acquisition_event(&context.events, EvidenceAcquisitionStage::Failed, &request)
+                .await?;
+              context
+                .events
+                .emit(RunEvent::Message(format!(
+                  "Falsifier acquisition {name:?} failed without semantic evidence: {error}"
+                )))
+                .await?;
+              continue;
+            }
+          };
+          let record = FalsificationExecutionRecord::from_trusted_execution(
+            execution.into_record(),
+            spec,
+            input,
+          )
+          .map_err(anyhow::Error::new)?;
+          let artifact_id =
+            evidence_graph::record_falsification(&self.cwd, evidence_graph, &record, spec)
+              .await?
+              .context("admitted falsifier did not issue an artifact")?;
+          context
+            .events
+            .emit(RunEvent::ArtifactIssued {
+              artifact_id,
+              revision: revision.to_owned(),
+              obligation_ids: request.obligation_ids.iter().cloned().collect(),
+            })
+            .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::Completed,
+            &request,
+          )
+          .await?;
+        }
+        EvidenceAcquisitionKind::HumanAttestation { .. } => {
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::Admitted,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::IssuerSelected,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::HumanActionRequired,
+            &request,
+          )
+          .await?;
+        }
+        EvidenceAcquisitionKind::InspectSource { .. } => continue,
+      }
+      emit_proof_transitions(
+        &context.events,
+        revision,
+        &request,
+        &proof_before,
+        evidence_graph,
+      )
+      .await?;
+      let decision = self
+        .evaluate_and_publish_completion_gate(
+          context,
+          state,
+          catalog,
+          evidence_graph,
+          project_report,
+          suite_hash,
+        )
+        .await?;
+      if decision == CompletionDecision::Done
+        || matches!(
+          &decision,
+          CompletionDecision::NotReady(blockers)
+            if blockers.iter().any(|blocker| matches!(
+              blocker,
+              CompletionBlocker::ProofContradicted(_)
+                | CompletionBlocker::HumanAttestationRequired(_)
+            ))
+        )
+      {
+        return Ok(Some(decision));
+      }
     }
   }
 
@@ -1002,19 +1391,40 @@ impl Controller {
     );
     self.publish(&context.events, state).await?;
     let mut catalog_batches = Vec::with_capacity(architect_batches.len());
+    let configured_check_names = context
+      .config
+      .verification
+      .checks
+      .iter()
+      .map(|check| check.name.as_str())
+      .collect::<Vec<_>>()
+      .join(", ");
+    let configured_trusted_verifier_names = context
+      .config
+      .verification
+      .trusted_checks
+      .iter()
+      .map(|check| check.name.as_str())
+      .collect::<Vec<_>>()
+      .join(", ");
     for batch in architect_batches {
       let completion_budget =
         CompletionBudget::from_retries(context.config.agent.completion_retries);
       let mut feedback = None;
       let mut attempt = 0;
       let candidate = loop {
+        let base_architect_spec = format!(
+          "{}\nController-configured project check names available to `named_project_check` contracts: [{}].\nController-configured trusted verifier names available to `trusted_verifier_check` contracts: [{}].",
+          batch.annotated_specification,
+          configured_check_names,
+          configured_trusted_verifier_names
+        );
         let architect_spec = match &feedback {
-          Some(feedback) => format!(
-            "{}\nDeterministic catalog validation rejected the previous result for this batch:\n{feedback}\nRegenerate this batch catalog and cover every assigned sourceRef token in at least one requirement sourceRefs entry.",
-            batch.annotated_specification
-          ),
-          None => batch.annotated_specification.clone(),
-        };
+        Some(feedback) => format!(
+          "{base_architect_spec}\nDeterministic catalog validation rejected the previous result for this batch:\n{feedback}\nRegenerate this batch catalog and cover every assigned sourceRef token in at least one requirement sourceRefs entry."
+        ),
+        None => base_architect_spec,
+      };
         let backend = self.backend.clone();
         let output = self
           .read_only_worker(
@@ -1033,6 +1443,7 @@ impl Controller {
           .build_batch(&batch, spec_hash.clone(), output)
           .and_then(|candidate| {
             catalog::validate(&candidate)?;
+            catalog::validate_evidence_contracts(&candidate, &context.config)?;
             catalog::validate_batch_coverage(&candidate, &batch.fragment_ids)?;
             Ok(candidate)
           });
@@ -1049,6 +1460,7 @@ impl Controller {
     }
     let catalog = catalog_authority.merge_batches(spec_hash, catalog_batches)?;
     catalog::validate(&catalog)?;
+    catalog::validate_evidence_contracts(&catalog, &context.config)?;
     catalog::validate_derived_coverage(&catalog)?;
     store::write_catalog(&self.cwd, &catalog).await?;
     context
@@ -1130,6 +1542,7 @@ impl Controller {
     &self,
     context: &BackendContext,
     catalog: &RequirementCatalog,
+    evidence_graph: &EvidenceGraphState,
     expected_revision: &str,
     generate: F,
   ) -> Result<SemanticAssessmentReport>
@@ -1153,7 +1566,7 @@ impl Controller {
         .await?;
       let result =
         decision::materialize_semantic_assessment(catalog, proposal).and_then(|result| {
-          verification::validate_semantic_assessment(catalog, &result)?;
+          verification::validate_semantic_assessment(evidence_graph, &result)?;
           Ok(result)
         });
       match result {
@@ -1340,6 +1753,51 @@ async fn prune_deferred_candidates(
   state.deferred_candidates = classification.retained;
   Ok(())
 }
+async fn emit_acquisition_event(
+  events: &EventSink,
+  stage: EvidenceAcquisitionStage,
+  request: &EvidenceAcquisitionRequest,
+) -> Result<()> {
+  events
+    .emit(RunEvent::EvidenceAcquisition {
+      stage,
+      revision: request.revision.clone(),
+      issuer: EvidenceIssuer::from_acquisition_kind(&request.kind),
+      obligation_ids: request.obligation_ids.iter().cloned().collect(),
+    })
+    .await
+}
+
+async fn emit_proof_transitions(
+  events: &EventSink,
+  revision: &str,
+  request: &EvidenceAcquisitionRequest,
+  before: &BTreeMap<tenet_domain::ids::ObligationId, ProofState>,
+  graph: &EvidenceGraphState,
+) -> Result<()> {
+  for obligation_id in &request.obligation_ids {
+    let previous = before
+      .get(obligation_id)
+      .copied()
+      .unwrap_or(ProofState::Insufficient);
+    let current = graph
+      .proof_derivations
+      .get(obligation_id)
+      .map(|derivation| derivation.state)
+      .unwrap_or(ProofState::Insufficient);
+    if previous != current {
+      events
+        .emit(RunEvent::ObligationProofChanged {
+          obligation_id: obligation_id.clone(),
+          revision: revision.to_owned(),
+          previous,
+          current,
+        })
+        .await?;
+    }
+  }
+  Ok(())
+}
 
 async fn retire_deferred_candidates(
   cwd: &Path,
@@ -1355,6 +1813,28 @@ async fn retire_deferred_candidates(
   Ok(())
 }
 
+fn implementation_gap_discoveries(report: &SemanticAssessmentReport) -> Vec<WorkerDiscovery> {
+  report
+    .assessments
+    .iter()
+    .filter_map(|assessment| match &assessment.assessment {
+      AssessmentJudgment::Insufficient {
+        reason,
+        gap_kind: GapKind::Implementation,
+        ..
+      } => Some(WorkerDiscovery {
+        discovery: Discovery::VerificationBlocker {
+          description: format!("{}: {reason}", assessment.obligation_id),
+        },
+        role: tenet_domain::model::WorkerRole::Assess,
+      }),
+      AssessmentJudgment::Supported { .. }
+      | AssessmentJudgment::Contradicted { .. }
+      | AssessmentJudgment::Insufficient { .. } => None,
+    })
+    .collect()
+}
+
 fn requirement_counts(
   catalog: &RequirementCatalog,
   graph: &EvidenceGraphState,
@@ -1365,13 +1845,35 @@ fn requirement_counts(
     ..Default::default()
   };
   for requirement in &catalog.requirements {
-    match graph.requirement_verification_state(&requirement.id, policy)? {
-      VerificationState::Verified => counts.verified += 1,
-      VerificationState::PartiallyVerified => counts.partially_verified += 1,
-      VerificationState::Unverified => counts.unverified += 1,
-      VerificationState::Uncertain => counts.uncertain += 1,
-      VerificationState::Stale => counts.stale += 1,
-      VerificationState::Contradicted => counts.contradicted += 1,
+    let states: Vec<_> = catalog
+      .acceptance_criteria
+      .iter()
+      .filter(|criterion| criterion.requirement_id == requirement.id && criterion.mandatory)
+      .flat_map(|criterion| {
+        catalog
+          .verification_obligations
+          .iter()
+          .filter(move |obligation| obligation.criterion_id == criterion.id && obligation.required)
+      })
+      .map(|obligation| {
+        graph
+          .proof_derivations
+          .get(&obligation.id)
+          .filter(|derivation| derivation.revision == policy.revision)
+          .map(|derivation| derivation.state)
+          .unwrap_or(ProofState::Insufficient)
+      })
+      .collect();
+    if !states.is_empty() && states.iter().all(|state| *state == ProofState::Proven) {
+      counts.verified += 1;
+    } else if states.contains(&ProofState::Contradicted) {
+      counts.contradicted += 1;
+    } else if states.contains(&ProofState::Stale) {
+      counts.stale += 1;
+    } else if states.contains(&ProofState::Proven) {
+      counts.partially_verified += 1;
+    } else {
+      counts.unverified += 1;
     }
   }
   Ok(counts)
@@ -1448,7 +1950,9 @@ fn completion_gate(
       blocked(|blocker| {
         matches!(
           blocker,
-          CompletionBlocker::SemanticGap(_) | CompletionBlocker::SemanticUncertain(_)
+          CompletionBlocker::ProofContradicted(_)
+            | CompletionBlocker::ProofInsufficient(_)
+            | CompletionBlocker::ProofStale(_)
         )
       }),
       format!(
@@ -1508,14 +2012,34 @@ fn project_layers(report: &ProjectVerificationRun) -> VerificationLayers {
 fn apply_semantic_layers(
   layers: &mut VerificationLayers,
   graph: &EvidenceGraphState,
-  policy: EvidencePolicy<'_>,
+  _policy: EvidencePolicy<'_>,
 ) {
-  let counts = graph.semantic_counts(policy);
-  layers.semantic_obligations_total = counts.total;
-  layers.semantic_satisfied = counts.satisfied;
-  layers.semantic_gaps = counts.gaps;
-  layers.semantic_uncertain = counts.uncertain;
-  layers.contradictions = counts.gaps;
+  let states: Vec<_> = graph
+    .obligations
+    .values()
+    .filter(|obligation| obligation.required)
+    .map(|obligation| {
+      graph
+        .proof_derivations
+        .get(&obligation.id)
+        .map(|derivation| derivation.state)
+        .unwrap_or(ProofState::Insufficient)
+    })
+    .collect();
+  layers.semantic_obligations_total = states.len();
+  layers.semantic_satisfied = states
+    .iter()
+    .filter(|state| **state == ProofState::Proven)
+    .count();
+  layers.semantic_gaps = states
+    .iter()
+    .filter(|state| **state == ProofState::Contradicted)
+    .count();
+  layers.semantic_uncertain = states
+    .iter()
+    .filter(|state| matches!(state, ProofState::Insufficient | ProofState::Stale))
+    .count();
+  layers.contradictions = layers.semantic_gaps;
 }
 
 fn integration_failure(outcome: &IntegrationOutcome) -> String {
@@ -1577,7 +2101,7 @@ pub async fn manual_verify(cwd: &Path) -> Result<ProjectVerificationRun> {
 mod tests {
   use super::*;
   use tenet_domain::{
-    evidence::{AcceptanceCriterion, VerificationObligation},
+    evidence::{AcceptanceCriterion, ObligationAssessmentResult, VerificationObligation},
     ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId, VerificationRunId},
     model::{ArchitectOutput, ArchitectRequirement, Requirement, RequirementAssessment},
     verification::{CommandResult, ProjectCheckResult, VerificationSpec},
@@ -1608,6 +2132,7 @@ mod tests {
         criterion_id: CriterionId::from("REQ-001/AC-01"),
         description: "Required behavior is observable".into(),
         required: true,
+        evidence_contract: Default::default(),
       }],
     }
   }
@@ -1865,7 +2390,7 @@ mod tests {
     state.verification_layers.project_checks_total = 1;
     state.verification_layers.project_checks_passed = 1;
     let decision = CompletionDecision::NotReady(vec![
-      CompletionBlocker::SemanticGap(ObligationId::from("REQ-001/AC-01/VO-01")),
+      CompletionBlocker::ProofContradicted(ObligationId::from("REQ-001/AC-01/VO-01")),
       CompletionBlocker::RepositoryDirty,
     ]);
 
@@ -1890,5 +2415,47 @@ mod tests {
       .items
       .iter()
       .all(|item| item.outcome == CompletionGateOutcome::Satisfied));
+  }
+
+  #[test]
+  fn internal_adjudication_routes_implementation_gaps_to_reconciliation() {
+    let report = SemanticAssessmentReport {
+      summary: "implementation is incomplete".into(),
+      assessments: vec![ObligationAssessmentResult {
+        obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+        assessment: AssessmentJudgment::Insufficient {
+          reason: "missing behavior".into(),
+          proposals: Vec::new(),
+          gap_kind: GapKind::Implementation,
+        },
+      }],
+    };
+
+    let discoveries = implementation_gap_discoveries(&report);
+
+    assert!(matches!(
+      discoveries.as_slice(),
+      [WorkerDiscovery {
+        discovery: Discovery::VerificationBlocker { description },
+        role: tenet_domain::model::WorkerRole::Assess,
+      }] if description.contains("missing behavior")
+    ));
+  }
+
+  #[test]
+  fn internal_adjudication_does_not_turn_evidence_gaps_into_implementation_work() {
+    let report = SemanticAssessmentReport {
+      summary: "evidence is unavailable".into(),
+      assessments: vec![ObligationAssessmentResult {
+        obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+        assessment: AssessmentJudgment::Insufficient {
+          reason: "missing authoritative artifact".into(),
+          proposals: Vec::new(),
+          gap_kind: GapKind::Evidence,
+        },
+      }],
+    };
+
+    assert!(implementation_gap_discoveries(&report).is_empty());
   }
 }

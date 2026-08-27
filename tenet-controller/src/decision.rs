@@ -820,7 +820,7 @@ mod tests {
   use chrono::{TimeZone, Utc};
   use tenet_domain::{
     evidence::{
-      AcceptanceCriterion, AgentObligationAssessment, ImplementationState, ObligationAssessment,
+      AcceptanceCriterion, AgentObligationAssessment, ImplementationState,
       SemanticAssessmentProposal, VerificationObligation,
     },
     ids::{CriterionId, ObligationId, RequirementId},
@@ -829,6 +829,7 @@ mod tests {
       DeferredCandidate, Requirement, RequirementCatalog, RunStatus, State, VerificationReport,
       WorkExecution, WorkLease, WorkScope, WorkStatus, WorkerSummary,
     },
+    proof::{AssessmentJudgment, GapKind},
     worker::CatalogCoverage,
   };
 
@@ -860,6 +861,7 @@ mod tests {
         criterion_id: CriterionId::from("REQ-001/AC-01"),
         description: "Verify behavior".into(),
         required: true,
+        evidence_contract: Default::default(),
       }],
       coverage: CatalogCoverage {
         normative_fragments: Vec::new(),
@@ -890,6 +892,7 @@ mod tests {
         criterion_id: CriterionId::from("REQ-002/AC-01"),
         description: "Verify second behavior".into(),
         required: true,
+        evidence_contract: Default::default(),
       });
     catalog
   }
@@ -952,9 +955,9 @@ mod tests {
         summary: "Satisfied".into(),
         assessments: vec![AgentObligationAssessment {
           obligation_handle: "O001".into(),
-          judgment: ObligationAssessment::Satisfied {
+          judgment: AssessmentJudgment::Supported {
+            artifact_ids: Vec::new(),
             rationale: "Verified by inspection".into(),
-            evidence_refs: vec!["src/lib.rs:1".into()],
           },
         }],
       },
@@ -1008,15 +1011,17 @@ mod tests {
         assessments: vec![
           AgentObligationAssessment {
             obligation_handle: "O002".into(),
-            judgment: ObligationAssessment::Gap {
-              description: "Second obligation has a gap".into(),
+            judgment: AssessmentJudgment::Insufficient {
+              reason: "Second obligation has a gap".into(),
+              proposals: Vec::new(),
+              gap_kind: GapKind::Implementation,
             },
           },
           AgentObligationAssessment {
             obligation_handle: "O001".into(),
-            judgment: ObligationAssessment::Satisfied {
-              rationale: "First obligation satisfied".into(),
-              evidence_refs: Vec::new(),
+            judgment: AssessmentJudgment::Supported {
+              artifact_ids: Vec::new(),
+              rationale: "First obligation supported".into(),
             },
           },
         ],
@@ -1034,11 +1039,11 @@ mod tests {
     );
     assert!(matches!(
       report.assessments[0].assessment,
-      ObligationAssessment::Satisfied { .. }
+      AssessmentJudgment::Supported { .. }
     ));
     assert!(matches!(
       report.assessments[1].assessment,
-      ObligationAssessment::Gap { .. }
+      AssessmentJudgment::Insufficient { .. }
     ));
   }
 
@@ -1073,8 +1078,10 @@ mod tests {
         summary: "Unknown handle".into(),
         assessments: vec![AgentObligationAssessment {
           obligation_handle: "O999".into(),
-          judgment: ObligationAssessment::Gap {
-            description: "Cannot establish obligation".into(),
+          judgment: AssessmentJudgment::Insufficient {
+            reason: "Cannot establish obligation".into(),
+            proposals: Vec::new(),
+            gap_kind: GapKind::Evidence,
           },
         }],
       },
@@ -1098,8 +1105,10 @@ mod tests {
 
     let duplicate = AgentObligationAssessment {
       obligation_handle: "O001".into(),
-      judgment: ObligationAssessment::Gap {
-        description: "Cannot establish obligation".into(),
+      judgment: AssessmentJudgment::Contradicted {
+        artifact_ids: Vec::new(),
+        rationale: "Cannot establish obligation".into(),
+        proposals: Vec::new(),
       },
     };
     let duplicate = materialize_semantic_assessment(

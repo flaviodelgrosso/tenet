@@ -29,10 +29,10 @@ Rules:
 - Use criterion ids REQ-NNN/AC-NN and obligation ids REQ-NNN/AC-NN/VO-NN in batch-local parent order. The controller renumbers all ids after merging batches.
 - Every controller-annotated sourceRef token in the assigned batch must map to at least one requirement. Copy only the exact short sourceRef tokens into sourceRefs; never emit SPEC fragment IDs, hashes, sections, or reference objects.
 - Treat every normative requirement as required, every acceptance criterion as mandatory, and every supporting obligation as required. Do not use false flags to remove scope.
-- Acceptance criteria describe observable, falsifiable truths. Verification obligations describe the semantic claims that must be established for those criteria; they never own execution authority.
-- Treat every obligation as semantic: provide its stable id, criterion id, description, and required flag only.
-- Work-unit suggested checks are advisory implementation feedback. They never become trusted project evidence or semantic satisfaction solely because an agent proposed them.
-- Project verification commands come only from project configuration and are executed by the controller.
+- Acceptance criteria describe observable, falsifiable truths. Verification obligations describe claims and must include an explicit evidenceContract.
+- The admissible leaf obligation contracts are `artifact/named_project_check` and `artifact/trusted_verifier_check`, each using an exact controller-provided configured name from its corresponding list. Never invent a check name. `all` and `any` are admissible only when every branch is independently admissible. Generic `artifact/project_verification` is not an obligation contract; repository-wide verification remains a separate global completion gate. Source inspection is supporting only and cannot satisfy an authoritative proof contract. Human attestation is unsupported because no issuer is configured. The controller rejects every unsupported leaf, including one nested inside `all` or `any`.
+- Work-unit suggested checks and assessor proposals are advisory. They never become trusted evidence solely because an agent proposed them.
+- Project verification and trusted-verifier specifications come only from controller configuration and are executed by the controller.
 - You are read-only. Inspect only when useful; do not modify the repository.
 - `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence.
 "#;
@@ -90,19 +90,19 @@ Constraints:
 - Never modify the work graph or coordinate with other workers.
 "#;
 
-const ASSESS: &str = r#"You are the independent semantic verifier for an autonomous spec-driven development controller.
+const ASSESS: &str = r#"You are an evidence adjudicator and falsifier for an autonomous spec-driven development controller.
 
-You receive fresh context after controller-owned project checks pass. Evaluate every required verification obligation against the authoritative specification, catalog, immutable repository revision, implementation, project results, and controller-owned evidence. Prior planner, implementer, and repair claims are not evidence. You are not the completion oracle.
+You receive fresh context after controller-owned project checks. Inspect only controller-provided artifacts and the immutable repository revision. Your judgment is advisory input; it can never create proof, contradiction, or DONE.
 
 Rules:
-- Return exactly one structured `satisfied`, `gap`, or `uncertain` judgment for each controller-selected obligation, in the supplied order. Do not copy obligation IDs into the judgments.
-- `satisfied` requires a concrete rationale and repository/project-evidence references.
-- `gap` names the missing or contradictory behavior. The controller will route the finding to reconciliation; never edit code or propose work units.
-- `uncertain` is required when evidence is insufficient or the specification/criterion is ambiguous. Set `specificationAmbiguous` when ambiguity is the cause; never invent an interpretation.
-- Project-check success is repository evidence, not automatic semantic satisfaction.
-- Do not declare requirements verified, completion eligible, or DONE. The controller binds obligation identities, revision, and provenance, then applies completion policy.
-- Do not modify the repository. You are read-only.
-- `.tenet/` and `tenet.toml` are controller-owned artifacts, not product evidence. Independently inspect source, tests, configuration, and behavior.
+- Return exactly one structured `supported`, `contradicted`, or `insufficient` judgment for every controller-selected obligation, in supplied order. Do not copy obligation IDs.
+- `supported` may reference only ArtifactIds already supplied by the controller. Never invent an ArtifactId, path reference, or authoritative observation.
+- `contradicted` is a suspicion unless its ArtifactIds refer to existing controller artifacts. Propose a reproducible evidence request when confirmation is possible; model suspicion is not fact.
+- `insufficient` identifies the gap kind and proposes evidence acquisition where useful. Evidence, specification, environment, verification, integration, and dependency gaps are not implementation defects.
+- Project-check success is not semantic proof unless the obligation's deterministic evidence contract admits that exact artifact.
+- Arbitrary commands you propose remain advisory. You cannot choose their provenance, authority, execution domain, or proof effect.
+- Search for unsupported semantic leaps and concrete counterexamples. Never declare requirements proven, completion eligible, or DONE.
+- You are read-only. Do not modify the repository.
 "#;
 
 pub fn full_role_prompt(role: WorkerRole, spec_file: &str) -> String {
@@ -156,20 +156,25 @@ mod tests {
   }
 
   #[test]
-  fn assess_is_an_independent_semantic_verifier_not_completion_oracle() {
+  fn assess_is_an_advisory_falsifier_not_completion_oracle() {
     let prompt = full_role_prompt(WorkerRole::Assess, "requirements/product.md");
 
-    assert!(prompt.contains("independent semantic verifier"));
-    assert!(prompt.contains("`satisfied`, `gap`, or `uncertain`"));
-    assert!(prompt.contains("not the completion oracle"));
+    assert!(prompt.contains("evidence adjudicator and falsifier"));
+    assert!(prompt.contains("`supported`, `contradicted`, or `insufficient`"));
+    assert!(prompt.contains("can never create proof, contradiction, or DONE"));
   }
 
   #[test]
-  fn architect_keeps_obligations_semantic_and_project_commands_controller_owned() {
+  fn architect_names_the_complete_admissible_contract_surface() {
     let prompt = full_role_prompt(WorkerRole::Architect, "requirements/product.md");
 
-    assert!(prompt.contains("never own execution authority"));
-    assert!(prompt.contains("Project verification commands come only from project configuration"));
+    assert!(prompt.contains("admissible leaf obligation contracts"));
+    assert!(prompt.contains("artifact/trusted_verifier_check"));
+    assert!(prompt.contains("Never invent a check name"));
+    assert!(prompt.contains("every branch is independently admissible"));
+    assert!(prompt.contains("Source inspection is supporting only"));
+    assert!(prompt.contains("controller rejects every unsupported leaf"));
+    assert!(prompt.contains("come only from controller configuration"));
   }
 
   #[test]

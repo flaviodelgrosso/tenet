@@ -20,9 +20,10 @@ pub(crate) async fn run(
   backend: Arc<dyn AgentBackend>,
   options: RunOptions,
 ) -> Result<State> {
+  let config = read_config(&cwd).await.ok();
+  store::bootstrap_controller_authority_identity()?;
   let initial = store::read_state(&cwd).await?;
   let catalog = store::read_catalog(&cwd).await?;
-  let config = read_config(&cwd).await.ok();
   let mode = InformationMode::from_flags(options.quiet, options.verbose);
   let mut console = ConsoleRenderer::stdout(mode);
   if let (Some(config), Ok(initial_revision)) = (config.as_ref(), git::head(&cwd).await) {

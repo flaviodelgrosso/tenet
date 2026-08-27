@@ -1,14 +1,15 @@
 use chrono::Utc;
 use tenet_domain::{
   evidence::{
-    AcceptanceCriterion, ObligationAssessment, ObligationAssessmentResult,
-    SemanticAssessmentReport, VerificationObligation,
+    AcceptanceCriterion, ObligationAssessmentResult, SemanticAssessmentReport,
+    VerificationObligation,
   },
   ids::{CriterionId, ObligationId, RequirementId, SpecFragmentId},
   model::{
     Discovery, DiscoveryRecord, DiscoveryStatus, MutationWorkerContext, Phase, ReconcileResult,
     Requirement, RequirementCatalog, RunStatus, State, WorkScope, WorkUnit, WorkerRole,
   },
+  proof::{AssessmentJudgment, GapKind},
   verification::VerificationReport,
   worker::{CatalogCoverage, SpecFragment, SpecReference},
 };
@@ -62,6 +63,7 @@ fn synthetic_catalog() -> RequirementCatalog {
           criterion_id: criterion_id.clone(),
           description: "Controller-bound verification obligation".repeat(2),
           required: true,
+          evidence_contract: Default::default(),
         });
       }
     }
@@ -134,9 +136,10 @@ async fn implement_and_repair_contexts_are_at_least_thirty_percent_smaller_witho
     .iter()
     .map(|obligation| ObligationAssessmentResult {
       obligation_id: obligation.id.clone(),
-      assessment: ObligationAssessment::Satisfied {
-        rationale: "Evidence for an earlier repository revision".into(),
-        evidence_refs: vec![format!("artifact:{}", obligation.id)],
+      assessment: AssessmentJudgment::Insufficient {
+        reason: "Evidence for an earlier repository revision".into(),
+        proposals: Vec::new(),
+        gap_kind: GapKind::Evidence,
       },
     })
     .collect();
@@ -162,9 +165,10 @@ async fn implement_and_repair_contexts_are_at_least_thirty_percent_smaller_witho
     .iter()
     .map(|obligation| ObligationAssessmentResult {
       obligation_id: obligation.id.clone(),
-      assessment: ObligationAssessment::Satisfied {
-        rationale: "Current revision evidence".into(),
-        evidence_refs: vec![format!("artifact:current:{}", obligation.id)],
+      assessment: AssessmentJudgment::Insufficient {
+        reason: "Current revision evidence is absent".into(),
+        proposals: Vec::new(),
+        gap_kind: GapKind::Evidence,
       },
     })
     .collect();
