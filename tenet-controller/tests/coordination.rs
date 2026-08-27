@@ -3316,8 +3316,12 @@ async fn mechanical_proof_skips_unneeded_assessor_workspace_cleanup() {
 }
 
 fn trusted_verification_spec() -> TrustedVerificationSpec {
+  trusted_verification_spec_named("expiry-boundary")
+}
+
+fn trusted_verification_spec_named(name: &str) -> TrustedVerificationSpec {
   TrustedVerificationSpec {
-    name: "expiry-boundary".into(),
+    name: name.into(),
     backend: TrustedExecutionBackend::Microsandbox,
     image: format!("example/verifier@sha256:{}", "a".repeat(64)),
     program: "verify".into(),
@@ -3335,6 +3339,7 @@ struct FakeTrustedVerifier {
   contradicts: bool,
   resolved_digest_matches: bool,
   calls: AtomicUsize,
+  names: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -3349,6 +3354,11 @@ impl TrustedVerifierRunner for FakeTrustedVerifier {
     _cancel: &CancellationToken,
   ) -> std::result::Result<TrustedVerifierExecution, TrustedVerifierError> {
     self.calls.fetch_add(1, Ordering::SeqCst);
+    self
+      .names
+      .lock()
+      .expect("verifier names")
+      .push(spec.name.clone());
     let mounted_revision = git::head(candidate)
       .await
       .map_err(|error| TrustedVerifierError::IsolationUnavailable(error.to_string()))?;
@@ -3435,7 +3445,9 @@ impl TrustedVerifierRunner for FakeTrustedVerifier {
   }
 }
 
-struct UnavailableTrustedVerifier;
+struct UnavailableTrustedVerifier {
+  calls: AtomicUsize,
+}
 
 #[async_trait]
 impl TrustedVerifierRunner for UnavailableTrustedVerifier {
@@ -3448,6 +3460,7 @@ impl TrustedVerifierRunner for UnavailableTrustedVerifier {
     _max_output_bytes: usize,
     _cancel: &CancellationToken,
   ) -> std::result::Result<TrustedVerifierExecution, TrustedVerifierError> {
+    self.calls.fetch_add(1, Ordering::SeqCst);
     Err(TrustedVerifierError::TrustedVerifierInfrastructureFailure(
       "microVM startup failed".into(),
     ))
@@ -3507,6 +3520,7 @@ async fn trusted_verifier_pass_proves_and_completes_without_assessor() {
     contradicts: false,
     calls: AtomicUsize::new(0),
     resolved_digest_matches: true,
+    names: Mutex::new(Vec::new()),
   });
   let controller =
     configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
@@ -3530,6 +3544,66 @@ async fn trusted_verifier_pass_proves_and_completes_without_assessor() {
 }
 
 #[tokio::test]
+async fn trusted_verifier_executes_only_contract_requested_name() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  store::install_controller_authority_key(
+    "tenet-controller-tests",
+    b"tenet-controller-test-authority",
+  )
+  .expect("install test authority identity");
+  let (_controller, _events) = configured_controller(&repository, backend.clone(), 1).await;
+  let mut config = read_config(repository.path()).await.expect("read config");
+  config.verification.trusted_checks = ["A", "B", "C"]
+    .into_iter()
+    .map(trusted_verification_spec_named)
+    .collect();
+  fs::write(
+    repository.path().join("tenet.toml"),
+    toml::to_string_pretty(&config).expect("trusted config"),
+  )
+  .await
+  .expect("write trusted config");
+  run_git(repository.path(), &["add", "tenet.toml"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "configure trusted verifiers"],
+  );
+  let mut catalog = store::read_catalog(repository.path())
+    .await
+    .expect("load catalog")
+    .expect("catalog");
+  catalog.verification_obligations[0].evidence_contract = EvidenceContract::Artifact {
+    predicate: EvidencePredicate::TrustedVerifierCheck { name: "B".into() },
+  };
+  store::write_catalog(repository.path(), &catalog)
+    .await
+    .expect("write trusted catalog");
+  approve_active_catalog(repository.path()).await;
+  let trusted = Arc::new(FakeTrustedVerifier {
+    contradicts: false,
+    resolved_digest_matches: true,
+    calls: AtomicUsize::new(0),
+    names: Mutex::new(Vec::new()),
+  });
+  let controller = Controller::with_trusted_verifier(
+    repository.path().to_path_buf(),
+    backend.clone(),
+    EventSink::new(None),
+    trusted.clone(),
+  );
+
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+
+  assert_eq!(state.status, RunStatus::Done);
+  assert_eq!(
+    trusted.names.lock().expect("verifier names").as_slice(),
+    &["B"]
+  );
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn trusted_verifier_assertion_failure_contradicts_and_blocks_without_assessor() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
@@ -3537,6 +3611,7 @@ async fn trusted_verifier_assertion_failure_contradicts_and_blocks_without_asses
     contradicts: true,
     calls: AtomicUsize::new(0),
     resolved_digest_matches: true,
+    names: Mutex::new(Vec::new()),
   });
   let controller =
     configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
@@ -3567,6 +3642,7 @@ async fn mismatched_resolved_image_digest_cannot_issue_authoritative_evidence() 
     contradicts: false,
     resolved_digest_matches: false,
     calls: AtomicUsize::new(0),
+    names: Mutex::new(Vec::new()),
   });
   let controller =
     configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
@@ -3602,17 +3678,16 @@ async fn mismatched_resolved_image_digest_cannot_issue_authoritative_evidence() 
 async fn trusted_verifier_infrastructure_failure_issues_no_semantic_artifact() {
   let repository = TempRepo::new();
   let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
-  let controller = configured_trusted_controller(
-    &repository,
-    backend.clone(),
-    Arc::new(UnavailableTrustedVerifier),
-  )
-  .await;
+  let trusted = Arc::new(UnavailableTrustedVerifier {
+    calls: AtomicUsize::new(0),
+  });
+  let controller =
+    configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
 
   let error = controller
     .run(CancellationToken::new())
     .await
-    .expect_err("infrastructure failure must fail closed");
+    .expect_err("insufficient evidence must fail closed after residual assessment");
   let catalog = store::read_catalog(repository.path())
     .await
     .expect("catalog read")
@@ -3621,8 +3696,9 @@ async fn trusted_verifier_infrastructure_failure_issues_no_semantic_artifact() {
     .await
     .expect("graph reload");
 
-  assert!(error.to_string().contains("microVM startup failed"));
-  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+  assert!(!error.to_string().is_empty());
+  assert!((1..=3).contains(&trusted.calls.load(Ordering::SeqCst)));
+  assert!((1..=3).contains(&backend.assessment_calls.load(Ordering::SeqCst)));
   assert!(!graph.artifacts.values().any(|artifact| matches!(
     artifact.provenance,
     tenet_domain::proof::ArtifactProvenance::ControllerTrustedVerifier

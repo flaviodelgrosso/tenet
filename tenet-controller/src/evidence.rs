@@ -17,9 +17,10 @@ use tenet_domain::{
   ids::{ArtifactId, CriterionId, EvidenceId, RequirementId},
   model::RequirementCatalog,
   proof::{
-    ArtifactAuthority, ArtifactObservation, ArtifactProvenance, ArtifactValidity,
-    DependencySurface, EvidenceArtifact, EvidenceArtifactKind, EvidenceContract, EvidencePredicate,
-    EvidenceRequestProposal,
+    derive_proof_state, ArtifactAuthority, ArtifactObservation, ArtifactProvenance,
+    ArtifactValidity, DependencySurface, EvidenceAcquisitionIdentity, EvidenceAcquisitionKind,
+    EvidenceAcquisitionRequest, EvidenceArtifact, EvidenceArtifactKind, EvidenceContract,
+    EvidencePredicate, EvidenceRequestProposal, ProofState,
   },
   trusted_verifier::{TrustedExecutionRecord, TrustedVerificationSpec},
   verification::ProjectVerificationRun,
@@ -43,6 +44,181 @@ pub fn graph_from_catalog(catalog: &RequirementCatalog) -> Result<EvidenceGraphS
       .context("register verification obligation")?;
   }
   Ok(graph)
+}
+pub fn plan_missing_evidence(
+  graph: &EvidenceGraphState,
+  revision: &str,
+  trusted_specs: &[TrustedVerificationSpec],
+  attempted: &BTreeSet<EvidenceAcquisitionIdentity>,
+) -> Result<Vec<EvidenceAcquisitionRequest>> {
+  let mut requests: Vec<EvidenceAcquisitionRequest> = Vec::new();
+  for obligation in graph.obligations.values().filter(|item| item.required) {
+    let Some(kind) = next_acquirable_kind(
+      &obligation.evidence_contract,
+      &obligation.id,
+      graph,
+      revision,
+      trusted_specs,
+      attempted,
+    )?
+    else {
+      continue;
+    };
+    let identity = EvidenceAcquisitionIdentity {
+      revision: revision.to_owned(),
+      kind: kind.clone(),
+    };
+    if let Some(existing) = requests
+      .iter_mut()
+      .find(|request| request.identity() == identity)
+    {
+      existing.obligation_ids.insert(obligation.id.clone());
+    } else {
+      requests.push(EvidenceAcquisitionRequest {
+        revision: revision.to_owned(),
+        kind,
+        obligation_ids: BTreeSet::from([obligation.id.clone()]),
+      });
+    }
+  }
+  Ok(requests)
+}
+
+fn next_acquirable_kind(
+  contract: &EvidenceContract,
+  obligation_id: &tenet_domain::ids::ObligationId,
+  graph: &EvidenceGraphState,
+  revision: &str,
+  trusted_specs: &[TrustedVerificationSpec],
+  attempted: &BTreeSet<EvidenceAcquisitionIdentity>,
+) -> Result<Option<EvidenceAcquisitionKind>> {
+  let proof = derive_proof_state(obligation_id, contract, graph.artifacts.values(), revision);
+  if matches!(proof.state, ProofState::Proven | ProofState::Contradicted) {
+    return Ok(None);
+  }
+  match contract {
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::TrustedVerifierCheck { name },
+    } => {
+      let Some(spec) = trusted_specs.iter().find(|spec| spec.name == *name) else {
+        return Ok(None);
+      };
+      let kind = EvidenceAcquisitionKind::TrustedVerifierCheck {
+        name: name.clone(),
+        spec_hash: spec.fingerprint()?,
+      };
+      let identity = EvidenceAcquisitionIdentity {
+        revision: revision.to_owned(),
+        kind: kind.clone(),
+      };
+      Ok((!attempted.contains(&identity)).then_some(kind))
+    }
+    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => {
+      for requirement in requirements {
+        if let Some(kind) = next_acquirable_kind(
+          requirement,
+          obligation_id,
+          graph,
+          revision,
+          trusted_specs,
+          attempted,
+        )? {
+          return Ok(Some(kind));
+        }
+      }
+      Ok(None)
+    }
+    EvidenceContract::Artifact { .. } | EvidenceContract::HumanAttestation { .. } => Ok(None),
+  }
+}
+
+pub fn admit_assessment_proposals(
+  graph: &EvidenceGraphState,
+  revision: &str,
+  report: &SemanticAssessmentReport,
+  trusted_specs: &[TrustedVerificationSpec],
+  attempted: &BTreeSet<EvidenceAcquisitionIdentity>,
+) -> Result<Vec<EvidenceAcquisitionRequest>> {
+  let mut admitted: Vec<EvidenceAcquisitionRequest> = Vec::new();
+  for item in &report.assessments {
+    let obligation = graph
+      .obligations
+      .get(&item.obligation_id)
+      .context("assessment targets unknown obligation")?;
+    let proof = derive_proof_state(
+      &obligation.id,
+      &obligation.evidence_contract,
+      graph.artifacts.values(),
+      revision,
+    );
+    if matches!(proof.state, ProofState::Proven | ProofState::Contradicted) {
+      continue;
+    }
+    for proposal in item.assessment.proposals() {
+      let kind = match proposal {
+        EvidenceRequestProposal::RunTrustedVerifierCheck { name } => {
+          let predicate = EvidencePredicate::TrustedVerifierCheck { name: name.clone() };
+          if !contract_contains_predicate(&obligation.evidence_contract, &predicate) {
+            continue;
+          }
+          let Some(spec) = trusted_specs.iter().find(|spec| spec.name == *name) else {
+            continue;
+          };
+          let leaf = EvidenceContract::Artifact { predicate };
+          if derive_proof_state(&obligation.id, &leaf, graph.artifacts.values(), revision).state
+            == ProofState::Proven
+          {
+            continue;
+          }
+          EvidenceAcquisitionKind::TrustedVerifierCheck {
+            name: name.clone(),
+            spec_hash: spec.fingerprint()?,
+          }
+        }
+        EvidenceRequestProposal::InspectSource {
+          path,
+          start_line,
+          end_line,
+        } => EvidenceAcquisitionKind::InspectSource {
+          path: path.clone(),
+          start_line: *start_line,
+          end_line: *end_line,
+        },
+        EvidenceRequestProposal::RunProjectCheck { .. }
+        | EvidenceRequestProposal::Reproduce { .. } => continue,
+      };
+      let identity = EvidenceAcquisitionIdentity {
+        revision: revision.to_owned(),
+        kind: kind.clone(),
+      };
+      if attempted.contains(&identity) {
+        continue;
+      }
+      if let Some(request) = admitted
+        .iter_mut()
+        .find(|request| request.identity() == identity)
+      {
+        request.obligation_ids.insert(obligation.id.clone());
+      } else {
+        admitted.push(EvidenceAcquisitionRequest {
+          revision: revision.to_owned(),
+          kind,
+          obligation_ids: BTreeSet::from([obligation.id.clone()]),
+        });
+      }
+    }
+  }
+  Ok(admitted)
+}
+
+fn contract_contains_predicate(contract: &EvidenceContract, predicate: &EvidencePredicate) -> bool {
+  match contract {
+    EvidenceContract::Artifact { predicate: actual } => actual == predicate,
+    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => requirements
+      .iter()
+      .any(|requirement| contract_contains_predicate(requirement, predicate)),
+    EvidenceContract::HumanAttestation { .. } => false,
+  }
 }
 
 pub async fn load(
@@ -145,77 +321,43 @@ pub async fn establish_semantic_assessment(
 pub async fn acquire_assessment_proposals(
   cwd: &Path,
   graph: &mut EvidenceGraphState,
-  revision: &str,
-  report: &SemanticAssessmentReport,
+  requests: &[EvidenceAcquisitionRequest],
 ) -> Result<Vec<ArtifactId>> {
   let mut acquired = Vec::new();
-  for item in &report.assessments {
-    let obligation = graph
-      .obligations
-      .get(&item.obligation_id)
-      .context("assessment targets unknown obligation")?
-      .clone();
-    for proposal in item.assessment.proposals() {
-      match proposal {
-        EvidenceRequestProposal::RunProjectCheck { name } => {
-          let admitted = contract_contains_named_check(&obligation.evidence_contract, name);
-          let exists = graph.artifacts.values().any(|artifact| {
-            artifact.revision == revision
-              && artifact.obligation_ids.contains(&item.obligation_id)
-              && matches!(&artifact.kind, EvidenceArtifactKind::CommandExecution { check_name: Some(actual), .. } if actual == name)
-          });
-          if !admitted || !exists {
-            continue;
-          }
-        }
-        EvidenceRequestProposal::InspectSource {
-          path,
-          start_line,
-          end_line,
-        } => {
-          let Some(artifact) = acquire_source_proposal(
-            cwd,
-            revision,
-            path,
-            *start_line,
-            *end_line,
-            item.obligation_id.clone(),
-          )
-          .await
-          else {
-            continue;
-          };
-          acquired.push(artifact.id);
-          graph
-            .establish_artifact(artifact)
-            .context("record controller source inspection")?;
-        }
-        EvidenceRequestProposal::Reproduce { .. } => {
-          // A reproduction request is assessor advice, not an execution grant. The
-          // persisted assessment retains it for a future controller-owned issuer.
-        }
-      }
-    }
+  for request in requests {
+    let EvidenceAcquisitionKind::InspectSource {
+      path,
+      start_line,
+      end_line,
+    } = &request.kind
+    else {
+      continue;
+    };
+    let Some(artifact) = inspect_source(
+      cwd,
+      &request.revision,
+      path,
+      *start_line,
+      *end_line,
+      request.obligation_ids.clone(),
+    )
+    .await
+    .ok() else {
+      continue;
+    };
+    acquired.push(artifact.id);
+    graph
+      .establish_artifact(artifact)
+      .context("record controller source inspection")?;
   }
   if acquired.is_empty() {
     return Ok(acquired);
   }
-  graph.derive_proofs(revision);
+  if let Some(revision) = requests.first().map(|request| request.revision.as_str()) {
+    graph.derive_proofs(revision);
+  }
   store::write_evidence_graph(cwd, graph).await?;
-
   Ok(acquired)
-}
-async fn acquire_source_proposal(
-  cwd: &Path,
-  revision: &str,
-  path: &str,
-  start_line: u32,
-  end_line: u32,
-  obligation_id: tenet_domain::ids::ObligationId,
-) -> Option<EvidenceArtifact> {
-  inspect_source(cwd, revision, path, start_line, end_line, obligation_id)
-    .await
-    .ok()
 }
 
 async fn inspect_source(
@@ -224,7 +366,7 @@ async fn inspect_source(
   path: &str,
   start_line: u32,
   end_line: u32,
-  obligation_id: tenet_domain::ids::ObligationId,
+  obligation_ids: BTreeSet<tenet_domain::ids::ObligationId>,
 ) -> Result<EvidenceArtifact> {
   let relative = Path::new(path);
   if relative.is_absolute()
@@ -281,7 +423,7 @@ async fn inspect_source(
       start_byte: start as u64,
       end_byte: end as u64,
     },
-    obligation_ids: BTreeSet::from([obligation_id]),
+    obligation_ids,
     validity: ArtifactValidity::Valid,
     dependencies: DependencySurface::Paths {
       blob_hashes: BTreeMap::from([(path.to_owned(), blob_hash)]),
@@ -299,18 +441,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     encoded.push(HEX[(byte & 0x0f) as usize] as char);
   }
   encoded
-}
-
-fn contract_contains_named_check(contract: &EvidenceContract, name: &str) -> bool {
-  match contract {
-    EvidenceContract::Artifact {
-      predicate: EvidencePredicate::NamedProjectCheck { name: expected },
-    } => expected == name,
-    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => requirements
-      .iter()
-      .any(|item| contract_contains_named_check(item, name)),
-    _ => false,
-  }
 }
 
 pub async fn invalidate(
@@ -436,7 +566,7 @@ mod tests {
       "src/lib.rs",
       1,
       1,
-      tenet_domain::ids::ObligationId::from("VO-1"),
+      BTreeSet::from([tenet_domain::ids::ObligationId::from("VO-1")]),
     )
     .await
     .expect("inspect immutable source");
@@ -466,16 +596,16 @@ mod tests {
 
   #[tokio::test]
   async fn inadmissible_source_proposal_is_rejected_without_error() {
-    let artifact = acquire_source_proposal(
+    let artifact = inspect_source(
       Path::new("."),
       "revision",
       "../outside",
       0,
       1,
-      tenet_domain::ids::ObligationId::from("VO-1"),
+      BTreeSet::from([tenet_domain::ids::ObligationId::from("VO-1")]),
     )
     .await;
-    assert!(artifact.is_none());
+    assert!(artifact.is_err());
   }
 
   #[tokio::test]
@@ -526,7 +656,9 @@ mod tests {
       }],
     };
 
-    let acquired = acquire_assessment_proposals(project.path(), &mut graph, "revision", &report)
+    let admitted = admit_assessment_proposals(&graph, "revision", &report, &[], &BTreeSet::new())
+      .expect("admit proposals");
+    let acquired = acquire_assessment_proposals(project.path(), &mut graph, &admitted)
       .await
       .expect("defer proposal");
 
@@ -537,5 +669,168 @@ mod tests {
       graph.proof_derivations[&obligation_id].state,
       ProofState::Insufficient
     );
+  }
+
+  fn trusted_spec(name: &str) -> TrustedVerificationSpec {
+    use tenet_domain::trusted_verifier::TrustedExecutionBackend;
+
+    TrustedVerificationSpec {
+      name: name.into(),
+      backend: TrustedExecutionBackend::Microsandbox,
+      image: format!("example/{name}@sha256:{}", "a".repeat(64)),
+      program: "/bin/check".into(),
+      args: Vec::new(),
+      working_directory: ".".into(),
+      environment: BTreeMap::new(),
+      timeout_secs: 300,
+      isolation: Default::default(),
+      resources: Default::default(),
+      protocol: Default::default(),
+    }
+  }
+
+  fn graph_with_contracts(contracts: Vec<EvidenceContract>) -> EvidenceGraphState {
+    use tenet_domain::{
+      evidence::{AcceptanceCriterion, VerificationObligation},
+      ids::{CriterionId, ObligationId, RequirementId},
+    };
+
+    let mut graph = EvidenceGraphState::new("spec");
+    graph.register_requirement(RequirementId::from("REQ-001"), true);
+    for (index, contract) in contracts.into_iter().enumerate() {
+      let criterion_id = CriterionId::from(format!("REQ-001/AC-{index:02}"));
+      graph
+        .add_criterion(AcceptanceCriterion {
+          id: criterion_id.clone(),
+          requirement_id: RequirementId::from("REQ-001"),
+          description: "Observable behavior".into(),
+          mandatory: true,
+        })
+        .expect("criterion");
+      graph
+        .add_obligation(VerificationObligation {
+          id: ObligationId::from(format!("REQ-001/AC-{index:02}/VO-01")),
+          criterion_id,
+          description: "Mechanical proof".into(),
+          required: true,
+          evidence_contract: contract,
+        })
+        .expect("obligation");
+    }
+    graph.derive_proofs("revision");
+    graph
+  }
+
+  fn trusted_contract(name: &str) -> EvidenceContract {
+    EvidenceContract::Artifact {
+      predicate: EvidencePredicate::TrustedVerifierCheck { name: name.into() },
+    }
+  }
+
+  #[test]
+  fn planner_derives_trusted_request_from_contract_without_assessment() {
+    let graph = graph_with_contracts(vec![trusted_contract("boundary")]);
+    let requests = plan_missing_evidence(
+      &graph,
+      "revision",
+      &[trusted_spec("boundary")],
+      &BTreeSet::new(),
+    )
+    .expect("plan evidence");
+
+    assert_eq!(requests.len(), 1);
+    assert!(matches!(
+      &requests[0].kind,
+      EvidenceAcquisitionKind::TrustedVerifierCheck { name, .. } if name == "boundary"
+    ));
+  }
+
+  #[test]
+  fn planner_uses_contract_order_and_skips_attempted_any_branches() {
+    let graph = graph_with_contracts(vec![EvidenceContract::Any {
+      requirements: vec![trusted_contract("first"), trusted_contract("second")],
+    }]);
+    let specs = [trusted_spec("first"), trusted_spec("second")];
+    let first = plan_missing_evidence(&graph, "revision", &specs, &BTreeSet::new())
+      .expect("plan first branch")
+      .remove(0);
+    let attempted = BTreeSet::from([first.identity()]);
+
+    let second = plan_missing_evidence(&graph, "revision", &specs, &attempted)
+      .expect("plan second branch")
+      .remove(0);
+
+    assert!(matches!(
+      second.kind,
+      EvidenceAcquisitionKind::TrustedVerifierCheck { name, .. } if name == "second"
+    ));
+  }
+
+  #[test]
+  fn planner_deduplicates_execution_and_derives_all_bindings() {
+    let graph = graph_with_contracts(vec![trusted_contract("shared"), trusted_contract("shared")]);
+    let requests = plan_missing_evidence(
+      &graph,
+      "revision",
+      &[trusted_spec("shared")],
+      &BTreeSet::new(),
+    )
+    .expect("plan shared evidence");
+
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].obligation_ids.len(), 2);
+  }
+  fn trusted_proposal(name: &str) -> SemanticAssessmentReport {
+    use tenet_domain::{
+      evidence::ObligationAssessmentResult,
+      ids::ObligationId,
+      proof::{AssessmentJudgment, GapKind},
+    };
+
+    SemanticAssessmentReport {
+      summary: "request observation".into(),
+      assessments: vec![ObligationAssessmentResult {
+        obligation_id: ObligationId::from("REQ-001/AC-00/VO-01"),
+        assessment: AssessmentJudgment::Insufficient {
+          reason: "missing observation".into(),
+          proposals: vec![EvidenceRequestProposal::RunTrustedVerifierCheck { name: name.into() }],
+          gap_kind: GapKind::Evidence,
+        },
+      }],
+    }
+  }
+
+  #[test]
+  fn proposal_admission_rejects_unknown_or_unrelated_verifier() {
+    let graph = graph_with_contracts(vec![trusted_contract("allowed")]);
+    let admitted = admit_assessment_proposals(
+      &graph,
+      "revision",
+      &trusted_proposal("invented"),
+      &[trusted_spec("invented")],
+      &BTreeSet::new(),
+    )
+    .expect("evaluate proposal");
+
+    assert!(admitted.is_empty());
+  }
+
+  #[test]
+  fn proposal_admission_returns_only_configured_contract_capability() {
+    let graph = graph_with_contracts(vec![trusted_contract("allowed")]);
+    let admitted = admit_assessment_proposals(
+      &graph,
+      "revision",
+      &trusted_proposal("allowed"),
+      &[trusted_spec("allowed")],
+      &BTreeSet::new(),
+    )
+    .expect("evaluate proposal");
+
+    assert_eq!(admitted.len(), 1);
+    assert!(matches!(
+      &admitted[0].kind,
+      EvidenceAcquisitionKind::TrustedVerifierCheck { name, .. } if name == "allowed"
+    ));
   }
 }

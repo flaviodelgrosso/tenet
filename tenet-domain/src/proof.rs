@@ -365,10 +365,57 @@ impl EvidenceArtifact {
   }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EvidenceAcquisitionKind {
+  TrustedVerifierCheck {
+    name: String,
+    #[serde(rename = "specHash")]
+    spec_hash: String,
+  },
+  InspectSource {
+    path: String,
+    #[serde(rename = "startLine")]
+    start_line: u32,
+    #[serde(rename = "endLine")]
+    end_line: u32,
+  },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceAcquisitionRequest {
+  pub revision: String,
+  #[serde(flatten)]
+  pub kind: EvidenceAcquisitionKind,
+  #[serde(rename = "obligationIds")]
+  pub obligation_ids: BTreeSet<ObligationId>,
+}
+
+impl EvidenceAcquisitionRequest {
+  pub fn identity(&self) -> EvidenceAcquisitionIdentity {
+    EvidenceAcquisitionIdentity {
+      revision: self.revision.clone(),
+      kind: self.kind.clone(),
+    }
+  }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct EvidenceAcquisitionIdentity {
+  pub revision: String,
+  #[serde(flatten)]
+  pub kind: EvidenceAcquisitionKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EvidenceRequestProposal {
   RunProjectCheck {
+    name: String,
+  },
+  RunTrustedVerifierCheck {
     name: String,
   },
   InspectSource {

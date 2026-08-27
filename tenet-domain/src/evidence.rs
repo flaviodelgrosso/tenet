@@ -490,7 +490,7 @@ impl EvidenceGraphState {
       .map(|obligation| obligation.id.clone())
       .collect();
     let observed_bindings: BTreeSet<_> = record.obligation_ids.iter().cloned().collect();
-    if bindings.is_empty() || bindings != observed_bindings {
+    if observed_bindings.is_empty() || !observed_bindings.is_subset(&bindings) {
       return Err(EvidenceGraphError::TrustedExecutionBindingMismatch);
     }
     let observation = record
@@ -519,7 +519,7 @@ impl EvidenceGraphState {
         isolation_report: Box::new(isolation_report),
         result: record.observation.clone(),
       },
-      obligation_ids: bindings,
+      obligation_ids: observed_bindings,
       validity: ArtifactValidity::Valid,
       dependencies: DependencySurface::RepositoryWide,
       compatible_revisions: BTreeSet::new(),

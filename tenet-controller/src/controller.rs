@@ -26,7 +26,9 @@ use tenet_domain::{
     Phase, ReconcileResult, RepairProgress, RequirementCatalog, RequirementCounts, RunStatus,
     State, VerificationLayers, VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
   },
-  proof::{AssessmentJudgment, EvidenceContract, EvidencePredicate, GapKind, ProofState},
+  proof::{
+    AssessmentJudgment, EvidenceAcquisitionIdentity, EvidenceAcquisitionKind, GapKind, ProofState,
+  },
   verification::ProjectVerificationRun,
 };
 
@@ -62,6 +64,13 @@ pub struct Controller {
 
 struct ScheduledAgent {
   backend: Arc<dyn AgentBackend>,
+}
+struct AcquisitionPass<'a> {
+  context: &'a BackendContext,
+  catalog: &'a RequirementCatalog,
+  project_report: &'a ProjectVerificationRun,
+  suite_hash: &'a str,
+  revision: &'a str,
 }
 
 #[async_trait]
@@ -825,43 +834,27 @@ impl Controller {
           .await?,
       ));
     }
-    if !context.config.verification.trusted_checks.is_empty() {
-      state.last_summary = "Running controller-owned trusted verification".into();
-      self.publish(&context.events, state).await?;
-      let run_id = context
-        .runtime_dir
-        .file_name()
-        .and_then(|value| value.to_str())
-        .context("trusted verification run id is unavailable")?;
-      let workspaces = WorkspaceManager::new(self.cwd.clone(), run_id);
-      let runner = self.trusted_verifier.as_ref();
-      for spec in &context.config.verification.trusted_checks {
-        let obligation_ids: Vec<_> = catalog
-          .verification_obligations
-          .iter()
-          .filter(|obligation| {
-            contract_contains_trusted_verifier(&obligation.evidence_contract, &spec.name)
-          })
-          .map(|obligation| obligation.id.clone())
-          .collect();
-        if obligation_ids.is_empty() {
-          continue;
-        }
-        let execution = run_isolated_trusted_verifier(TrustedVerifierRequest {
-          repository: &self.cwd,
-          workspaces: &workspaces,
+    let mut attempted_acquisitions = BTreeSet::new();
+    if let Some(decision) = self
+      .acquire_missing_authoritative_evidence(
+        AcquisitionPass {
+          context,
+          catalog,
+          project_report: &project_report,
+          suite_hash: &suite_hash,
           revision: &verified_revision,
-          spec,
-          obligation_ids: &obligation_ids,
-          max_output_bytes: context.config.verification.max_output_bytes,
-          runner,
-          cancel: &context.cancel,
-        })
-        .await
-        .map_err(anyhow::Error::new)?;
-        let record = execution.into_record();
-        evidence_graph::record_trusted_execution(&self.cwd, evidence_graph, &record, spec).await?;
-      }
+        },
+        state,
+        evidence_graph,
+        &mut attempted_acquisitions,
+      )
+      .await?
+    {
+      return match decision::apply_completion_decision(state, &decision) {
+        decision::NextAction::Finish => Ok(Some(state.clone())),
+        decision::NextAction::Block(reason) => Ok(Some(self.block(context, state, &reason).await?)),
+        _ => bail!("authoritative acquisition produced an invalid controller action"),
+      };
     }
     let mechanical_decision = self
       .evaluate_and_publish_completion_gate(
@@ -943,13 +936,15 @@ impl Controller {
       &semantic_report,
     )
     .await?;
-    evidence_graph::acquire_assessment_proposals(
-      &self.cwd,
+    let admitted_proposals = evidence_graph::admit_assessment_proposals(
       evidence_graph,
       &verified_revision,
       &semantic_report,
-    )
-    .await?;
+      &context.config.verification.trusted_checks,
+      &attempted_acquisitions,
+    )?;
+    evidence_graph::acquire_assessment_proposals(&self.cwd, evidence_graph, &admitted_proposals)
+      .await?;
     let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
     state.requirement_counts = requirement_counts(catalog, evidence_graph, policy)?;
     apply_semantic_layers(&mut state.verification_layers, evidence_graph, policy);
@@ -982,6 +977,110 @@ impl Controller {
       decision::NextAction::Finish => Ok(Some(state.clone())),
       decision::NextAction::Block(reason) => Ok(Some(self.block(context, state, &reason).await?)),
       _ => bail!("completion policy returned an action invalid for this driver step"),
+    }
+  }
+
+  async fn acquire_missing_authoritative_evidence(
+    &self,
+    pass: AcquisitionPass<'_>,
+    state: &mut State,
+    evidence_graph: &mut EvidenceGraphState,
+    attempted: &mut BTreeSet<EvidenceAcquisitionIdentity>,
+  ) -> Result<Option<CompletionDecision>> {
+    let AcquisitionPass {
+      context,
+      catalog,
+      project_report,
+      suite_hash,
+      revision,
+    } = pass;
+    let run_id = context
+      .runtime_dir
+      .file_name()
+      .and_then(|value| value.to_str())
+      .context("trusted verification run id is unavailable")?;
+    let workspaces = WorkspaceManager::new(self.cwd.clone(), run_id);
+    loop {
+      evidence_graph.derive_proofs(revision);
+      let requests = evidence_graph::plan_missing_evidence(
+        evidence_graph,
+        revision,
+        &context.config.verification.trusted_checks,
+        attempted,
+      )?;
+      let Some(request) = requests.into_iter().next() else {
+        return Ok(None);
+      };
+      let identity = request.identity();
+      if !attempted.insert(identity) {
+        continue;
+      }
+      state.last_summary = "Acquiring controller-authorized evidence".into();
+      self.publish(&context.events, state).await?;
+      match &request.kind {
+        EvidenceAcquisitionKind::TrustedVerifierCheck { name, spec_hash } => {
+          let Some(spec) = context
+            .config
+            .verification
+            .trusted_checks
+            .iter()
+            .find(|spec| spec.name == *name)
+          else {
+            continue;
+          };
+          if spec.fingerprint()?.as_str() != spec_hash {
+            continue;
+          }
+          let obligation_ids: Vec<_> = request.obligation_ids.iter().cloned().collect();
+          let execution = run_isolated_trusted_verifier(TrustedVerifierRequest {
+            repository: &self.cwd,
+            workspaces: &workspaces,
+            revision,
+            spec,
+            obligation_ids: &obligation_ids,
+            max_output_bytes: context.config.verification.max_output_bytes,
+            runner: self.trusted_verifier.as_ref(),
+            cancel: &context.cancel,
+          })
+          .await;
+          let execution = match execution {
+            Ok(execution) => execution,
+            Err(error) if context.cancel.is_cancelled() => return Err(anyhow::Error::new(error)),
+            Err(error) => {
+              context
+                .events
+                .emit(RunEvent::Message(format!(
+                  "Authoritative acquisition {name:?} failed without semantic evidence: {error}"
+                )))
+                .await?;
+              continue;
+            }
+          };
+          let record = execution.into_record();
+          evidence_graph::record_trusted_execution(&self.cwd, evidence_graph, &record, spec)
+            .await?;
+        }
+        EvidenceAcquisitionKind::InspectSource { .. } => continue,
+      }
+      let decision = self
+        .evaluate_and_publish_completion_gate(
+          context,
+          state,
+          catalog,
+          evidence_graph,
+          project_report,
+          suite_hash,
+        )
+        .await?;
+      if decision == CompletionDecision::Done
+        || matches!(
+          &decision,
+          CompletionDecision::NotReady(blockers)
+            if blockers.iter().any(|blocker| matches!(blocker, CompletionBlocker::ProofContradicted(_)))
+        )
+      {
+        return Ok(Some(decision));
+      }
     }
   }
 
@@ -1613,18 +1712,6 @@ fn completion_gate(
     earned: matches!(decision, CompletionDecision::Done),
     items,
     blockers: blockers.iter().map(ToString::to_string).collect(),
-  }
-}
-
-fn contract_contains_trusted_verifier(contract: &EvidenceContract, name: &str) -> bool {
-  match contract {
-    EvidenceContract::Artifact {
-      predicate: EvidencePredicate::TrustedVerifierCheck { name: expected },
-    } => expected == name,
-    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => requirements
-      .iter()
-      .any(|requirement| contract_contains_trusted_verifier(requirement, name)),
-    _ => false,
   }
 }
 
