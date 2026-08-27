@@ -9,18 +9,41 @@ pub enum ArtifactAuthority {
   AgentAssertion,
   AgentExploratoryExecution,
   TenetObservedProjectVerifier,
+  TenetObservedAuthoritySnapshotVerifier,
 }
 
 impl ArtifactAuthority {
-  pub fn admits(&self, expected: &VerifierAuthority) -> bool {
+  pub fn admits(&self, expected: VerifierAuthority) -> bool {
     matches!(
       (self, expected),
       (
         Self::TenetObservedProjectVerifier,
         VerifierAuthority::Project
+      ) | (
+        Self::TenetObservedAuthoritySnapshotVerifier,
+        VerifierAuthority::AuthoritySnapshot
       )
     )
   }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(transparent)]
+pub struct GitObjectId(pub String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+  tag = "authority",
+  rename_all = "snake_case",
+  rename_all_fields = "camelCase"
+)]
+pub enum OracleIdentity {
+  Project,
+  AuthoritySnapshot {
+    authority_revision: String,
+    bundle_path: String,
+    bundle_object_id: GitObjectId,
+  },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -72,6 +95,7 @@ pub struct EvidenceArtifact {
   pub spec_digest: String,
   pub contract_digest: String,
   pub authority: ArtifactAuthority,
+  pub oracle_identity: OracleIdentity,
   pub provenance: ArtifactProvenance,
   pub effect: EvidenceEffect,
   pub validity: ArtifactValidity,

@@ -4,7 +4,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::policy::VerificationPolicy;
+use crate::policy::{VerificationPolicy, VerifierAuthority};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
@@ -43,6 +43,7 @@ pub struct VerificationObligation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvidenceContract {
   pub verifier_id: String,
+  pub authority: VerifierAuthority,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +102,15 @@ pub enum ContractError {
     obligation: String,
     verifier: String,
   },
+  #[error(
+    "obligation `{obligation}` requires verifier authority `{required:?}` but verifier `{verifier}` has authority `{configured:?}`"
+  )]
+  VerifierAuthorityMismatch {
+    obligation: String,
+    verifier: String,
+    required: VerifierAuthority,
+    configured: VerifierAuthority,
+  },
   #[error("proposal contains no requirements")]
   MissingRequirements,
 }
@@ -116,11 +126,6 @@ pub fn validate_proposal(
     return Err(ContractError::MissingRequirements);
   }
 
-  let verifier_ids: BTreeSet<&str> = policy
-    .verifiers
-    .iter()
-    .map(|verifier| verifier.id.as_str())
-    .collect();
   let mut requirement_ids = BTreeSet::new();
   let mut obligation_ids = BTreeSet::new();
 
@@ -145,10 +150,22 @@ pub fn validate_proposal(
         });
       }
       validate_statement("obligation", &obligation.id.0, &obligation.statement)?;
-      if !verifier_ids.contains(obligation.evidence_contract.verifier_id.as_str()) {
+      let Some(verifier) = policy
+        .verifiers
+        .iter()
+        .find(|verifier| verifier.id == obligation.evidence_contract.verifier_id)
+      else {
         return Err(ContractError::UnknownVerifier {
           obligation: obligation.id.0.clone(),
           verifier: obligation.evidence_contract.verifier_id.clone(),
+        });
+      };
+      if obligation.evidence_contract.authority != verifier.authority {
+        return Err(ContractError::VerifierAuthorityMismatch {
+          obligation: obligation.id.0.clone(),
+          verifier: verifier.id.clone(),
+          required: obligation.evidence_contract.authority,
+          configured: verifier.authority,
         });
       }
     }

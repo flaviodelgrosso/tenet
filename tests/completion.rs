@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use tenet_domain::{
   completion::{
     derive_completion, derive_obligation_state, DerivationContext, ObligationState, Verdict,
@@ -8,7 +10,7 @@ use tenet_domain::{
   },
   evidence::{
     ArtifactAuthority, ArtifactProvenance, ArtifactValidity, DependencySurface, EvidenceArtifact,
-    EvidenceEffect, VerifierObservation,
+    EvidenceEffect, OracleIdentity, VerifierObservation,
   },
   policy::{RepositoryConfig, VerifierAuthority, VerifierSpec},
 };
@@ -28,6 +30,7 @@ fn fixture() -> (AdmittedContract, RepositoryConfig, EvidenceArtifact) {
         statement: "configured check passes".into(),
         evidence_contract: EvidenceContract {
           verifier_id: "quality".into(),
+          authority: VerifierAuthority::Project,
         },
       }],
     }],
@@ -43,6 +46,7 @@ fn fixture() -> (AdmittedContract, RepositoryConfig, EvidenceArtifact) {
       max_output_bytes: 1024,
       env: Default::default(),
       authority: VerifierAuthority::Project,
+      oracle_path: None,
     }],
   };
   let evidence = EvidenceArtifact {
@@ -54,6 +58,7 @@ fn fixture() -> (AdmittedContract, RepositoryConfig, EvidenceArtifact) {
     spec_digest: "spec".into(),
     contract_digest: "contract".into(),
     authority: ArtifactAuthority::TenetObservedProjectVerifier,
+    oracle_identity: OracleIdentity::Project,
     provenance: ArtifactProvenance::TenetLocalVerifier,
     effect: EvidenceEffect::Supports,
     validity: ArtifactValidity::Valid,
@@ -70,6 +75,7 @@ fn fixture() -> (AdmittedContract, RepositoryConfig, EvidenceArtifact) {
 
 fn derive(evidence: &[EvidenceArtifact]) -> tenet_domain::completion::ObligationResult {
   let (contract, policy, _) = fixture();
+  let oracle_identities = BTreeMap::from([("quality".into(), OracleIdentity::Project)]);
   derive_obligation_state(
     &DerivationContext {
       authority_revision: "authority",
@@ -79,6 +85,7 @@ fn derive(evidence: &[EvidenceArtifact]) -> tenet_domain::completion::Obligation
       policy_digest: "policy",
       contract: &contract,
       policy: &policy,
+      oracle_identities: &oracle_identities,
     },
     &ObligationId("REQ-001/VO-001".into()),
     evidence,
@@ -133,6 +140,24 @@ fn stale_and_mismatched_bindings_cannot_satisfy() {
   assert_eq!(revision.state, ObligationState::Stale);
   assert_eq!(specification.state, ObligationState::Stale);
   assert_eq!(policy.state, ObligationState::Stale);
+}
+
+#[test]
+fn mismatched_oracle_identity_cannot_satisfy() {
+  let (_, _, mut evidence) = fixture();
+  evidence.oracle_identity = OracleIdentity::AuthoritySnapshot {
+    authority_revision: "authority".into(),
+    bundle_path: "oracle".into(),
+    bundle_object_id: tenet_domain::evidence::GitObjectId("object".into()),
+  };
+  assert_eq!(derive(&[evidence]).state, ObligationState::Stale);
+}
+
+#[test]
+fn mismatched_artifact_authority_cannot_satisfy() {
+  let (_, _, mut evidence) = fixture();
+  evidence.authority = ArtifactAuthority::TenetObservedAuthoritySnapshotVerifier;
+  assert_eq!(derive(&[evidence]).state, ObligationState::MissingEvidence);
 }
 
 #[test]

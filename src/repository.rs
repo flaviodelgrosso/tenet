@@ -241,6 +241,41 @@ pub fn read_revision_file(root: &Path, revision: &str, path: &str) -> Result<Opt
   Ok(Some(output.stdout))
 }
 
+pub fn revision_directory_object(root: &Path, revision: &str, path: &str) -> Result<String> {
+  let output = Command::new("git")
+    .args([
+      "--no-replace-objects",
+      "--literal-pathspecs",
+      "ls-tree",
+      "-z",
+      "--full-tree",
+      revision,
+      "--",
+      path,
+    ])
+    .current_dir(root)
+    .output()
+    .with_context(|| format!("inspect authority oracle bundle `{path}`"))?;
+  if !output.status.success() {
+    bail!(
+      "inspect authority oracle bundle `{path}`: {}",
+      String::from_utf8_lossy(&output.stderr).trim()
+    );
+  }
+  let record = output
+    .stdout
+    .strip_suffix(&[0])
+    .with_context(|| format!("authority oracle bundle `{path}` does not exist"))?;
+  if record.contains(&0) {
+    bail!("authority oracle bundle `{path}` is ambiguous");
+  }
+  let entry = parse_tree_entry(record)?;
+  if entry.path != Path::new(path) || entry.mode != "040000" || entry.kind != "tree" {
+    bail!("authority oracle bundle `{path}` must be a Git tree");
+  }
+  Ok(entry.object)
+}
+
 pub fn changed_paths(
   root: &Path,
   authority_revision: &str,

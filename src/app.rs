@@ -1,5 +1,5 @@
 use std::{
-  collections::BTreeMap,
+  collections::{BTreeMap, BTreeSet},
   fs,
   path::{Path, PathBuf},
   process::ExitCode,
@@ -18,9 +18,9 @@ use tenet_domain::{
   digest::{bytes_digest, canonical_digest},
   evidence::{
     ArtifactAuthority, ArtifactProvenance, ArtifactValidity, DependencySurface, EvidenceArtifact,
-    EvidenceEffect,
+    EvidenceEffect, GitObjectId, OracleIdentity,
   },
-  policy::{validate_policy, VerificationPolicy},
+  policy::{validate_policy, VerificationPolicy, VerifierAuthority},
 };
 
 use crate::{
@@ -344,12 +344,16 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
   }
   validate_admitted_contract(&contract, &policy)?;
 
-  let changed_paths = repository::changed_paths(
-    &root,
-    &authority_revision,
-    &revision,
-    &[CONFIG_PATH, CONTRACT_PATH, &policy.spec_path],
-  )?;
+  let mut authority_paths = BTreeSet::from([CONFIG_PATH, CONTRACT_PATH, policy.spec_path.as_str()]);
+  authority_paths.extend(
+    policy
+      .verifiers
+      .iter()
+      .filter_map(|verifier| verifier.oracle_path.as_deref()),
+  );
+  let authority_paths = authority_paths.into_iter().collect::<Vec<_>>();
+  let changed_paths =
+    repository::changed_paths(&root, &authority_revision, &revision, &authority_paths)?;
   if !changed_paths.is_empty() {
     let message = format!(
       "candidate changed authority-owned paths: {}; admit and select a new authority revision",
@@ -367,10 +371,9 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
     return finish_gate(&root, result, Vec::new(), json);
   }
 
-  let materialized = MaterializedRevision::create(&root, &revision)?;
-  let checkout = materialized.path();
   let mut observations = BTreeMap::new();
   let mut infrastructure_errors = BTreeMap::new();
+  let mut oracle_identities = BTreeMap::new();
   for obligation in contract.obligations() {
     let verifier_id = &obligation.evidence_contract.verifier_id;
     if observations.contains_key(verifier_id) || infrastructure_errors.contains_key(verifier_id) {
@@ -381,7 +384,42 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
       .iter()
       .find(|item| &item.id == verifier_id)
       .context("validated verifier disappeared")?;
-    match run_verifier(checkout, verifier) {
+    let oracle_identity = match verifier.authority {
+      VerifierAuthority::Project => OracleIdentity::Project,
+      VerifierAuthority::AuthoritySnapshot => {
+        let bundle_path = verifier
+          .oracle_path
+          .as_deref()
+          .context("validated authority_snapshot verifier lost oracle_path")?;
+        let object =
+          repository::revision_directory_object(&root, &authority_revision, bundle_path)?;
+        OracleIdentity::AuthoritySnapshot {
+          authority_revision: authority_revision.clone(),
+          bundle_path: bundle_path.into(),
+          bundle_object_id: GitObjectId(object),
+        }
+      }
+    };
+    oracle_identities.insert(verifier_id.clone(), oracle_identity);
+
+    let candidate = MaterializedRevision::create(&root, &revision)?;
+    let authority = if verifier.authority == VerifierAuthority::AuthoritySnapshot {
+      Some(MaterializedRevision::create(&root, &authority_revision)?)
+    } else {
+      None
+    };
+    let oracle_bundle = match authority.as_ref() {
+      Some(materialized) => Some(
+        materialized.path().join(
+          verifier
+            .oracle_path
+            .as_deref()
+            .context("validated authority_snapshot verifier lost oracle_path")?,
+        ),
+      ),
+      None => None,
+    };
+    match run_verifier(candidate.path(), oracle_bundle.as_deref(), verifier) {
       Ok(observation) if observation.timed_out => {
         infrastructure_errors.insert(verifier_id.clone(), "verifier timed out".to_owned());
       }
@@ -410,6 +448,7 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
     policy_digest: &policy_digest,
     contract: &contract,
     policy: &policy,
+    oracle_identities: &oracle_identities,
   };
   for obligation in contract.obligations() {
     let verifier_id = &obligation.evidence_contract.verifier_id;
@@ -434,6 +473,21 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
       Some(126) => EvidenceEffect::Inconclusive,
       _ => EvidenceEffect::Contradicts,
     };
+    let verifier = policy
+      .verifiers
+      .iter()
+      .find(|item| &item.id == verifier_id)
+      .context("validated verifier disappeared")?;
+    let authority = match verifier.authority {
+      VerifierAuthority::Project => ArtifactAuthority::TenetObservedProjectVerifier,
+      VerifierAuthority::AuthoritySnapshot => {
+        ArtifactAuthority::TenetObservedAuthoritySnapshotVerifier
+      }
+    };
+    let oracle_identity = oracle_identities
+      .get(verifier_id)
+      .context("executed verifier has no oracle identity")?
+      .clone();
     artifacts.push(EvidenceArtifact {
       obligation_id: obligation.id.clone(),
       authority_revision: authority_revision.clone(),
@@ -442,7 +496,8 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
       policy_digest: policy_digest.clone(),
       spec_digest: spec_digest.clone(),
       contract_digest: contract_digest.clone(),
-      authority: ArtifactAuthority::TenetObservedProjectVerifier,
+      authority,
+      oracle_identity,
       provenance: ArtifactProvenance::TenetLocalVerifier,
       effect,
       validity: ArtifactValidity::Valid,

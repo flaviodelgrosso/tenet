@@ -7,23 +7,50 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use tenet_domain::{evidence::VerifierObservation, policy::VerifierSpec};
+use tenet_domain::{
+  evidence::VerifierObservation,
+  policy::{VerifierAuthority, VerifierSpec},
+};
 
-pub fn run_verifier(checkout: &Path, verifier: &VerifierSpec) -> Result<VerifierObservation> {
-  let executable = verifier.argv.first().context("verifier argv is empty")?;
-  let checkout = checkout
+pub fn run_verifier(
+  candidate_checkout: &Path,
+  oracle_bundle: Option<&Path>,
+  verifier: &VerifierSpec,
+) -> Result<VerifierObservation> {
+  let configured_executable = verifier.argv.first().context("verifier argv is empty")?;
+  let candidate_checkout = candidate_checkout
     .canonicalize()
     .context("canonicalize candidate checkout")?;
-  let cwd = checkout.join(&verifier.cwd);
-  let mut command = Command::new(executable);
+  let (execution_root, executable) = match verifier.authority {
+    VerifierAuthority::Project => (candidate_checkout.clone(), configured_executable.into()),
+    VerifierAuthority::AuthoritySnapshot => {
+      let bundle = oracle_bundle
+        .context("authority_snapshot verifier has no materialized oracle bundle")?
+        .canonicalize()
+        .context("canonicalize authority oracle bundle")?;
+      let executable = bundle
+        .join(configured_executable)
+        .canonicalize()
+        .context("resolve authority oracle executable")?;
+      if !executable.starts_with(&bundle) || !executable.is_file() {
+        anyhow::bail!("authority oracle executable must be a file inside its bundle");
+      }
+      (bundle, executable)
+    }
+  };
+  let cwd = execution_root.join(&verifier.cwd);
+  let mut command = Command::new(&executable);
   command
     .args(&verifier.argv[1..])
     .envs(&verifier.env)
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
+  if verifier.authority == VerifierAuthority::AuthoritySnapshot {
+    command.env("TENET_CANDIDATE_ROOT", &candidate_checkout);
+  }
   #[cfg(unix)]
-  let cwd_handle = open_verifier_cwd(&checkout, &verifier.cwd)?;
+  let cwd_handle = open_verifier_cwd(&execution_root, &verifier.cwd)?;
   #[cfg(unix)]
   {
     use std::os::{fd::AsRawFd, unix::process::CommandExt};
@@ -47,9 +74,9 @@ pub fn run_verifier(checkout: &Path, verifier: &VerifierSpec) -> Result<Verifier
     let cwd = cwd
       .canonicalize()
       .with_context(|| format!("resolve verifier working directory `{}`", verifier.cwd))?;
-    if !cwd.starts_with(&checkout) {
+    if !cwd.starts_with(&execution_root) {
       anyhow::bail!(
-        "verifier working directory `{}` escapes the candidate checkout",
+        "verifier working directory `{}` escapes its execution root",
         verifier.cwd
       );
     }

@@ -4,10 +4,11 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifierAuthority {
   Project,
+  AuthoritySnapshot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -33,6 +34,8 @@ pub struct VerifierSpec {
   #[serde(default)]
   pub env: BTreeMap<String, String>,
   pub authority: VerifierAuthority,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub oracle_path: Option<String>,
 }
 
 pub type VerificationPolicy = RepositoryConfig;
@@ -67,6 +70,12 @@ pub enum PolicyError {
   InvalidTimeout(String),
   #[error("verifier `{0}` output limit must be positive")]
   InvalidOutputLimit(String),
+  #[error("project verifier `{0}` must not configure oracle_path")]
+  UnexpectedOraclePath(String),
+  #[error("authority_snapshot verifier `{0}` must configure a repository-relative oracle_path")]
+  InvalidOraclePath(String),
+  #[error("authority_snapshot verifier `{0}` executable must be relative to its oracle bundle")]
+  InvalidOracleExecutable(String),
 }
 
 pub fn validate_policy(policy: &VerificationPolicy) -> Result<(), PolicyError> {
@@ -99,6 +108,24 @@ pub fn validate_policy(policy: &VerificationPolicy) -> Result<(), PolicyError> {
     }
     if verifier.max_output_bytes == 0 {
       return Err(PolicyError::InvalidOutputLimit(verifier.id.clone()));
+    }
+    match verifier.authority {
+      VerifierAuthority::Project if verifier.oracle_path.is_some() => {
+        return Err(PolicyError::UnexpectedOraclePath(verifier.id.clone()));
+      }
+      VerifierAuthority::Project => {}
+      VerifierAuthority::AuthoritySnapshot => {
+        let valid_oracle_path = verifier
+          .oracle_path
+          .as_deref()
+          .is_some_and(|path| path != "." && is_safe_relative_path(path));
+        if !valid_oracle_path {
+          return Err(PolicyError::InvalidOraclePath(verifier.id.clone()));
+        }
+        if !is_safe_relative_path(&verifier.argv[0]) {
+          return Err(PolicyError::InvalidOracleExecutable(verifier.id.clone()));
+        }
+      }
     }
   }
   Ok(())

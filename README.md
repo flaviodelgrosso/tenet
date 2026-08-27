@@ -49,9 +49,9 @@ tenet init --spec SPEC.md --json
 
 Initialization is repository-local and idempotent for the same specification. It does not alter `AGENTS.md`, `CLAUDE.md`, or global tooling configuration.
 
-### 2. Configure project verifiers
+### 2. Configure verifiers
 
-Edit `.tenet/tenet.toml`:
+Edit `.tenet/tenet.toml`. A project verifier executes the authority-defined command in the candidate tree:
 
 ```toml
 version = 1
@@ -66,7 +66,22 @@ max_output_bytes = 65536
 authority = "project"
 ```
 
-Verifier commands are structured argument arrays, not shell strings. Final gating reads the command definition from authority revision A, executes it in a temporary detached materialization of candidate revision R, captures bounded output, and enforces the configured timeout.
+An authority-snapshot verifier keeps its executable and assets in a repository directory owned by A:
+
+```toml
+[[verifiers]]
+id = "acceptance"
+argv = ["verify"]
+cwd = "."
+timeout_seconds = 300
+max_output_bytes = 65536
+authority = "authority_snapshot"
+oracle_path = ".tenet/oracles/acceptance"
+```
+
+For `authority_snapshot`, `oracle_path` must name a Git tree and `argv[0]` and `cwd` are relative to that bundle. Tenet materializes the bundle from A, runs the A-owned executable with the bundle as its execution root, and exposes the independent fresh candidate tree through `TENET_CANDIDATE_ROOT`. The executable must be a file that resolves inside the bundle. Oracle scripts should read or execute candidate content only through `TENET_CANDIDATE_ROOT`; relative helpers and assets resolve from the A-owned bundle.
+
+Verifier commands are structured argument arrays, not shell strings. Final gating reads each command definition from authority revision A, executes every distinct verifier against its own temporary materialization of candidate revision R, captures bounded output, and enforces the configured timeout.
 
 Verifier exit semantics:
 
@@ -76,7 +91,7 @@ Verifier exit semantics:
 - any other ordinary exit code: contradicts the bound obligation;
 - timeout, launch failure, or termination without an exit code: infrastructure error.
 
-`authority = "project"` is the only currently executable authority. It identifies a repository-owned check observed by Tenet's ordinary local process runner; it does not claim protected execution or resistance to candidate-controlled oracle manipulation.
+`authority = "project"` identifies a repository-owned check executed from R, so candidate content may influence both implementation and oracle. `authority = "authority_snapshot"` identifies an oracle bundle loaded from A and executed with R only as explicit candidate input. It establishes provenance and candidate independence of the admitted oracle bundle; it does not establish oracle adequacy, protected execution, semantic correctness, or complete coverage of the associated claim.
 
 ### 3. Propose a completion contract
 
@@ -120,7 +135,7 @@ tenet gate \
   --json
 ```
 
-Tenet resolves both arguments to exact commits, requires A to be an ancestor of R, and loads the specification, admitted contract, and verifier policy only from A. It rejects R if `.tenet/tenet.toml`, `.tenet/contract.json`, or A's configured specification path differs between A and R. Verifiers defined by A execute against R's detached candidate tree.
+Tenet resolves both arguments to exact commits, requires A to be an ancestor of R, and loads the specification, admitted contract, verifier policy, and authority-snapshot oracle bundles only from A. It rejects R if `.tenet/tenet.toml`, `.tenet/contract.json`, A's configured specification path, or any configured authority-snapshot `oracle_path` differs between A and R. Project verifiers execute inside independent detached candidate trees; authority-snapshot verifiers execute from independent A-owned bundles against independent detached candidate trees.
 
 The deterministic verdict is one of:
 
@@ -131,7 +146,7 @@ The deterministic verdict is one of:
 
 Only `done` authorizes completion. The result includes exact `authorityRevision` and `revision` identities plus specification, contract, and policy digests from A.
 
-An authority-surface change returns `authority_surface_changed`; intentional control-plane changes require admission and selection of a new authority revision. Other failed gates return typed blockers. Tenet does not decide what code to write or attempt fixes; the caller owns that engineering loop.
+An authority-surface change returns `authority_surface_changed`; candidate changes to an oracle bundle cannot authorize `DONE` under the old A. Intentional control-plane or oracle changes require admission and selection of a new authority revision. Other failed gates return typed blockers. Tenet does not decide what code to write or attempt fixes; the caller owns that engineering loop.
 
 ### 6. Inspect state and evidence
 
@@ -150,7 +165,7 @@ The semantic chain is deliberately small:
 Specification
   -> Requirement or claim
     -> Verification obligation
-      -> Evidence contract (configured verifier ID)
+      -> Evidence contract (configured verifier ID and required authority)
 ```
 
 Evidence mechanically binds:
@@ -158,25 +173,26 @@ Evidence mechanically binds:
 - obligation ID;
 - exact authority Git revision;
 - exact candidate Git revision;
-- verifier identity and implemented authority classification;
+- verifier identity, required authority, and observed authority classification;
+- oracle identity, including A and the authority-snapshot bundle's Git tree object ID when applicable;
 - specification, contract, and policy digests from the authority revision;
 - supporting, contradicting, or inconclusive effect;
 - repository-wide dependency surface;
 - validity and captured observation.
 
-Repository-wide freshness is conservative: evidence from another authority revision, candidate revision, or control-plane digest cannot satisfy an obligation. Gate execution currently reruns required verifiers rather than relying on cache reuse; local history is audit data only.
+Repository-wide freshness is conservative: evidence from another authority revision, candidate revision, control-plane digest, verifier authority, or oracle identity cannot satisfy an obligation. Gate execution reruns required verifiers rather than relying on cache reuse; local history is audit data only.
 
 Authoritative contradiction wins over unrelated supporting evidence for the same obligation. Missing, stale, unverified, or contradictory evidence cannot produce `DONE`.
 
 ## Claim-to-oracle honesty
 
-Verifier mapping is admitted policy. A project verifier proves only that the admitted project check produced the observed result against R. A passing generic test suite does not automatically become a complete semantic oracle for every associated claim, and candidate code may still influence a project-owned oracle. Operator review of claim-to-evidence mappings remains part of the trust model.
+Verifier mapping and required authority are admitted contract semantics. A project verifier proves only that the admitted project check produced the observed result against R. An authority-snapshot verifier additionally proves that the executed oracle bundle came from A and that R could not replace that committed bundle while retaining A. Neither mode proves that a passing generic test suite is a sufficient semantic oracle, that coverage is complete, or that the associated claim is universally correct. Operator review of claim-to-evidence mappings remains part of the trust model.
 
 ## Threat model
 
-The authority revision supplied by the operator or CI is trusted repository control state. Coding-agent statements and candidate-selected control-plane files are epistemically untrusted. Tenet does not provide a security boundary against an arbitrary process intentionally bypassing the protocol while running under the same OS principal.
+The authority revision supplied by the operator or CI is trusted repository control state. Coding-agent statements and candidate-selected control-plane files are epistemically untrusted. Tenet does not provide a security boundary against an arbitrary process intentionally bypassing the protocol or modifying another process's files while running under the same OS principal. `authority_snapshot` is a provenance and workflow boundary within that model, not a sandbox.
 
-Tenet uses deterministic hashes for identity and staleness binding, not authentication. The default workflow requires no persistent secret or model credential.
+Tenet uses Git object IDs and deterministic hashes for identity and staleness binding, not authentication. The default workflow requires no persistent secret or model credential.
 
 ## Fresh clones and CI
 

@@ -1,9 +1,11 @@
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
   contract::{AdmittedContract, ObligationId},
-  evidence::{ArtifactValidity, EvidenceArtifact, EvidenceEffect},
+  evidence::{ArtifactValidity, EvidenceArtifact, EvidenceEffect, OracleIdentity},
   policy::VerificationPolicy,
 };
 
@@ -73,6 +75,7 @@ pub struct DerivationContext<'a> {
   pub policy_digest: &'a str,
   pub contract: &'a AdmittedContract,
   pub policy: &'a VerificationPolicy,
+  pub oracle_identities: &'a BTreeMap<String, OracleIdentity>,
 }
 
 pub fn derive_obligation_state(
@@ -108,6 +111,24 @@ pub fn derive_obligation_state(
       "admitted verifier is absent from policy",
     );
   };
+  if verifier.authority != obligation.evidence_contract.authority {
+    return result(
+      obligation_id,
+      ObligationState::Unverifiable,
+      BlockerCode::VerifierNotConfigured,
+      Some(verifier_id),
+      "admitted verifier authority differs from the evidence contract",
+    );
+  }
+  let Some(oracle_identity) = context.oracle_identities.get(verifier_id) else {
+    return result(
+      obligation_id,
+      ObligationState::Unverifiable,
+      BlockerCode::VerifierNotConfigured,
+      Some(verifier_id),
+      "admitted verifier has no resolved oracle identity",
+    );
+  };
 
   let matching: Vec<&EvidenceArtifact> = evidence
     .iter()
@@ -134,14 +155,17 @@ pub fn derive_obligation_state(
       && artifact.revision == context.revision
       && artifact.spec_digest == context.spec_digest
       && artifact.contract_digest == context.contract_digest
-      && artifact.policy_digest == context.policy_digest;
+      && artifact.policy_digest == context.policy_digest
+      && artifact.oracle_identity == *oracle_identity;
     if !binding_matches || artifact.validity == ArtifactValidity::Stale {
       saw_stale = true;
       continue;
     }
     if artifact.validity != ArtifactValidity::Valid
       || artifact.provenance != crate::evidence::ArtifactProvenance::TenetLocalVerifier
-      || !artifact.authority.admits(&verifier.authority)
+      || !artifact
+        .authority
+        .admits(obligation.evidence_contract.authority)
     {
       continue;
     }
