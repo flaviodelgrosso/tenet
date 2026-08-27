@@ -1,51 +1,61 @@
-name: CI
+name: CI # Continuous Integration
 
 on:
   push:
-    branches: [main, master]
+    branches:
+      - main
+    paths-ignore:
+      - "**.md"
   pull_request:
-  workflow_dispatch:
+    paths-ignore:
+      - "**.md"
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  rust:
-    name: Rust checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  test:
+    name: Test Suite
+    runs-on: ubuntu-24.04
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache Cargo artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check compilation
-        run: cargo check --workspace --all-targets --all-features --locked
-
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
       - name: Run tests
-        run: cargo test --workspace --all-targets --all-features --locked
+        run: cargo test --no-default-features --features all-static --workspace
+
+  rustfmt:
+    name: Rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          components: clippy
+      - name: Clippy check
+        run: cargo clippy --all-targets --all-features --workspace -- -D warnings
