@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::{
   ids::{ObligationId, VerificationRunId},
-  proof::{ArtifactObservation, ExecutionObservation},
+  proof::{ArtifactObservation, DependencyPolicy, ExecutionObservation},
 };
 
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
@@ -193,6 +193,8 @@ pub struct TrustedVerificationSpec {
   pub resources: TrustedResourcePolicy,
   #[serde(default)]
   pub protocol: TrustedVerifierProtocol,
+  #[serde(default)]
+  pub dependencies: DependencyPolicy,
 }
 
 impl TrustedVerificationSpec {
@@ -203,6 +205,10 @@ impl TrustedVerificationSpec {
     if self.backend != TrustedExecutionBackend::Microsandbox {
       return Err(TrustedVerifierSpecError::UnsupportedBackend);
     }
+    self
+      .dependencies
+      .validate()
+      .map_err(|error| TrustedVerifierSpecError::InvalidDependencies(error.to_string()))?;
     self.image_digest()?;
     if self.program.trim().is_empty() {
       return Err(TrustedVerifierSpecError::BlankProgram);
@@ -270,6 +276,8 @@ pub enum TrustedVerifierSpecError {
   UnsupportedBackend,
   #[error("trusted verifier image must use an immutable sha256 digest")]
   UnpinnedImage,
+  #[error("trusted verifier dependency policy is invalid: {0}")]
+  InvalidDependencies(String),
   #[error("trusted verifier program must not be blank")]
   BlankProgram,
   #[error("trusted verifier working_directory must remain within the candidate repository")]
@@ -495,6 +503,7 @@ mod tests {
       isolation: TrustedIsolationPolicy::default(),
       resources: TrustedResourcePolicy::default(),
       protocol: TrustedVerifierProtocol::ExitCode,
+      dependencies: Default::default(),
     }
   }
 

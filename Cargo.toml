@@ -23,6 +23,7 @@ async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 colored = "3"
+ed25519-dalek = "3"
 globset = "0.4"
 hmac = "0.13"
 jsonschema = "0.49"

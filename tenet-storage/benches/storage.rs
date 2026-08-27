@@ -177,7 +177,7 @@ fn main() {
     let start = Instant::now();
     for _ in 0..ITERATIONS {
       storage
-        .load_evidence_graph(&catalog, &[], &[])
+        .load_evidence_graph(&catalog, &[], &[], &[])
         .await
         .expect("completion evidence facts");
     }

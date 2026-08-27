@@ -327,6 +327,7 @@ mod tests {
         isolation: Default::default(),
         resources: Default::default(),
         protocol: TrustedVerifierProtocol::ExitCode,
+        dependencies: Default::default(),
       },
       protocol: FalsifierProtocol::ExitCode,
       input: Some(StructuredFalsifierInputSpec {

@@ -115,6 +115,10 @@ uuid_id!(
   VerificationRunId,
   "UUID-backed identity for one controller verification run."
 );
+uuid_id!(
+  HumanAttestationId,
+  "UUID-backed identity for one authenticated human attestation."
+);
 
 #[cfg(test)]
 mod tests {

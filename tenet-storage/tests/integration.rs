@@ -4,11 +4,13 @@ use tenet_domain::{
   model::{IntegrationPhase, IntegrationTransaction},
   verification::ProjectVerificationRun,
 };
-use tenet_storage::Storage;
+use tenet_storage::{install_controller_authority_key, Storage};
 
 mod support;
 
 async fn prepared() -> (tempfile::TempDir, Storage, IntegrationTransaction) {
+  install_controller_authority_key("tenet-integration-tests", b"tenet-integration-authority")
+    .expect("install project authority key");
   let project = tempfile::tempdir().expect("temporary project");
   let storage = Storage::open(project.path()).await.expect("open storage");
   let catalog = support::catalog();

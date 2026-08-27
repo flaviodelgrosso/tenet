@@ -12,11 +12,13 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio_util::sync::CancellationToken;
 
 use tenet_domain::{
   config::{read_config, Config, TENET_DIR},
   evidence::EvidenceGraphState,
   falsifier::{FalsificationExecutionRecord, FalsifierSpec},
+  human_attestation::{HumanAttestationRecord, HumanAttestorSpec},
   model::{
     CatalogApproval, CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
     RequirementCatalog, State,
@@ -25,6 +27,8 @@ use tenet_domain::{
   verification::ProjectVerificationRun,
 };
 use tenet_storage::Storage;
+
+use crate::{verifier, workspace::WorkspaceManager};
 const AUTHORITY_NAMESPACE_ENV: &str = "TENET_CONTROLLER_AUTHORITY_NAMESPACE";
 const AUTHORITY_KEY_FD_ENV: &str = "TENET_CONTROLLER_AUTHORITY_KEY_FD";
 const MAX_AUTHORITY_KEY_BYTES: u64 = 1024 * 1024;
@@ -215,6 +219,7 @@ pub async fn read_evidence_graph(
       &catalog,
       &config.verification.trusted_checks,
       &config.verification.falsifiers,
+      &config.verification.human_attestors,
     )
     .await?;
   if graph.specification_hash != expected.specification_hash
@@ -310,6 +315,23 @@ pub async fn record_falsification(
     .record_falsification(run_id, record, spec)
     .await
     .context("record controller-owned falsification")?;
+  Ok(())
+}
+pub async fn record_human_attestation(
+  cwd: &Path,
+  record: &HumanAttestationRecord,
+  attestor: &HumanAttestorSpec,
+) -> Result<()> {
+  let storage = Storage::open(cwd).await?;
+  let state = storage.load_current_state().await?;
+  let run_id = state
+    .run_id
+    .as_deref()
+    .ok_or_else(|| anyhow!("cannot persist human attestation without an active run"))?;
+  storage
+    .record_human_attestation(run_id, record, attestor)
+    .await
+    .context("record authenticated human attestation")?;
   Ok(())
 }
 
@@ -414,15 +436,64 @@ pub async fn recover_integration(cwd: &Path, state: &mut State, config: &Config)
       transaction.id
     ));
   }
-  let report = storage
+  let report = match storage
     .load_project_verification(transaction.verification_run_id)
     .await?
-    .ok_or_else(|| {
-      anyhow!(
-        "integration recovery is missing project verification {}",
-        transaction.verification_run_id
+  {
+    Some(report) => report,
+    None => {
+      let previous_verification_run_id = transaction.verification_run_id;
+      if !crate::git::is_clean(cwd).await? {
+        anyhow::bail!(
+          "integration recovery cannot reverify legacy evidence from a dirty canonical repository"
+        );
+      }
+      let workspaces = WorkspaceManager::new(
+        cwd.to_path_buf(),
+        format!("{}-recovery", transaction.run_id),
+      );
+      let report = verifier::run_project_verification_isolated(
+        cwd,
+        &workspaces,
+        &transaction.new_head,
+        config,
+        "integration-recovery-project-verification",
+        &CancellationToken::new(),
       )
-    })?;
+      .await
+      .context("rerun project verification for integration recovery")?;
+      if !report.passed {
+        anyhow::bail!(
+          "integration recovery project verification failed for {}",
+          transaction.new_head
+        );
+      }
+      storage
+        .record_project_verification(&transaction.run_id, &report)
+        .await?;
+      let verification_hash = project_verification_hash(&report)?;
+      let updated_at = Utc::now().to_rfc3339();
+      storage
+        .replace_integration_verification(
+          &transaction,
+          report.run_id,
+          &verification_hash,
+          &updated_at,
+        )
+        .await?;
+      for completed in &mut state.completed_work_units {
+        if completed.work_unit == transaction.work_unit
+          && completed.verification_run_id == previous_verification_run_id
+        {
+          completed.verification_run_id = report.run_id;
+        }
+      }
+      transaction.verification_run_id = report.run_id;
+      transaction.verification_hash = verification_hash;
+      transaction.updated_at = updated_at;
+      report
+    }
+  };
   verify_transaction_evidence(&transaction, &report, &config.verification.suite_hash()?)?;
   if transaction.phase == IntegrationPhase::Prepared {
     transaction.phase = IntegrationPhase::GitCommitted;

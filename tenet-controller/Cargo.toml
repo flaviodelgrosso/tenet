@@ -21,6 +21,9 @@ tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
 proptest.workspace = true
+sqlx.workspace = true
+tenet-storage = { path = "../tenet-storage" }
 tempfile = "3"
 toml.workspace = true

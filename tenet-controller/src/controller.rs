@@ -15,7 +15,8 @@ use uuid::Uuid;
 use tenet_domain::{
   config::{config_path, ensure_config, read_config, TENET_DIR},
   events::{
-    CompletionGate, CompletionGateItem, CompletionGateOutcome, EventSink, RunEvent, RunLogger,
+    CompletionGate, CompletionGateItem, CompletionGateOutcome, EventSink, EvidenceAcquisitionStage,
+    EvidenceIssuer, RunEvent, RunLogger,
   },
   evidence::{
     EvidenceGraphState, EvidencePolicy, ImplementationState, SemanticAssessmentProposal,
@@ -28,7 +29,8 @@ use tenet_domain::{
     State, VerificationLayers, VerificationReport, WorkExecution, WorkStatus, WorkerDiscovery,
   },
   proof::{
-    AssessmentJudgment, EvidenceAcquisitionIdentity, EvidenceAcquisitionKind, GapKind, ProofState,
+    AssessmentJudgment, EvidenceAcquisitionIdentity, EvidenceAcquisitionKind,
+    EvidenceAcquisitionRequest, GapKind, ProofState,
   },
   verification::ProjectVerificationRun,
 };
@@ -968,8 +970,13 @@ impl Controller {
         _ => bail!("admitted acquisition produced an invalid controller action"),
       };
     }
-    evidence_graph::acquire_assessment_proposals(&self.cwd, evidence_graph, &admitted_proposals)
-      .await?;
+    evidence_graph::acquire_assessment_proposals(
+      &self.cwd,
+      evidence_graph,
+      &context.events,
+      &admitted_proposals,
+    )
+    .await?;
     let policy = EvidencePolicy::new(&verified_revision, &suite_hash);
     state.requirement_counts = requirement_counts(catalog, evidence_graph, policy)?;
     apply_semantic_layers(&mut state.verification_layers, evidence_graph, policy);
@@ -1047,6 +1054,25 @@ impl Controller {
       if !attempted.insert(identity) {
         continue;
       }
+      let proof_before: BTreeMap<_, _> = request
+        .obligation_ids
+        .iter()
+        .map(|obligation_id| {
+          let state = evidence_graph
+            .proof_derivations
+            .get(obligation_id)
+            .map(|derivation| derivation.state)
+            .unwrap_or(ProofState::Insufficient);
+          (obligation_id.clone(), state)
+        })
+        .collect();
+      emit_acquisition_event(
+        &context.events,
+        EvidenceAcquisitionStage::GapDetected,
+        &request,
+      )
+      .await?;
+      emit_acquisition_event(&context.events, EvidenceAcquisitionStage::Planned, &request).await?;
       state.last_summary = "Acquiring controller-authorized evidence".into();
       self.publish(&context.events, state).await?;
       match &request.kind {
@@ -1058,11 +1084,37 @@ impl Controller {
             .iter()
             .find(|spec| spec.name == *name)
           else {
+            emit_acquisition_event(
+              &context.events,
+              EvidenceAcquisitionStage::Rejected,
+              &request,
+            )
+            .await?;
             continue;
           };
           if spec.fingerprint()?.as_str() != spec_hash {
+            emit_acquisition_event(
+              &context.events,
+              EvidenceAcquisitionStage::Rejected,
+              &request,
+            )
+            .await?;
             continue;
           }
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::Admitted,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::IssuerSelected,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(&context.events, EvidenceAcquisitionStage::Started, &request)
+            .await?;
           let obligation_ids: Vec<_> = request.obligation_ids.iter().cloned().collect();
           let execution = run_isolated_trusted_verifier(TrustedVerifierRequest {
             repository: &self.cwd,
@@ -1079,6 +1131,8 @@ impl Controller {
             Ok(execution) => execution,
             Err(error) if context.cancel.is_cancelled() => return Err(anyhow::Error::new(error)),
             Err(error) => {
+              emit_acquisition_event(&context.events, EvidenceAcquisitionStage::Failed, &request)
+                .await?;
               context
                 .events
                 .emit(RunEvent::Message(format!(
@@ -1089,8 +1143,24 @@ impl Controller {
             }
           };
           let record = execution.into_record();
-          evidence_graph::record_trusted_execution(&self.cwd, evidence_graph, &record, spec)
+          let artifact_id =
+            evidence_graph::record_trusted_execution(&self.cwd, evidence_graph, &record, spec)
+              .await?
+              .context("admitted trusted verifier did not issue an artifact")?;
+          context
+            .events
+            .emit(RunEvent::ArtifactIssued {
+              artifact_id,
+              revision: revision.to_owned(),
+              obligation_ids: request.obligation_ids.iter().cloned().collect(),
+            })
             .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::Completed,
+            &request,
+          )
+          .await?;
         }
         EvidenceAcquisitionKind::FalsifierCheck {
           name,
@@ -1104,11 +1174,37 @@ impl Controller {
             .iter()
             .find(|spec| spec.name() == name)
           else {
+            emit_acquisition_event(
+              &context.events,
+              EvidenceAcquisitionStage::Rejected,
+              &request,
+            )
+            .await?;
             continue;
           };
           if spec.fingerprint()?.as_str() != spec_hash {
+            emit_acquisition_event(
+              &context.events,
+              EvidenceAcquisitionStage::Rejected,
+              &request,
+            )
+            .await?;
             continue;
           }
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::Admitted,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::IssuerSelected,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(&context.events, EvidenceAcquisitionStage::Started, &request)
+            .await?;
           let input = canonical_input
             .as_deref()
             .map(serde_json::from_str)
@@ -1132,6 +1228,8 @@ impl Controller {
             Ok(execution) => execution,
             Err(error) if context.cancel.is_cancelled() => return Err(anyhow::Error::new(error)),
             Err(error) => {
+              emit_acquisition_event(&context.events, EvidenceAcquisitionStage::Failed, &request)
+                .await?;
               context
                 .events
                 .emit(RunEvent::Message(format!(
@@ -1147,10 +1245,55 @@ impl Controller {
             input,
           )
           .map_err(anyhow::Error::new)?;
-          evidence_graph::record_falsification(&self.cwd, evidence_graph, &record, spec).await?;
+          let artifact_id =
+            evidence_graph::record_falsification(&self.cwd, evidence_graph, &record, spec)
+              .await?
+              .context("admitted falsifier did not issue an artifact")?;
+          context
+            .events
+            .emit(RunEvent::ArtifactIssued {
+              artifact_id,
+              revision: revision.to_owned(),
+              obligation_ids: request.obligation_ids.iter().cloned().collect(),
+            })
+            .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::Completed,
+            &request,
+          )
+          .await?;
+        }
+        EvidenceAcquisitionKind::HumanAttestation { .. } => {
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::Admitted,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::IssuerSelected,
+            &request,
+          )
+          .await?;
+          emit_acquisition_event(
+            &context.events,
+            EvidenceAcquisitionStage::HumanActionRequired,
+            &request,
+          )
+          .await?;
         }
         EvidenceAcquisitionKind::InspectSource { .. } => continue,
       }
+      emit_proof_transitions(
+        &context.events,
+        revision,
+        &request,
+        &proof_before,
+        evidence_graph,
+      )
+      .await?;
       let decision = self
         .evaluate_and_publish_completion_gate(
           context,
@@ -1165,7 +1308,11 @@ impl Controller {
         || matches!(
           &decision,
           CompletionDecision::NotReady(blockers)
-            if blockers.iter().any(|blocker| matches!(blocker, CompletionBlocker::ProofContradicted(_)))
+            if blockers.iter().any(|blocker| matches!(
+              blocker,
+              CompletionBlocker::ProofContradicted(_)
+                | CompletionBlocker::HumanAttestationRequired(_)
+            ))
         )
       {
         return Ok(Some(decision));
@@ -1604,6 +1751,51 @@ async fn prune_deferred_candidates(
     git::delete_ref(cwd, reference).await?;
   }
   state.deferred_candidates = classification.retained;
+  Ok(())
+}
+async fn emit_acquisition_event(
+  events: &EventSink,
+  stage: EvidenceAcquisitionStage,
+  request: &EvidenceAcquisitionRequest,
+) -> Result<()> {
+  events
+    .emit(RunEvent::EvidenceAcquisition {
+      stage,
+      revision: request.revision.clone(),
+      issuer: EvidenceIssuer::from_acquisition_kind(&request.kind),
+      obligation_ids: request.obligation_ids.iter().cloned().collect(),
+    })
+    .await
+}
+
+async fn emit_proof_transitions(
+  events: &EventSink,
+  revision: &str,
+  request: &EvidenceAcquisitionRequest,
+  before: &BTreeMap<tenet_domain::ids::ObligationId, ProofState>,
+  graph: &EvidenceGraphState,
+) -> Result<()> {
+  for obligation_id in &request.obligation_ids {
+    let previous = before
+      .get(obligation_id)
+      .copied()
+      .unwrap_or(ProofState::Insufficient);
+    let current = graph
+      .proof_derivations
+      .get(obligation_id)
+      .map(|derivation| derivation.state)
+      .unwrap_or(ProofState::Insufficient);
+    if previous != current {
+      events
+        .emit(RunEvent::ObligationProofChanged {
+          obligation_id: obligation_id.clone(),
+          revision: revision.to_owned(),
+          previous,
+          current,
+        })
+        .await?;
+    }
+  }
   Ok(())
 }
 

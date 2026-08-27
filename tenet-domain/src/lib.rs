@@ -5,6 +5,7 @@ pub mod error;
 pub mod events;
 pub mod evidence;
 pub mod falsifier;
+pub mod human_attestation;
 pub mod ids;
 pub mod model;
 pub mod proof;

@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 
 use chrono::{TimeZone, Utc};
+use ed25519_dalek::SigningKey;
 use tenet_domain::{
   evidence::{ObligationAssessmentResult, SemanticAssessmentReport},
   falsifier::{FalsificationExecutionRecord, FalsifierProtocol, FalsifierSpec},
+  human_attestation::{HumanAttestationBinding, HumanAttestationRecord, HumanAttestorSpec},
   ids::{ArtifactId, ObligationId, VerificationRunId},
   proof::{
-    ArtifactAuthority, AssessmentJudgment, EvidenceContract, EvidencePredicate,
-    ExecutionObservation, ProofState,
+    statement_hash, ArtifactAuthority, AssessmentJudgment, DependencyPolicy, DependencySurface,
+    EvidenceContract, EvidencePredicate, ExecutionObservation, ProofState,
   },
   trusted_verifier::{
     CandidateFilesystemPolicy, ControlChannel, EnvironmentPolicy, GuestSecurityProfile,
@@ -57,6 +59,8 @@ async fn prepared_storage() -> (
   Storage,
   tenet_domain::model::RequirementCatalog,
 ) {
+  install_controller_authority_key("tenet-storage-tests", b"tenet-storage-test-authority")
+    .expect("install project authority key");
   let project = tempfile::tempdir().expect("temporary project");
   let storage = Storage::open(project.path()).await.expect("open storage");
   let mut catalog = support::catalog();
@@ -101,7 +105,7 @@ async fn artifact_and_derivation_survive_restart_with_provenance() {
     .await
     .expect("reopen storage");
   let loaded = reopened
-    .load_evidence_graph(&catalog, &[], &[])
+    .load_evidence_graph(&catalog, &[], &[], &[])
     .await
     .expect("load graph");
   assert_eq!(loaded.artifacts.get(&ids[0]), graph.artifacts.get(&ids[0]));
@@ -110,6 +114,50 @@ async fn artifact_and_derivation_survive_restart_with_provenance() {
     ProofState::Proven
   );
   assert_eq!(loaded.proof_derivations, graph.proof_derivations);
+}
+
+#[tokio::test]
+async fn tampered_project_verification_record_cannot_mint_configured_check_authority() {
+  let (_project_dir, storage, catalog) = prepared_storage().await;
+  let project = project_run("revision-1");
+  storage
+    .record_project_verification("run-1", &project)
+    .await
+    .expect("project verification");
+  let mut graph = support::empty_graph(&catalog);
+  graph.record_project_verification(&project);
+  graph.record_project_artifacts(&project).expect("artifacts");
+  graph.derive_proofs("revision-1");
+  storage
+    .persist_evidence_graph("run-1", &graph)
+    .await
+    .expect("persist graph");
+
+  let mut forged = project;
+  forged.checks[0].result.exit_code = Some(99);
+  sqlx::query(
+    "UPDATE project_verification_runs SET verification_json = ?, passed = 1 WHERE id = ?",
+  )
+  .bind(serde_json::to_string(&forged).expect("forged project JSON"))
+  .bind(forged.run_id.to_string())
+  .execute(storage.pool())
+  .await
+  .expect("tamper project verification issuer record");
+  sqlx::query(
+    "UPDATE project_verification_checks SET exit_code = 99 WHERE verification_run_id = ?",
+  )
+  .bind(forged.run_id.to_string())
+  .execute(storage.pool())
+  .await
+  .expect("tamper project verification check");
+
+  let error = storage
+    .load_evidence_graph(&catalog, &[], &[], &[])
+    .await
+    .expect_err("forged project verification authority must fail authentication");
+  assert!(error
+    .to_string()
+    .contains("controller authority authentication tag is invalid"));
 }
 
 #[tokio::test]
@@ -127,7 +175,7 @@ async fn stale_artifact_and_blocking_proof_survive_restart() {
     .expect("persist stale graph");
 
   let loaded = storage
-    .load_evidence_graph(&catalog, &[], &[])
+    .load_evidence_graph(&catalog, &[], &[], &[])
     .await
     .expect("load graph");
   assert_eq!(
@@ -191,6 +239,7 @@ fn trusted_spec() -> TrustedVerificationSpec {
     isolation: TrustedIsolationPolicy::default(),
     resources: TrustedResourcePolicy::default(),
     protocol: TrustedVerifierProtocol::ExitCode,
+    dependencies: Default::default(),
   }
 }
 
@@ -295,7 +344,7 @@ async fn authenticated_falsifier_artifact_survives_restart() {
     .expect("persist falsification");
   let mut graph = support::empty_graph(&catalog);
   graph
-    .record_falsification(&record, &spec)
+    .record_falsification(&record, &spec, DependencySurface::RepositoryWide)
     .expect("issue artifact");
   graph.derive_proofs("revision-1");
   storage
@@ -305,7 +354,7 @@ async fn authenticated_falsifier_artifact_survives_restart() {
 
   let reopened = Storage::open(project.path()).await.expect("reopen");
   let loaded = reopened
-    .load_evidence_graph(&catalog, &[], std::slice::from_ref(&spec))
+    .load_evidence_graph(&catalog, &[], std::slice::from_ref(&spec), &[])
     .await
     .expect("reload falsifier authority");
 
@@ -349,7 +398,7 @@ async fn trusted_execution_authority_survives_restart_and_revalidation() {
     .expect("trusted record");
   let mut graph = support::empty_graph(&catalog);
   let artifact_id = graph
-    .record_trusted_execution(&record, &spec)
+    .record_trusted_execution(&record, &spec, DependencySurface::RepositoryWide)
     .expect("trusted artifact")
     .expect("authoritative artifact");
   graph.derive_proofs("revision-1");
@@ -360,7 +409,7 @@ async fn trusted_execution_authority_survives_restart_and_revalidation() {
 
   let reopened = Storage::open(project.path()).await.expect("reopen");
   let loaded = reopened
-    .load_evidence_graph(&catalog, std::slice::from_ref(&spec), &[])
+    .load_evidence_graph(&catalog, std::slice::from_ref(&spec), &[], &[])
     .await
     .expect("revalidated graph");
 
@@ -404,26 +453,29 @@ async fn changed_controller_verifier_spec_rejects_persisted_authority() {
     .expect("trusted record");
   let mut graph = support::empty_graph(&catalog);
   graph
-    .record_trusted_execution(&record, &spec)
+    .record_trusted_execution(&record, &spec, DependencySurface::RepositoryWide)
     .expect("trusted artifact");
   graph.derive_proofs("revision-1");
   storage
     .persist_evidence_graph("run-1", &graph)
     .await
     .expect("persist graph");
-  let mut changed = spec;
-  changed.args.push("--changed".into());
+  let mut changed_args = spec.clone();
+  changed_args.args.push("--changed".into());
+  let mut changed_image = spec;
+  changed_image.image = format!("example/verifier@sha256:{}", "b".repeat(64));
 
-  let loaded = storage
-    .load_evidence_graph(&catalog, &[changed], &[])
-    .await
-    .expect("stale verifier authority is rejected without blocking reload");
-
-  assert!(loaded.artifacts.is_empty());
-  assert_eq!(
-    loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
-    ProofState::Insufficient
-  );
+  for changed in [changed_args, changed_image] {
+    let loaded = storage
+      .load_evidence_graph(&catalog, &[changed], &[], &[])
+      .await
+      .expect("changed verifier authority is rejected without blocking reload");
+    assert!(loaded.artifacts.is_empty());
+    assert_eq!(
+      loaded.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+      ProofState::Insufficient
+    );
+  }
 }
 
 #[tokio::test]
@@ -436,7 +488,7 @@ async fn prior_catalog_authority_cannot_replay_for_a_reused_obligation_id() {
     .expect("trusted record");
   let mut graph = support::empty_graph(&catalog);
   graph
-    .record_trusted_execution(&record, &spec)
+    .record_trusted_execution(&record, &spec, DependencySurface::RepositoryWide)
     .expect("trusted artifact");
   graph.derive_proofs("revision-1");
   storage
@@ -460,7 +512,7 @@ async fn prior_catalog_authority_cannot_replay_for_a_reused_obligation_id() {
   pool.close().await;
 
   let loaded = storage
-    .load_evidence_graph(&changed_catalog, &[spec], &[])
+    .load_evidence_graph(&changed_catalog, &[spec], &[], &[])
     .await
     .expect("stale catalog authority is rejected without blocking reload");
 
@@ -473,7 +525,7 @@ async fn forged_trusted_artifact_without_execution_record_is_rejected() {
   let record = trusted_record(&spec, TrustedExecutionResult::Supports);
   let mut graph = support::empty_graph(&catalog);
   graph
-    .record_trusted_execution(&record, &spec)
+    .record_trusted_execution(&record, &spec, DependencySurface::RepositoryWide)
     .expect("domain artifact");
 
   let error = storage
@@ -494,7 +546,7 @@ async fn tampered_trusted_execution_record_fails_authentication() {
     .expect("trusted record");
   let mut graph = support::empty_graph(&catalog);
   graph
-    .record_trusted_execution(&record, &spec)
+    .record_trusted_execution(&record, &spec, DependencySurface::RepositoryWide)
     .expect("trusted artifact");
   graph.derive_proofs("revision-1");
   storage
@@ -512,7 +564,7 @@ async fn tampered_trusted_execution_record_fails_authentication() {
     .expect("tamper execution record");
   pool.close().await;
   let loaded = storage
-    .load_evidence_graph(&catalog, &[spec], &[])
+    .load_evidence_graph(&catalog, &[spec], &[], &[])
     .await
     .expect("tampered authority is rejected without blocking reload");
 
@@ -537,4 +589,107 @@ fn changed_controller_authority_identity_is_rejected() {
   assert!(error
     .to_string()
     .contains("controller authority identity changed"));
+}
+
+#[tokio::test]
+async fn authenticated_human_attestation_survives_restart_and_proves_exact_contract() {
+  install_controller_authority_key("tenet-storage-tests", b"tenet-storage-test-authority")
+    .expect("install authority key");
+  let project = tempfile::tempdir().expect("temporary project");
+  let storage = Storage::open(project.path()).await.expect("open storage");
+  let mut catalog = support::catalog();
+  let statement = "Manual visual review confirms the exact interaction";
+  catalog.verification_obligations[0].evidence_contract = EvidenceContract::HumanAttestation {
+    statement: statement.into(),
+  };
+  storage
+    .persist_catalog("spec.md", Utc::now(), &catalog)
+    .await
+    .expect("persist catalog");
+  storage.create_run("run-human").await.expect("create run");
+  let secret = [7_u8; 32];
+  let verifying_key = SigningKey::from_bytes(&secret).verifying_key();
+  let attestor = HumanAttestorSpec {
+    id: "alice".into(),
+    public_key: verifying_key
+      .to_bytes()
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect(),
+    dependencies: DependencyPolicy::Paths {
+      patterns: vec!["src/**".into()],
+    },
+  };
+  let obligation_id = catalog.verification_obligations[0].id.clone();
+  let record = HumanAttestationRecord::sign(
+    &attestor,
+    &secret,
+    HumanAttestationBinding {
+      statement_hash: statement_hash(statement),
+      obligation_id: obligation_id.clone(),
+      catalog_hash: catalog.catalog_hash().expect("catalog hash"),
+      revision: "revision-human".into(),
+      issued_at: Utc::now(),
+      dependencies: DependencySurface::Paths {
+        patterns: vec!["src/**".into()],
+        blob_hashes: BTreeMap::from([("src/lib.rs".into(), "blob-1".into())]),
+      },
+    },
+  )
+  .expect("sign attestation");
+  storage
+    .record_human_attestation("run-human", &record, &attestor)
+    .await
+    .expect("persist attestation issuer record");
+  let mut graph = support::empty_graph(&catalog);
+  graph
+    .record_human_attestation(
+      &record,
+      &attestor,
+      &catalog.catalog_hash().expect("catalog hash"),
+    )
+    .expect("issue human artifact");
+  graph.derive_proofs("revision-human");
+  storage
+    .persist_evidence_graph("run-human", &graph)
+    .await
+    .expect("persist human artifact");
+  drop(storage);
+
+  let reopened = Storage::open(project.path()).await.expect("reopen storage");
+  let loaded = reopened
+    .load_evidence_graph(&catalog, &[], &[], std::slice::from_ref(&attestor))
+    .await
+    .expect("reload authenticated human authority");
+  assert_eq!(
+    loaded.proof_derivations[&obligation_id].state,
+    ProofState::Proven
+  );
+  let unknown_attestor = reopened
+    .load_evidence_graph(&catalog, &[], &[], &[])
+    .await
+    .expect("reject unknown attestor without blocking reload");
+  assert!(unknown_attestor.artifacts.is_empty());
+  assert_eq!(
+    unknown_attestor.proof_derivations[&obligation_id].state,
+    ProofState::Insufficient
+  );
+  let database = project.path().join(".tenet/tenet.db");
+  let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
+    .await
+    .expect("open database for human reuse mutation");
+  sqlx::query("UPDATE evidence_artifacts SET artifact_json = json_set(artifact_json, '$.compatibleRevisions', json_array('forged-revision'))")
+    .execute(&pool)
+    .await
+    .expect("forge human compatibility revision");
+  pool.close().await;
+  let forged = reopened
+    .load_evidence_graph(&catalog, &[], &[], std::slice::from_ref(&attestor))
+    .await
+    .expect("reject forged human reuse without blocking reload");
+  assert!(forged.artifacts.is_empty());
+  assert_eq!(
+    forged.proof_derivations[&obligation_id].state,
+    ProofState::Insufficient
+  );
 }

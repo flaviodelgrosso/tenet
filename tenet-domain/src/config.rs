@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use tokio::fs;
 
 use crate::{
-  falsifier::FalsifierSpec, model::WorkerRole, trusted_verifier::TrustedVerificationSpec,
-  verification::VerificationSpec,
+  falsifier::FalsifierSpec, human_attestation::HumanAttestorSpec, model::WorkerRole,
+  trusted_verifier::TrustedVerificationSpec, verification::VerificationSpec,
 };
 
 pub const TENET_DIR: &str = ".tenet";
@@ -289,6 +289,8 @@ pub struct VerificationConfig {
   pub trusted_checks: Vec<TrustedVerificationSpec>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub falsifiers: Vec<FalsifierSpec>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub human_attestors: Vec<HumanAttestorSpec>,
   #[serde(default = "default_verification_timeout_secs")]
   pub timeout_secs: u64,
   #[serde(default = "default_max_output_bytes")]
@@ -339,6 +341,8 @@ struct VerificationConfigWire {
   trusted_checks: Vec<TrustedVerificationSpec>,
   #[serde(default)]
   falsifiers: Vec<FalsifierSpec>,
+  #[serde(default)]
+  human_attestors: Vec<HumanAttestorSpec>,
   #[serde(default = "default_verification_timeout_secs")]
   timeout_secs: u64,
   #[serde(default = "default_max_output_bytes")]
@@ -355,6 +359,7 @@ impl<'de> Deserialize<'de> for VerificationConfig {
       checks: wire.checks,
       trusted_checks: wire.trusted_checks,
       falsifiers: wire.falsifiers,
+      human_attestors: wire.human_attestors,
       timeout_secs: wire.timeout_secs,
       max_output_bytes: wire.max_output_bytes,
     };
@@ -369,6 +374,7 @@ impl Default for VerificationConfig {
       checks: Vec::new(),
       trusted_checks: Vec::new(),
       falsifiers: Vec::new(),
+      human_attestors: Vec::new(),
       timeout_secs: DEFAULT_VERIFICATION_TIMEOUT_SECS,
       max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
     }
@@ -402,6 +408,15 @@ impl VerificationConfig {
       }
       if trusted_names.contains(falsifier.name()) {
         anyhow::bail!("trusted verifier and falsifier names must be distinct");
+      }
+    }
+    let mut attestor_ids = BTreeSet::new();
+    for attestor in &self.human_attestors {
+      attestor
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid human attestor {:?}: {error}", attestor.id))?;
+      if !attestor_ids.insert(attestor.id.as_str()) {
+        anyhow::bail!("duplicate human attestor identity {:?}", attestor.id);
       }
     }
     for check in &self.checks {
@@ -703,6 +718,8 @@ mod tests {
       [
         "checks",
         "trusted_checks",
+        "falsifiers",
+        "human_attestors",
         "max_output_bytes",
         "timeout_secs"
       ]
@@ -1085,7 +1102,7 @@ mod tests {
   fn structured_trusted_check_deserializes_with_enforced_defaults() {
     let image = format!("example/verifier@sha256:{}", "a".repeat(64));
     let text = format!(
-      "version = 1\nspec_file = \"spec.md\"\nmax_cycles = 25\nmax_repair_attempts = 3\n[agent]\nid = \"test-agent\"\n[[verification.trusted_checks]]\nname = \"expiry-boundary\"\nbackend = \"microsandbox\"\nimage = \"{image}\"\nprogram = \"verify\"\nargs = [\"--expiry\"]\n"
+      "version = 1\nspec_file = \"spec.md\"\nmax_cycles = 25\nmax_repair_attempts = 3\n[agent]\nid = \"test-agent\"\n[[verification.trusted_checks]]\nname = \"expiry-boundary\"\nbackend = \"microsandbox\"\nimage = \"{image}\"\nprogram = \"verify\"\nargs = [\"--expiry\"]\ndependencies = {{ policy = \"paths\", patterns = [\"src/**\"] }}\n"
     );
 
     let config: Config = toml::from_str(&text).expect("structured trusted check");
@@ -1094,6 +1111,12 @@ mod tests {
     assert_eq!(check.name, "expiry-boundary");
     assert_eq!(check.args, ["--expiry"]);
     assert_eq!(check.isolation, Default::default());
+    assert_eq!(
+      check.dependencies,
+      crate::proof::DependencyPolicy::Paths {
+        patterns: vec!["src/**".into()]
+      }
+    );
   }
 
   #[test]

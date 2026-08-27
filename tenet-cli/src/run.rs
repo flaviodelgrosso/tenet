@@ -21,13 +21,7 @@ pub(crate) async fn run(
   options: RunOptions,
 ) -> Result<State> {
   let config = read_config(&cwd).await.ok();
-  let trusted_authority_required = config
-    .as_ref()
-    .is_some_and(|config| !config.verification.trusted_checks.is_empty())
-    || store::trusted_authority_identity_required(&cwd).await?;
-  if trusted_authority_required {
-    store::bootstrap_controller_authority_identity()?;
-  }
+  store::bootstrap_controller_authority_identity()?;
   let initial = store::read_state(&cwd).await?;
   let catalog = store::read_catalog(&cwd).await?;
   let mode = InformationMode::from_flags(options.quiet, options.verbose);

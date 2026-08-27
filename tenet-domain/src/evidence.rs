@@ -7,11 +7,12 @@ use thiserror::Error;
 
 use crate::{
   falsifier::{FalsificationExecutionRecord, FalsifierSpec},
+  human_attestation::{HumanAttestationRecord, HumanAttestorSpec},
   ids::{ArtifactId, CriterionId, EvidenceId, ObligationId, RequirementId, VerificationRunId},
   proof::{
     derive_proof_state, ArtifactAuthority, ArtifactObservation, ArtifactProvenance,
-    ArtifactValidity, AssessmentJudgment, AssessmentRecord, DependencySurface, EvidenceArtifact,
-    EvidenceArtifactKind, EvidenceContract, EvidencePredicate, ExecutionDomain,
+    ArtifactValidity, AssessmentJudgment, AssessmentRecord, DependencyPolicy, DependencySurface,
+    EvidenceArtifact, EvidenceArtifactKind, EvidenceContract, EvidencePredicate, ExecutionDomain,
     ExecutionObservation, ProofDerivation, ProofState,
   },
   trusted_verifier::{TrustedExecutionRecord, TrustedVerificationSpec},
@@ -477,9 +478,15 @@ impl EvidenceGraphState {
     &mut self,
     record: &TrustedExecutionRecord,
     spec: &TrustedVerificationSpec,
+    dependencies: DependencySurface,
   ) -> Result<Option<ArtifactId>, EvidenceGraphError> {
     if !record.can_issue_authority(spec) {
       return Ok(None);
+    }
+    if !dependency_surface_matches_policy(&dependencies, &spec.dependencies) {
+      return Err(EvidenceGraphError::InvalidArtifact(
+        "trusted verifier dependency materialization does not match its configured policy".into(),
+      ));
     }
     let predicate = EvidencePredicate::TrustedVerifierCheck {
       name: spec.name.clone(),
@@ -522,7 +529,7 @@ impl EvidenceGraphState {
       },
       obligation_ids: observed_bindings,
       validity: ArtifactValidity::Valid,
-      dependencies: DependencySurface::RepositoryWide,
+      dependencies,
       compatible_revisions: BTreeSet::new(),
     };
     let id = artifact.id;
@@ -533,9 +540,15 @@ impl EvidenceGraphState {
     &mut self,
     record: &FalsificationExecutionRecord,
     spec: &FalsifierSpec,
+    dependencies: DependencySurface,
   ) -> Result<Option<ArtifactId>, EvidenceGraphError> {
     if !record.can_issue_authority(spec) {
       return Ok(None);
+    }
+    if !dependency_surface_matches_policy(&dependencies, &spec.execution.dependencies) {
+      return Err(EvidenceGraphError::InvalidArtifact(
+        "falsifier dependency materialization does not match its configured policy".into(),
+      ));
     }
     let predicate = EvidencePredicate::FalsifierCheck {
       name: spec.name().into(),
@@ -577,12 +590,62 @@ impl EvidenceGraphState {
       },
       obligation_ids: observed,
       validity: ArtifactValidity::Valid,
-      dependencies: DependencySurface::RepositoryWide,
+      dependencies,
       compatible_revisions: BTreeSet::new(),
     };
     let id = artifact.id;
     self.establish_artifact(artifact)?;
     Ok(Some(id))
+  }
+  pub fn record_human_attestation(
+    &mut self,
+    record: &HumanAttestationRecord,
+    attestor: &HumanAttestorSpec,
+    catalog_hash: &str,
+  ) -> Result<ArtifactId, EvidenceGraphError> {
+    record
+      .verify(attestor)
+      .map_err(|error| EvidenceGraphError::InvalidArtifact(error.to_string()))?;
+    if record.catalog_hash != catalog_hash {
+      return Err(EvidenceGraphError::InvalidArtifact(
+        "human attestation targets an obsolete catalog".into(),
+      ));
+    }
+    let obligation = self
+      .obligations
+      .get(&record.obligation_id)
+      .ok_or_else(|| EvidenceGraphError::UnknownObligation(record.obligation_id.clone()))?;
+    if !contract_contains_human_statement(&obligation.evidence_contract, &record.statement_hash) {
+      return Err(EvidenceGraphError::InvalidArtifact(
+        "human attestation does not match the obligation contract".into(),
+      ));
+    }
+    let artifact = EvidenceArtifact {
+      id: ArtifactId::new(),
+      revision: record.revision.clone(),
+      observed_at: record.issued_at,
+      authority: ArtifactAuthority::Authoritative,
+      provenance: ArtifactProvenance::ControllerHumanAttestation {
+        attestor: record.attestor_id.clone(),
+      },
+      observation: ArtifactObservation::Supports,
+      kind: EvidenceArtifactKind::HumanAttestation {
+        attestation_id: record.id,
+        attestor_id: record.attestor_id.clone(),
+        statement_hash: record.statement_hash.clone(),
+        catalog_hash: record.catalog_hash.clone(),
+        attestation_record_hash: record
+          .record_hash()
+          .map_err(|error| EvidenceGraphError::InvalidArtifact(error.to_string()))?,
+      },
+      obligation_ids: BTreeSet::from([record.obligation_id.clone()]),
+      validity: ArtifactValidity::Valid,
+      dependencies: record.dependencies.clone(),
+      compatible_revisions: BTreeSet::new(),
+    };
+    let id = artifact.id;
+    self.establish_artifact(artifact)?;
+    Ok(id)
   }
 
   pub fn record_assessment_judgments(
@@ -856,6 +919,19 @@ impl EvidenceGraphState {
   }
 }
 
+fn dependency_surface_matches_policy(
+  surface: &DependencySurface,
+  policy: &DependencyPolicy,
+) -> bool {
+  match (surface, policy) {
+    (DependencySurface::RepositoryWide, DependencyPolicy::RepositoryWide) => true,
+    (DependencySurface::Paths { patterns, .. }, DependencyPolicy::Paths { patterns: expected }) => {
+      patterns == expected
+    }
+    _ => false,
+  }
+}
+
 fn contract_contains(contract: &EvidenceContract, predicate: &EvidencePredicate) -> bool {
   match contract {
     EvidenceContract::Artifact { predicate: actual } => actual == predicate,
@@ -863,6 +939,17 @@ fn contract_contains(contract: &EvidenceContract, predicate: &EvidencePredicate)
       .iter()
       .any(|item| contract_contains(item, predicate)),
     EvidenceContract::HumanAttestation { .. } => false,
+  }
+}
+fn contract_contains_human_statement(contract: &EvidenceContract, expected_hash: &str) -> bool {
+  match contract {
+    EvidenceContract::HumanAttestation { statement } => {
+      crate::proof::statement_hash(statement) == expected_hash
+    }
+    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => requirements
+      .iter()
+      .any(|item| contract_contains_human_statement(item, expected_hash)),
+    EvidenceContract::Artifact { .. } => false,
   }
 }
 

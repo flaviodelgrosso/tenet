@@ -3,7 +3,9 @@ use std::{collections::BTreeMap, path::Path, process::Command};
 use chrono::Utc;
 use tenet_domain::{
   ids::{ObligationId, VerificationRunId},
-  proof::{EvidenceContract, EvidencePredicate, ExecutionObservation, ProofState},
+  proof::{
+    DependencySurface, EvidenceContract, EvidencePredicate, ExecutionObservation, ProofState,
+  },
   trusted_verifier::{
     CandidateFilesystemPolicy, ControlChannel, EnvironmentPolicy, GuestSecurityProfile,
     HostRepositoryMountPolicy, IsolationBoundary, IsolationCapabilityReport, NetworkPolicy,
@@ -36,6 +38,7 @@ fn spec() -> TrustedVerificationSpec {
     isolation: TrustedIsolationPolicy::default(),
     resources: TrustedResourcePolicy::default(),
     protocol: TrustedVerifierProtocol::ExitCode,
+    dependencies: Default::default(),
   }
 }
 
@@ -118,7 +121,7 @@ async fn write_authority(repository: &Path) {
     .expect("persist trusted execution");
   let mut graph = support::empty_graph(&catalog);
   graph
-    .record_trusted_execution(&record, &spec)
+    .record_trusted_execution(&record, &spec, DependencySurface::RepositoryWide)
     .expect("record trusted artifact")
     .expect("authoritative artifact");
   graph.derive_proofs("revision-1");
@@ -139,7 +142,7 @@ async fn read_authority(repository: &Path, key: &[u8], should_validate: bool) {
     .expect("load catalog")
     .expect("active catalog");
   let graph = storage
-    .load_evidence_graph(&catalog, &[spec()], &[])
+    .load_evidence_graph(&catalog, &[spec()], &[], &[])
     .await
     .expect("load evidence graph");
   let proof = &graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")];

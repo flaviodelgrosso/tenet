@@ -12,6 +12,7 @@ use std::{
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
+use ed25519_dalek::SigningKey;
 use tokio::{
   fs,
   sync::{mpsc, Notify},
@@ -31,6 +32,7 @@ use tenet_domain::{
     SemanticAssessmentProposal, VerificationObligation,
   },
   falsifier::{FalsifierProtocol, FalsifierSpec},
+  human_attestation::{HumanAttestationBinding, HumanAttestationRecord, HumanAttestorSpec},
   ids::{ArchitectSourceRef, CriterionId, ObligationId, RequirementId, VerificationRunId},
   model::{
     AgentReconciliationProposal, AgentRequirementAssessment, AgentWorkUnit, ArchitectOutput,
@@ -40,8 +42,8 @@ use tenet_domain::{
     WorkExecution, WorkLease, WorkScope, WorkUnit, WorkerRole, WorkerSummary,
   },
   proof::{
-    AssessmentJudgment, EvidenceContract, EvidencePredicate, ExecutionObservation, GapKind,
-    ProofState,
+    statement_hash, AssessmentJudgment, DependencyPolicy, DependencySurface, EvidenceContract,
+    EvidencePredicate, ExecutionObservation, GapKind, ProofState,
   },
   trusted_verifier::{
     CandidateFilesystemPolicy, ControlChannel, EnvironmentPolicy, GuestSecurityProfile,
@@ -882,6 +884,11 @@ async fn configured_controller(
   backend: Arc<FakeBackend>,
   max_parallel_workers: usize,
 ) -> (Controller, mpsc::UnboundedReceiver<RunEvent>) {
+  store::install_controller_authority_key(
+    "tenet-controller-tests",
+    b"tenet-controller-test-authority",
+  )
+  .expect("install controller test authority");
   *backend.canonical.lock().expect("canonical path lock") = Some(repository.path().to_path_buf());
   let mut config = Config::default();
   config.agent.custom = Some(CustomAgentConfig {
@@ -951,6 +958,11 @@ async fn run_after_approval_if_required(
 
 #[tokio::test]
 async fn manual_verify_runs_project_suite_without_requirement_catalog() {
+  store::install_controller_authority_key(
+    "tenet-controller-tests",
+    b"tenet-controller-test-authority",
+  )
+  .expect("install controller test authority");
   let repository = TempRepo::new();
   let mut config = Config::default();
   config.agent.custom = Some(CustomAgentConfig {
@@ -2805,6 +2817,11 @@ async fn write_recovery_transaction(
   new_head: &str,
   phase: IntegrationPhase,
 ) -> IntegrationTransaction {
+  store::install_controller_authority_key(
+    "tenet-controller-tests",
+    b"tenet-controller-test-authority",
+  )
+  .expect("install controller test authority");
   let mut report = passing_project_verification();
   report.revision = new_head.into();
   let catalog = RequirementCatalog {
@@ -2965,6 +2982,138 @@ async fn assert_new_head_transaction_recovers(phase: IntegrationPhase) {
     .await
     .expect("read journal")
     .is_none());
+}
+
+#[tokio::test]
+async fn legacy_unauthed_verification_is_rerun_after_git_committed_recovery() {
+  let repository = TempRepo::new();
+  store::ensure_layout(repository.path())
+    .await
+    .expect("ensure layout");
+  let old_head = git::head(repository.path()).await.expect("old head");
+  std::fs::write(repository.path().join("recovered.txt"), "committed").expect("recovery file");
+  run_git(repository.path(), &["add", "recovered.txt"]);
+  run_git(repository.path(), &["commit", "-m", "already advanced"]);
+  let new_head = git::head(repository.path()).await.expect("new head");
+  let transaction = write_recovery_transaction(
+    &repository,
+    &old_head,
+    &new_head,
+    IntegrationPhase::GitCommitted,
+  )
+  .await;
+  let mut persisted_state = store::read_state(repository.path())
+    .await
+    .expect("read recovery state");
+  persisted_state
+    .completed_work_units
+    .push(CompletedWorkUnit {
+      work_unit: transaction.work_unit.clone(),
+      completed_at: "state persisted before journal completion".into(),
+      verification_run_id: transaction.verification_run_id,
+    });
+  store::write_state(repository.path(), &persisted_state)
+    .await
+    .expect("persist crash-window completion");
+  let storage = tenet_storage::Storage::open(repository.path())
+    .await
+    .expect("open storage");
+  sqlx::query("UPDATE project_verification_runs SET verification_json = NULL, authority_mac = NULL WHERE id = ?")
+    .bind(transaction.verification_run_id.to_string())
+    .execute(storage.pool())
+    .await
+    .expect("simulate pre-authority-migration verification");
+  std::fs::write(
+    repository.path().join("tenet.toml"),
+    "[verification]\nchecks = []\n",
+  )
+  .expect("tamper recovery configuration");
+  let mut state = State::fresh();
+  let error = store::recover_integration(repository.path(), &mut state, &passing_project_config())
+    .await
+    .expect_err("dirty recovery configuration must not authorize reverification");
+  assert!(error.to_string().contains("dirty canonical repository"));
+  std::fs::remove_file(repository.path().join("tenet.toml"))
+    .expect("remove dirty recovery configuration");
+  let mut state = State::fresh();
+
+  store::recover_integration(repository.path(), &mut state, &passing_project_config())
+    .await
+    .expect("reverify and recover committed integration");
+
+  assert_eq!(state.completed_work_units.len(), 1);
+  assert_ne!(
+    state.completed_work_units[0].verification_run_id,
+    transaction.verification_run_id
+  );
+  assert!(store::read_integration_journal(repository.path())
+    .await
+    .expect("read journal")
+    .is_none());
+}
+
+#[tokio::test]
+async fn crash_after_verification_rebind_does_not_duplicate_completed_work() {
+  let repository = TempRepo::new();
+  store::ensure_layout(repository.path())
+    .await
+    .expect("ensure layout");
+  let old_head = git::head(repository.path()).await.expect("old head");
+  std::fs::write(repository.path().join("recovered.txt"), "committed").expect("recovery file");
+  run_git(repository.path(), &["add", "recovered.txt"]);
+  run_git(repository.path(), &["commit", "-m", "already advanced"]);
+  let new_head = git::head(repository.path()).await.expect("new head");
+  let transaction = write_recovery_transaction(
+    &repository,
+    &old_head,
+    &new_head,
+    IntegrationPhase::GitCommitted,
+  )
+  .await;
+  let mut persisted_state = store::read_state(repository.path())
+    .await
+    .expect("read recovery state");
+  persisted_state
+    .completed_work_units
+    .push(CompletedWorkUnit {
+      work_unit: transaction.work_unit.clone(),
+      completed_at: "state persisted before journal completion".into(),
+      verification_run_id: transaction.verification_run_id,
+    });
+  store::write_state(repository.path(), &persisted_state)
+    .await
+    .expect("persist crash-window completion");
+  let storage = tenet_storage::Storage::open(repository.path())
+    .await
+    .expect("open storage");
+  let mut replacement = passing_project_verification();
+  replacement.revision.clone_from(&new_head);
+  storage
+    .record_project_verification("recovery-run", &replacement)
+    .await
+    .expect("persist replacement verification");
+  let replacement_hash = store::project_verification_hash(&replacement).expect("replacement hash");
+  storage
+    .replace_integration_verification(
+      &transaction,
+      replacement.run_id,
+      &replacement_hash,
+      "rebound before crash",
+    )
+    .await
+    .expect("atomically rebind journal and persisted completion");
+  drop(storage);
+
+  let mut recovered = State::fresh();
+  store::recover_integration(repository.path(), &mut recovered, &passing_project_config())
+    .await
+    .expect("resume after crash immediately following rebind");
+
+  assert_eq!(recovered.completed_work_units.len(), 1);
+  assert_eq!(
+    recovered.completed_work_units[0].verification_run_id,
+    replacement.run_id
+  );
 }
 
 #[tokio::test]
@@ -3333,6 +3482,7 @@ fn trusted_verification_spec_named(name: &str) -> TrustedVerificationSpec {
     isolation: TrustedIsolationPolicy::default(),
     resources: TrustedResourcePolicy::default(),
     protocol: TrustedVerifierProtocol::ExitCode,
+    dependencies: Default::default(),
   }
 }
 
@@ -3540,6 +3690,246 @@ async fn trusted_verifier_pass_proves_and_completes_without_assessor() {
   assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
   assert_eq!(
     graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Proven
+  );
+}
+
+#[tokio::test]
+async fn hybrid_machine_and_human_contract_completes_only_after_explicit_attestation() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let trusted = Arc::new(FakeTrustedVerifier {
+    contradicts: false,
+    calls: AtomicUsize::new(0),
+    resolved_digest_matches: true,
+    names: Mutex::new(Vec::new()),
+  });
+  let controller =
+    configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
+  let secret = [7_u8; 32];
+  let public_key: String = SigningKey::from_bytes(&secret)
+    .verifying_key()
+    .to_bytes()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  let mut config = read_config(repository.path()).await.expect("read config");
+  config.verification.human_attestors = vec![HumanAttestorSpec {
+    id: "alice".into(),
+    public_key,
+    dependencies: DependencyPolicy::RepositoryWide,
+  }];
+  fs::write(
+    repository.path().join("tenet.toml"),
+    toml::to_string_pretty(&config).expect("human config"),
+  )
+  .await
+  .expect("write human config");
+  run_git(repository.path(), &["add", "tenet.toml"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "configure human attestor"],
+  );
+  let mut catalog = store::read_catalog(repository.path())
+    .await
+    .expect("load catalog")
+    .expect("catalog");
+  catalog.verification_obligations[0].evidence_contract = EvidenceContract::All {
+    requirements: vec![
+      EvidenceContract::HumanAttestation {
+        statement: "Manual visual review confirms the exact interaction".into(),
+      },
+      EvidenceContract::Artifact {
+        predicate: EvidencePredicate::TrustedVerifierCheck {
+          name: "expiry-boundary".into(),
+        },
+      },
+    ],
+  };
+  store::write_catalog(repository.path(), &catalog)
+    .await
+    .expect("write hybrid catalog");
+  approve_active_catalog(repository.path()).await;
+
+  let state = controller.run(CancellationToken::new()).await.expect("run");
+  let mut graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("load hybrid evidence");
+  assert_eq!(state.status, RunStatus::Blocked);
+  assert_eq!(trusted.calls.load(Ordering::SeqCst), 1);
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+  assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Insufficient
+  );
+  let revision = git::head(repository.path())
+    .await
+    .expect("current revision");
+  let catalog_hash = catalog.catalog_hash().expect("catalog hash");
+  let attestation = HumanAttestationRecord::sign(
+    &config.verification.human_attestors[0],
+    &secret,
+    HumanAttestationBinding {
+      statement_hash: statement_hash("Manual visual review confirms the exact interaction"),
+      obligation_id: ObligationId::from("REQ-001/AC-01/VO-01"),
+      catalog_hash: catalog_hash.clone(),
+      revision,
+      issued_at: Utc::now(),
+      dependencies: DependencySurface::RepositoryWide,
+    },
+  )
+  .expect("sign explicit human attestation");
+  controller_evidence::record_human_attestation(
+    repository.path(),
+    &mut graph,
+    &attestation,
+    &config.verification.human_attestors[0],
+    &catalog_hash,
+  )
+  .await
+  .expect("record explicit human authority");
+  assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Proven,
+    "explicit attestation must complete the hybrid proof before resume"
+  );
+  let completed = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("resume after human attestation");
+  let graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("reload completed hybrid evidence");
+  assert_eq!(trusted.calls.load(Ordering::SeqCst), 1);
+  assert_eq!(completed.status, RunStatus::Done, "state: {completed:#?}");
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+  assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Proven
+  );
+}
+#[tokio::test]
+async fn unchanged_scoped_dependencies_reuse_trusted_proof_without_execution_or_assessment() {
+  let repository = TempRepo::new();
+  let backend = Arc::new(FakeBackend::new(BackendMode::Normal));
+  let trusted = Arc::new(FakeTrustedVerifier {
+    contradicts: false,
+    calls: AtomicUsize::new(0),
+    resolved_digest_matches: true,
+    names: Mutex::new(Vec::new()),
+  });
+  let controller =
+    configured_trusted_controller(&repository, backend.clone(), trusted.clone()).await;
+  std::fs::create_dir_all(repository.path().join("src")).expect("create source directory");
+  std::fs::write(repository.path().join("src/lib.rs"), "pub fn stable() {}\n")
+    .expect("write dependency");
+  let mut config = read_config(repository.path()).await.expect("read config");
+  config.verification.trusted_checks[0].dependencies = DependencyPolicy::Paths {
+    patterns: vec!["src/**".into()],
+  };
+  fs::write(
+    repository.path().join("tenet.toml"),
+    toml::to_string_pretty(&config).expect("scoped config"),
+  )
+  .await
+  .expect("write scoped config");
+  run_git(repository.path(), &["add", "-A"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "configure scoped verifier"],
+  );
+
+  let state = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("first run");
+  assert_eq!(state.status, RunStatus::Done);
+  assert_eq!(trusted.calls.load(Ordering::SeqCst), 1);
+  std::fs::write(repository.path().join("docs.txt"), "unrelated\n").expect("write unrelated");
+  run_git(repository.path(), &["add", "docs.txt"]);
+  run_git(repository.path(), &["commit", "-m", "unrelated change"]);
+  let revision = git::head(repository.path()).await.expect("new revision");
+  let catalog = store::read_catalog(repository.path())
+    .await
+    .expect("catalog read")
+    .expect("catalog");
+  let mut graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("load graph");
+  controller_evidence::invalidate(
+    repository.path(),
+    &EventSink::new(None),
+    &mut graph,
+    &revision,
+    &config.verification.suite_hash().expect("suite hash"),
+  )
+  .await
+  .expect("transition evidence revision");
+  let mut graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("reload compatible evidence after persisted transition");
+  let requests = controller_evidence::plan_missing_evidence(
+    &graph,
+    &revision,
+    &config.verification.trusted_checks,
+    &config.verification.falsifiers,
+    &BTreeSet::new(),
+  )
+  .expect("plan evidence");
+  assert!(requests.is_empty());
+  assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Proven
+  );
+  assert_eq!(trusted.calls.load(Ordering::SeqCst), 1);
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+  std::fs::write(
+    repository.path().join("src/lib.rs"),
+    "pub fn changed() {}\n",
+  )
+  .expect("change bound dependency");
+  run_git(repository.path(), &["add", "src/lib.rs"]);
+  run_git(
+    repository.path(),
+    &["commit", "-m", "change bound dependency"],
+  );
+  let changed_revision = git::head(repository.path())
+    .await
+    .expect("changed revision");
+  controller_evidence::invalidate(
+    repository.path(),
+    &EventSink::new(None),
+    &mut graph,
+    &changed_revision,
+    &config.verification.suite_hash().expect("suite hash"),
+  )
+  .await
+  .expect("invalidate changed dependency");
+  let requests = controller_evidence::plan_missing_evidence(
+    &graph,
+    &changed_revision,
+    &config.verification.trusted_checks,
+    &config.verification.falsifiers,
+    &BTreeSet::new(),
+  )
+  .expect("plan reacquisition");
+  assert_eq!(requests.len(), 1);
+  assert_eq!(
+    graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
+    ProofState::Stale
+  );
+  let refreshed = controller
+    .run(CancellationToken::new())
+    .await
+    .expect("reacquire changed dependency evidence");
+  let refreshed_graph = controller_evidence::load(repository.path(), &catalog)
+    .await
+    .expect("load fresh dependency evidence");
+  assert_eq!(refreshed.status, RunStatus::Done);
+  assert_eq!(trusted.calls.load(Ordering::SeqCst), 2);
+  assert_eq!(backend.assessment_calls.load(Ordering::SeqCst), 0);
+  assert_eq!(
+    refreshed_graph.proof_derivations[&ObligationId::from("REQ-001/AC-01/VO-01")].state,
     ProofState::Proven
   );
 }

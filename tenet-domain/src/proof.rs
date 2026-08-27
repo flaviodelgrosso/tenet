@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{DateTime, Utc};
+use globset::{Glob, GlobSetBuilder};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -8,7 +9,7 @@ use thiserror::Error;
 
 use crate::{
   falsifier::FalsifierResult,
-  ids::{ArtifactId, ObligationId, VerificationRunId},
+  ids::{ArtifactId, HumanAttestationId, ObligationId, VerificationRunId},
   trusted_verifier::IsolationCapabilityReport,
   verification::{VerificationAuthority, VerificationSpec},
 };
@@ -95,15 +96,98 @@ impl ArtifactValidity {
   }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DependencyPolicy {
+  #[default]
+  RepositoryWide,
+  Paths {
+    patterns: Vec<String>,
+  },
+}
+
+impl DependencyPolicy {
+  pub fn validate(&self) -> Result<(), DependencyPolicyError> {
+    match self {
+      Self::RepositoryWide => Ok(()),
+      Self::Paths { patterns } if patterns.is_empty() => Err(DependencyPolicyError::EmptyPaths),
+      Self::Paths { patterns } => build_glob_set(patterns).map(|_| ()),
+    }
+  }
+
+  pub fn materialize(
+    &self,
+    repository_blobs: &BTreeMap<String, String>,
+  ) -> Result<DependencySurface, DependencyPolicyError> {
+    match self {
+      Self::RepositoryWide => Ok(DependencySurface::RepositoryWide),
+      Self::Paths { patterns } => {
+        let globs = build_glob_set(patterns)?;
+        let blob_hashes = repository_blobs
+          .iter()
+          .filter(|(path, _)| globs.is_match(path))
+          .map(|(path, hash)| (path.clone(), hash.clone()))
+          .collect();
+        Ok(DependencySurface::Paths {
+          patterns: patterns.clone(),
+          blob_hashes,
+        })
+      }
+    }
+  }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DependencyPolicyError {
+  #[error("path dependency policy must declare at least one pattern")]
+  EmptyPaths,
+  #[error("invalid path dependency pattern {0:?}")]
+  InvalidPattern(String),
+}
+
+fn build_glob_set(patterns: &[String]) -> Result<globset::GlobSet, DependencyPolicyError> {
+  let mut builder = GlobSetBuilder::new();
+  for pattern in patterns {
+    if pattern.trim().is_empty() {
+      return Err(DependencyPolicyError::InvalidPattern(pattern.clone()));
+    }
+    let glob =
+      Glob::new(pattern).map_err(|_| DependencyPolicyError::InvalidPattern(pattern.clone()))?;
+    builder.add(glob);
+  }
+  builder
+    .build()
+    .map_err(|_| DependencyPolicyError::InvalidPattern("<glob-set>".into()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum DependencySurface {
   RepositoryWide,
   Paths {
+    patterns: Vec<String>,
     #[serde(rename = "blobHashes")]
     blob_hashes: BTreeMap<String, String>,
   },
   Unknown,
+}
+fn valid_authoritative_dependencies(
+  dependencies: &DependencySurface,
+  compatible_revisions: &BTreeSet<String>,
+) -> bool {
+  match dependencies {
+    DependencySurface::RepositoryWide => compatible_revisions.is_empty(),
+    DependencySurface::Paths {
+      patterns,
+      blob_hashes,
+    } => build_glob_set(patterns).is_ok_and(|globs| {
+      blob_hashes.keys().all(|path| globs.is_match(path))
+        && compatible_revisions
+          .iter()
+          .all(|revision| !revision.trim().is_empty())
+    }),
+    DependencySurface::Unknown => false,
+  }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,8 +272,16 @@ pub enum EvidenceArtifactKind {
     passed: bool,
   },
   HumanAttestation {
+    #[serde(rename = "attestationId")]
+    attestation_id: HumanAttestationId,
+    #[serde(rename = "attestorId")]
+    attestor_id: String,
     #[serde(rename = "statementHash")]
     statement_hash: String,
+    #[serde(rename = "catalogHash")]
+    catalog_hash: String,
+    #[serde(rename = "attestationRecordHash")]
+    attestation_record_hash: String,
   },
 }
 
@@ -251,7 +343,7 @@ impl EvidenceArtifact {
           result,
           ..
         },
-        DependencySurface::RepositoryWide,
+        dependencies,
       ) => {
         !verifier_name.trim().is_empty()
           && !spec_hash.is_empty()
@@ -274,7 +366,7 @@ impl EvidenceArtifact {
           && isolation_report.input_entries <= isolation_report.max_input_entries
           && result.exit_code.is_some()
           && !result.timed_out
-          && self.compatible_revisions.is_empty()
+          && valid_authoritative_dependencies(dependencies, &self.compatible_revisions)
       }
       (
         ArtifactProvenance::ControllerFalsifier,
@@ -291,7 +383,7 @@ impl EvidenceArtifact {
           result,
           ..
         },
-        DependencySurface::RepositoryWide,
+        dependencies,
       ) => {
         !falsifier_name.trim().is_empty()
           && !spec_hash.is_empty()
@@ -303,7 +395,7 @@ impl EvidenceArtifact {
           && protocol_result.authoritative_observation().is_some()
           && result.exit_code.is_some()
           && !result.timed_out
-          && self.compatible_revisions.is_empty()
+          && valid_authoritative_dependencies(dependencies, &self.compatible_revisions)
       }
       (
         ArtifactProvenance::ControllerSourceInspection,
@@ -315,23 +407,36 @@ impl EvidenceArtifact {
           start_byte,
           end_byte,
         },
-        DependencySurface::Paths { blob_hashes },
+        DependencySurface::Paths {
+          patterns,
+          blob_hashes,
+        },
       ) => {
         !blob_sha256.is_empty()
           && !content_sha256.is_empty()
           && start_byte < end_byte
           && blob_hashes.len() == 1
+          && patterns == &vec![path.clone()]
           && blob_hashes.get(path) == Some(blob_sha256)
       }
       (
         ArtifactProvenance::ControllerHumanAttestation { attestor },
         ArtifactAuthority::Authoritative,
-        EvidenceArtifactKind::HumanAttestation { statement_hash },
-        DependencySurface::RepositoryWide,
+        EvidenceArtifactKind::HumanAttestation {
+          attestor_id,
+          statement_hash,
+          catalog_hash,
+          attestation_record_hash,
+          ..
+        },
+        dependencies,
       ) => {
-        !attestor.trim().is_empty()
+        attestor == attestor_id
+          && !attestor.trim().is_empty()
           && !statement_hash.is_empty()
-          && self.compatible_revisions.is_empty()
+          && !catalog_hash.is_empty()
+          && !attestation_record_hash.is_empty()
+          && valid_authoritative_dependencies(dependencies, &self.compatible_revisions)
       }
       (
         ArtifactProvenance::AgentProposedExecution { .. },
@@ -363,11 +468,20 @@ impl EvidenceArtifact {
       return;
     }
     let definitely_unaffected = match (&self.dependencies, current_blob_hashes) {
-      (DependencySurface::Paths { blob_hashes }, Some(current)) if !blob_hashes.is_empty() => {
-        blob_hashes
+      (
+        DependencySurface::Paths {
+          patterns,
+          blob_hashes,
+        },
+        Some(current),
+      ) => build_glob_set(patterns).is_ok_and(|globs| {
+        let materialized: BTreeMap<_, _> = current
           .iter()
-          .all(|(path, hash)| current.get(path) == Some(hash))
-      }
+          .filter(|(path, _)| globs.is_match(path))
+          .map(|(path, hash)| (path.clone(), hash.clone()))
+          .collect();
+        materialized == *blob_hashes
+      }),
       _ => false,
     };
     if definitely_unaffected {
@@ -437,6 +551,10 @@ pub enum EvidenceAcquisitionKind {
     spec_hash: String,
     #[serde(default, rename = "canonicalInput")]
     canonical_input: Option<String>,
+  },
+  HumanAttestation {
+    #[serde(rename = "statementHash")]
+    statement_hash: String,
   },
   InspectSource {
     path: String,
@@ -653,7 +771,7 @@ fn evaluate(
           && artifact.observation == ArtifactObservation::Supports
           && matches!(
             &artifact.kind,
-            EvidenceArtifactKind::HumanAttestation { statement_hash } if statement_hash == &expected_hash
+            EvidenceArtifactKind::HumanAttestation { statement_hash, .. } if statement_hash == &expected_hash
           )
       });
       current.map_or_else(
@@ -998,6 +1116,7 @@ mod tests {
       obligation_ids: [ObligationId::from("VO-1")].into(),
       validity: ArtifactValidity::Valid,
       dependencies: DependencySurface::Paths {
+        patterns: vec!["src/lib.rs".into()],
         blob_hashes: BTreeMap::from([("src/lib.rs".into(), "blob-hash".into())]),
       },
       compatible_revisions: BTreeSet::new(),
@@ -1015,7 +1134,11 @@ mod tests {
       },
       observation: ArtifactObservation::Supports,
       kind: EvidenceArtifactKind::HumanAttestation {
+        attestation_id: HumanAttestationId::new(),
+        attestor_id: "registered-human".into(),
         statement_hash: statement_hash(statement),
+        catalog_hash: "catalog".into(),
+        attestation_record_hash: "record".into(),
       },
       obligation_ids: [ObligationId::from("VO-1")].into(),
       validity: ArtifactValidity::Valid,
@@ -1269,12 +1392,59 @@ mod tests {
       ArtifactObservation::Supports,
     );
     item.dependencies = DependencySurface::Paths {
+      patterns: vec!["src/lib.rs".into()],
       blob_hashes: BTreeMap::from([("src/lib.rs".into(), "hash-1".into())]),
     };
     let current = BTreeMap::from([("src/lib.rs".into(), "hash-1".into())]);
     item.transition_revision("r2", Some(&current));
     assert!(item.is_compatible_with("r2"));
     assert!(item.validity.is_valid());
+  }
+
+  #[test]
+  fn unrelated_changes_preserve_scoped_contradiction() {
+    let mut item = trusted_artifact("r1", ArtifactObservation::Contradicts, "boundary");
+    item.dependencies = DependencySurface::Paths {
+      patterns: vec!["src/**".into()],
+      blob_hashes: BTreeMap::from([("src/lib.rs".into(), "hash-1".into())]),
+    };
+    let current = BTreeMap::from([
+      ("src/lib.rs".into(), "hash-1".into()),
+      ("README.md".into(), "unrelated".into()),
+    ]);
+    item.transition_revision("r2", Some(&current));
+    assert!(item.is_compatible_with("r2"));
+    assert_eq!(item.observation, ArtifactObservation::Contradicts);
+    assert!(item.validate().is_ok());
+  }
+
+  #[test]
+  fn changed_removed_or_added_scoped_paths_become_stale() {
+    let dependency = || DependencySurface::Paths {
+      patterns: vec!["src/**".into()],
+      blob_hashes: BTreeMap::from([("src/lib.rs".into(), "hash-1".into())]),
+    };
+    for current in [
+      BTreeMap::from([("src/lib.rs".into(), "hash-2".into())]),
+      BTreeMap::new(),
+      BTreeMap::from([
+        ("src/lib.rs".into(), "hash-1".into()),
+        ("src/new.rs".into(), "hash-new".into()),
+      ]),
+    ] {
+      let mut item = trusted_artifact("r1", ArtifactObservation::Contradicts, "boundary");
+      item.dependencies = dependency();
+      item.transition_revision("r2", Some(&current));
+      assert!(!item.validity.is_valid());
+    }
+  }
+
+  #[test]
+  fn repository_wide_artifact_never_reuses_across_revisions() {
+    let mut item = trusted_artifact("r1", ArtifactObservation::Supports, "boundary");
+    item.transition_revision("r2", Some(&BTreeMap::new()));
+    assert!(!item.validity.is_valid());
+    assert!(!item.is_compatible_with("r2"));
   }
 
   #[test]

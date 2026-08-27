@@ -4,7 +4,7 @@ use tenet_domain::{
   evidence::EvidenceGraphState,
   ids::{CriterionId, ObligationId, RequirementId, SpecFragmentId},
   model::RequirementCatalog,
-  proof::ProofState,
+  proof::{derive_proof_state, EvidenceContract, ProofState},
   verification::ProjectVerificationRun,
 };
 
@@ -16,6 +16,7 @@ pub enum CompletionBlocker {
   ProofContradicted(ObligationId),
   ProofInsufficient(ObligationId),
   ProofStale(ObligationId),
+  HumanAttestationRequired(ObligationId),
   ProjectVerificationFailed,
   ProjectVerificationStale,
   RepositoryChangedAfterVerification,
@@ -45,6 +46,12 @@ impl std::fmt::Display for CompletionBlocker {
         write!(formatter, "authoritative proof is insufficient for {id}")
       }
       Self::ProofStale(id) => write!(formatter, "authoritative proof is stale for {id}"),
+      Self::HumanAttestationRequired(id) => {
+        write!(
+          formatter,
+          "obligation {id} requires explicit authenticated human attestation"
+        )
+      }
       Self::ProjectVerificationFailed => formatter.write_str("project verification failed"),
       Self::ProjectVerificationStale => {
         formatter.write_str("project verification does not match the current revision and suite")
@@ -171,6 +178,17 @@ impl CompletionPolicy {
             }
             ProofState::Insufficient => {
               blockers.insert(CompletionBlocker::ProofInsufficient(obligation.id.clone()));
+              if human_requirement(
+                &obligation.evidence_contract,
+                &obligation.id,
+                context.evidence,
+                context.current_revision,
+              ) == HumanRequirement::Required
+              {
+                blockers.insert(CompletionBlocker::HumanAttestationRequired(
+                  obligation.id.clone(),
+                ));
+              }
             }
             ProofState::Stale => {
               blockers.insert(CompletionBlocker::ProofStale(obligation.id.clone()));
@@ -200,6 +218,89 @@ impl CompletionPolicy {
       CompletionDecision::Done
     } else {
       CompletionDecision::NotReady(blockers.into_iter().collect())
+    }
+  }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HumanRequirement {
+  Satisfied,
+  CanProceedWithoutHuman,
+  Required,
+  Impossible,
+}
+
+fn human_requirement(
+  contract: &EvidenceContract,
+  obligation_id: &ObligationId,
+  evidence: &EvidenceGraphState,
+  revision: &str,
+) -> HumanRequirement {
+  let state = derive_proof_state(
+    obligation_id,
+    contract,
+    evidence.artifacts.values(),
+    revision,
+  )
+  .state;
+  if state == ProofState::Proven {
+    return HumanRequirement::Satisfied;
+  }
+  if state == ProofState::Contradicted {
+    return HumanRequirement::Impossible;
+  }
+  match contract {
+    EvidenceContract::HumanAttestation { .. } => HumanRequirement::Required,
+    EvidenceContract::Artifact { .. } => HumanRequirement::CanProceedWithoutHuman,
+    EvidenceContract::All { requirements } => {
+      let (all_satisfied, impossible, required) = requirements.iter().fold(
+        (true, false, false),
+        |(all_satisfied, impossible, required), requirement| match human_requirement(
+          requirement,
+          obligation_id,
+          evidence,
+          revision,
+        ) {
+          HumanRequirement::Satisfied => (all_satisfied, impossible, required),
+          HumanRequirement::CanProceedWithoutHuman => (false, impossible, required),
+          HumanRequirement::Required => (false, impossible, true),
+          HumanRequirement::Impossible => (false, true, required),
+        },
+      );
+      if impossible {
+        HumanRequirement::Impossible
+      } else if required {
+        HumanRequirement::Required
+      } else if all_satisfied {
+        HumanRequirement::Satisfied
+      } else {
+        HumanRequirement::CanProceedWithoutHuman
+      }
+    }
+    EvidenceContract::Any { requirements } => {
+      let (satisfied, can_proceed, required) = requirements.iter().fold(
+        (false, false, false),
+        |(satisfied, can_proceed, required), requirement| match human_requirement(
+          requirement,
+          obligation_id,
+          evidence,
+          revision,
+        ) {
+          HumanRequirement::Satisfied => (true, can_proceed, required),
+          HumanRequirement::CanProceedWithoutHuman => (satisfied, true, required),
+          HumanRequirement::Required => (satisfied, can_proceed, true),
+          HumanRequirement::Impossible => (satisfied, can_proceed, required),
+        },
+      );
+      if satisfied {
+        HumanRequirement::Satisfied
+      } else if can_proceed {
+        HumanRequirement::CanProceedWithoutHuman
+      } else if required {
+        HumanRequirement::Required
+      } else {
+        HumanRequirement::Impossible
+      }
     }
   }
 }
@@ -421,6 +522,7 @@ mod tests {
       catalog: &catalog,
       evidence: &graph,
       project_verification: &project,
+
       current_suite_hash: "suite",
       current_revision: "abc",
       repository_clean: true,
@@ -434,5 +536,30 @@ mod tests {
           ObligationId::from("REQ-001/AC-01/VO-01")
         ))
     ));
+  }
+  #[test]
+  fn unresolved_machine_alternative_does_not_require_human_attestation() {
+    let decision = decision_with_contract(
+      true,
+      None,
+      EvidenceContract::Any {
+        requirements: vec![
+          EvidenceContract::HumanAttestation {
+            statement: "Manual review".into(),
+          },
+          EvidenceContract::Artifact {
+            predicate: EvidencePredicate::TrustedVerifierCheck {
+              name: "machine".into(),
+            },
+          },
+        ],
+      },
+    );
+    let CompletionDecision::NotReady(blockers) = decision else {
+      panic!("missing machine evidence must block");
+    };
+    assert!(!blockers
+      .iter()
+      .any(|blocker| matches!(blocker, CompletionBlocker::HumanAttestationRequired(_))));
   }
 }

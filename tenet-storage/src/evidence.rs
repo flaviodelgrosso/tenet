@@ -12,7 +12,8 @@ use tenet_domain::{
     SemanticAssessmentReport,
   },
   falsifier::{FalsificationExecutionRecord, FalsifierResult, FalsifierSpec},
-  ids::{EvidenceId, ObligationId, VerificationRunId},
+  human_attestation::{HumanAttestationRecord, HumanAttestorSpec, HumanSignatureAlgorithm},
+  ids::{EvidenceId, HumanAttestationId, ObligationId, VerificationRunId},
   model::RequirementCatalog,
   proof::{
     derive_proof_state, ArtifactAuthority, ArtifactProvenance, ArtifactValidity, EvidenceArtifact,
@@ -61,9 +62,16 @@ impl Storage {
     run_id: &str,
     verification: &ProjectVerificationRun,
   ) -> Result<(), StorageError> {
+    let verification_json = serde_json::to_string(verification)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let authority_mac = authority_mac(&[
+      b"project-verification-v1",
+      run_id.as_bytes(),
+      verification_json.as_bytes(),
+    ])?;
     let mut transaction = self.pool.begin().await.map_err(StorageError::from_sqlx)?;
     let verification_id = verification.run_id.to_string();
-    sqlx::query("INSERT INTO project_verification_runs(id, run_id, revision, suite_hash, passed, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    sqlx::query("INSERT INTO project_verification_runs(id, run_id, revision, suite_hash, passed, started_at, finished_at, verification_json, authority_mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
       .bind(&verification_id)
       .bind(run_id)
       .bind(&verification.revision)
@@ -71,6 +79,8 @@ impl Storage {
       .bind(verification.passed)
       .bind(verification.started_at.to_rfc3339())
       .bind(verification.finished_at.to_rfc3339())
+      .bind(verification_json)
+      .bind(authority_mac)
       .execute(&mut *transaction)
       .await
       .map_err(StorageError::from_sqlx)?;
@@ -231,6 +241,53 @@ impl Storage {
       .map_err(StorageError::from_sqlx)
   }
 
+  /// Persists a signed human attestation after registry and catalog admission.
+  pub async fn record_human_attestation(
+    &self,
+    run_id: &str,
+    record: &HumanAttestationRecord,
+    attestor: &HumanAttestorSpec,
+  ) -> Result<(), StorageError> {
+    record
+      .verify(attestor)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let catalog = self.load_active_catalog().await?.ok_or_else(|| {
+      StorageError::IntegrityViolation("human attestation requires an active catalog".into())
+    })?;
+    let catalog_hash = catalog
+      .catalog_hash()
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    if record.catalog_hash != catalog_hash
+      || !catalog
+        .verification_obligations
+        .iter()
+        .any(|obligation| obligation.id == record.obligation_id)
+    {
+      return Err(StorageError::IntegrityViolation(
+        "human attestation targets an obsolete or unknown contract".into(),
+      ));
+    }
+    let record_json = serde_json::to_string(record)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    sqlx::query("INSERT INTO human_attestations(id, run_id, attestor_id, statement_hash, obligation_id, catalog_hash, revision, issued_at, algorithm, public_key, signature, record_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(record.id.to_string())
+      .bind(run_id)
+      .bind(&record.attestor_id)
+      .bind(&record.statement_hash)
+      .bind(record.obligation_id.as_str())
+      .bind(&record.catalog_hash)
+      .bind(&record.revision)
+      .bind(record.issued_at.to_rfc3339())
+      .bind("ed25519")
+      .bind(&record.public_key)
+      .bind(&record.signature)
+      .bind(record_json)
+      .execute(&self.pool)
+      .await
+      .map(|_| ())
+      .map_err(StorageError::from_sqlx)
+  }
+
   /// Validates and atomically records advisory assessment judgments.
   pub async fn record_semantic_assessment(
     &self,
@@ -300,9 +357,12 @@ impl Storage {
     catalog: &RequirementCatalog,
     trusted_specs: &[TrustedVerificationSpec],
     falsifier_specs: &[FalsifierSpec],
+    human_attestors: &[HumanAttestorSpec],
   ) -> Result<EvidenceGraphState, StorageError> {
     let mut graph = empty_graph(catalog)?;
-    for project in self.load_project_verifications().await? {
+    let (project_verifications, project_authority_rejected) =
+      self.load_project_verifications().await?;
+    for project in project_verifications {
       graph.project_evidence.insert(project.run_id, project);
     }
     for evidence in self
@@ -316,8 +376,10 @@ impl Storage {
         .establish_evidence(evidence)
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
     }
-    let (artifacts, authority_rejected) =
-      self.load_artifacts(trusted_specs, falsifier_specs).await?;
+    let (artifacts, artifact_authority_rejected) = self
+      .load_artifacts(trusted_specs, falsifier_specs, human_attestors)
+      .await?;
+    let authority_rejected = project_authority_rejected || artifact_authority_rejected;
     for artifact in artifacts {
       graph
         .establish_artifact(artifact)
@@ -424,7 +486,7 @@ impl Storage {
     verification_run_id: VerificationRunId,
   ) -> Result<Option<ProjectVerificationRun>, StorageError> {
     let id = verification_run_id.to_string();
-    let row = sqlx::query("SELECT revision, suite_hash, passed, started_at, finished_at FROM project_verification_runs WHERE id = ?")
+    let row = sqlx::query("SELECT run_id, revision, suite_hash, passed, started_at, finished_at, verification_json, authority_mac FROM project_verification_runs WHERE id = ?")
       .bind(&id)
       .fetch_optional(&self.pool)
       .await
@@ -432,7 +494,24 @@ impl Storage {
     let Some(row) = row else {
       return Ok(None);
     };
-    Ok(Some(ProjectVerificationRun {
+    let Some(verification_json) = row.get::<Option<String>, _>("verification_json") else {
+      return Ok(None);
+    };
+    let Some(tag) = row.get::<Option<String>, _>("authority_mac") else {
+      return Ok(None);
+    };
+    let owner_run_id = row.get::<String, _>("run_id");
+    verify_authority_mac(
+      &[
+        b"project-verification-v1",
+        owner_run_id.as_bytes(),
+        verification_json.as_bytes(),
+      ],
+      &tag,
+    )?;
+    let persisted: ProjectVerificationRun = serde_json::from_str(&verification_json)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let reconstructed = ProjectVerificationRun {
       run_id: verification_run_id,
       revision: row.get("revision"),
       suite_hash: row.get("suite_hash"),
@@ -440,36 +519,48 @@ impl Storage {
       passed: row.get("passed"),
       started_at: parse_timestamp(&row.get::<String, _>("started_at"))?,
       finished_at: parse_timestamp(&row.get::<String, _>("finished_at"))?,
-    }))
+    };
+    if persisted != reconstructed {
+      return Err(StorageError::IntegrityViolation(
+        "project verification columns or checks disagree with authenticated payload".into(),
+      ));
+    }
+    Ok(Some(persisted))
   }
 
   async fn load_project_verifications(
     &self,
-  ) -> Result<Vec<ProjectVerificationEvidence>, StorageError> {
-    let rows = sqlx::query("SELECT id, revision, suite_hash, passed, finished_at FROM project_verification_runs ORDER BY finished_at, id")
-      .fetch_all(&self.pool)
-      .await
-      .map_err(StorageError::from_sqlx)?;
-    let mut evidence = Vec::with_capacity(rows.len());
-    for row in rows {
-      let id = row.get::<String, _>("id");
-      let checks = self.load_project_checks(&id).await?;
+  ) -> Result<(Vec<ProjectVerificationEvidence>, bool), StorageError> {
+    let ids = sqlx::query_scalar::<_, String>(
+      "SELECT id FROM project_verification_runs ORDER BY finished_at, id",
+    )
+    .fetch_all(&self.pool)
+    .await
+    .map_err(StorageError::from_sqlx)?;
+    let mut evidence = Vec::with_capacity(ids.len());
+    let mut authority_rejected = false;
+    for id in ids {
+      let run_id = parse_uuid_id(&id)?;
+      let Some(run) = self.load_project_verification(run_id).await? else {
+        authority_rejected = true;
+        continue;
+      };
       evidence.push(ProjectVerificationEvidence {
-        run_id: parse_uuid_id(&id)?,
-        revision: row.get("revision"),
-        suite_hash: row.get("suite_hash"),
-        result: if row.get::<bool, _>("passed") {
+        run_id: run.run_id,
+        revision: run.revision,
+        suite_hash: run.suite_hash,
+        result: if run.passed {
           EvidenceResult::Passed
         } else {
           EvidenceResult::Failed
         },
-        check_results: checks,
-        observed_at: parse_timestamp(&row.get::<String, _>("finished_at"))?,
+        check_results: run.checks,
+        observed_at: run.finished_at,
         source: EvidenceSource::ProjectVerification,
         provenance: ProjectEvidenceProvenance::ControllerExecution,
       });
     }
-    Ok(evidence)
+    Ok((evidence, authority_rejected))
   }
 
   async fn load_project_checks(
@@ -692,13 +783,92 @@ impl Storage {
     Ok((record, spec))
   }
 
+  async fn load_human_attestation(
+    &self,
+    id: HumanAttestationId,
+    human_attestors: Option<&[HumanAttestorSpec]>,
+  ) -> Result<HumanAttestationRecord, StorageError> {
+    let id_text = id.to_string();
+    let row = sqlx::query("SELECT attestor_id, statement_hash, obligation_id, catalog_hash, revision, issued_at, algorithm, public_key, signature, record_json FROM human_attestations WHERE id = ?")
+      .bind(&id_text)
+      .fetch_optional(&self.pool)
+      .await
+      .map_err(StorageError::from_sqlx)?
+      .ok_or_else(|| StorageError::IntegrityViolation(
+        "human artifact references an unknown attestation record".into(),
+      ))?;
+    let record_json = row.get::<String, _>("record_json");
+    let record: HumanAttestationRecord = serde_json::from_str(&record_json)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let algorithm = match record.algorithm {
+      HumanSignatureAlgorithm::Ed25519 => "ed25519",
+    };
+    let columns_match = record.id == id
+      && record.attestor_id == row.get::<String, _>("attestor_id")
+      && record.statement_hash == row.get::<String, _>("statement_hash")
+      && record.obligation_id.as_str() == row.get::<String, _>("obligation_id")
+      && record.catalog_hash == row.get::<String, _>("catalog_hash")
+      && record.revision == row.get::<String, _>("revision")
+      && record.issued_at.to_rfc3339() == row.get::<String, _>("issued_at")
+      && algorithm == row.get::<String, _>("algorithm")
+      && record.public_key == row.get::<String, _>("public_key")
+      && record.signature == row.get::<String, _>("signature");
+    if !columns_match {
+      return Err(StorageError::IntegrityViolation(
+        "human attestation columns disagree with signed record".into(),
+      ));
+    }
+    let attestor = match human_attestors {
+      Some(registry) => registry
+        .iter()
+        .find(|item| item.id == record.attestor_id)
+        .cloned()
+        .ok_or_else(|| {
+          StorageError::IntegrityViolation(
+            "human attestation does not match the current controller registry".into(),
+          )
+        })?,
+      None => HumanAttestorSpec {
+        id: record.attestor_id.clone(),
+        public_key: record.public_key.clone(),
+        dependencies: match &record.dependencies {
+          tenet_domain::proof::DependencySurface::Paths { patterns, .. } => {
+            tenet_domain::proof::DependencyPolicy::Paths {
+              patterns: patterns.clone(),
+            }
+          }
+          tenet_domain::proof::DependencySurface::RepositoryWide
+          | tenet_domain::proof::DependencySurface::Unknown => {
+            tenet_domain::proof::DependencyPolicy::RepositoryWide
+          }
+        },
+      },
+    };
+    record
+      .verify(&attestor)
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    let catalog = self.load_active_catalog().await?.ok_or_else(|| {
+      StorageError::IntegrityViolation("human attestation requires an active catalog".into())
+    })?;
+    let catalog_hash = catalog
+      .catalog_hash()
+      .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+    if record.catalog_hash != catalog_hash {
+      return Err(StorageError::IntegrityViolation(
+        "human attestation targets an obsolete catalog".into(),
+      ));
+    }
+    Ok(record)
+  }
+
   async fn load_artifacts(
     &self,
     trusted_specs: &[TrustedVerificationSpec],
     falsifier_specs: &[FalsifierSpec],
+    human_attestors: &[HumanAttestorSpec],
   ) -> Result<(Vec<EvidenceArtifact>, bool), StorageError> {
     let rows = sqlx::query(
-      "SELECT id, run_id, revision, authority, validity, artifact_json, authority_context_hash, authority_mac FROM evidence_artifacts ORDER BY id",
+      "SELECT e.id, e.run_id, e.revision, e.authority, e.validity, e.artifact_json, e.authority_context_hash, e.authority_mac, d.dependency_json FROM evidence_artifacts e LEFT JOIN evidence_artifact_dependencies d ON d.artifact_id = e.id ORDER BY e.id",
     )
     .fetch_all(&self.pool)
     .await
@@ -713,10 +883,17 @@ impl Storage {
       artifact
         .validate()
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
-      if matches!(
-        artifact.provenance,
-        ArtifactProvenance::ControllerTrustedVerifier | ArtifactProvenance::ControllerFalsifier
-      ) {
+      if let Some(dependency_json) = row.get::<Option<String>, _>("dependency_json") {
+        let persisted: tenet_domain::proof::DependencySurface =
+          serde_json::from_str(&dependency_json)
+            .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+        if persisted != artifact.dependencies {
+          return Err(StorageError::IntegrityViolation(
+            "artifact dependency metadata disagrees with the artifact record".into(),
+          ));
+        }
+      }
+      if artifact.authority == ArtifactAuthority::Authoritative {
         let Some(tag) = row.get::<Option<String>, _>("authority_mac") else {
           authority_rejected = true;
           continue;
@@ -748,7 +925,12 @@ impl Storage {
           )
           .is_err()
           || self
-            .validate_artifact_issuance(&artifact, Some(trusted_specs), Some(falsifier_specs))
+            .validate_artifact_issuance(
+              &artifact,
+              Some(trusted_specs),
+              Some(falsifier_specs),
+              Some(human_attestors),
+            )
             .await
             .is_err()
         {
@@ -757,7 +939,12 @@ impl Storage {
         }
       } else {
         self
-          .validate_artifact_issuance(&artifact, Some(trusted_specs), Some(falsifier_specs))
+          .validate_artifact_issuance(
+            &artifact,
+            Some(trusted_specs),
+            Some(falsifier_specs),
+            Some(human_attestors),
+          )
           .await?;
       }
       let bindings: BTreeSet<_> = sqlx::query_scalar::<_, String>("SELECT obligation_id FROM artifact_obligations WHERE artifact_id = ? ORDER BY obligation_id")
@@ -783,6 +970,7 @@ impl Storage {
     artifact: &EvidenceArtifact,
     trusted_specs: Option<&[TrustedVerificationSpec]>,
     falsifier_specs: Option<&[FalsifierSpec]>,
+    human_attestors: Option<&[HumanAttestorSpec]>,
   ) -> Result<(), StorageError> {
     match (&artifact.provenance, &artifact.kind) {
       (
@@ -939,9 +1127,38 @@ impl Storage {
           }
         }
       }
-      (ArtifactProvenance::ControllerHumanAttestation { .. }, _) => {
+      (
+        ArtifactProvenance::ControllerHumanAttestation { attestor },
+        EvidenceArtifactKind::HumanAttestation {
+          attestation_id,
+          attestor_id,
+          statement_hash,
+          catalog_hash,
+          attestation_record_hash,
+        },
+      ) => {
+        let record = self
+          .load_human_attestation(*attestation_id, human_attestors)
+          .await?;
+        let matches_record = record.attestor_id == *attestor
+          && record.attestor_id == *attestor_id
+          && record.statement_hash == *statement_hash
+          && record.catalog_hash == *catalog_hash
+          && record.revision == artifact.revision
+          && record.record_hash().ok().as_deref() == Some(attestation_record_hash.as_str())
+          && artifact.obligation_ids.len() == 1
+          && artifact.obligation_ids.contains(&record.obligation_id)
+          && record.dependencies == artifact.dependencies;
+        if !matches_record {
+          return Err(StorageError::IntegrityViolation(
+            "human artifact disagrees with authenticated attestation record".into(),
+          ));
+        }
+      }
+      (ArtifactProvenance::ControllerHumanAttestation { .. }, _)
+      | (_, EvidenceArtifactKind::HumanAttestation { .. }) => {
         return Err(StorageError::IntegrityViolation(
-          "human attestations require a configured issuer registry".into(),
+          "human attestation authority requires matching provenance and artifact kind".into(),
         ));
       }
       _ => {}
@@ -1044,14 +1261,19 @@ impl Storage {
         .validate()
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
       self
-        .validate_artifact_issuance(artifact, None, None)
+        .validate_artifact_issuance(artifact, None, None, None)
         .await?;
+      let artifact_id = artifact.id.to_string();
+      let artifact_run_id =
+        sqlx::query_scalar::<_, String>("SELECT run_id FROM evidence_artifacts WHERE id = ?")
+          .bind(&artifact_id)
+          .fetch_optional(&mut *transaction)
+          .await
+          .map_err(StorageError::from_sqlx)?
+          .unwrap_or_else(|| run_id.to_owned());
       let json = serde_json::to_string(artifact)
         .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
-      let authority_context_hash = if matches!(
-        artifact.provenance,
-        ArtifactProvenance::ControllerTrustedVerifier | ArtifactProvenance::ControllerFalsifier
-      ) {
+      let authority_context_hash = if artifact.authority == ArtifactAuthority::Authoritative {
         Some(
           self
             .authority_context_hash(artifact.obligation_ids.iter())
@@ -1062,16 +1284,30 @@ impl Storage {
       };
       let authority_mac = authority_context_hash
         .as_ref()
-        .map(|context| authority_mac(&[context.as_bytes(), run_id.as_bytes(), json.as_bytes()]))
+        .map(|context| {
+          authority_mac(&[
+            context.as_bytes(),
+            artifact_run_id.as_bytes(),
+            json.as_bytes(),
+          ])
+        })
         .transpose()?;
       sqlx::query("INSERT INTO evidence_artifacts(id, run_id, revision, authority, validity, artifact_json, authority_context_hash, authority_mac) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET validity = excluded.validity, artifact_json = excluded.artifact_json, authority_context_hash = excluded.authority_context_hash, authority_mac = excluded.authority_mac")
-        .bind(artifact.id.to_string()).bind(run_id).bind(&artifact.revision)
+        .bind(&artifact_id).bind(&artifact_run_id).bind(&artifact.revision)
         .bind(authority_name(artifact.authority)).bind(artifact_validity_name(&artifact.validity)).bind(json)
         .bind(authority_context_hash).bind(authority_mac)
         .execute(&mut *transaction).await.map_err(StorageError::from_sqlx)?;
+      let dependency_json = serde_json::to_string(&artifact.dependencies)
+        .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?;
+      sqlx::query("INSERT INTO evidence_artifact_dependencies(artifact_id, dependency_json) VALUES (?, ?) ON CONFLICT(artifact_id) DO UPDATE SET dependency_json = excluded.dependency_json")
+        .bind(&artifact_id)
+        .bind(dependency_json)
+        .execute(&mut *transaction)
+        .await
+        .map_err(StorageError::from_sqlx)?;
       for obligation_id in &artifact.obligation_ids {
         sqlx::query("INSERT INTO artifact_obligations(artifact_id, obligation_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
-          .bind(artifact.id.to_string()).bind(obligation_id.as_str())
+          .bind(&artifact_id).bind(obligation_id.as_str())
           .execute(&mut *transaction).await.map_err(StorageError::from_sqlx)?;
       }
     }

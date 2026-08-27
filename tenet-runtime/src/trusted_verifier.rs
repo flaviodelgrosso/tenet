@@ -222,10 +222,15 @@ async fn materialize_revision(
       "candidate revision {observed} does not match requested {revision}"
     )));
   }
-  let (archive, archive_bytes) =
-    git::archive(candidate, revision, resources.max_input_archive_bytes)
-      .await
-      .map_err(|error| TrustedVerifierError::IsolationUnavailable(error.to_string()))?;
+  let (archive, archive_bytes) = git::archive(
+    candidate,
+    revision,
+    resources.max_input_archive_bytes,
+    resources.max_input_tree_bytes,
+    resources.max_input_entries,
+  )
+  .await
+  .map_err(|error| TrustedVerifierError::IsolationUnavailable(error.to_string()))?;
   let directory = tempfile::tempdir().map_err(|error| {
     TrustedVerifierError::IsolationUnavailable(format!(
       "create private revision export directory: {error}"
@@ -1207,6 +1212,7 @@ mod tests {
       isolation: Default::default(),
       resources: Default::default(),
       protocol: Default::default(),
+      dependencies: Default::default(),
     }
   }
 
@@ -1399,6 +1405,8 @@ mod tests {
       repository.path(),
       &revision,
       resources.max_input_archive_bytes,
+      resources.max_input_tree_bytes,
+      resources.max_input_entries,
     )
     .await
     .expect("raw fixture archive");
@@ -1432,6 +1440,7 @@ mod tests {
       isolation: Default::default(),
       resources,
       protocol: Default::default(),
+      dependencies: Default::default(),
     };
     let workspaces = WorkspaceManager::new(repository.path().to_path_buf(), "msb-acceptance");
     let runner = MicrosandboxTrustedVerifier::default();

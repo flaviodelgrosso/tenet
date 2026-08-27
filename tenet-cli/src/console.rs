@@ -525,6 +525,63 @@ impl ConsolePresenter {
         evidence_id: evidence_id.to_string(),
         revision: revision.clone(),
       }],
+      RunEvent::ArtifactReused {
+        artifact_id,
+        from_revision,
+        to_revision,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "EVIDENCE".into(),
+        summary: format!("artifact {artifact_id} reused"),
+        detail: format!("unchanged declared dependencies · {from_revision} -> {to_revision}"),
+      }],
+      RunEvent::ArtifactBecameStale {
+        artifact_id,
+        revision,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "EVIDENCE".into(),
+        summary: format!("artifact {artifact_id} became stale"),
+        detail: format!("declared dependencies changed at {revision}"),
+      }],
+      RunEvent::EvidenceAcquisition {
+        stage,
+        revision,
+        issuer,
+        obligation_ids,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "ACQUIRE".into(),
+        summary: format!("{stage:?} {issuer:?}"),
+        detail: format!(
+          "revision {revision} · {} obligation(s)",
+          obligation_ids.len()
+        ),
+      }],
+      RunEvent::ArtifactIssued {
+        artifact_id,
+        revision,
+        obligation_ids,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "EVIDENCE".into(),
+        summary: format!("artifact {artifact_id} issued"),
+        detail: format!(
+          "revision {revision} · {} obligation(s)",
+          obligation_ids.len()
+        ),
+      }],
+      RunEvent::ObligationProofChanged {
+        obligation_id,
+        revision,
+        previous,
+        current,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "PROOF".into(),
+        summary: format!("{obligation_id}: {previous:?} -> {current:?}"),
+        detail: format!("revision {revision}"),
+      }],
       RunEvent::EvidenceContradiction {
         obligation_id,
         evidence_ids,

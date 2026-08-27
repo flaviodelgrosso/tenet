@@ -199,6 +199,30 @@
         "max_input_entries": { "type": "integer", "minimum": 1, "maximum": 250000, "default": 100000 }
       }
     },
+    "dependencyPolicy": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["policy"],
+          "properties": { "policy": { "const": "repository_wide" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["policy", "patterns"],
+          "properties": {
+            "policy": { "const": "paths" },
+            "patterns": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" }
+            }
+          }
+        }
+      ],
+      "default": { "policy": "repository_wide" }
+    },
     "trustedVerificationSpec": {
       "type": "object",
       "additionalProperties": false,
@@ -231,7 +255,62 @@
         "isolation": { "$ref": "#/$defs/trustedIsolationPolicy" },
         "resources": { "$ref": "#/$defs/trustedResourcePolicy" },
         "protocol": { "type": "string", "const": "exit_code", "default": "exit_code" }
+        ,"dependencies": { "$ref": "#/$defs/dependencyPolicy" }
       }
+    },
+    "humanAttestorSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "publicKey"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "pattern": ".*\\S.*" },
+        "publicKey": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+        "dependencies": { "$ref": "#/$defs/dependencyPolicy" }
+      }
+    },
+    "structuredFalsifierInputSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "argument"],
+      "properties": {
+        "schema": { "type": "object" },
+        "argument": { "type": "string", "minLength": 1, "pattern": "^\\S+$" },
+        "maxBytes": { "type": "integer", "minimum": 1, "maximum": 1048576, "default": 16384 }
+      }
+    },
+    "falsifierSpec": {
+      "type": "object",
+      "description": "Trusted verifier fields plus an explicit bounded falsifier protocol and optional structured input.",
+      "required": ["name", "backend", "image", "program"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "backend": { "const": "microsandbox" },
+        "image": { "type": "string", "pattern": "^.+@sha256:[0-9A-Fa-f]{64}$" },
+        "program": { "type": "string", "minLength": 1 },
+        "args": { "$ref": "#/$defs/stringList", "default": [] },
+        "working_directory": { "type": "string", "minLength": 1, "default": "." },
+        "environment": {
+          "type": "object",
+          "default": {},
+          "propertyNames": {
+            "minLength": 1,
+            "allOf": [
+              { "not": { "enum": ["HOME", "PATH", "TMPDIR", "USER"] } },
+              { "not": { "pattern": "^MSB_" } },
+              { "not": { "pattern": "=" } }
+            ]
+          },
+          "additionalProperties": { "type": "string" }
+        },
+        "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 300 },
+        "isolation": { "$ref": "#/$defs/trustedIsolationPolicy" },
+        "resources": { "$ref": "#/$defs/trustedResourcePolicy" },
+        "protocol": { "const": "exit_code", "default": "exit_code" },
+        "dependencies": { "$ref": "#/$defs/dependencyPolicy" },
+        "result_protocol": { "const": "exit_code", "default": "exit_code" },
+        "input": { "$ref": "#/$defs/structuredFalsifierInputSpec" }
+      },
+      "additionalProperties": false
     },
     "verificationConfig": {
       "type": "object",
@@ -250,6 +329,16 @@
           "items": { "$ref": "#/$defs/trustedVerificationSpec" },
           "default": [],
           "description": "Named controller-owned checks executed only through enforced trusted isolation."
+        },
+        "falsifiers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/falsifierSpec" },
+          "default": []
+        },
+        "human_attestors": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/humanAttestorSpec" },
+          "default": []
         },
         "timeout_secs": {
           "type": "integer",

@@ -525,12 +525,19 @@ pub fn validate_evidence_contracts(catalog: &RequirementCatalog, config: &Config
   if falsifiers.len() != config.verification.falsifiers.len() {
     bail!("falsifier names must be unique");
   }
+  let attestors: BTreeSet<_> = config
+    .verification
+    .human_attestors
+    .iter()
+    .map(|attestor| attestor.id.as_str())
+    .collect();
   for obligation in &catalog.verification_obligations {
     validate_contract_with_falsifiers(
       &obligation.evidence_contract,
       &checks,
       &trusted,
       &falsifiers,
+      &attestors,
     )
     .with_context(|| format!("invalid evidence contract for {}", obligation.id))?;
   }
@@ -543,7 +550,13 @@ fn validate_contract(
   checks: &BTreeSet<&str>,
   trusted: &BTreeSet<&str>,
 ) -> Result<()> {
-  validate_contract_with_falsifiers(contract, checks, trusted, &BTreeSet::new())
+  validate_contract_with_falsifiers(
+    contract,
+    checks,
+    trusted,
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+  )
 }
 
 fn validate_contract_with_falsifiers(
@@ -551,6 +564,7 @@ fn validate_contract_with_falsifiers(
   checks: &BTreeSet<&str>,
   trusted: &BTreeSet<&str>,
   falsifiers: &BTreeSet<&str>,
+  attestors: &BTreeSet<&str>,
 ) -> Result<()> {
   match contract {
     EvidenceContract::Artifact {
@@ -593,11 +607,16 @@ fn validate_contract_with_falsifiers(
         bail!("composite evidence contract must not be empty");
       }
       for requirement in requirements {
-        validate_contract_with_falsifiers(requirement, checks, trusted, falsifiers)?;
+        validate_contract_with_falsifiers(requirement, checks, trusted, falsifiers, attestors)?;
       }
     }
-    EvidenceContract::HumanAttestation { .. } => {
-      bail!("human attestation requires a configured controller issuer");
+    EvidenceContract::HumanAttestation { statement } => {
+      if statement.trim().is_empty() {
+        bail!("human attestation statement must not be blank");
+      }
+      if attestors.is_empty() {
+        bail!("human attestation requires a configured controller issuer");
+      }
     }
   }
   Ok(())

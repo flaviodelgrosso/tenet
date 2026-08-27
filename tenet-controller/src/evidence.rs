@@ -9,25 +9,26 @@ use sha2::{Digest, Sha256};
 
 use tenet_domain::{
   config::{CONFIG_FILE, TENET_DIR},
-  events::{EventSink, RunEvent},
+  events::{EventSink, EvidenceAcquisitionStage, EvidenceIssuer, RunEvent},
   evidence::{
     EvidenceGraphState, EvidencePolicy, EvidenceProjection, EvidenceValidity,
     SemanticAssessmentReport, VerificationState,
   },
   falsifier::{FalsificationExecutionRecord, FalsifierSpec},
+  human_attestation::{HumanAttestationRecord, HumanAttestorSpec},
   ids::{ArtifactId, CriterionId, EvidenceId, RequirementId},
   model::RequirementCatalog,
   proof::{
     derive_proof_state, ArtifactAuthority, ArtifactObservation, ArtifactProvenance,
-    ArtifactValidity, DependencySurface, EvidenceAcquisitionIdentity, EvidenceAcquisitionKind,
-    EvidenceAcquisitionRequest, EvidenceArtifact, EvidenceArtifactKind, EvidenceContract,
-    EvidencePredicate, EvidenceRequestProposal, ProofState,
+    ArtifactValidity, DependencyPolicy, DependencySurface, EvidenceAcquisitionIdentity,
+    EvidenceAcquisitionKind, EvidenceAcquisitionRequest, EvidenceArtifact, EvidenceArtifactKind,
+    EvidenceContract, EvidencePredicate, EvidenceRequestProposal, ProofState,
   },
   trusted_verifier::{TrustedExecutionRecord, TrustedVerificationSpec},
   verification::ProjectVerificationRun,
 };
 
-use tenet_runtime::store;
+use tenet_runtime::{git, store};
 
 pub fn graph_from_catalog(catalog: &RequirementCatalog) -> Result<EvidenceGraphState> {
   let mut graph = EvidenceGraphState::new(&catalog.spec_hash);
@@ -137,7 +138,18 @@ fn next_acquirable_kind(
       };
       Ok((!attempted.contains(&identity)).then_some(kind))
     }
+    EvidenceContract::HumanAttestation { statement } => {
+      let kind = EvidenceAcquisitionKind::HumanAttestation {
+        statement_hash: tenet_domain::proof::statement_hash(statement),
+      };
+      let identity = EvidenceAcquisitionIdentity {
+        revision: revision.to_owned(),
+        kind: kind.clone(),
+      };
+      Ok((!attempted.contains(&identity)).then_some(kind))
+    }
     EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => {
+      let mut pending_human = None;
       for requirement in requirements {
         if let Some(kind) = next_acquirable_kind(
           requirement,
@@ -148,12 +160,16 @@ fn next_acquirable_kind(
           falsifier_specs,
           attempted,
         )? {
-          return Ok(Some(kind));
+          if matches!(kind, EvidenceAcquisitionKind::HumanAttestation { .. }) {
+            pending_human.get_or_insert(kind);
+          } else {
+            return Ok(Some(kind));
+          }
         }
       }
-      Ok(None)
+      Ok(pending_human)
     }
-    EvidenceContract::Artifact { .. } | EvidenceContract::HumanAttestation { .. } => Ok(None),
+    EvidenceContract::Artifact { .. } => Ok(None),
   }
 }
 
@@ -354,8 +370,9 @@ pub async fn record_trusted_execution(
   spec: &TrustedVerificationSpec,
 ) -> Result<Option<ArtifactId>> {
   store::record_trusted_execution(cwd, record, spec).await?;
+  let dependencies = materialize_dependencies(cwd, &record.revision, &spec.dependencies).await?;
   let artifact_id = graph
-    .record_trusted_execution(record, spec)
+    .record_trusted_execution(record, spec, dependencies)
     .context("issue controller trusted-verifier artifact")?;
   graph.derive_proofs(&record.revision);
   store::write_evidence_graph(cwd, graph).await?;
@@ -368,9 +385,46 @@ pub async fn record_falsification(
   spec: &FalsifierSpec,
 ) -> Result<Option<ArtifactId>> {
   store::record_falsification(cwd, record, spec).await?;
+  let dependencies =
+    materialize_dependencies(cwd, &record.revision, &spec.execution.dependencies).await?;
   let artifact_id = graph
-    .record_falsification(record, spec)
+    .record_falsification(record, spec, dependencies)
     .context("issue controller falsifier artifact")?;
+  graph.derive_proofs(&record.revision);
+  store::write_evidence_graph(cwd, graph).await?;
+  Ok(artifact_id)
+}
+
+async fn materialize_dependencies(
+  cwd: &Path,
+  revision: &str,
+  policy: &DependencyPolicy,
+) -> Result<DependencySurface> {
+  if matches!(policy, DependencyPolicy::RepositoryWide) {
+    return Ok(DependencySurface::RepositoryWide);
+  }
+  let blobs = git::repository_blob_hashes(cwd, revision).await?;
+  policy
+    .materialize(&blobs)
+    .map_err(|error| anyhow::anyhow!(error))
+}
+
+pub async fn record_human_attestation(
+  cwd: &Path,
+  graph: &mut EvidenceGraphState,
+  record: &HumanAttestationRecord,
+  attestor: &HumanAttestorSpec,
+  catalog_hash: &str,
+) -> Result<ArtifactId> {
+  let dependencies =
+    materialize_dependencies(cwd, &record.revision, &attestor.dependencies).await?;
+  if dependencies != record.dependencies {
+    bail!("human attestation dependency snapshot was not controller-materialized");
+  }
+  store::record_human_attestation(cwd, record, attestor).await?;
+  let artifact_id = graph
+    .record_human_attestation(record, attestor, catalog_hash)
+    .context("issue authenticated human-attestation artifact")?;
   graph.derive_proofs(&record.revision);
   store::write_evidence_graph(cwd, graph).await?;
   Ok(artifact_id)
@@ -394,6 +448,7 @@ pub async fn establish_semantic_assessment(
 pub async fn acquire_assessment_proposals(
   cwd: &Path,
   graph: &mut EvidenceGraphState,
+  events: &EventSink,
   requests: &[EvidenceAcquisitionRequest],
 ) -> Result<Vec<ArtifactId>> {
   let mut acquired = Vec::new();
@@ -406,6 +461,21 @@ pub async fn acquire_assessment_proposals(
     else {
       continue;
     };
+    let obligation_ids: Vec<_> = request.obligation_ids.iter().cloned().collect();
+    for stage in [
+      EvidenceAcquisitionStage::Admitted,
+      EvidenceAcquisitionStage::IssuerSelected,
+      EvidenceAcquisitionStage::Started,
+    ] {
+      events
+        .emit(RunEvent::EvidenceAcquisition {
+          stage,
+          revision: request.revision.clone(),
+          issuer: EvidenceIssuer::SourceInspection,
+          obligation_ids: obligation_ids.clone(),
+        })
+        .await?;
+    }
     let Some(artifact) = inspect_source(
       cwd,
       &request.revision,
@@ -416,12 +486,36 @@ pub async fn acquire_assessment_proposals(
     )
     .await
     .ok() else {
+      events
+        .emit(RunEvent::EvidenceAcquisition {
+          stage: EvidenceAcquisitionStage::Failed,
+          revision: request.revision.clone(),
+          issuer: EvidenceIssuer::SourceInspection,
+          obligation_ids,
+        })
+        .await?;
       continue;
     };
-    acquired.push(artifact.id);
+    let artifact_id = artifact.id;
+    acquired.push(artifact_id);
     graph
       .establish_artifact(artifact)
       .context("record controller source inspection")?;
+    events
+      .emit(RunEvent::ArtifactIssued {
+        artifact_id,
+        revision: request.revision.clone(),
+        obligation_ids: request.obligation_ids.iter().cloned().collect(),
+      })
+      .await?;
+    events
+      .emit(RunEvent::EvidenceAcquisition {
+        stage: EvidenceAcquisitionStage::Completed,
+        revision: request.revision.clone(),
+        issuer: EvidenceIssuer::SourceInspection,
+        obligation_ids: request.obligation_ids.iter().cloned().collect(),
+      })
+      .await?;
   }
   if acquired.is_empty() {
     return Ok(acquired);
@@ -499,6 +593,7 @@ async fn inspect_source(
     obligation_ids,
     validity: ArtifactValidity::Valid,
     dependencies: DependencySurface::Paths {
+      patterns: vec![path.to_owned()],
       blob_hashes: BTreeMap::from([(path.to_owned(), blob_hash)]),
     },
     compatible_revisions: BTreeSet::new(),
@@ -527,8 +622,25 @@ pub async fn invalidate(
   let requirement_before = verification_states(graph, policy)?;
   let criterion_before = criterion_states(graph, policy)?;
   let invalidated = graph.invalidate_where(revision, Utc::now(), |_| true);
-  let invalidated_artifacts = graph.transition_artifacts(revision, None);
-  if invalidated.is_empty() && invalidated_artifacts.is_empty() {
+  let transitioning_artifacts: Vec<_> = graph
+    .artifacts
+    .values()
+    .filter(|artifact| artifact.validity.is_valid() && !artifact.is_compatible_with(revision))
+    .map(|artifact| (artifact.id, artifact.revision.clone()))
+    .collect();
+  let artifact_transition_needed = !transitioning_artifacts.is_empty();
+  let needs_blob_hashes = graph.artifacts.values().any(|artifact| {
+    artifact.validity.is_valid()
+      && !artifact.is_compatible_with(revision)
+      && matches!(&artifact.dependencies, DependencySurface::Paths { .. })
+  });
+  let repository_blobs = if needs_blob_hashes {
+    Some(git::repository_blob_hashes(cwd, revision).await?)
+  } else {
+    None
+  };
+  graph.transition_artifacts(revision, repository_blobs.as_ref());
+  if invalidated.is_empty() && !artifact_transition_needed {
     return Ok(());
   }
   store::write_evidence_graph(cwd, graph).await?;
@@ -539,6 +651,25 @@ pub async fn invalidate(
         revision: revision.to_owned(),
       })
       .await?;
+  }
+  for (artifact_id, from_revision) in transitioning_artifacts {
+    let artifact = graph
+      .artifacts
+      .get(&artifact_id)
+      .context("transitioned artifact disappeared from evidence graph")?;
+    let event = if artifact.is_compatible_with(revision) && artifact.validity.is_valid() {
+      RunEvent::ArtifactReused {
+        artifact_id,
+        from_revision,
+        to_revision: revision.to_owned(),
+      }
+    } else {
+      RunEvent::ArtifactBecameStale {
+        artifact_id,
+        revision: revision.to_owned(),
+      }
+    };
+    events.emit(event).await?;
   }
   emit_transitions(
     events,
@@ -660,7 +791,7 @@ mod tests {
           content_sha256,
           ..
         },
-        DependencySurface::Paths { blob_hashes }
+        DependencySurface::Paths { blob_hashes, .. }
       ) if path == "src/lib.rs"
         && !content_sha256.is_empty()
         && blob_hashes.get(path) == Some(blob_sha256)
@@ -732,9 +863,10 @@ mod tests {
     let admitted =
       admit_assessment_proposals(&graph, "revision", &report, &[], &[], &BTreeSet::new())
         .expect("admit proposals");
-    let acquired = acquire_assessment_proposals(project.path(), &mut graph, &admitted)
-      .await
-      .expect("defer proposal");
+    let acquired =
+      acquire_assessment_proposals(project.path(), &mut graph, &EventSink::new(None), &admitted)
+        .await
+        .expect("defer proposal");
 
     assert!(acquired.is_empty());
     assert!(!marker.exists());
@@ -760,6 +892,7 @@ mod tests {
       isolation: Default::default(),
       resources: Default::default(),
       protocol: Default::default(),
+      dependencies: Default::default(),
     }
   }
 
