@@ -1474,7 +1474,7 @@ mod tests {
     let architect = json!({
       "requirements":[{"id":"REQ-001","title":"Title","description":"Description","required":true,"sourceRefs":["B0001-F01"]}],
       "acceptanceCriteria":[{"id":"REQ-001/AC-01","requirementId":"REQ-001","description":"Observable","mandatory":true}],
-      "verificationObligations":[{"id":"REQ-001/AC-01/VO-01","criterionId":"REQ-001/AC-01","description":"Behavior is satisfied","required":true}]
+      "verificationObligations":[{"id":"REQ-001/AC-01/VO-01","criterionId":"REQ-001/AC-01","description":"Behavior is satisfied","required":true,"evidenceContract":{"type":"artifact","predicate":{"type":"named_project_check","name":"project verification"}}}]
     });
     let worker = json!({"summary":"done","changedFiles":["src/lib.rs"],"testsRun":["cargo test"],"notes":[],"discoveries":[{"type":"blocker","description":"blocked"}]});
 
@@ -1488,9 +1488,10 @@ mod tests {
       "assessments": [{
         "obligationHandle": "O001",
         "judgment": {
-          "status": "satisfied",
-          "rationale": "Observed behavior",
-          "evidenceRefs": ["src/lib.rs"]
+          "judgment": "insufficient",
+          "reason": "Additional evidence required",
+          "proposals": [],
+          "gapKind": "evidence"
         }
       }]
     });

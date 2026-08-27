@@ -1,5 +1,5 @@
 use std::{
-  collections::BTreeMap,
+  collections::{BTreeMap, BTreeSet},
   fmt::Write as _,
   path::{Component, Path, PathBuf},
 };
@@ -9,7 +9,10 @@ use serde::{de, ser::SerializeStruct, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
-use crate::{model::WorkerRole, verification::VerificationSpec};
+use crate::{
+  falsifier::FalsifierSpec, human_attestation::HumanAttestorSpec, model::WorkerRole,
+  trusted_verifier::TrustedVerificationSpec, verification::VerificationSpec,
+};
 
 pub const TENET_DIR: &str = ".tenet";
 pub const CONFIG_FILE: &str = "tenet.toml";
@@ -21,6 +24,8 @@ const DEFAULT_COMPLETION_RETRIES: u32 = 2;
 const DEFAULT_TURN_TIMEOUT_SECS: u64 = 900;
 const DEFAULT_VERIFICATION_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_VERIFICATION_TIMEOUT_SECS: u64 = 3_600;
+const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_STAGNATION_LIMIT: u32 = 3;
 const DEFAULT_MAX_PARALLEL_WORKERS: usize = 1;
 
@@ -280,6 +285,12 @@ impl AgentPreferences {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VerificationConfig {
   pub checks: Vec<ProjectVerificationCheck>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub trusted_checks: Vec<TrustedVerificationSpec>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub falsifiers: Vec<FalsifierSpec>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub human_attestors: Vec<HumanAttestorSpec>,
   #[serde(default = "default_verification_timeout_secs")]
   pub timeout_secs: u64,
   #[serde(default = "default_max_output_bytes")]
@@ -326,6 +337,12 @@ impl ProjectVerificationCheck {
 struct VerificationConfigWire {
   #[serde(default)]
   checks: Vec<ProjectVerificationCheck>,
+  #[serde(default)]
+  trusted_checks: Vec<TrustedVerificationSpec>,
+  #[serde(default)]
+  falsifiers: Vec<FalsifierSpec>,
+  #[serde(default)]
+  human_attestors: Vec<HumanAttestorSpec>,
   #[serde(default = "default_verification_timeout_secs")]
   timeout_secs: u64,
   #[serde(default = "default_max_output_bytes")]
@@ -340,6 +357,9 @@ impl<'de> Deserialize<'de> for VerificationConfig {
     let wire = VerificationConfigWire::deserialize(deserializer)?;
     let config = Self {
       checks: wire.checks,
+      trusted_checks: wire.trusted_checks,
+      falsifiers: wire.falsifiers,
+      human_attestors: wire.human_attestors,
       timeout_secs: wire.timeout_secs,
       max_output_bytes: wire.max_output_bytes,
     };
@@ -352,6 +372,9 @@ impl Default for VerificationConfig {
   fn default() -> Self {
     Self {
       checks: Vec::new(),
+      trusted_checks: Vec::new(),
+      falsifiers: Vec::new(),
+      human_attestors: Vec::new(),
       timeout_secs: DEFAULT_VERIFICATION_TIMEOUT_SECS,
       max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
     }
@@ -360,8 +383,41 @@ impl Default for VerificationConfig {
 
 impl VerificationConfig {
   fn validate(&self) -> Result<()> {
-    if self.timeout_secs == 0 {
-      anyhow::bail!("verification.timeout_secs must be at least 1");
+    if !(1..=MAX_VERIFICATION_TIMEOUT_SECS).contains(&self.timeout_secs) {
+      anyhow::bail!("verification.timeout_secs is outside controller bounds");
+    }
+    if self.max_output_bytes > MAX_OUTPUT_BYTES {
+      anyhow::bail!("verification.max_output_bytes exceeds the controller limit");
+    }
+    let mut trusted_names = BTreeSet::new();
+    for check in &self.trusted_checks {
+      check
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid trusted verifier {:?}: {error}", check.name))?;
+      if !trusted_names.insert(check.name.as_str()) {
+        anyhow::bail!("duplicate trusted verifier name {:?}", check.name);
+      }
+    }
+    let mut falsifier_names = BTreeSet::new();
+    for falsifier in &self.falsifiers {
+      falsifier
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid falsifier {:?}: {error}", falsifier.name()))?;
+      if !falsifier_names.insert(falsifier.name()) {
+        anyhow::bail!("duplicate falsifier name {:?}", falsifier.name());
+      }
+      if trusted_names.contains(falsifier.name()) {
+        anyhow::bail!("trusted verifier and falsifier names must be distinct");
+      }
+    }
+    let mut attestor_ids = BTreeSet::new();
+    for attestor in &self.human_attestors {
+      attestor
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid human attestor {:?}: {error}", attestor.id))?;
+      if !attestor_ids.insert(attestor.id.as_str()) {
+        anyhow::bail!("duplicate human attestor identity {:?}", attestor.id);
+      }
     }
     for check in &self.checks {
       if check.name.trim().is_empty() {
@@ -376,8 +432,11 @@ impl VerificationConfig {
       if check.working_directory.trim().is_empty() {
         anyhow::bail!("project verification check working_directory must not be blank");
       }
-      if check.timeout_secs == Some(0) {
-        anyhow::bail!("project verification check timeout_secs must be at least 1");
+      if check
+        .timeout_secs
+        .is_some_and(|timeout| !(1..=MAX_VERIFICATION_TIMEOUT_SECS).contains(&timeout))
+      {
+        anyhow::bail!("project verification check timeout_secs is outside controller bounds");
       }
     }
     Ok(())
@@ -558,7 +617,7 @@ mod tests {
 
   use super::{
     config_path, config_schema_path, ensure_config, read_config, Config, CONFIG_SCHEMA_DIRECTIVE,
-    CONFIG_SCHEMA_FILE, TENET_DIR,
+    CONFIG_SCHEMA_FILE, MAX_OUTPUT_BYTES, TENET_DIR,
   };
   use crate::model::WorkerRole;
 
@@ -656,9 +715,16 @@ mod tests {
         .keys()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>(),
-      ["checks", "max_output_bytes", "timeout_secs"]
-        .into_iter()
-        .collect(),
+      [
+        "checks",
+        "trusted_checks",
+        "falsifiers",
+        "human_attestors",
+        "max_output_bytes",
+        "timeout_secs"
+      ]
+      .into_iter()
+      .collect(),
     );
     assert_eq!(
       schema["$defs"]["projectVerificationCheck"]["properties"]
@@ -933,6 +999,17 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn read_config_rejects_excessive_verification_output_retention() {
+    let text = serialized_config(
+      |config| config.verification.max_output_bytes = MAX_OUTPUT_BYTES + 1,
+      "",
+    );
+    let error = read_error(text).await;
+
+    assert!(error.contains("verification.max_output_bytes exceeds the controller limit"));
+  }
+
+  #[tokio::test]
   async fn read_config_rejects_blank_registry_identity() {
     let text = serialized_config(|config| config.agent.id = Some(" \t".into()), "");
     let error = read_error(text).await;
@@ -1020,6 +1097,54 @@ mod tests {
       check.effective_timeout_secs(config.verification.timeout_secs),
       600
     );
+  }
+  #[test]
+  fn structured_trusted_check_deserializes_with_enforced_defaults() {
+    let image = format!("example/verifier@sha256:{}", "a".repeat(64));
+    let text = format!(
+      "version = 1\nspec_file = \"spec.md\"\nmax_cycles = 25\nmax_repair_attempts = 3\n[agent]\nid = \"test-agent\"\n[[verification.trusted_checks]]\nname = \"expiry-boundary\"\nbackend = \"microsandbox\"\nimage = \"{image}\"\nprogram = \"verify\"\nargs = [\"--expiry\"]\ndependencies = {{ policy = \"paths\", patterns = [\"src/**\"] }}\n"
+    );
+
+    let config: Config = toml::from_str(&text).expect("structured trusted check");
+    let check = &config.verification.trusted_checks[0];
+
+    assert_eq!(check.name, "expiry-boundary");
+    assert_eq!(check.args, ["--expiry"]);
+    assert_eq!(check.isolation, Default::default());
+    assert_eq!(
+      check.dependencies,
+      crate::proof::DependencyPolicy::Paths {
+        patterns: vec!["src/**".into()]
+      }
+    );
+  }
+
+  #[test]
+  fn duplicate_trusted_check_names_are_rejected() {
+    let image = format!("example/verifier@sha256:{}", "a".repeat(64));
+    let check = format!(
+      "[[verification.trusted_checks]]\nname = \"expiry-boundary\"\nbackend = \"microsandbox\"\nimage = \"{image}\"\nprogram = \"verify\"\n"
+    );
+    let text = format!(
+      "version = 1\nspec_file = \"spec.md\"\nmax_cycles = 25\nmax_repair_attempts = 3\n[agent]\nid = \"test-agent\"\n{check}{check}"
+    );
+
+    let error = toml::from_str::<Config>(&text).expect_err("duplicate name");
+
+    assert!(error
+      .to_string()
+      .contains("duplicate trusted verifier name"));
+  }
+  #[test]
+  fn unknown_trusted_verifier_backend_is_rejected() {
+    let image = format!("example/verifier@sha256:{}", "a".repeat(64));
+    let text = format!(
+      "version = 1\nspec_file = \"spec.md\"\nmax_cycles = 25\nmax_repair_attempts = 3\n[agent]\nid = \"test-agent\"\n[[verification.trusted_checks]]\nname = \"expiry-boundary\"\nbackend = \"host\"\nimage = \"{image}\"\nprogram = \"verify\"\n"
+    );
+
+    let error = toml::from_str::<Config>(&text).expect_err("unknown backend");
+
+    assert!(error.to_string().contains("unknown variant `host`"));
   }
 
   #[test]

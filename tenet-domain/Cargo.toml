@@ -8,6 +8,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+ed25519-dalek.workspace = true
+globset.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

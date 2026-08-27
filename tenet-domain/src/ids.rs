@@ -108,8 +108,16 @@ macro_rules! uuid_id {
 
 uuid_id!(EvidenceId, "UUID-backed identity for one evidence fact.");
 uuid_id!(
+  ArtifactId,
+  "UUID-backed identity for one controller-issued evidence artifact."
+);
+uuid_id!(
   VerificationRunId,
   "UUID-backed identity for one controller verification run."
+);
+uuid_id!(
+  HumanAttestationId,
+  "UUID-backed identity for one authenticated human attestation."
 );
 
 #[cfg(test)]

@@ -8,13 +8,12 @@ use anyhow::Result;
 use colored::Colorize;
 use tenet_domain::{
   events::{CompletionGate, CompletionGateOutcome, RunEvent},
-  evidence::{
-    Evidence, EvidenceResult, EvidenceSource, ObligationAssessment, SemanticAssessmentReport,
-  },
+  evidence::SemanticAssessmentReport,
   model::{
     Phase, RepositoryChange, RunStatus, State, WorkExecution, WorkLease, WorkUnit, WorkerEvent,
     WorkerRole,
   },
+  proof::AssessmentJudgment,
   verification::{ProjectVerificationRun, VerificationReport},
 };
 
@@ -249,19 +248,10 @@ pub(crate) enum ConsoleEvent {
     at: String,
     report: SemanticAssessmentReport,
   },
-  SemanticEvidence {
+  ArtifactStale {
     at: String,
-    evidence: Evidence,
-  },
-  StaleEvidence {
-    at: String,
-    evidence_id: String,
+    artifact_id: String,
     revision: String,
-  },
-  Contradiction {
-    at: String,
-    obligation_id: String,
-    evidence_count: usize,
   },
   Progress(ProgressSnapshot),
   CompletionGate(CompletionGate),
@@ -290,9 +280,7 @@ impl ConsoleEvent {
         | Self::Verification { .. }
         | Self::AdvisoryVerification { .. }
         | Self::SemanticAssessment { .. }
-        | Self::SemanticEvidence { .. }
-        | Self::StaleEvidence { .. }
-        | Self::Contradiction { .. }
+        | Self::ArtifactStale { .. }
         | Self::CompletionGate(_)
         | Self::Error { .. }
     )
@@ -309,7 +297,6 @@ pub(crate) struct ConsolePresenter {
   candidates: BTreeMap<String, WorkExecution>,
   current_integration: Option<String>,
   seen_work: BTreeSet<String>,
-  shown_semantic_findings: BTreeSet<String>,
   last_repair: Option<(String, u32)>,
   last_progress: Option<ProgressSnapshot>,
   last_failure: Option<String>,
@@ -327,7 +314,6 @@ impl ConsolePresenter {
       candidates: BTreeMap::new(),
       current_integration: None,
       seen_work: BTreeSet::new(),
-      shown_semantic_findings: BTreeSet::new(),
       last_repair: None,
       last_progress: None,
       last_failure: None,
@@ -476,63 +462,65 @@ impl ConsolePresenter {
           reason: reason.clone(),
         }]
       }
-      RunEvent::SemanticAssessment(report) => {
-        self.shown_semantic_findings.extend(
-          report
-            .assessments
-            .iter()
-            .filter(|item| !matches!(item.assessment, ObligationAssessment::Satisfied { .. }))
-            .map(|item| item.obligation_id.to_string()),
-        );
-        vec![ConsoleEvent::SemanticAssessment {
-          at: now(),
-          report: report.clone(),
-        }]
-      }
-      RunEvent::EvidenceEstablished(evidence) => vec![ConsoleEvent::Diagnostic {
-        at: evidence.observed_at.to_rfc3339(),
-        label: "EVIDENCE".into(),
-        summary: format!("{} established", evidence.obligation_id),
-        detail: format!(
-          "revision {} · {:?}\n{}\n{}",
-          evidence.revision,
-          evidence.source,
-          evidence.rationale,
-          evidence.evidence_refs.join("\n")
-        ),
-      }],
-      RunEvent::EvidenceFailed(evidence)
-        if evidence.source == EvidenceSource::SemanticAssessment
-          && self
-            .shown_semantic_findings
-            .insert(evidence.obligation_id.to_string()) =>
-      {
-        vec![ConsoleEvent::SemanticEvidence {
-          at: evidence.observed_at.to_rfc3339(),
-          evidence: evidence.clone(),
-        }]
-      }
-      RunEvent::EvidenceFailed(evidence) => vec![ConsoleEvent::Diagnostic {
-        at: evidence.observed_at.to_rfc3339(),
-        label: "EVIDENCE".into(),
-        summary: format!("{} did not establish", evidence.obligation_id),
-        detail: evidence.rationale.clone(),
-      }],
-      RunEvent::EvidenceInvalidated {
-        evidence_id,
-        revision,
-      } => vec![ConsoleEvent::StaleEvidence {
+      RunEvent::SemanticAssessment(report) => vec![ConsoleEvent::SemanticAssessment {
         at: now(),
-        evidence_id: evidence_id.to_string(),
+        report: report.clone(),
+      }],
+      RunEvent::ArtifactReused {
+        artifact_id,
+        from_revision,
+        to_revision,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "EVIDENCE".into(),
+        summary: format!("artifact {artifact_id} reused"),
+        detail: format!("unchanged declared dependencies · {from_revision} -> {to_revision}"),
+      }],
+      RunEvent::ArtifactBecameStale {
+        artifact_id,
+        revision,
+      } => vec![ConsoleEvent::ArtifactStale {
+        at: now(),
+        artifact_id: artifact_id.to_string(),
         revision: revision.clone(),
       }],
-      RunEvent::EvidenceContradiction {
-        obligation_id,
-        evidence_ids,
-      } => vec![ConsoleEvent::Contradiction {
+      RunEvent::EvidenceAcquisition {
+        stage,
+        revision,
+        issuer,
+        obligation_ids,
+      } => vec![ConsoleEvent::Diagnostic {
         at: now(),
-        obligation_id: obligation_id.to_string(),
-        evidence_count: evidence_ids.len(),
+        label: "ACQUIRE".into(),
+        summary: format!("{stage:?} {issuer:?}"),
+        detail: format!(
+          "revision {revision} · {} obligation(s)",
+          obligation_ids.len()
+        ),
+      }],
+      RunEvent::ArtifactIssued {
+        artifact_id,
+        revision,
+        obligation_ids,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "EVIDENCE".into(),
+        summary: format!("artifact {artifact_id} issued"),
+        detail: format!(
+          "revision {revision} · {} obligation(s)",
+          obligation_ids.len()
+        ),
+      }],
+      RunEvent::ObligationProofChanged {
+        obligation_id,
+        revision,
+        previous,
+        current,
+      } => vec![ConsoleEvent::Diagnostic {
+        at: now(),
+        label: "CONTRACT".into(),
+        summary: format!("{obligation_id}: {previous:?} -> {current:?}"),
+        detail: format!("revision {revision}"),
       }],
       RunEvent::CompletionGate(gate) => vec![ConsoleEvent::CompletionGate(gate.clone())],
       RunEvent::Message(message) => vec![ConsoleEvent::Milestone {

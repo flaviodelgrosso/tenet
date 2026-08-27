@@ -68,7 +68,7 @@ pub(crate) enum Command {
     #[command(subcommand)]
     command: RequirementsCommand,
   },
-  /// Export semantic and project evidence.
+  /// Export admitted evidence artifacts and advisory assessments.
   Evidence {
     #[command(subcommand)]
     command: EvidenceCommand,
@@ -114,6 +114,18 @@ pub(crate) enum EvidenceCommand {
     json: bool,
     #[arg(long)]
     requirement: Option<String>,
+  },
+  /// Sign and persist the exact human-attestation contract for one obligation.
+  Attest {
+    #[arg(long)]
+    obligation: String,
+    #[arg(long)]
+    statement: String,
+    #[arg(long)]
+    attestor: String,
+    /// File descriptor containing exactly one 32-byte Ed25519 private key as 64 hex characters.
+    #[arg(long)]
+    signing_key_fd: i32,
   },
 }
 
@@ -193,6 +205,37 @@ mod tests {
           requirement: Some(_)
         }
       }
+    ));
+  }
+
+  #[test]
+  fn evidence_attest_requires_explicit_binding_and_key_fd() {
+    let cli = Cli::try_parse_from([
+      "tenet",
+      "evidence",
+      "attest",
+      "--obligation",
+      "REQ-001/AC-001/VO-001",
+      "--attestor",
+      "alice",
+      "--signing-key-fd",
+      "7",
+      "--statement",
+      "Manual visual review confirms the exact interaction",
+    ])
+    .expect("parse evidence attest");
+    assert!(matches!(
+      cli.command,
+      Command::Evidence {
+        command: super::EvidenceCommand::Attest {
+          obligation,
+          attestor,
+          signing_key_fd: 7,
+          statement,
+        }
+      } if obligation == "REQ-001/AC-001/VO-001"
+        && attestor == "alice"
+        && statement == "Manual visual review confirms the exact interaction"
     ));
   }
 

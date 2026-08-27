@@ -12,9 +12,11 @@ pub use context::WorkUnitContext;
 use std::{
   path::{Path, PathBuf},
   str::FromStr,
+  sync::OnceLock,
   time::Duration,
 };
 
+use sha2::{Digest, Sha256};
 use sqlx::{
   migrate::Migrator,
   sqlite::{
@@ -25,6 +27,49 @@ use sqlx::{
 use thiserror::Error;
 
 static MIGRATOR: Migrator = sqlx::migrate!();
+static CONTROLLER_AUTHORITY_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// Installs controller-only key material used to authenticate trusted authority across restarts.
+pub fn install_controller_authority_key(
+  authority_namespace: &str,
+  key_material: &[u8],
+) -> Result<(), StorageError> {
+  if authority_namespace.trim().is_empty() || key_material.is_empty() {
+    return Err(StorageError::IntegrityViolation(
+      "controller authority namespace and key material cannot be empty".into(),
+    ));
+  }
+  let mut digest = Sha256::new();
+  digest.update(b"tenet-controller-authority-v2");
+  digest.update((authority_namespace.len() as u64).to_be_bytes());
+  digest.update(authority_namespace.as_bytes());
+  digest.update((key_material.len() as u64).to_be_bytes());
+  digest.update(key_material);
+  let derived: [u8; 32] = digest.finalize().into();
+  if let Some(current) = CONTROLLER_AUTHORITY_KEY.get() {
+    if current != &derived {
+      return Err(StorageError::IntegrityViolation(
+        "controller authority identity changed within this process".into(),
+      ));
+    }
+    return Ok(());
+  }
+  match CONTROLLER_AUTHORITY_KEY.set(derived) {
+    Ok(()) => Ok(()),
+    Err(raced) if CONTROLLER_AUTHORITY_KEY.get() == Some(&raced) => Ok(()),
+    Err(_) => Err(StorageError::IntegrityViolation(
+      "controller authority identity changed during initialization".into(),
+    )),
+  }
+}
+
+pub(crate) fn controller_authority_key() -> Result<&'static [u8; 32], StorageError> {
+  CONTROLLER_AUTHORITY_KEY.get().ok_or_else(|| {
+    StorageError::IntegrityViolation(
+      "trusted authority requires a controller-only external identity".into(),
+    )
+  })
+}
 
 /// The file name of the authoritative controller database.
 pub const DATABASE_FILE: &str = "tenet.db";
@@ -236,6 +281,37 @@ impl Storage {
   #[doc(hidden)]
   pub fn pool(&self) -> &SqlitePool {
     &self.pool
+  }
+  /// Returns whether persisted authoritative evidence requires external identity validation.
+  pub async fn has_trusted_authority(&self) -> Result<bool, StorageError> {
+    let project_verifications = sqlx::query_scalar::<_, i64>(
+      "SELECT COUNT(*) FROM project_verification_runs WHERE authority_mac IS NOT NULL",
+    )
+    .fetch_one(&self.pool)
+    .await
+    .map_err(StorageError::from_sqlx)?;
+    let trusted_executions =
+      sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM trusted_verifier_executions")
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StorageError::from_sqlx)?;
+    let falsifier_executions =
+      sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM falsifier_executions")
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StorageError::from_sqlx)?;
+    let artifacts = sqlx::query_scalar::<_, i64>(
+      "SELECT COUNT(*) FROM evidence_artifacts WHERE authority_mac IS NOT NULL",
+    )
+    .fetch_one(&self.pool)
+    .await
+    .map_err(StorageError::from_sqlx)?;
+    Ok(
+      project_verifications > 0
+        || trusted_executions > 0
+        || falsifier_executions > 0
+        || artifacts > 0,
+    )
   }
 
   /// Runs SQLite's bounded `quick_check` diagnostic.

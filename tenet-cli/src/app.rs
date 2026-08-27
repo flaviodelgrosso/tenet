@@ -1,11 +1,25 @@
-use std::{io::IsTerminal, path::PathBuf, process::ExitCode, sync::Arc};
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, RawFd};
+use std::{
+  io::{IsTerminal, Read},
+  path::PathBuf,
+  process::ExitCode,
+  sync::Arc,
+};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::Parser;
 use tenet_acp::acp::AcpRuntime;
-use tenet_controller::{catalog, controller::manual_verify, AgentBackend};
-use tenet_domain::model::{CatalogApproval, RunStatus};
+use tenet_controller::{catalog, controller::manual_verify, evidence, AgentBackend};
+use tenet_domain::{
+  config::read_config,
+  evidence::EvidencePolicy,
+  human_attestation::{HumanAttestationBinding, HumanAttestationRecord},
+  ids::ObligationId,
+  model::{CatalogApproval, RunStatus},
+  proof::{statement_hash, EvidenceContract},
+};
 use tenet_runtime::store;
 use tenet_storage::{DatabaseHealth, Storage};
 
@@ -91,6 +105,20 @@ impl App {
         command: EvidenceCommand::Dump { json, requirement },
       }) => {
         self.dump_evidence(json, requirement.as_deref()).await?;
+        ExitCode::SUCCESS
+      }
+      Some(Command::Evidence {
+        command:
+          EvidenceCommand::Attest {
+            obligation,
+            statement,
+            attestor,
+            signing_key_fd,
+          },
+      }) => {
+        self
+          .attest(&obligation, &statement, &attestor, signing_key_fd)
+          .await?;
         ExitCode::SUCCESS
       }
       Some(Command::Roadmap {
@@ -242,17 +270,102 @@ impl App {
       .load_active_catalog()
       .await?
       .context("no active requirement catalog")?;
-    let graph = storage.load_evidence_graph(&catalog).await?;
+    let config = read_config(&self.cwd).await?;
+    if storage.has_trusted_authority().await? {
+      store::bootstrap_controller_authority_identity()
+        .context("trusted evidence inspection requires controller authority identity")?;
+    }
+    let graph = storage
+      .load_evidence_graph(
+        &catalog,
+        &config.verification.trusted_checks,
+        &config.verification.falsifiers,
+        &config.verification.human_attestors,
+      )
+      .await?;
     if let Some(requirement) = requirement {
-      let evidence: Vec<_> = graph
-        .evidence
-        .values()
-        .filter(|item| item.requirement_id.as_str() == requirement)
-        .collect();
-      println!("{}", serde_json::to_string_pretty(&evidence)?);
+      let revision = tenet_runtime::git::head(&self.cwd).await?;
+      let projection = graph
+        .projection(&requirement.into(), EvidencePolicy::new(&revision))
+        .context("unknown requirement")?;
+      println!("{}", serde_json::to_string_pretty(&projection)?);
     } else {
       println!("{}", serde_json::to_string_pretty(&graph)?);
     }
+    Ok(())
+  }
+
+  async fn attest(
+    &self,
+    obligation_id: &str,
+    expected_statement: &str,
+    attestor_id: &str,
+    signing_key_fd: i32,
+  ) -> Result<()> {
+    let storage = Storage::open_existing(&self.cwd).await?;
+    let catalog = storage
+      .load_active_catalog()
+      .await?
+      .context("no active requirement catalog")?;
+    let config = read_config(&self.cwd).await?;
+    let obligation_id = ObligationId::from(obligation_id);
+    let obligation = catalog
+      .verification_obligations
+      .iter()
+      .find(|item| item.id == obligation_id)
+      .context("unknown verification obligation")?;
+    let statement = human_statement(&obligation.evidence_contract, expected_statement)
+      .context("obligation has no human-attestation contract with that exact statement")?;
+    let expected_statement_hash = statement_hash(statement);
+    let attestor = config
+      .verification
+      .human_attestors
+      .iter()
+      .find(|item| item.id == attestor_id)
+      .context("unknown configured human attestor")?;
+    let revision = tenet_runtime::git::head(&self.cwd).await?;
+    let repository_blobs = tenet_runtime::git::repository_blob_hashes(&self.cwd, &revision).await?;
+    let dependencies = attestor
+      .dependencies
+      .materialize(&repository_blobs)
+      .context("materialize configured human-attestation dependencies")?;
+    let catalog_hash = catalog.catalog_hash()?;
+    let mut secret_key = read_signing_key(signing_key_fd)?;
+    let signed = HumanAttestationRecord::sign(
+      attestor,
+      &secret_key,
+      HumanAttestationBinding {
+        statement_hash: expected_statement_hash,
+        obligation_id,
+        catalog_hash: catalog_hash.clone(),
+        revision,
+        issued_at: Utc::now(),
+        dependencies,
+      },
+    );
+    secret_key.fill(0);
+    let record = signed.context("sign exact human attestation")?;
+    store::bootstrap_controller_authority_identity().context(
+      "attestation requires a controller authority identity to authenticate artifact transitions",
+    )?;
+    let mut graph = storage
+      .load_evidence_graph(
+        &catalog,
+        &config.verification.trusted_checks,
+        &config.verification.falsifiers,
+        &config.verification.human_attestors,
+      )
+      .await?;
+    let artifact_id =
+      evidence::record_human_attestation(&self.cwd, &mut graph, &record, attestor, &catalog_hash)
+        .await?;
+    println!("Authenticated human attestation recorded.");
+    println!("attestor: {}", attestor.id);
+    println!("obligation: {}", record.obligation_id);
+    println!("statement: {statement}");
+    println!("statement hash: {}", record.statement_hash);
+    println!("revision: {}", record.revision);
+    println!("artifact: {artifact_id}");
     Ok(())
   }
 
@@ -268,6 +381,8 @@ impl App {
   }
 
   async fn verify(&self, json: bool) -> Result<ExitCode> {
+    store::bootstrap_controller_authority_identity()
+      .context("project verification requires a controller authority identity")?;
     let report = manual_verify(&self.cwd).await?;
     if json {
       println!("{}", serde_json::to_string_pretty(&report)?);
@@ -306,4 +421,51 @@ impl App {
       ExitCode::from(1)
     })
   }
+}
+fn human_statement<'a>(contract: &'a EvidenceContract, expected: &str) -> Option<&'a str> {
+  match contract {
+    EvidenceContract::HumanAttestation { statement } if statement == expected => Some(statement),
+    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => requirements
+      .iter()
+      .find_map(|requirement| human_statement(requirement, expected)),
+    EvidenceContract::Artifact { .. } | EvidenceContract::HumanAttestation { .. } => None,
+  }
+}
+
+#[cfg(unix)]
+fn read_signing_key(descriptor: i32) -> Result<[u8; 32]> {
+  if descriptor < 0 {
+    bail!("human attestation signing-key file descriptor must not be negative");
+  }
+  // SAFETY: the explicit attest command transfers ownership of this inherited descriptor.
+  let mut file = unsafe { std::fs::File::from_raw_fd(descriptor as RawFd) };
+  let mut encoded = Vec::new();
+  Read::by_ref(&mut file)
+    .take(66)
+    .read_to_end(&mut encoded)
+    .context("read human attestation signing key file descriptor")?;
+  while matches!(encoded.last(), Some(b'\n' | b'\r')) {
+    encoded.pop();
+  }
+  if encoded.len() != 64 || !encoded.iter().all(u8::is_ascii_hexdigit) {
+    encoded.fill(0);
+    bail!("human attestation signing key must be exactly 64 hexadecimal characters");
+  }
+  let mut secret = [0_u8; 32];
+  for (destination, pair) in secret.iter_mut().zip(encoded.as_chunks::<2>().0) {
+    let high = (pair[0] as char)
+      .to_digit(16)
+      .context("invalid signing key")?;
+    let low = (pair[1] as char)
+      .to_digit(16)
+      .context("invalid signing key")?;
+    *destination = ((high << 4) | low) as u8;
+  }
+  encoded.fill(0);
+  Ok(secret)
+}
+
+#[cfg(not(unix))]
+fn read_signing_key(_descriptor: i32) -> Result<[u8; 32]> {
+  bail!("inherited human signing-key descriptors require a Unix host")
 }

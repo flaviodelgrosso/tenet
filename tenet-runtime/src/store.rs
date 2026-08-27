@@ -1,7 +1,9 @@
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, RawFd};
 use std::{
   fmt::Write as _,
   fs::OpenOptions,
-  io::Write,
+  io::{Read, Write},
   path::{Path, PathBuf},
   process::Command,
 };
@@ -10,17 +12,104 @@ use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio_util::sync::CancellationToken;
 
 use tenet_domain::{
   config::{read_config, Config, TENET_DIR},
   evidence::EvidenceGraphState,
+  falsifier::{FalsificationExecutionRecord, FalsifierSpec},
+  human_attestation::{HumanAttestationRecord, HumanAttestorSpec},
   model::{
     CatalogApproval, CompletedWorkUnit, IntegrationPhase, IntegrationTransaction, ReconcileResult,
     RequirementCatalog, State,
   },
+  trusted_verifier::{TrustedExecutionRecord, TrustedVerificationSpec},
   verification::ProjectVerificationRun,
 };
 use tenet_storage::Storage;
+
+use crate::{verifier, workspace::WorkspaceManager};
+const AUTHORITY_NAMESPACE_ENV: &str = "TENET_CONTROLLER_AUTHORITY_NAMESPACE";
+const AUTHORITY_KEY_FD_ENV: &str = "TENET_CONTROLLER_AUTHORITY_KEY_FD";
+const MAX_AUTHORITY_KEY_BYTES: u64 = 1024 * 1024;
+
+struct ControllerAuthorityIdentity {
+  namespace: String,
+  key_material: Vec<u8>,
+}
+
+impl ControllerAuthorityIdentity {
+  fn from_environment() -> Result<Self> {
+    let namespace = std::env::var(AUTHORITY_NAMESPACE_ENV)
+      .with_context(|| format!("{AUTHORITY_NAMESPACE_ENV} is required for trusted authority"))?;
+    std::env::remove_var(AUTHORITY_NAMESPACE_ENV);
+    if namespace.trim().is_empty() {
+      anyhow::bail!("{AUTHORITY_NAMESPACE_ENV} must not be blank");
+    }
+    let descriptor = std::env::var(AUTHORITY_KEY_FD_ENV)
+      .with_context(|| format!("{AUTHORITY_KEY_FD_ENV} is required for trusted authority"))?;
+    std::env::remove_var(AUTHORITY_KEY_FD_ENV);
+    let descriptor = descriptor.parse::<i64>().with_context(|| {
+      format!("{AUTHORITY_KEY_FD_ENV} must contain an inherited file descriptor")
+    })?;
+    let key_material = read_authority_key(descriptor)?;
+    if key_material.is_empty() {
+      anyhow::bail!("controller authority key must not be empty");
+    }
+    Ok(Self {
+      namespace,
+      key_material,
+    })
+  }
+
+  fn install(mut self) -> Result<()> {
+    let result = install_controller_authority_key(&self.namespace, &self.key_material);
+    self.key_material.fill(0);
+    result
+  }
+}
+
+#[cfg(unix)]
+fn read_authority_key(descriptor: i64) -> Result<Vec<u8>> {
+  let descriptor = RawFd::try_from(descriptor)
+    .context("controller authority key file descriptor is outside the supported range")?;
+  if descriptor < 0 {
+    anyhow::bail!("controller authority key file descriptor must not be negative");
+  }
+  // SAFETY: ownership of this inherited descriptor is transferred by the launcher contract.
+  let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+  let mut key = Vec::new();
+  Read::by_ref(&mut file)
+    .take(MAX_AUTHORITY_KEY_BYTES + 1)
+    .read_to_end(&mut key)
+    .context("read controller authority key file descriptor")?;
+  if key.len() as u64 > MAX_AUTHORITY_KEY_BYTES {
+    key.fill(0);
+    anyhow::bail!("controller authority key exceeds {MAX_AUTHORITY_KEY_BYTES} bytes");
+  }
+  Ok(key)
+}
+
+#[cfg(not(unix))]
+fn read_authority_key(_descriptor: i64) -> Result<Vec<u8>> {
+  anyhow::bail!("inherited controller authority key descriptors require a Unix host")
+}
+
+pub fn bootstrap_controller_authority_identity() -> Result<()> {
+  ControllerAuthorityIdentity::from_environment()?.install()
+}
+
+pub async fn trusted_authority_identity_required(cwd: &Path) -> Result<bool> {
+  Ok(Storage::open(cwd).await?.has_trusted_authority().await?)
+}
+
+pub fn install_controller_authority_key(
+  authority_namespace: &str,
+  key_material: &[u8],
+) -> Result<()> {
+  tenet_storage::install_controller_authority_key(authority_namespace, key_material)
+    .context("install controller authority identity")
+}
 
 pub async fn ensure_layout(cwd: &Path) -> Result<()> {
   fs::create_dir_all(cwd.join(TENET_DIR).join("runs")).await?;
@@ -124,7 +213,15 @@ pub async fn read_evidence_graph(
     .load_active_catalog()
     .await?
     .ok_or_else(|| anyhow!("cannot load evidence without an active catalog"))?;
-  let graph = storage.load_evidence_graph(&catalog).await?;
+  let config = read_config(cwd).await?;
+  let graph = storage
+    .load_evidence_graph(
+      &catalog,
+      &config.verification.trusted_checks,
+      &config.verification.falsifiers,
+      &config.verification.human_attestors,
+    )
+    .await?;
   if graph.specification_hash != expected.specification_hash
     || graph.requirements != expected.requirements
     || graph.required_requirements != expected.required_requirements
@@ -184,6 +281,57 @@ pub async fn record_manual_verification(
     .record_project_verification(run_id, report)
     .await
     .context("record project verification")?;
+  Ok(())
+}
+pub async fn record_trusted_execution(
+  cwd: &Path,
+  record: &TrustedExecutionRecord,
+  spec: &TrustedVerificationSpec,
+) -> Result<()> {
+  let storage = Storage::open(cwd).await?;
+  let state = storage.load_current_state().await?;
+  let run_id = state
+    .run_id
+    .as_deref()
+    .ok_or_else(|| anyhow!("cannot persist trusted execution without an active run"))?;
+  storage
+    .record_trusted_execution(run_id, record, spec)
+    .await
+    .context("record controller-owned trusted execution")?;
+  Ok(())
+}
+pub async fn record_falsification(
+  cwd: &Path,
+  record: &FalsificationExecutionRecord,
+  spec: &FalsifierSpec,
+) -> Result<()> {
+  let storage = Storage::open(cwd).await?;
+  let state = storage.load_current_state().await?;
+  let run_id = state
+    .run_id
+    .as_deref()
+    .ok_or_else(|| anyhow!("cannot persist falsification without an active run"))?;
+  storage
+    .record_falsification(run_id, record, spec)
+    .await
+    .context("record controller-owned falsification")?;
+  Ok(())
+}
+pub async fn record_human_attestation(
+  cwd: &Path,
+  record: &HumanAttestationRecord,
+  attestor: &HumanAttestorSpec,
+) -> Result<()> {
+  let storage = Storage::open(cwd).await?;
+  let state = storage.load_current_state().await?;
+  let run_id = state
+    .run_id
+    .as_deref()
+    .ok_or_else(|| anyhow!("cannot persist human attestation without an active run"))?;
+  storage
+    .record_human_attestation(run_id, record, attestor)
+    .await
+    .context("record authenticated human attestation")?;
   Ok(())
 }
 
@@ -288,15 +436,64 @@ pub async fn recover_integration(cwd: &Path, state: &mut State, config: &Config)
       transaction.id
     ));
   }
-  let report = storage
+  let report = match storage
     .load_project_verification(transaction.verification_run_id)
     .await?
-    .ok_or_else(|| {
-      anyhow!(
-        "integration recovery is missing project verification {}",
-        transaction.verification_run_id
+  {
+    Some(report) => report,
+    None => {
+      let previous_verification_run_id = transaction.verification_run_id;
+      if !crate::git::is_clean(cwd).await? {
+        anyhow::bail!(
+          "integration recovery cannot reverify legacy evidence from a dirty canonical repository"
+        );
+      }
+      let workspaces = WorkspaceManager::new(
+        cwd.to_path_buf(),
+        format!("{}-recovery", transaction.run_id),
+      );
+      let report = verifier::run_project_verification_isolated(
+        cwd,
+        &workspaces,
+        &transaction.new_head,
+        config,
+        "integration-recovery-project-verification",
+        &CancellationToken::new(),
       )
-    })?;
+      .await
+      .context("rerun project verification for integration recovery")?;
+      if !report.passed {
+        anyhow::bail!(
+          "integration recovery project verification failed for {}",
+          transaction.new_head
+        );
+      }
+      storage
+        .record_project_verification(&transaction.run_id, &report)
+        .await?;
+      let verification_hash = project_verification_hash(&report)?;
+      let updated_at = Utc::now().to_rfc3339();
+      storage
+        .replace_integration_verification(
+          &transaction,
+          report.run_id,
+          &verification_hash,
+          &updated_at,
+        )
+        .await?;
+      for completed in &mut state.completed_work_units {
+        if completed.work_unit == transaction.work_unit
+          && completed.verification_run_id == previous_verification_run_id
+        {
+          completed.verification_run_id = report.run_id;
+        }
+      }
+      transaction.verification_run_id = report.run_id;
+      transaction.verification_hash = verification_hash;
+      transaction.updated_at = updated_at;
+      report
+    }
+  };
   verify_transaction_evidence(&transaction, &report, &config.verification.suite_hash()?)?;
   if transaction.phase == IntegrationPhase::Prepared {
     transaction.phase = IntegrationPhase::GitCommitted;

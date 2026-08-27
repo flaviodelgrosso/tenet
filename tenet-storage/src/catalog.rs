@@ -78,12 +78,13 @@ impl Storage {
         .map_err(StorageError::from_sqlx)?;
     }
     for (ordinal, obligation) in catalog.verification_obligations.iter().enumerate() {
-      sqlx::query("INSERT INTO verification_obligations(id, criterion_id, ordinal, description, required) VALUES (?, ?, ?, ?, ?)")
+      sqlx::query("INSERT INTO verification_obligations(id, criterion_id, ordinal, description, required, evidence_contract_json) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(obligation.id.as_str())
         .bind(obligation.criterion_id.as_str())
         .bind(ordinal as i64)
         .bind(&obligation.description)
         .bind(obligation.required)
+        .bind(serde_json::to_string(&obligation.evidence_contract).map_err(|error| StorageError::IntegrityViolation(error.to_string()))?)
         .execute(&mut *transaction)
         .await
         .map_err(StorageError::from_sqlx)?;
@@ -188,19 +189,23 @@ impl Storage {
       })
       .collect();
 
-    let obligation_rows = sqlx::query("SELECT id, criterion_id, description, required FROM verification_obligations ORDER BY ordinal")
+    let obligation_rows = sqlx::query("SELECT id, criterion_id, description, required, evidence_contract_json FROM verification_obligations ORDER BY ordinal")
       .fetch_all(&self.pool)
       .await
       .map_err(StorageError::from_sqlx)?;
     let verification_obligations = obligation_rows
       .into_iter()
-      .map(|row| VerificationObligation {
-        id: ObligationId::from(row.get::<String, _>("id")),
-        criterion_id: CriterionId::from(row.get::<String, _>("criterion_id")),
-        description: row.get("description"),
-        required: row.get("required"),
+      .map(|row| {
+        Ok(VerificationObligation {
+          id: ObligationId::from(row.get::<String, _>("id")),
+          criterion_id: CriterionId::from(row.get::<String, _>("criterion_id")),
+          description: row.get("description"),
+          required: row.get("required"),
+          evidence_contract: serde_json::from_str(&row.get::<String, _>("evidence_contract_json"))
+            .map_err(|error| StorageError::IntegrityViolation(error.to_string()))?,
+        })
       })
-      .collect();
+      .collect::<Result<Vec<_>, StorageError>>()?;
     let uncovered_fragment_ids = sqlx::query_scalar::<_, String>(
       "SELECT fragment_id FROM uncovered_spec_fragments WHERE spec_hash = ? ORDER BY ordinal",
     )
@@ -311,6 +316,9 @@ async fn clear_active_catalog(
     "DELETE FROM repair_progress",
     "DELETE FROM leases",
     "DELETE FROM reconcile_rounds",
+    "DELETE FROM proof_derivations",
+    "DELETE FROM assessment_judgments",
+    "DELETE FROM evidence_artifacts",
     "DELETE FROM semantic_evidence",
     "DELETE FROM uncovered_spec_fragments",
     "DELETE FROM requirements",

@@ -12,8 +12,8 @@ use crate::model::{
   WorkExecution, WorkLease, WorkUnit, WorkerEvent,
 };
 use crate::{
-  evidence::{Evidence, SemanticAssessmentReport, VerificationState},
-  ids::{CriterionId, EvidenceId, ObligationId, RequirementId},
+  evidence::{SemanticAssessmentReport, VerificationState},
+  ids::{ArtifactId, CriterionId, ObligationId, RequirementId},
   verification::ProjectVerificationRun,
 };
 
@@ -40,6 +40,47 @@ pub struct CompletionGate {
   pub earned: bool,
   pub items: Vec<CompletionGateItem>,
   pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceAcquisitionStage {
+  GapDetected,
+  Planned,
+  Admitted,
+  Rejected,
+  IssuerSelected,
+  Started,
+  Completed,
+  Failed,
+  HumanActionRequired,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EvidenceIssuer {
+  TrustedVerifier { name: String },
+  Falsifier { name: String },
+  HumanAttestor { statement_hash: String },
+  SourceInspection,
+}
+impl EvidenceIssuer {
+  pub fn from_acquisition_kind(kind: &crate::proof::EvidenceAcquisitionKind) -> Self {
+    match kind {
+      crate::proof::EvidenceAcquisitionKind::TrustedVerifierCheck { name, .. } => {
+        Self::TrustedVerifier { name: name.clone() }
+      }
+      crate::proof::EvidenceAcquisitionKind::FalsifierCheck { name, .. } => {
+        Self::Falsifier { name: name.clone() }
+      }
+      crate::proof::EvidenceAcquisitionKind::HumanAttestation { statement_hash } => {
+        Self::HumanAttestor {
+          statement_hash: statement_hash.clone(),
+        }
+      }
+      crate::proof::EvidenceAcquisitionKind::InspectSource { .. } => Self::SourceInspection,
+    }
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -86,15 +127,31 @@ pub enum RunEvent {
   ProjectVerification(ProjectVerificationRun),
   SemanticAssessment(SemanticAssessmentReport),
   RepositoryChanges(Vec<RepositoryChange>),
-  EvidenceEstablished(Evidence),
-  EvidenceFailed(Evidence),
-  EvidenceInvalidated {
-    evidence_id: EvidenceId,
+  ArtifactReused {
+    artifact_id: ArtifactId,
+    from_revision: String,
+    to_revision: String,
+  },
+  ArtifactBecameStale {
+    artifact_id: ArtifactId,
     revision: String,
   },
-  EvidenceContradiction {
+  EvidenceAcquisition {
+    stage: EvidenceAcquisitionStage,
+    revision: String,
+    issuer: EvidenceIssuer,
+    obligation_ids: Vec<ObligationId>,
+  },
+  ArtifactIssued {
+    artifact_id: ArtifactId,
+    revision: String,
+    obligation_ids: Vec<ObligationId>,
+  },
+  ObligationProofChanged {
     obligation_id: ObligationId,
-    evidence_ids: Vec<EvidenceId>,
+    revision: String,
+    previous: crate::proof::ProofState,
+    current: crate::proof::ProofState,
   },
   CriterionVerificationChanged {
     criterion_id: CriterionId,
@@ -218,24 +275,24 @@ impl RunLogger {
       RunEvent::RepositoryChanges(v) => {
         serde_json::json!({"type":"repository_changes","value":v})
       }
-      RunEvent::EvidenceEstablished(v) => {
-        serde_json::json!({"type":"evidence_established","value":v})
-      }
-      RunEvent::EvidenceFailed(v) => {
-        serde_json::json!({"type":"evidence_failed","value":v})
-      }
-      RunEvent::EvidenceInvalidated {
-        evidence_id,
+      RunEvent::ArtifactReused {
+        artifact_id,
+        from_revision,
+        to_revision,
+      } => serde_json::json!({
+        "type":"artifact_reused",
+        "artifactId":artifact_id,
+        "fromRevision":from_revision,
+        "toRevision":to_revision
+      }),
+      RunEvent::ArtifactBecameStale {
+        artifact_id,
         revision,
-      } => {
-        serde_json::json!({"type":"evidence_invalidated","evidenceId":evidence_id,"revision":revision})
-      }
-      RunEvent::EvidenceContradiction {
-        obligation_id,
-        evidence_ids,
-      } => {
-        serde_json::json!({"type":"evidence_contradiction","obligationId":obligation_id,"evidenceIds":evidence_ids})
-      }
+      } => serde_json::json!({
+        "type":"artifact_became_stale",
+        "artifactId":artifact_id,
+        "revision":revision
+      }),
       RunEvent::CriterionVerificationChanged {
         criterion_id,
         previous,
@@ -253,6 +310,40 @@ impl RunLogger {
       RunEvent::CompletionGate(v) => {
         serde_json::json!({"type":"completion_gate","value":v})
       }
+      RunEvent::EvidenceAcquisition {
+        stage,
+        revision,
+        issuer,
+        obligation_ids,
+      } => serde_json::json!({
+        "type":"evidence_acquisition",
+        "stage":stage,
+        "revision":revision,
+        "issuer":issuer,
+        "obligationIds":obligation_ids
+      }),
+      RunEvent::ArtifactIssued {
+        artifact_id,
+        revision,
+        obligation_ids,
+      } => serde_json::json!({
+        "type":"artifact_issued",
+        "artifactId":artifact_id,
+        "revision":revision,
+        "obligationIds":obligation_ids
+      }),
+      RunEvent::ObligationProofChanged {
+        obligation_id,
+        revision,
+        previous,
+        current,
+      } => serde_json::json!({
+        "type":"obligation_proof_changed",
+        "obligationId":obligation_id,
+        "revision":revision,
+        "previous":previous,
+        "current":current
+      }),
       RunEvent::Finished(v) => serde_json::json!({"type":"finished","value":v}),
     };
     let mut file = self.events.lock().await;
@@ -381,7 +472,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn evidence_invalidation_is_logged_as_structured_event() {
+  async fn acquisition_lifecycle_is_logged_without_executable_payloads() {
     let directory = tempfile::tempdir().expect("temporary log directory");
     let logger = Arc::new(
       RunLogger::create(directory.path().to_path_buf())
@@ -389,22 +480,24 @@ mod tests {
         .expect("run logger"),
     );
     let sink = EventSink::new(None).with_logger(logger);
-    let evidence_id = EvidenceId::new();
-
     sink
-      .emit(RunEvent::EvidenceInvalidated {
-        evidence_id,
+      .emit(RunEvent::EvidenceAcquisition {
+        stage: EvidenceAcquisitionStage::Started,
         revision: "abc123".into(),
+        issuer: EvidenceIssuer::TrustedVerifier {
+          name: "boundary".into(),
+        },
+        obligation_ids: vec![ObligationId::from("REQ-1/AC-1/VO-1")],
       })
       .await
-      .expect("emit evidence event");
-
+      .expect("emit acquisition event");
     let text = tokio::fs::read_to_string(directory.path().join("events.jsonl"))
       .await
       .expect("read event log");
     let value: serde_json::Value = serde_json::from_str(text.trim()).expect("event JSON");
-    assert_eq!(value["type"], "evidence_invalidated");
-    assert_eq!(value["evidenceId"], evidence_id.to_string());
-    assert_eq!(value["revision"], "abc123");
+    assert_eq!(value["type"], "evidence_acquisition");
+    assert_eq!(value["stage"], "started");
+    assert_eq!(value["issuer"]["type"], "trusted_verifier");
+    assert!(value.get("program").is_none());
   }
 }

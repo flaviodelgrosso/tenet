@@ -10,6 +10,7 @@ anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 globset.workspace = true
+jsonschema.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -20,6 +21,9 @@ tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+ed25519-dalek.workspace = true
 proptest.workspace = true
+sqlx.workspace = true
+tenet-storage = { path = "../tenet-storage" }
 tempfile = "3"
 toml.workspace = true

@@ -257,42 +257,18 @@ impl<W: Write> ConsoleRenderer<W> {
       ConsoleEvent::SemanticAssessment { at, report } => {
         self.render_semantic_assessment(at, report)?;
       }
-      ConsoleEvent::SemanticEvidence { at, evidence } => {
-        let mut details = wrap_text(&evidence.rationale, 68);
-        if !evidence.evidence_refs.is_empty() {
-          details.push(format!("evidence: {}", evidence.evidence_refs.join(" · ")));
-        }
-        let (tone, label) = match evidence.result {
-          EvidenceResult::Failed => (Tone::Failure, "GAP"),
-          EvidenceResult::Inconclusive => (Tone::Warning, "UNCERTAIN"),
-          EvidenceResult::Passed => (Tone::Success, "EVIDENCE"),
-        };
-        self.entry(at, tone, label, evidence.obligation_id.as_ref(), &details)?;
-      }
-      ConsoleEvent::StaleEvidence {
+      ConsoleEvent::ArtifactStale {
         at,
-        evidence_id,
+        artifact_id,
         revision,
       } => self.entry(
         at,
         Tone::Warning,
         "STALE",
-        evidence_id,
+        artifact_id,
         &[format!(
-          "repository advanced to {}",
-          self.display_revision(revision)
+          "artifact is not authoritative for revision {revision}"
         )],
-      )?,
-      ConsoleEvent::Contradiction {
-        at,
-        obligation_id,
-        evidence_count,
-      } => self.entry(
-        at,
-        Tone::Failure,
-        "CONTRADICT",
-        obligation_id,
-        &[format!("{evidence_count} conflicting evidence item(s)")],
       )?,
       ConsoleEvent::Progress(progress) => self.entry(
         &now(),
@@ -545,39 +521,39 @@ impl<W: Write> ConsoleRenderer<W> {
     report: &SemanticAssessmentReport,
   ) -> Result<()> {
     let total = report.assessments.len();
-    let satisfied = report
+    let supported = report
       .assessments
       .iter()
-      .filter(|item| matches!(item.assessment, ObligationAssessment::Satisfied { .. }))
+      .filter(|item| matches!(item.assessment, AssessmentJudgment::Supported { .. }))
       .count();
     for item in &report.assessments {
       match &item.assessment {
-        ObligationAssessment::Gap { description } => self.entry(
+        AssessmentJudgment::Contradicted { rationale, .. } => self.entry(
           at,
           Tone::Failure,
-          "GAP",
+          "SUSPECTED",
           item.obligation_id.as_ref(),
-          &wrap_text(description, 68),
+          &wrap_text(rationale, 68),
         )?,
-        ObligationAssessment::Uncertain { reason, .. } => self.entry(
+        AssessmentJudgment::Insufficient { reason, .. } => self.entry(
           at,
           Tone::Warning,
-          "UNCERTAIN",
+          "INSUFFICIENT",
           item.obligation_id.as_ref(),
           &wrap_text(reason, 68),
         )?,
-        ObligationAssessment::Satisfied { .. } => {}
+        AssessmentJudgment::Supported { .. } => {}
       }
     }
     self.entry(
       at,
-      if satisfied == total {
+      if supported == total {
         Tone::Success
       } else {
         Tone::Warning
       },
       "ASSESS",
-      &format!("semantic obligations {satisfied}/{total}"),
+      &format!("advisory support {supported}/{total}"),
       &[],
     )
   }
