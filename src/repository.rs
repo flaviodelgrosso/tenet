@@ -1,7 +1,7 @@
 use std::{
   collections::BTreeSet,
   fs::{self, OpenOptions},
-  io::{BufRead, BufReader, Read, Write},
+  io::{BufRead, BufReader, ErrorKind, Read, Write},
   path::{Component, Path, PathBuf},
   process::{Command, Stdio},
 };
@@ -17,6 +17,8 @@ pub const CONFIG_PATH: &str = ".tenet/tenet.toml";
 pub const CONTRACT_PATH: &str = ".tenet/contract.json";
 pub const STATE_PATH: &str = ".tenet/state.json";
 pub const SKILL_PATH: &str = ".agents/skills/tenet/SKILL.md";
+
+const DEFAULT_SPECIFICATION: &str = "# Tenet completion specification\n\nDescribe the required behavior and acceptance criteria for this repository.\n";
 
 pub const SKILL: &str = r#"---
 name: tenet
@@ -69,22 +71,35 @@ pub fn initialize(root: &Path, spec: &Path) -> Result<(RepositoryConfig, String,
   let canonical_root = root
     .canonicalize()
     .context("canonicalize repository root")?;
-  let canonical_spec = spec
-    .canonicalize()
-    .with_context(|| format!("read specification {}", spec.display()))?;
-  let relative = canonical_spec
-    .strip_prefix(&canonical_root)
-    .context("specification must be inside the Git repository")?;
-  let spec_path = relative
-    .to_str()
-    .context("specification path must be UTF-8")?
-    .replace('\\', "/");
+  let config_path = root.join(CONFIG_PATH);
+  let created = !config_path.exists();
+  let existing = (!created).then(|| load_policy(root)).transpose()?;
+  let canonical_spec = match spec.canonicalize() {
+    Ok(path) => path,
+    Err(error) if error.kind() == ErrorKind::NotFound => {
+      let requested_spec_path = specification_path(&canonical_root, &spec)?;
+      if let Some(existing) = &existing {
+        if existing.spec_path != requested_spec_path {
+          bail!(
+            "repository is already initialized for specification `{}`",
+            existing.spec_path
+          );
+        }
+      }
+      create_default_specification(&canonical_root, &spec)?;
+      spec
+        .canonicalize()
+        .with_context(|| format!("canonicalize created specification {}", spec.display()))?
+    }
+    Err(error) => {
+      return Err(error).with_context(|| format!("read specification {}", spec.display()))
+    }
+  };
+  let spec_path = specification_path(&canonical_root, &canonical_spec)?;
 
   fs::create_dir_all(root.join(TENET_DIR)).context("create .tenet directory")?;
   fs::create_dir_all(root.join(".agents/skills/tenet")).context("create Tenet Skill directory")?;
 
-  let config_path = root.join(CONFIG_PATH);
-  let created = !config_path.exists();
   let config = if created {
     let config = RepositoryConfig {
       version: 1,
@@ -94,7 +109,7 @@ pub fn initialize(root: &Path, spec: &Path) -> Result<(RepositoryConfig, String,
     atomic_write(&config_path, toml::to_string_pretty(&config)?.as_bytes())?;
     config
   } else {
-    let existing = load_policy(root)?;
+    let existing = existing.context("load existing repository policy")?;
     if existing.spec_path != spec_path {
       bail!(
         "repository is already initialized for specification `{}`",
@@ -111,6 +126,60 @@ pub fn initialize(root: &Path, spec: &Path) -> Result<(RepositoryConfig, String,
   atomic_write(&root.join(SKILL_PATH), SKILL.as_bytes())?;
   let spec_digest = specification_digest(root, &config)?;
   Ok((config, spec_digest, created))
+}
+
+fn specification_path(canonical_root: &Path, spec: &Path) -> Result<String> {
+  let relative = spec
+    .strip_prefix(canonical_root)
+    .context("specification must be inside the Git repository")?;
+  let mut normalized = PathBuf::new();
+  for component in relative.components() {
+    match component {
+      Component::CurDir => {}
+      Component::Normal(component) => normalized.push(component),
+      Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+        bail!("specification must be inside the Git repository")
+      }
+    }
+  }
+  if normalized.as_os_str().is_empty() {
+    bail!("specification must be a file inside the Git repository");
+  }
+  normalized
+    .to_str()
+    .context("specification path must be UTF-8")
+    .map(|path| path.replace('\\', "/"))
+}
+
+fn create_default_specification(canonical_root: &Path, spec: &Path) -> Result<()> {
+  let relative = PathBuf::from(specification_path(canonical_root, spec)?);
+  let mut components = relative.components().peekable();
+  let mut directory = canonical_root.to_path_buf();
+  let file_name = loop {
+    match components.next() {
+      Some(Component::CurDir) => continue,
+      Some(Component::Normal(component)) if components.peek().is_some() => {
+        directory.push(component);
+        if directory.exists() {
+          directory = directory.canonicalize().with_context(|| {
+            format!(
+              "canonicalize specification directory {}",
+              directory.display()
+            )
+          })?;
+          if !directory.starts_with(canonical_root) {
+            bail!("specification must be inside the Git repository");
+          }
+        } else {
+          fs::create_dir(&directory)
+            .with_context(|| format!("create specification directory {}", directory.display()))?;
+        }
+      }
+      Some(Component::Normal(component)) => break component,
+      Some(_) | None => bail!("specification must be a file inside the Git repository"),
+    }
+  };
+  atomic_write(&directory.join(file_name), DEFAULT_SPECIFICATION.as_bytes())
 }
 
 pub fn load_policy(root: &Path) -> Result<VerificationPolicy> {

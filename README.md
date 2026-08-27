@@ -41,7 +41,7 @@ The CLI is the universal protocol. Skill discovery paths and invocation syntax d
 
 ### 1. Initialize the repository
 
-The target must already be a Git repository, and the specification must be inside it.
+The target must already be a Git repository, and the specification path must resolve inside it. If `--spec` names a missing file, `init` creates its missing parent directories inside the repository and writes a starter specification. Existing specification content is never replaced.
 
 ```bash
 tenet init --spec SPEC.md --json

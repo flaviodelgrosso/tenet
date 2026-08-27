@@ -31,7 +31,7 @@ impl Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-  /// Initialize repository-local Tenet policy and workflow instructions.
+  /// Initialize repository-local Tenet policy and workflow instructions, creating a missing specification.
   Init {
     #[arg(long, value_name = "PATH")]
     spec: PathBuf,

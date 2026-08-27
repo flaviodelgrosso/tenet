@@ -54,6 +54,9 @@ pub fn run(cli: Cli) -> Result<ExitCode> {
 
 fn initialize(cwd: &Path, spec: &Path, json: bool) -> Result<ExitCode> {
   let root = discover_root(cwd)?;
+  let cwd = cwd
+    .canonicalize()
+    .context("canonicalize working directory")?;
   let spec = if spec.is_absolute() {
     spec.to_path_buf()
   } else {

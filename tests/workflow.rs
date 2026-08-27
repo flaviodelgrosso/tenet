@@ -241,6 +241,23 @@ fn init_is_idempotent_and_generates_only_repository_local_tenet_files() {
 }
 
 #[test]
+fn init_creates_a_missing_default_specification_inside_the_repository() {
+  let repository = Repository::new();
+  fs::remove_file(repository.path().join("SPEC.md")).expect("remove specification");
+
+  let first = success_json(repository.tenet(&["init", "--spec", "docs/TENET.md", "--json"]));
+  assert_eq!(first["created"], true);
+  assert_eq!(first["specPath"], "docs/TENET.md");
+  assert_eq!(
+    fs::read_to_string(repository.path().join("docs/TENET.md")).unwrap(),
+    "# Tenet completion specification\n\nDescribe the required behavior and acceptance criteria for this repository.\n"
+  );
+
+  let second = success_json(repository.tenet(&["init", "--spec", "docs/TENET.md", "--json"]));
+  assert_eq!(second["created"], false);
+}
+
+#[test]
 fn generated_skill_is_portable_concise_and_not_authoritative() {
   let repository = Repository::new();
   repository.init();
