@@ -1,6 +1,6 @@
 # Contributing to tenet
 
-Thank you for helping improve `tenet`. Contributions that test its assumptions are especially valuable: benchmarks, adversarial cases, deterministic verification, isolation, recovery behavior, documentation, and negative results are all welcome.
+Thank you for helping improve `tenet`. Contributions that test its assumptions are especially valuable: adversarial contract cases, deterministic verification, evidence validity, revision binding, documentation, and negative results.
 
 Please read the [Code of Conduct](CODE_OF_CONDUCT.md) before participating.
 
@@ -9,7 +9,7 @@ Please read the [Code of Conduct](CODE_OF_CONDUCT.md) before participating.
 - Search existing issues and pull requests before opening a new one.
 - For a substantial change, open an issue first so the scope and design can be discussed.
 - Keep changes focused. Separate unrelated fixes into separate pull requests.
-- Do not include secrets, credentials, generated controller state, or unrelated `.tenet/` artifacts in commits.
+- Do not include secrets, credentials, generated local audit state, or unrelated `.tenet/` artifacts in commits.
 
 ## Development setup
 
@@ -45,8 +45,8 @@ If you change Rust source, run `make fmt` and include only the formatting change
 ## Making a change
 
 1. Create a branch from the current default branch.
-2. Read the relevant code, tests, README sections, and `spec.md` before changing behavior.
-3. Preserve the controller's explicit state transitions, deterministic verification, fail-closed behavior, and durable artifacts.
+2. Read the relevant code, tests, README sections, and completion-authority requirements before changing behavior.
+3. Preserve deterministic completion derivation, exact-revision binding, authority distinctions, and fail-closed evidence semantics.
 4. Add or update tests when a change introduces or alters observable behavior.
 5. Update documentation and examples when commands, configuration, or user-visible behavior changes.
 6. Run the applicable checks, preferably `make ci`.

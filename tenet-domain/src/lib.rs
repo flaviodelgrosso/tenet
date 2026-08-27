@@ -1,14 +1,7 @@
-//! Semantic domain models and pure invariants for Tenet state, catalogs, verification, and evidence.
+//! Pure contract, evidence, and completion semantics for Tenet.
 
-pub mod config;
-pub mod error;
-pub mod events;
+pub mod completion;
+pub mod contract;
+pub mod digest;
 pub mod evidence;
-pub mod falsifier;
-pub mod human_attestation;
-pub mod ids;
-pub mod model;
-pub mod proof;
-pub mod trusted_verifier;
-pub mod verification;
-pub mod worker;
+pub mod policy;

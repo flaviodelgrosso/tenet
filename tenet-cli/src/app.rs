@@ -1,488 +1,619 @@
-#[cfg(unix)]
-use std::os::fd::{FromRawFd, RawFd};
 use std::{
-  io::{IsTerminal, Read},
-  path::PathBuf,
+  collections::BTreeMap,
+  fs,
+  path::{Path, PathBuf},
   process::ExitCode,
-  sync::Arc,
 };
 
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
-use clap::Parser;
-use tenet_acp::acp::AcpRuntime;
-use tenet_controller::{catalog, controller::manual_verify, evidence, AgentBackend};
+use schemars::schema_for;
 use tenet_domain::{
-  config::read_config,
-  evidence::EvidencePolicy,
-  human_attestation::{HumanAttestationBinding, HumanAttestationRecord},
-  ids::ObligationId,
-  model::{CatalogApproval, RunStatus},
-  proof::{statement_hash, EvidenceContract},
+  completion::{
+    derive_completion, derive_obligation_state, Blocker, BlockerCode, DerivationContext,
+    ObligationResult, ObligationState, Verdict,
+  },
+  contract::{
+    validate_proposal, AdmittedContract, ContractProposal, ProposalRecord, VerificationObligation,
+  },
+  digest::canonical_digest,
+  evidence::{
+    ArtifactAuthority, ArtifactProvenance, ArtifactValidity, DependencySurface, EvidenceArtifact,
+    EvidenceEffect,
+  },
+  policy::{VerificationPolicy, VerifierAuthority},
 };
-use tenet_runtime::{
-  authority::{AuthorityBootstrap, AuthorityInitialization},
-  store,
-};
-use tenet_storage::{DatabaseHealth, Storage};
 
 use crate::{
-  agents,
-  cli::{Cli, Command, DbCommand, DumpCommand, EvidenceCommand, RequirementsCommand},
-  run::{self, RunOptions},
+  audit::AuditState,
+  cli::{Cli, Command, ContractCommand},
+  repository::{
+    self, atomic_write, discover_root, load_policy, policy_digest, specification_digest,
+    MaterializedRevision, CONFIG_PATH, CONTRACT_PATH, SKILL_PATH, TENET_DIR,
+  },
+  response::{
+    ApprovalResult, ContractState, EvidenceResult, GateResult, InitResult, ProposalResult,
+    StatusResult,
+  },
+  verifier::run_verifier,
 };
 
-pub(crate) struct App {
-  cwd: PathBuf,
-  backend: Arc<dyn AgentBackend>,
-  command: Option<Command>,
-  authority: AuthorityBootstrap,
+pub fn run(cli: Cli) -> Result<ExitCode> {
+  let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
+  match cli.command {
+    Command::Init { spec, json } => initialize(&cwd, &spec, json),
+    Command::Status { json } => status(&cwd, json),
+    Command::Contract { command } => contract(&cwd, command),
+    Command::Gate { revision, json } => gate(&cwd, &revision, json),
+    Command::Evidence { revision, json } => evidence(&cwd, revision.as_deref(), json),
+  }
 }
 
-impl App {
-  pub(crate) fn new() -> Result<Self> {
-    let cli = Cli::parse();
-    let cur_dir = std::env::current_dir().context("current directory")?;
+fn initialize(cwd: &Path, spec: &Path, json: bool) -> Result<ExitCode> {
+  let root = discover_root(cwd)?;
+  let spec = if spec.is_absolute() {
+    spec.to_path_buf()
+  } else {
+    cwd.join(spec)
+  };
+  let (policy, spec_digest, created) = repository::initialize(&root, &spec)?;
+  let result = InitResult {
+    schema_version: 1,
+    initialized: true,
+    created,
+    spec_path: policy.spec_path,
+    spec_digest,
+    contract_state: if root.join(CONTRACT_PATH).exists() {
+      ContractState::Admitted
+    } else {
+      ContractState::Missing
+    },
+    skill_path: SKILL_PATH.into(),
+  };
+  print_value(&result, json, |value| {
+    println!("initialized: {}", value.initialized);
+    println!("specification: {} ({})", value.spec_path, value.spec_digest);
+    println!("contract: {:?}", value.contract_state);
+    println!("skill: {}", value.skill_path);
+  })?;
+  Ok(ExitCode::SUCCESS)
+}
 
-    let authority = AuthorityBootstrap::from_environment()?;
-    Ok(Self {
-      cwd: cli.cwd.unwrap_or(cur_dir),
-      backend: Arc::new(AcpRuntime),
-      command: Some(cli.command),
-      authority,
+fn status(cwd: &Path, json: bool) -> Result<ExitCode> {
+  let root = discover_root(cwd)?;
+  if !root.join(CONFIG_PATH).exists() {
+    let result = StatusResult {
+      schema_version: 1,
+      initialized: false,
+      spec_path: None,
+      spec_digest: None,
+      policy_digest: None,
+      contract_state: ContractState::Missing,
+      contract_digest: None,
+      last_gated_revision: None,
+      last_verdict: None,
+      unresolved_obligations: Vec::new(),
+    };
+    print_status(&result, json)?;
+    return Ok(ExitCode::from(2));
+  }
+  let policy = load_policy(&root)?;
+  let current_spec_digest = specification_digest(&root, &policy)?;
+  let current_policy_digest = policy_digest(&policy)?;
+  let contract = load_contract_optional(&root)?;
+  let contract_digest = contract
+    .as_ref()
+    .map(canonical_digest)
+    .transpose()
+    .context("hash admitted contract")?;
+  let pending = has_pending_proposal(&root)?;
+  let contract_state = match &contract {
+    Some(contract)
+      if contract.spec_digest != current_spec_digest
+        || contract.policy_digest != current_policy_digest =>
+    {
+      ContractState::Stale
+    }
+    Some(_) => ContractState::Admitted,
+    None if pending => ContractState::PendingApproval,
+    None => ContractState::Missing,
+  };
+  let audit = AuditState::load(&root)?;
+  let last = audit.gates.last();
+  let unresolved_obligations = last
+    .map(|gate| {
+      gate
+        .obligations
+        .iter()
+        .filter(|item| item.state != ObligationState::ContractSatisfied)
+        .cloned()
+        .collect()
     })
-  }
+    .unwrap_or_default();
+  let result = StatusResult {
+    schema_version: 1,
+    initialized: true,
+    spec_path: Some(policy.spec_path),
+    spec_digest: Some(current_spec_digest),
+    policy_digest: Some(current_policy_digest),
+    contract_state,
+    contract_digest,
+    last_gated_revision: last.map(|gate| gate.revision.clone()),
+    last_verdict: last.map(|gate| gate.verdict.clone()),
+    unresolved_obligations,
+  };
+  print_status(&result, json)?;
+  Ok(ExitCode::SUCCESS)
+}
 
-  pub(crate) async fn run(mut self) -> Result<ExitCode> {
-    let command = self
-      .command
-      .take()
-      .expect("Clap requires an explicit subcommand");
-    if command.requires_authority() {
-      self.authority.install(&self.cwd)?;
+fn contract(cwd: &Path, command: ContractCommand) -> Result<ExitCode> {
+  match command {
+    ContractCommand::Schema { .. } => {
+      let schema = schema_for!(ContractProposal);
+      println!("{}", serde_json::to_string_pretty(&schema)?);
+      Ok(ExitCode::SUCCESS)
     }
-    let exit_code = match command {
-      Command::Init => {
-        self.initialize().await?;
-        ExitCode::SUCCESS
-      }
-      Command::Run { quiet, verbose } | Command::Resume { quiet, verbose } => {
-        let state = run::run(self.cwd, self.backend, RunOptions { quiet, verbose }).await?;
-        if matches!(
-          state.status,
-          RunStatus::Blocked | RunStatus::Failed | RunStatus::Stopped
-        ) {
-          ExitCode::from(2)
-        } else {
-          ExitCode::SUCCESS
-        }
-      }
-      Command::Agent { command } => {
-        if agents::handle(&self.cwd, command).await? {
-          ExitCode::SUCCESS
-        } else {
-          ExitCode::from(2)
-        }
-      }
-      Command::Status { json } => {
-        self.print_status(json).await?;
-        ExitCode::SUCCESS
-      }
-      Command::Verify { json } => self.verify(json).await?,
-      Command::Db {
-        command: DbCommand::Check,
-      } => {
-        self.check_database().await?;
-        ExitCode::SUCCESS
-      }
-      Command::State {
-        command: DumpCommand::Dump { json },
-      } => {
-        self.dump_state(json).await?;
-        ExitCode::SUCCESS
-      }
-      Command::Requirements {
-        command: RequirementsCommand::Dump { json },
-      } => {
-        self.dump_requirements(json).await?;
-        ExitCode::SUCCESS
-      }
-      Command::Requirements {
-        command: RequirementsCommand::Approve,
-      } => {
-        self.approve_requirements().await?;
-        ExitCode::SUCCESS
-      }
-      Command::Evidence {
-        command: EvidenceCommand::Dump { json, requirement },
-      } => {
-        self.dump_evidence(json, requirement.as_deref()).await?;
-        ExitCode::SUCCESS
-      }
-      Command::Evidence {
-        command:
-          EvidenceCommand::Attest {
-            obligation,
-            statement,
-            attestor,
-            signing_key_fd,
-          },
-      } => {
-        self
-          .attest(&obligation, &statement, &attestor, signing_key_fd)
-          .await?;
-        ExitCode::SUCCESS
-      }
-      Command::Roadmap {
-        command: DumpCommand::Dump { json },
-      } => {
-        self.dump_roadmap(json).await?;
-        ExitCode::SUCCESS
-      }
-    };
-    Ok(exit_code)
+    ContractCommand::Propose { file, json } => propose(cwd, &file, json),
+    ContractCommand::Approve {
+      proposal,
+      digest,
+      json,
+    } => approve(cwd, &proposal, &digest, json),
   }
+}
 
-  async fn initialize(&mut self) -> Result<()> {
-    let authority = self.authority.initialize(&self.cwd)?;
-    store::ensure_layout(&self.cwd).await?;
-    store::ensure_gitignore(&self.cwd).await?;
-    let config = tenet_domain::config::ensure_config(&self.cwd).await?;
-    store::ensure_spec(&self.cwd, &config).await?;
-    self.print_initialization(&authority);
-    Ok(())
-  }
-
-  fn print_initialization(&self, authority: &AuthorityInitialization) {
-    println!("Initialized tenet in {}", self.cwd.display());
-    println!(
-      "Controller authority: {} ({})",
-      authority.authority_id,
-      authority.provider.display_name()
+fn propose(cwd: &Path, file: &Path, json: bool) -> Result<ExitCode> {
+  let root = initialized_root(cwd)?;
+  let policy = load_policy(&root)?;
+  let current_spec_digest = specification_digest(&root, &policy)?;
+  let current_policy_digest = policy_digest(&policy)?;
+  let file = absolute_from(cwd, file);
+  let bytes = fs::read(&file).with_context(|| format!("read proposal {}", file.display()))?;
+  let proposal: ContractProposal =
+    serde_json::from_slice(&bytes).context("parse contract proposal")?;
+  validate_proposal(&proposal, &policy).context("validate contract proposal")?;
+  if proposal.spec_digest != current_spec_digest {
+    bail!(
+      "proposal specification digest `{}` does not match current `{current_spec_digest}`",
+      proposal.spec_digest
     );
-    if authority.created {
-      println!(
-        "The controller credential was provisioned securely and will be resolved automatically."
-      );
-    } else {
-      println!("The existing controller credential is available and consistent.");
-    }
-    if std::io::stdout().is_terminal() {
-      println!("Run `tenet agents` to browse ACP Registry agents, then `tenet agents select <id>`");
-    } else {
-      println!("Set exactly one of agent.id (Registry) or [agent.custom] in tenet.toml; no agent was selected automatically");
-    }
   }
-
-  async fn print_status(&self, json: bool) -> Result<()> {
-    let state = Storage::open_existing(&self.cwd)
-      .await?
-      .load_current_state()
-      .await?;
-    if json {
-      println!("{}", serde_json::to_string_pretty(&state)?);
-      return Ok(());
-    }
-    println!("status: {:?}", state.status);
-    println!("phase: {:?}", state.phase);
-    println!("cycle: {}", state.cycle);
-    println!(
-      "requirements: {}/{} verified ({} stale, {} contradicted)",
-      state.requirement_counts.verified,
-      state.requirement_counts.total,
-      state.requirement_counts.stale,
-      state.requirement_counts.contradicted
+  if proposal.policy_digest != current_policy_digest {
+    bail!(
+      "proposal policy digest `{}` does not match current `{current_policy_digest}`",
+      proposal.policy_digest
     );
-    println!(
-      "project checks: {}/{} {}",
-      state.verification_layers.project_checks_passed,
-      state.verification_layers.project_checks_total,
-      if state.verification_layers.project_passed {
-        "PASS"
-      } else {
-        "NOT PASSING"
-      }
+  }
+  let digest = canonical_digest(&proposal).context("hash contract proposal")?;
+  let proposal_id = format!(
+    "proposal-{}",
+    digest_key(&digest).chars().take(16).collect::<String>()
+  );
+  let record = ProposalRecord {
+    proposal_id: proposal_id.clone(),
+    proposal_digest: digest.clone(),
+    proposal,
+  };
+  let mut encoded = serde_json::to_vec_pretty(&record)?;
+  encoded.push(b'\n');
+  atomic_write(&proposal_path(&root, &digest), &encoded)?;
+  let result = ProposalResult {
+    schema_version: 1,
+    proposal_id,
+    proposal_digest: digest,
+    approval_required: true,
+  };
+  print_value(&result, json, |value| {
+    println!("proposal: {}", value.proposal_id);
+    println!("digest: {}", value.proposal_digest);
+    println!("approval required: true");
+  })?;
+  Ok(ExitCode::SUCCESS)
+}
+
+fn approve(cwd: &Path, proposal_id: &str, digest: &str, json: bool) -> Result<ExitCode> {
+  let root = initialized_root(cwd)?;
+  let path = proposal_path(&root, digest);
+  let bytes = fs::read(&path).with_context(|| {
+    format!("pending proposal `{digest}` not found; submit it with `tenet contract propose`")
+  })?;
+  let record: ProposalRecord = serde_json::from_slice(&bytes).context("parse pending proposal")?;
+  if record.proposal_id != proposal_id || record.proposal_digest != digest {
+    bail!("approval identity does not match the stored proposal");
+  }
+  let actual_digest = canonical_digest(&record.proposal)?;
+  if actual_digest != digest {
+    bail!("stored proposal content does not match approval digest");
+  }
+  let policy = load_policy(&root)?;
+  validate_proposal(&record.proposal, &policy).context("revalidate contract proposal")?;
+  let spec_digest = specification_digest(&root, &policy)?;
+  let current_policy_digest = policy_digest(&policy)?;
+  if record.proposal.spec_digest != spec_digest
+    || record.proposal.policy_digest != current_policy_digest
+  {
+    bail!("proposal is stale because the specification or verification policy changed");
+  }
+  let admitted = AdmittedContract::from(record);
+  let contract_digest = canonical_digest(&admitted)?;
+  let mut encoded = serde_json::to_vec_pretty(&admitted)?;
+  encoded.push(b'\n');
+  atomic_write(&root.join(CONTRACT_PATH), &encoded)?;
+  let result = ApprovalResult {
+    schema_version: 1,
+    proposal_id: admitted.proposal_id,
+    proposal_digest: admitted.proposal_digest,
+    contract_digest,
+    contract_path: CONTRACT_PATH.into(),
+  };
+  print_value(&result, json, |value| {
+    println!("admitted proposal: {}", value.proposal_id);
+    println!("proposal digest: {}", value.proposal_digest);
+    println!("contract digest: {}", value.contract_digest);
+  })?;
+  Ok(ExitCode::SUCCESS)
+}
+
+fn gate(cwd: &Path, revision: &str, json: bool) -> Result<ExitCode> {
+  let root = discover_root(cwd)?;
+  let revision = repository::resolve_revision(&root, revision)?;
+  let materialized = MaterializedRevision::create(&root, &revision)?;
+  let checkout = materialized.path();
+
+  if !checkout.join(CONFIG_PATH).exists() {
+    let result = control_plane_gate(
+      revision,
+      BlockerCode::RepositoryNotInitialized,
+      "selected revision is not Tenet-enabled",
     );
-    println!(
-      "semantic obligations: {}/{} SATISFIED ({} gaps, {} uncertain)",
-      state.verification_layers.semantic_satisfied,
-      state.verification_layers.semantic_obligations_total,
-      state.verification_layers.semantic_gaps,
-      state.verification_layers.semantic_uncertain
+    return finish_gate(&root, result, Vec::new(), json);
+  }
+  let policy = load_policy(checkout)?;
+  let spec_digest = specification_digest(checkout, &policy)?;
+  let policy_digest = policy_digest(&policy)?;
+  let Some(contract) = load_contract_optional(checkout)? else {
+    let mut result = control_plane_gate(
+      revision,
+      BlockerCode::ContractMissing,
+      "selected revision has no admitted completion contract",
     );
-    println!(
-      "contradictions: {}",
-      state.verification_layers.contradictions
+    result.spec_digest = spec_digest;
+    result.policy_digest = policy_digest;
+    return finish_gate(&root, result, Vec::new(), json);
+  };
+  let contract_digest = canonical_digest(&contract)?;
+  if contract.spec_digest != spec_digest {
+    let result = mismatch_gate(
+      revision,
+      spec_digest,
+      contract_digest,
+      policy_digest,
+      BlockerCode::SpecificationChanged,
+      "specification digest differs from the admitted contract",
     );
-    println!(
-      "completion: {}",
-      if state.verification_layers.completion_eligible {
-        "ELIGIBLE"
-      } else {
-        "BLOCKED"
-      }
+    return finish_gate(&root, result, Vec::new(), json);
+  }
+  if contract.policy_digest != policy_digest {
+    let result = mismatch_gate(
+      revision,
+      spec_digest,
+      contract_digest,
+      policy_digest,
+      BlockerCode::PolicyChanged,
+      "verification policy digest differs from the admitted contract",
     );
-    for lease in state.active_leases.values() {
-      println!(
-        "active work: {} · {} ({})",
-        lease.work_unit.id, lease.work_unit.title, lease.worker_id
-      );
+    return finish_gate(&root, result, Vec::new(), json);
+  }
+  validate_admitted_contract(&contract, &policy)?;
+
+  let mut observations = BTreeMap::new();
+  let mut infrastructure_errors = BTreeMap::new();
+  for obligation in contract.obligations() {
+    let verifier_id = &obligation.evidence_contract.verifier_id;
+    if observations.contains_key(verifier_id) || infrastructure_errors.contains_key(verifier_id) {
+      continue;
     }
-    println!("summary: {}", state.last_summary);
-    if let Some(reason) = state.blocked_reason {
-      println!("blocked: {reason}");
-    }
-    if let Some(error) = state.last_error {
-      println!("error: {error}");
-    }
-    Ok(())
-  }
-
-  async fn check_database(&self) -> Result<()> {
-    let storage = Storage::open_existing(&self.cwd).await?;
-    let quick = storage.quick_check().await?;
-    let foreign_keys = storage.foreign_key_check().await?;
-    if quick != DatabaseHealth::Ok || foreign_keys != DatabaseHealth::Ok {
-      anyhow::bail!("database check failed: quick={quick:?}, foreign_keys={foreign_keys:?}");
-    }
-    println!("database: {}", storage.path().display());
-    println!("quick_check: ok");
-    println!("foreign_key_check: ok");
-    Ok(())
-  }
-
-  async fn dump_state(&self, _json: bool) -> Result<()> {
-    let value = Storage::open_existing(&self.cwd)
-      .await?
-      .load_current_state()
-      .await?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
-    Ok(())
-  }
-
-  async fn dump_requirements(&self, _json: bool) -> Result<()> {
-    let value = Storage::open_existing(&self.cwd)
-      .await?
-      .load_active_catalog()
-      .await?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
-    Ok(())
-  }
-
-  async fn approve_requirements(&self) -> Result<()> {
-    let storage = Storage::open(&self.cwd).await?;
-    let catalog = storage
-      .load_active_catalog()
-      .await?
-      .context("no active requirement catalog to approve")?;
-    catalog::validate(&catalog).context("active requirement catalog is structurally invalid")?;
-    let catalog_hash = catalog.catalog_hash()?;
-    let approval = CatalogApproval {
-      spec_hash: catalog.spec_hash.clone(),
-      catalog_hash: catalog_hash.clone(),
-      approved_at: Utc::now(),
-    };
-    storage.persist_catalog_approval(&approval).await?;
-    println!("Approved requirement catalog.");
-    println!("specification: {}", approval.spec_hash);
-    println!("catalog: {catalog_hash}");
-    println!("requirements: {}", catalog.requirements.len());
-    Ok(())
-  }
-
-  async fn dump_evidence(&self, _json: bool, requirement: Option<&str>) -> Result<()> {
-    let storage = Storage::open_existing(&self.cwd).await?;
-    let catalog = storage
-      .load_active_catalog()
-      .await?
-      .context("no active requirement catalog")?;
-    let config = read_config(&self.cwd).await?;
-    let graph = storage
-      .load_evidence_graph(
-        &catalog,
-        &config.verification.trusted_checks,
-        &config.verification.falsifiers,
-        &config.verification.human_attestors,
-      )
-      .await?;
-    if let Some(requirement) = requirement {
-      let revision = tenet_runtime::git::head(&self.cwd).await?;
-      let projection = graph
-        .projection(&requirement.into(), EvidencePolicy::new(&revision))
-        .context("unknown requirement")?;
-      println!("{}", serde_json::to_string_pretty(&projection)?);
-    } else {
-      println!("{}", serde_json::to_string_pretty(&graph)?);
-    }
-    Ok(())
-  }
-
-  async fn attest(
-    &self,
-    obligation_id: &str,
-    expected_statement: &str,
-    attestor_id: &str,
-    signing_key_fd: i32,
-  ) -> Result<()> {
-    let storage = Storage::open_existing(&self.cwd).await?;
-    let catalog = storage
-      .load_active_catalog()
-      .await?
-      .context("no active requirement catalog")?;
-    let config = read_config(&self.cwd).await?;
-    let obligation_id = ObligationId::from(obligation_id);
-    let obligation = catalog
-      .verification_obligations
+    let verifier = policy
+      .verifiers
       .iter()
-      .find(|item| item.id == obligation_id)
-      .context("unknown verification obligation")?;
-    let statement = human_statement(&obligation.evidence_contract, expected_statement)
-      .context("obligation has no human-attestation contract with that exact statement")?;
-    let expected_statement_hash = statement_hash(statement);
-    let attestor = config
-      .verification
-      .human_attestors
-      .iter()
-      .find(|item| item.id == attestor_id)
-      .context("unknown configured human attestor")?;
-    let revision = tenet_runtime::git::head(&self.cwd).await?;
-    let repository_blobs = tenet_runtime::git::repository_blob_hashes(&self.cwd, &revision).await?;
-    let dependencies = attestor
-      .dependencies
-      .materialize(&repository_blobs)
-      .context("materialize configured human-attestation dependencies")?;
-    let catalog_hash = catalog.catalog_hash()?;
-    let mut secret_key = read_signing_key(signing_key_fd)?;
-    let signed = HumanAttestationRecord::sign(
-      attestor,
-      &secret_key,
-      HumanAttestationBinding {
-        statement_hash: expected_statement_hash,
-        obligation_id,
-        catalog_hash: catalog_hash.clone(),
-        revision,
-        issued_at: Utc::now(),
-        dependencies,
-      },
-    );
-    secret_key.fill(0);
-    let record = signed.context("sign exact human attestation")?;
-    let mut graph = storage
-      .load_evidence_graph(
-        &catalog,
-        &config.verification.trusted_checks,
-        &config.verification.falsifiers,
-        &config.verification.human_attestors,
-      )
-      .await?;
-    let artifact_id =
-      evidence::record_human_attestation(&self.cwd, &mut graph, &record, attestor, &catalog_hash)
-        .await?;
-    println!("Authenticated human attestation recorded.");
-    println!("attestor: {}", attestor.id);
-    println!("obligation: {}", record.obligation_id);
-    println!("statement: {statement}");
-    println!("statement hash: {}", record.statement_hash);
-    println!("revision: {}", record.revision);
-    println!("artifact: {artifact_id}");
-    Ok(())
-  }
-
-  async fn dump_roadmap(&self, _json: bool) -> Result<()> {
-    let storage = Storage::open_existing(&self.cwd).await?;
-    let state = storage.load_current_state().await?;
-    let value = match state.run_id {
-      Some(run_id) => storage.load_latest_reconcile_result(&run_id).await?,
-      None => None,
-    };
-    println!("{}", serde_json::to_string_pretty(&value)?);
-    Ok(())
-  }
-
-  async fn verify(&self, json: bool) -> Result<ExitCode> {
-    let report = manual_verify(&self.cwd).await?;
-    if json {
-      println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-      println!("revision: {}", report.revision);
-      println!("suite: {}", report.suite_hash);
-      for check in &report.checks {
-        let mark = if check.result.exit_code == Some(0) && !check.result.timed_out {
-          "PASS"
-        } else if check.result.timed_out {
-          "TIMEOUT"
-        } else {
-          "FAIL"
-        };
-        println!(
-          "[{mark}] {}: {} ({} ms)",
-          check.name, check.result.command, check.result.duration_ms
+      .find(|item| &item.id == verifier_id)
+      .context("validated verifier disappeared")?;
+    match run_verifier(checkout, verifier) {
+      Ok(observation) if observation.timed_out => {
+        infrastructure_errors.insert(verifier_id.clone(), "verifier timed out".to_owned());
+      }
+      Ok(observation) if observation.exit_code.is_none() => {
+        infrastructure_errors.insert(
+          verifier_id.clone(),
+          "verifier terminated without an exit code".to_owned(),
         );
-        if mark != "PASS" {
-          if !check.result.stderr.trim().is_empty() {
-            eprintln!("{}", check.result.stderr.trim());
-          }
-          if !check.result.stdout.trim().is_empty() {
-            eprintln!("{}", check.result.stdout.trim());
-          }
-        }
       }
-      println!(
-        "verification: {}",
-        if report.passed { "PASS" } else { "FAIL" }
-      );
+      Ok(observation) => {
+        observations.insert(verifier_id.clone(), observation);
+      }
+      Err(error) => {
+        infrastructure_errors.insert(verifier_id.clone(), format!("{error:#}"));
+      }
     }
-    Ok(if report.passed {
-      ExitCode::SUCCESS
-    } else {
-      ExitCode::from(1)
-    })
   }
-}
-fn human_statement<'a>(contract: &'a EvidenceContract, expected: &str) -> Option<&'a str> {
-  match contract {
-    EvidenceContract::HumanAttestation { statement } if statement == expected => Some(statement),
-    EvidenceContract::All { requirements } | EvidenceContract::Any { requirements } => requirements
+
+  let mut artifacts = Vec::new();
+  let mut obligations = Vec::new();
+  let context = DerivationContext {
+    revision: &revision,
+    spec_digest: &spec_digest,
+    contract_digest: &contract_digest,
+    policy_digest: &policy_digest,
+    contract: &contract,
+    policy: &policy,
+  };
+  for obligation in contract.obligations() {
+    let verifier_id = &obligation.evidence_contract.verifier_id;
+    if let Some(message) = infrastructure_errors.get(verifier_id) {
+      obligations.push(infrastructure_result(obligation, verifier_id, message));
+      continue;
+    }
+    let observation = observations
+      .get(verifier_id)
+      .context("verifier produced neither observation nor error")?
+      .clone();
+    if observation.exit_code == Some(125) {
+      obligations.push(derive_obligation_state(
+        &context,
+        &obligation.id,
+        &artifacts,
+      ));
+      continue;
+    }
+    let verifier = policy
+      .verifiers
       .iter()
-      .find_map(|requirement| human_statement(requirement, expected)),
-    EvidenceContract::Artifact { .. } | EvidenceContract::HumanAttestation { .. } => None,
+      .find(|item| &item.id == verifier_id)
+      .context("validated verifier disappeared")?;
+    let effect = match observation.exit_code {
+      Some(0) => EvidenceEffect::Supports,
+      Some(126) => EvidenceEffect::Inconclusive,
+      _ => EvidenceEffect::Contradicts,
+    };
+    artifacts.push(EvidenceArtifact {
+      obligation_id: obligation.id.clone(),
+      revision: revision.clone(),
+      verifier_id: verifier_id.clone(),
+      policy_digest: policy_digest.clone(),
+      spec_digest: spec_digest.clone(),
+      contract_digest: contract_digest.clone(),
+      authority: match verifier.authority {
+        VerifierAuthority::Project => ArtifactAuthority::TenetObservedProjectVerifier,
+        VerifierAuthority::Protected => ArtifactAuthority::TenetObservedProtectedVerifier,
+      },
+      provenance: ArtifactProvenance::TenetLocalVerifier,
+      effect,
+      validity: ArtifactValidity::Valid,
+      dependency_surface: DependencySurface::RepositoryWide,
+      observation,
+    });
+    let mut derived = derive_obligation_state(&context, &obligation.id, &artifacts);
+    if derived.state == ObligationState::Contradicted {
+      derived.blockers.push(Blocker {
+        code: BlockerCode::VerifierFailed,
+        obligation_id: Some(obligation.id.clone()),
+        verifier_id: Some(verifier_id.clone()),
+        message: "configured verifier exited unsuccessfully".into(),
+      });
+    }
+    obligations.push(derived);
+  }
+  let verdict = derive_completion(&obligations);
+  let blockers = obligations
+    .iter()
+    .flat_map(|item| item.blockers.clone())
+    .collect();
+  let result = GateResult {
+    schema_version: 1,
+    revision,
+    spec_digest,
+    contract_digest,
+    policy_digest,
+    verdict,
+    obligations,
+    blockers,
+  };
+  finish_gate(&root, result, artifacts, json)
+}
+
+fn evidence(cwd: &Path, revision: Option<&str>, json: bool) -> Result<ExitCode> {
+  let root = initialized_root(cwd)?;
+  let audit = AuditState::load(&root)?;
+  let artifacts = audit
+    .evidence
+    .into_iter()
+    .filter(|item| revision.is_none_or(|revision| item.revision == revision))
+    .collect();
+  let gates = audit
+    .gates
+    .into_iter()
+    .filter(|item| revision.is_none_or(|revision| item.revision == revision))
+    .collect();
+  let result = EvidenceResult {
+    schema_version: 1,
+    revision: revision.map(str::to_owned),
+    artifacts,
+    gates,
+  };
+  print_value(&result, json, |value| {
+    println!("revision: {}", value.revision.as_deref().unwrap_or("all"));
+    println!("artifacts: {}", value.artifacts.len());
+    for gate in &value.gates {
+      println!("gate: {} {:?}", gate.revision, gate.verdict);
+      for blocker in &gate.blockers {
+        println!("  {:?}: {}", blocker.code, blocker.message);
+      }
+    }
+  })?;
+  Ok(ExitCode::SUCCESS)
+}
+
+fn finish_gate(
+  root: &Path,
+  result: GateResult,
+  artifacts: Vec<EvidenceArtifact>,
+  json: bool,
+) -> Result<ExitCode> {
+  let mut audit = AuditState::load(root)?;
+  audit.evidence.extend(artifacts);
+  audit.gates.push(result.clone());
+  audit.save(root)?;
+  print_value(&result, json, |value| {
+    println!("revision: {}", value.revision);
+    println!("verdict: {:?}", value.verdict);
+    println!("specification: {}", value.spec_digest);
+    println!("contract: {}", value.contract_digest);
+    println!("policy: {}", value.policy_digest);
+    for blocker in &value.blockers {
+      println!("blocker {:?}: {}", blocker.code, blocker.message);
+    }
+  })?;
+  Ok(match result.verdict {
+    Verdict::Done => ExitCode::SUCCESS,
+    Verdict::NotDone => ExitCode::from(2),
+    Verdict::Inconclusive => ExitCode::from(3),
+    Verdict::InfrastructureError => ExitCode::from(4),
+  })
+}
+
+fn control_plane_gate(revision: String, code: BlockerCode, message: &str) -> GateResult {
+  mismatch_gate(
+    revision,
+    String::new(),
+    String::new(),
+    String::new(),
+    code,
+    message,
+  )
+}
+
+fn mismatch_gate(
+  revision: String,
+  spec_digest: String,
+  contract_digest: String,
+  policy_digest: String,
+  code: BlockerCode,
+  message: &str,
+) -> GateResult {
+  GateResult {
+    schema_version: 1,
+    revision,
+    spec_digest,
+    contract_digest,
+    policy_digest,
+    verdict: Verdict::NotDone,
+    obligations: Vec::new(),
+    blockers: vec![Blocker {
+      code,
+      obligation_id: None,
+      verifier_id: None,
+      message: message.into(),
+    }],
   }
 }
 
-#[cfg(unix)]
-fn read_signing_key(descriptor: i32) -> Result<[u8; 32]> {
-  if descriptor < 0 {
-    bail!("human attestation signing-key file descriptor must not be negative");
+fn infrastructure_result(
+  obligation: &VerificationObligation,
+  verifier_id: &str,
+  message: &str,
+) -> ObligationResult {
+  ObligationResult {
+    obligation_id: obligation.id.clone(),
+    state: ObligationState::InfrastructureError,
+    blockers: vec![Blocker {
+      code: BlockerCode::VerifierInfrastructureError,
+      obligation_id: Some(obligation.id.clone()),
+      verifier_id: Some(verifier_id.into()),
+      message: message.into(),
+    }],
   }
-  // SAFETY: the explicit attest command transfers ownership of this inherited descriptor.
-  let mut file = unsafe { std::fs::File::from_raw_fd(descriptor as RawFd) };
-  let mut encoded = Vec::new();
-  Read::by_ref(&mut file)
-    .take(66)
-    .read_to_end(&mut encoded)
-    .context("read human attestation signing key file descriptor")?;
-  while matches!(encoded.last(), Some(b'\n' | b'\r')) {
-    encoded.pop();
-  }
-  if encoded.len() != 64 || !encoded.iter().all(u8::is_ascii_hexdigit) {
-    encoded.fill(0);
-    bail!("human attestation signing key must be exactly 64 hexadecimal characters");
-  }
-  let mut secret = [0_u8; 32];
-  for (destination, pair) in secret.iter_mut().zip(encoded.as_chunks::<2>().0) {
-    let high = (pair[0] as char)
-      .to_digit(16)
-      .context("invalid signing key")?;
-    let low = (pair[1] as char)
-      .to_digit(16)
-      .context("invalid signing key")?;
-    *destination = ((high << 4) | low) as u8;
-  }
-  encoded.fill(0);
-  Ok(secret)
 }
 
-#[cfg(not(unix))]
-fn read_signing_key(_descriptor: i32) -> Result<[u8; 32]> {
-  bail!("inherited human signing-key descriptors require a Unix host")
+fn validate_admitted_contract(
+  contract: &AdmittedContract,
+  policy: &VerificationPolicy,
+) -> Result<()> {
+  let proposal = ContractProposal {
+    schema_version: contract.schema_version,
+    spec_digest: contract.spec_digest.clone(),
+    policy_digest: contract.policy_digest.clone(),
+    requirements: contract.requirements.clone(),
+  };
+  validate_proposal(&proposal, policy).context("validate admitted contract")
+}
+
+fn load_contract_optional(root: &Path) -> Result<Option<AdmittedContract>> {
+  let path = root.join(CONTRACT_PATH);
+  if !path.exists() {
+    return Ok(None);
+  }
+  let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+  serde_json::from_slice(&bytes)
+    .context("parse admitted completion contract")
+    .map(Some)
+}
+
+fn initialized_root(cwd: &Path) -> Result<PathBuf> {
+  let root = discover_root(cwd)?;
+  if !root.join(CONFIG_PATH).exists() {
+    bail!("repository is not initialized; run `tenet init --spec <path>`");
+  }
+  Ok(root)
+}
+
+fn proposal_path(root: &Path, digest: &str) -> PathBuf {
+  root
+    .join(TENET_DIR)
+    .join("proposals")
+    .join(format!("{}.json", digest_key(digest)))
+}
+
+fn digest_key(digest: &str) -> &str {
+  digest.strip_prefix("sha256:").unwrap_or(digest)
+}
+
+fn has_pending_proposal(root: &Path) -> Result<bool> {
+  let directory = root.join(TENET_DIR).join("proposals");
+  if !directory.exists() {
+    return Ok(false);
+  }
+  Ok(fs::read_dir(directory)?.next().transpose()?.is_some())
+}
+
+fn absolute_from(cwd: &Path, path: &Path) -> PathBuf {
+  if path.is_absolute() {
+    path.to_path_buf()
+  } else {
+    cwd.join(path)
+  }
+}
+
+fn print_status(result: &StatusResult, json: bool) -> Result<()> {
+  print_value(result, json, |value| {
+    println!("initialized: {}", value.initialized);
+    println!("contract: {:?}", value.contract_state);
+    if let Some(spec_digest) = &value.spec_digest {
+      println!("specification: {spec_digest}");
+    }
+    if let Some(last_revision) = &value.last_gated_revision {
+      println!("last gate: {} {:?}", last_revision, value.last_verdict);
+    }
+    println!(
+      "unresolved obligations: {}",
+      value.unresolved_obligations.len()
+    );
+  })
+}
+
+fn print_value<T: serde::Serialize>(value: &T, json: bool, human: impl FnOnce(&T)) -> Result<()> {
+  if json {
+    println!("{}", serde_json::to_string_pretty(value)?);
+  } else {
+    human(value);
+  }
+  Ok(())
 }
