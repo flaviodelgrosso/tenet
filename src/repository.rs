@@ -24,26 +24,27 @@ pub const SKILL: &str = r#"---
 name: tenet
 description: Use when the user explicitly asks to use Tenet, invokes the Tenet workflow, or requests implementation or completion under this repository's Tenet contract.
 compatibility: Requires the tenet CLI and Git.
-metadata:
-  tenet-skill-version: "3"
 ---
 
 # Tenet workflow
 
 Tenet determines whether candidate revision R satisfies the admitted completion contract from authority revision A. It does not perform the engineering.
 
-1. Run `tenet status --json` and use only its current repository state.
-2. If the contract is missing, inspect the configured specification, get the proposal shape with `tenet contract schema --json`, and submit it with `tenet contract propose --file <path> --json`.
-3. On `pending_approval`, show the user the exact proposal: its ID and digest; every requirement and obligation ID and statement; every primary verifier mapping; and every oracle-assurance ID, criterion, verifier, and authority mapping. Request an explicit approval naming that exact ID and digest.
-4. Never self-approve, infer approval from silence, a generic acknowledgement, or a prior approval. Only after the user explicitly approves that exact ID and digest, run `tenet contract approve --proposal <id> --digest <digest> --json`.
-5. If the proposal content, specification, policy, ID, or digest changes before admission—or the CLI rejects the approval as stale or mismatched—treat the approval as invalid. Show the current proposal and request fresh explicit approval; never retry admission using the prior approval.
-6. Treat A as operator/CI-provided trust context. Never choose or advance A yourself; if none is provided, stop and ask the user.
-7. Perform the engineering normally and produce immutable candidate commit R.
-8. Run `tenet gate --authority-revision <authority-sha> --revision <candidate-sha> --json`.
-9. On a non-`done` verdict, inspect typed blockers and `tenet evidence --revision <candidate-sha> --json`, then continue or report the blocker.
-10. Declare completion only when Tenet returns `done` for the exact (A, R) pair you report.
+1. Run `tenet status --json` and use only the current repository state.
+2. If the contract is missing, inspect the configured specification and verification policy before proposing anything. Treat explicit acceptance criteria and Definition of Done items as completion requirements that must not be silently omitted.
+3. Build a verification plan from the specification. For each material obligation, identify what observable evidence would actually support it and which configured verifier can produce that evidence. Verifier availability alone is not sufficient: do not map unrelated claims to a generic verifier merely because it is the only one configured, and do not claim that a verifier proves properties it does not observe.
+4. If the current policy lacks a suitable verifier for a material obligation, do not weaken or compress the contract to fit the available verifiers. Prepare or request the missing verification policy and oracle assets before proposing the contract. Keep verification tooling external and use `authority_snapshot` when an oracle must be independent of candidate revision R.
+5. Once the verification policy can support the intended obligations, get the proposal shape with `tenet contract schema --json` and submit the completion contract with `tenet contract propose --file <path> --json`.
+6. On `pending_approval`, show the user the exact proposal: its ID and digest; every requirement and obligation ID and statement; every primary verifier mapping; and every oracle-assurance ID, criterion, verifier, and authority mapping. Call out any specification requirement that remains non-mechanically verified or intentionally grouped under another obligation.
+7. Never self-approve, infer approval from silence, a generic acknowledgement, or a prior approval. Only after the user explicitly approves that exact ID and digest, run `tenet contract approve --proposal <id> --digest <digest> --json`.
+8. If the proposal content, specification, policy, ID, or digest changes before admission—or the CLI rejects the approval as stale or mismatched—treat the approval as invalid. Show the current proposal and request fresh explicit approval; never retry admission using the prior approval.
+9. After contract admission and before implementation begins, the authority surface must be frozen in an immutable Git commit containing the admitted specification, verification policy, completion contract, and any authority-owned oracle assets. Treat the exact full commit SHA selected by the operator or CI as authority revision A. Never choose, infer, or advance A yourself, and never silently use candidate revision R as A. If A has not been provided, stop before engineering and ask for it.
+10. Perform the engineering normally without modifying the authority-owned surface, and produce immutable candidate commit R descended from A.
+11. Run `tenet gate --authority-revision <authority-sha> --revision <candidate-sha> --json`.
+12. On a non-`done` verdict, inspect typed blockers and `tenet evidence --revision <candidate-sha> --json`, then continue engineering or report the blocker. Do not weaken the admitted contract or authority to make the candidate pass.
+13. Declare completion only when Tenet returns `done` for the exact operator-provided A and exact candidate R you report.
 
-Proposal/admission separation is a same-user workflow boundary, not a security sandbox. The CLI is authoritative; this optional Skill is not.
+Proposal/admission separation and operator selection of A are same-user workflow trust boundaries, not security sandboxes. The CLI is authoritative; this optional Skill is not.
 "#;
 
 pub fn discover_root(cwd: &Path) -> Result<PathBuf> {
