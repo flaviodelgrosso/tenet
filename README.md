@@ -12,42 +12,56 @@ It is not a claim of universal correctness or mathematical proof unless the admi
 
 ## Quick start
 
+Install Tenet, initialize the repository once, then register its local stdio MCP server in the coding agent:
+
 ```bash
 cargo install tenet-cli
-
-cd my-project
-tenet init --spec SPEC.md
-
-# Configure authoritative verifiers in .tenet/tenet.toml.
-# Start your coding agent normally.
-# Explicitly invoke the repository's Tenet Skill using that agent's native Skill UX.
+cd /path/to/repository
+tenet init
 ```
 
-`tenet init` creates:
+`tenet init` is the only user-facing CLI workflow. It defaults to `SPEC.md`; use `tenet init --spec path/to/spec.md` when the repository uses another specification. Initialization creates repository-local policy, state exclusions, and a portable Agent Skill without replacing existing specification content.
+
+Generic MCP configuration:
+
+```json
+{
+  "mcpServers": {
+    "tenet": {
+      "command": "tenet",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+`tenet mcp` is the local stdio server entrypoint for agent/runtime configuration, not an interactive user command. After initialization, agents call semantic `tenet_*` tools; Tenet does not spawn its CLI or parse CLI output.
 
 ```text
-.tenet/
-  tenet.toml       version-controlled specification and verifier policy
-  .gitignore       excludes local audit and proposal state
-.agents/skills/tenet/
-  SKILL.md         optional, explicitly invoked Agent Skills workflow
+Coding agent -> MCP adapter -> shared Tenet application/domain core
+
+User -> CLI adapter -> repository initialization only
 ```
 
-After an operator admits a contract, commit `.tenet/contract.json` with its policy and specification. That commit can then be selected as an authority revision. Local `.tenet/state.json` records observations and gate history, but never defines what `DONE` means.
+After an operator admits a contract, commit `.tenet/contract.json` with its policy, specification, generated Skill, and authority-owned oracle assets. The operator may then explicitly select that immutable commit as authority revision A. Local `.tenet/state.json` records observations and gate history but never defines completion.
 
-The CLI is the universal protocol. Skill discovery paths and invocation syntax differ between coding-agent runtimes; Tenet correctness never depends on Skill support or automatic discovery.
+### MCP tool surface
 
-## Workflow
+- `tenet_status`: inspect initialization, contract, digest, last-gate, and unresolved-obligation state without running verifiers.
+- `tenet_contract_schema`: obtain the proposal schema generated from the canonical Rust type.
+- `tenet_policy_schema`: obtain the verification-policy schema generated from canonical Rust types.
+- `tenet_contract_propose`: validate and persist a deterministic proposal pending explicit human approval.
+- `tenet_contract_approve`: admit only the exact approved proposal after revalidating its ID, digest, specification, policy, and semantics.
+- `tenet_gate`: evaluate explicit `authorityRevision` and `revision` values and return a typed verdict, obligations, and blockers.
+- `tenet_evidence`: return structured evidence and gate history for an exact candidate revision.
+
+Malformed tool inputs and invalid operations are MCP tool errors. `not_done`, `inconclusive`, contradictions, and `infrastructure_error` are structured Tenet outcomes, not protocol failures. Only `done` authorizes a completion claim.
+
+## MCP-first workflow
 
 ### 1. Initialize the repository
 
-The target must already be a Git repository, and the specification path must resolve inside it. If `--spec` names a missing file, `init` creates its missing parent directories inside the repository and writes a starter specification. Existing specification content is never replaced.
-
-```bash
-tenet init --spec SPEC.md --json
-```
-
-Initialization is repository-local and idempotent for the same specification. It does not alter `AGENTS.md`, `CLAUDE.md`, or global tooling configuration.
+The target must already be a Git repository, and the specification path must resolve inside it. If the selected specification is missing, `tenet init` creates missing parent directories inside the repository and writes a starter specification. Existing specification content is never replaced. Initialization is repository-local and idempotent for the same specification. It does not alter `AGENTS.md`, `CLAUDE.md`, or global tooling configuration.
 
 ### 2. Configure verifiers
 
@@ -127,56 +141,30 @@ The primary verifier produces claim evidence. Every listed assurance verifier mu
 
 ### 3. Propose a completion contract
 
-Get the proposal schema generated from Tenet's Rust request type:
+The coding agent obtains the proposal schema from `tenet_contract_schema`, constructs a typed proposal, and submits it with `tenet_contract_propose`. A proposal binds claims and obligations to verifier IDs already present in repository policy; it cannot introduce executable commands.
 
-```bash
-tenet contract schema --json
-```
+Tenet returns an exact proposal ID and deterministic digest. `pending_approval` does not admit the contract.
 
-A proposal binds claims and obligations to verifier IDs already present in repository policy. It cannot introduce executable commands.
+### 4. Obtain explicit human approval and admit the contract
 
-```bash
-tenet contract propose --file proposal.json --json
-```
+Before calling `tenet_contract_approve`, the coding agent must present:
 
-Tenet returns a proposal ID and deterministic digest. Entering `pending_approval` does not admit it.
-
-### 4. Obtain human admission and persist it
-
-The coding agent must present the user with the exact pending proposal before requesting admission:
-
-- proposal ID and digest;
+- the exact proposal ID and digest;
 - every requirement and obligation ID and statement;
 - every obligation's primary verifier ID and authority mapping; and
-- every assurance ID, criterion, verifier ID, and authority mapping.
+- every oracle-assurance ID, criterion, verifier ID, and authority mapping.
 
-The user must explicitly approve that exact ID and digest. The coding agent must neither self-approve nor infer approval from silence, a generic acknowledgement, or an earlier approval. After the user gives explicit approval, the coding agent—not the user—may persist it with:
+The human must explicitly approve that exact proposal. The agent must not self-approve or infer approval from silence, a generic acknowledgement, continuation, or an earlier approval. `tenet_contract_approve` receives the exact `proposalId` and `proposalDigest`, then revalidates stored content plus the current specification and policy before writing `.tenet/contract.json`.
 
-```bash
-tenet contract approve \
-  --proposal proposal-0123456789abcdef \
-  --digest sha256:... \
-  --json
-```
+A proposal-content change creates a new digest and ID. A specification or policy change makes the proposal stale. Either change invalidates earlier approval and requires the agent to present the current proposal and request fresh explicit approval.
 
-The command verifies the stored proposal ID, digest, and content, then revalidates the current specification and verification policy before writing `.tenet/contract.json`. A proposal-content change has a new digest and proposal ID; a specification or policy change makes the pending proposal stale. In either case, the earlier human approval is invalid: the agent must show the current proposal and request fresh explicit approval before it can run `approve`.
+Commit the admitted specification, policy, contract, generated Skill, and authority-owned oracle assets. The operator—not Tenet or the coding agent—explicitly selects that immutable commit as authority revision A.
 
-Admission writes `.tenet/contract.json`; commit it with `.tenet/tenet.toml`, the specification, and the generated Skill. Select that exact commit as the new authority revision before gating descendants that intentionally change the control plane.
+### 5. Gate an exact candidate under an exact authority
 
-Proposal/admission separation is a domain workflow boundary under the default same-user trust model, not a security sandbox.
+The agent calls `tenet_gate` with explicit full commit identities: `authorityRevision = A` and `revision = R`. Tenet resolves both identities to commits, requires A to be an ancestor of R, and loads the specification, admitted contract, verifier policy, and authority-snapshot oracle bundles only from A. It rejects R if `.tenet/tenet.toml`, `.tenet/contract.json`, A's configured specification path, or any configured authority-snapshot `oracle_path` differs between A and R.
 
-### 5. Gate a candidate under an authority revision
-
-The operator or CI selects trusted authority commit A. Produce candidate commit R, then invoke:
-
-```bash
-tenet gate \
-  --authority-revision <authority-sha> \
-  --revision <candidate-sha> \
-  --json
-```
-
-Tenet resolves both arguments to exact commits, requires A to be an ancestor of R, and loads the specification, admitted contract, verifier policy, and authority-snapshot oracle bundles only from A. It rejects R if `.tenet/tenet.toml`, `.tenet/contract.json`, A's configured specification path, or any configured authority-snapshot `oracle_path` differs between A and R. Project verifiers execute inside independent detached candidate trees; authority-snapshot verifiers execute from independent A-owned bundles against independent detached candidate trees.
+Project verifiers execute inside independent detached candidate trees. Authority-snapshot verifiers execute from independent A-owned bundles against independent detached candidate trees.
 
 The deterministic verdict is one of:
 
@@ -185,18 +173,13 @@ The deterministic verdict is one of:
 - `inconclusive`
 - `infrastructure_error`
 
-Only `done` authorizes completion. The result includes exact `authorityRevision` and `revision` identities plus specification, contract, and policy digests from A.
+The structured result includes exact authority and candidate identities, authority control-plane digests, typed obligation states, and typed blockers. Only `done` authorizes completion. On any other verdict, the agent inspects `tenet_evidence` for exact R and continues engineering or reports the blocker; it must never weaken authority to obtain `done`.
 
-An authority-surface change returns `authority_surface_changed`; candidate changes to an oracle bundle cannot authorize `DONE` under the old A. Intentional control-plane or oracle changes require admission and selection of a new authority revision. Other failed gates return typed blockers. Tenet does not decide what code to write or attempt fixes; the caller owns that engineering loop.
+An authority-surface change returns `authority_surface_changed`. Intentional control-plane or oracle changes require a newly admitted contract and explicit selection of a new authority revision.
 
-### 6. Inspect state and evidence
+### 6. Inspect status and evidence
 
-```bash
-tenet status --json
-tenet evidence --revision <sha> --json
-```
-
-`status` is cheap and never launches verifiers. `evidence` explains persisted observations and gate decisions without requiring direct inspection of local state files.
+`tenet_status` is cheap and never launches verifiers. `tenet_evidence` explains persisted observations and gate decisions for an explicit exact candidate revision without requiring direct inspection of local state files.
 
 ## Contract and evidence model
 
@@ -242,20 +225,13 @@ Tenet uses Git object IDs and deterministic hashes for identity and staleness bi
 
 ## Fresh clones and CI
 
-Canonical completion semantics live in Git. A fresh clone containing authority commit A and descendant candidate commit R can run:
-
-```bash
-tenet gate \
-  --authority-revision <trusted-base-sha> \
-  --revision <candidate-sha> \
-  --json
-```
-
-No previous local audit state, proposal state, developer credential, or coding-agent session is required. CI supplies the trusted authority SHA and invokes the same universal CLI directly.
+Canonical completion semantics live in Git. A fresh clone containing authority commit A and descendant candidate commit R can launch `tenet mcp` and call `tenet_gate` with those exact full revisions. No previous local audit state, proposal state, developer credential, or coding-agent session is required. CI must act as an MCP client and supply the trusted authority SHA; the removed operational CLI commands are not compatibility paths.
 
 ## Architecture
 
-The project is a single Cargo package with a root `src/` folder. Its library target contains pure contract validation, evidence types, and deterministic completion derivation; its `tenet` binary contains repository initialization, authority Git-object reads, candidate materialization, verifier execution, local audit persistence, and typed CLI rendering.
+The project is a single Cargo package with a root `src/` folder. Its library target contains pure contract validation, evidence types, and deterministic completion derivation. The shared application layer contains repository initialization, authority Git-object reads, candidate materialization, verifier execution, and local audit persistence.
+
+The MCP adapter calls typed application operations directly for normal post-initialization work. The CLI adapter calls only repository initialization; the hidden `mcp` entrypoint starts the stdio transport. Neither adapter duplicates domain semantics.
 
 The product boundary is strict: coding agents own reasoning, planning, editing, delegation, branches, worktrees, tests, and fixes. Tenet owns authority snapshots, admitted contracts, independent observations, evidence validity, and deterministic completion derivation for exact `(A, R)` pairs.
 

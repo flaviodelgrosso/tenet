@@ -5,7 +5,7 @@ use tenet_domain::{
   evidence::EvidenceArtifact,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InitResult {
   pub schema_version: u32,
@@ -26,7 +26,7 @@ pub enum ContractState {
   Stale,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProposalResult {
   pub schema_version: u32,
@@ -35,7 +35,7 @@ pub struct ProposalResult {
   pub approval_required: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovalResult {
   pub schema_version: u32,
@@ -45,7 +45,7 @@ pub struct ApprovalResult {
   pub contract_path: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StatusResult {
   pub schema_version: u32,
@@ -61,7 +61,7 @@ pub struct StatusResult {
   pub unresolved_obligations: Vec<ObligationResult>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GateResult {
   pub schema_version: u32,
@@ -75,7 +75,7 @@ pub struct GateResult {
   pub blockers: Vec<Blocker>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvidenceResult {
   pub schema_version: u32,

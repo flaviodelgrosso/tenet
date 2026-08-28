@@ -1,7 +1,8 @@
 use std::{
   fs,
+  io::{BufRead, BufReader, Write},
   path::Path,
-  process::Command,
+  process::{Command, Stdio},
   time::{Duration, Instant},
 };
 
@@ -9,6 +10,25 @@ use serde_json::{json, Value};
 
 struct Repository {
   directory: tempfile::TempDir,
+}
+
+struct OperationOutput {
+  code: i32,
+  value: Value,
+  status: TestStatus,
+  stdout: Vec<u8>,
+}
+
+struct TestStatus(i32);
+
+impl TestStatus {
+  fn success(&self) -> bool {
+    self.0 == 0
+  }
+
+  fn code(&self) -> Option<i32> {
+    Some(self.0)
+  }
 }
 
 impl Repository {
@@ -45,19 +65,110 @@ impl Repository {
       .expect("run tenet")
   }
 
-  fn gate(&self, authority_revision: &str, revision: &str) -> std::process::Output {
-    self.tenet(&[
-      "gate",
-      "--authority-revision",
-      authority_revision,
-      "--revision",
-      revision,
-      "--json",
-    ])
+  fn mcp_request(&self, method: &str, params: Value) -> Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tenet"))
+      .arg("--cwd")
+      .arg(self.path())
+      .arg("mcp")
+      .env_remove("OPENAI_API_KEY")
+      .env_remove("ANTHROPIC_API_KEY")
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .spawn()
+      .expect("start Tenet MCP server");
+    let mut stdin = child.stdin.take().expect("MCP stdin");
+    let stdout = child.stdout.take().expect("MCP stdout");
+    let mut stdout = BufReader::new(stdout);
+
+    write_message(
+      &mut stdin,
+      &json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "protocolVersion": "2025-11-25",
+          "capabilities": {},
+          "clientInfo": { "name": "tenet-workflow-test", "version": "1" }
+        }
+      }),
+    );
+    let initialized = read_message(&mut stdout);
+    assert_eq!(initialized["result"]["serverInfo"]["name"], "tenet");
+    write_message(
+      &mut stdin,
+      &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    );
+    write_message(
+      &mut stdin,
+      &json!({ "jsonrpc": "2.0", "id": 2, "method": method, "params": params }),
+    );
+    let response = read_message(&mut stdout);
+    drop(stdin);
+    assert!(child.wait().expect("wait for MCP server").success());
+    response
+  }
+
+  fn mcp_tool(&self, name: &str, arguments: Value) -> OperationOutput {
+    let response = self.mcp_request(
+      "tools/call",
+      json!({ "name": name, "arguments": arguments }),
+    );
+    if response["result"]["isError"] == true {
+      let value = json!({
+        "message": response["result"]["content"][0]["text"]
+      });
+      return operation_output(1, value);
+    }
+    let value = response["result"]["structuredContent"].clone();
+    let code = match value["verdict"].as_str() {
+      Some("not_done") => 2,
+      Some("inconclusive") => 3,
+      Some("infrastructure_error") => 4,
+      _ => 0,
+    };
+    operation_output(code, value)
+  }
+
+  fn status(&self) -> OperationOutput {
+    self.mcp_tool("tenet_status", json!({}))
+  }
+
+  fn policy_schema(&self) -> OperationOutput {
+    self.mcp_tool("tenet_policy_schema", json!({}))
+  }
+
+  fn contract_schema(&self) -> OperationOutput {
+    self.mcp_tool("tenet_contract_schema", json!({}))
+  }
+
+  fn propose_file(&self, path: &Path) -> OperationOutput {
+    let proposal =
+      serde_json::from_slice(&fs::read(path).expect("read proposal")).expect("parse proposal");
+    self.mcp_tool("tenet_contract_propose", proposal)
+  }
+
+  fn approve(&self, proposal_id: &str, proposal_digest: &str) -> OperationOutput {
+    self.mcp_tool(
+      "tenet_contract_approve",
+      json!({ "proposalId": proposal_id, "proposalDigest": proposal_digest }),
+    )
+  }
+
+  fn evidence(&self, revision: &str) -> OperationOutput {
+    self.mcp_tool("tenet_evidence", json!({ "revision": revision }))
+  }
+
+  fn gate(&self, authority_revision: &str, revision: &str) -> OperationOutput {
+    self.mcp_tool(
+      "tenet_gate",
+      json!({ "authorityRevision": authority_revision, "revision": revision }),
+    )
   }
 
   fn init(&self) -> Value {
-    success_json(self.tenet(&["init", "--spec", "SPEC.md", "--json"]))
+    success_json(self.tenet(&["init", "--json"]))
   }
 
   fn configure(&self, command: &[&str]) -> Value {
@@ -85,7 +196,7 @@ impl Repository {
       ),
     )
     .expect("write policy");
-    success_json(self.tenet(&["status", "--json"]))
+    success_json(self.status())
   }
 
   fn propose_and_approve(&self, status: &Value) -> Value {
@@ -117,25 +228,14 @@ impl Repository {
       serde_json::to_vec_pretty(&proposal).expect("encode proposal"),
     )
     .expect("write proposal");
-    let proposed = success_json(self.tenet(&[
-      "contract",
-      "propose",
-      "--file",
-      proposal_path.to_str().expect("UTF-8 path"),
-      "--json",
-    ]));
+    let proposed = success_json(self.propose_file(&proposal_path));
     success_json(
-      self.tenet(&[
-        "contract",
-        "approve",
-        "--proposal",
+      self.approve(
         proposed["proposalId"].as_str().expect("proposal ID"),
-        "--digest",
         proposed["proposalDigest"]
           .as_str()
           .expect("proposal digest"),
-        "--json",
-      ]),
+      ),
     )
   }
 
@@ -192,18 +292,62 @@ fn git_output(cwd: &Path, arguments: &[&str]) -> String {
   String::from_utf8(output.stdout).expect("UTF-8 Git output")
 }
 
-fn success_json(output: std::process::Output) -> Value {
-  assert!(
-    output.status.success(),
-    "command failed: {}",
-    String::from_utf8_lossy(&output.stderr)
-  );
-  serde_json::from_slice(&output.stdout).expect("JSON response")
+fn operation_output(code: i32, value: Value) -> OperationOutput {
+  let stdout = serde_json::to_vec(&value).expect("encode operation output");
+  OperationOutput {
+    code,
+    value,
+    status: TestStatus(code),
+    stdout,
+  }
 }
 
-fn failure_json(output: std::process::Output, expected_code: i32) -> Value {
-  assert_eq!(output.status.code(), Some(expected_code));
-  serde_json::from_slice(&output.stdout).expect("JSON failure response")
+fn write_message(writer: &mut impl Write, message: &Value) {
+  serde_json::to_writer(&mut *writer, message).expect("encode MCP message");
+  writer.write_all(b"\n").expect("write MCP newline");
+  writer.flush().expect("flush MCP message");
+}
+
+fn read_message(reader: &mut impl BufRead) -> Value {
+  let mut line = String::new();
+  reader.read_line(&mut line).expect("read MCP response");
+  assert!(!line.is_empty(), "MCP server closed without a response");
+  serde_json::from_str(&line).expect("decode MCP response")
+}
+
+trait TestOutput {
+  fn code(&self) -> i32;
+  fn value(&self) -> Value;
+}
+
+impl TestOutput for std::process::Output {
+  fn code(&self) -> i32 {
+    self.status.code().unwrap_or(-1)
+  }
+
+  fn value(&self) -> Value {
+    serde_json::from_slice(&self.stdout).expect("JSON response")
+  }
+}
+
+impl TestOutput for OperationOutput {
+  fn code(&self) -> i32 {
+    self.code
+  }
+
+  fn value(&self) -> Value {
+    self.value.clone()
+  }
+}
+
+fn success_json(output: impl TestOutput) -> Value {
+  assert_eq!(output.code(), 0, "operation failed");
+  output.value()
+}
+
+fn failure_json(output: impl TestOutput, expected_code: i32) -> Value {
+  assert_eq!(output.code(), expected_code);
+  output.value()
 }
 
 #[test]
@@ -258,6 +402,51 @@ fn init_creates_a_missing_default_specification_inside_the_repository() {
 }
 
 #[test]
+fn init_defaults_to_the_repository_root_specification_from_a_subdirectory() {
+  let repository = Repository::new();
+  let nested = repository.path().join("nested");
+  fs::create_dir(&nested).expect("create nested directory");
+
+  let initialized = success_json(
+    Command::new(env!("CARGO_BIN_EXE_tenet"))
+      .arg("--cwd")
+      .arg(&nested)
+      .args(["init", "--json"])
+      .output()
+      .expect("initialize from nested directory"),
+  );
+
+  assert_eq!(initialized["specPath"], "SPEC.md");
+  assert!(!nested.join("SPEC.md").exists());
+}
+
+#[test]
+fn public_cli_exposes_only_repository_initialization() {
+  let repository = Repository::new();
+  let initialized = repository.tenet(&["init"]);
+  assert!(initialized.status.success());
+
+  let help = repository.tenet(&["--help"]);
+  assert!(help.status.success());
+  let help = String::from_utf8(help.stdout).expect("UTF-8 help");
+  assert!(help.contains("init"));
+  for hidden in ["status", "contract", "policy", "gate", "evidence", "mcp"] {
+    assert!(
+      !help.contains(&format!("\n  {hidden}")),
+      "public help exposes {hidden}"
+    );
+  }
+
+  for removed in ["status", "contract", "policy", "gate", "evidence"] {
+    let output = repository.tenet(&[removed]);
+    assert!(
+      !output.status.success(),
+      "removed command {removed} succeeded"
+    );
+  }
+}
+
+#[test]
 fn generated_skill_is_portable_concise_and_not_authoritative() {
   let repository = Repository::new();
   repository.init();
@@ -265,29 +454,28 @@ fn generated_skill_is_portable_concise_and_not_authoritative() {
     .expect("read skill");
 
   assert!(skill.starts_with("---\nname: tenet\n"));
-  assert!(skill.contains("tenet-skill-version: \"4\""));
-  assert!(skill.contains("On `pending_approval`, show the user the exact proposal"));
+  assert!(skill.contains("tenet-skill-version: \"6\""));
+  assert!(skill.contains("`tenet init` is the only user-facing CLI workflow"));
+  assert!(skill.contains("interact with Tenet only through its semantic MCP tools"));
+  assert!(skill.contains("present the exact proposal ID and digest"));
   assert!(skill.contains("every requirement and obligation ID and statement"));
-  assert!(skill.contains("every primary verifier mapping"));
+  assert!(skill.contains("every primary verifier and authority mapping"));
   assert!(skill.contains("every oracle-assurance ID, criterion, verifier, and authority mapping"));
-  assert!(skill.contains("Never self-approve, infer approval from silence"));
-  assert!(skill
-    .contains("user explicitly approves that exact ID and digest, run `tenet contract approve"));
-  assert!(skill.contains("proposal content, specification, policy, ID, or digest changes"));
+  assert!(skill.contains("Never self-approve or infer approval from silence"));
+  assert!(skill.contains("Only after explicit approval, call `tenet_contract_approve`"));
+  assert!(skill.contains("content, specification, policy, ID, or digest changed"));
   assert!(skill.contains("Never choose or advance A yourself"));
-  assert!(skill
-    .contains("tenet gate --authority-revision <authority-sha> --revision <candidate-sha> --json"));
-  assert!(skill.contains("exact (A, R) pair"));
-  assert!(skill.contains("tenet policy schema --json"));
-  assert!(skill.contains("`strings`, `nm`, `objdump`"));
-  assert!(skill.contains("never infer hidden configuration"));
-  assert!(skill.contains("capability absent from this CLI schema is unsupported"));
-  assert!(skill.lines().count() < 45);
+  assert!(skill.contains("Call `tenet_gate` with both exact full revisions"));
+  assert!(skill.contains("Claim completion only when `tenet_gate` returns `done`"));
+  assert!(skill.contains("exact reported (A, R) pair"));
+  assert!(skill.contains("Inspect `tenet_policy_schema`"));
+  assert!(skill.contains("never infer hidden capabilities or reverse-engineer the binary"));
+  assert!(skill.lines().count() < 35);
+  assert_eq!(skill, include_str!("../.agents/skills/tenet/SKILL.md"));
   for forbidden in [
     "Codex",
     "Claude",
     "Gemini",
-    "MCP",
     "ACP",
     "contract.json",
     "verifier_id",
@@ -299,7 +487,7 @@ fn generated_skill_is_portable_concise_and_not_authoritative() {
 #[test]
 fn policy_schema_exposes_every_supported_verifier_field() {
   let repository = Repository::new();
-  let schema = success_json(repository.tenet(&["policy", "schema", "--json"]));
+  let schema = success_json(repository.policy_schema());
   let verifier = &schema["$defs"]["VerifierSpec"];
   let properties = verifier["properties"]
     .as_object()
@@ -336,7 +524,7 @@ fn proposal_schema_validation_and_operator_admission_are_separate() {
   let repository = Repository::new();
   repository.init();
   let status = repository.configure(&["/usr/bin/true"]);
-  let schema = success_json(repository.tenet(&["contract", "schema", "--json"]));
+  let schema = success_json(repository.contract_schema());
   assert_eq!(schema["properties"]["requirements"]["type"], "array");
 
   let approval = repository.propose_and_approve(&status);
@@ -368,13 +556,9 @@ fn proposal_cannot_introduce_an_unknown_verifier() {
     serde_json::to_vec(&proposal).unwrap(),
   )
   .unwrap();
-  let output = repository.tenet(&[
-    "contract",
-    "propose",
-    "--file",
+  let output = repository.propose_file(Path::new(
     repository.path().join("bad.json").to_str().unwrap(),
-    "--json",
-  ]);
+  ));
   assert!(!output.status.success());
   let error: Value = serde_json::from_slice(&output.stdout).expect("typed JSON error");
   assert!(error["message"]
@@ -406,13 +590,7 @@ fn proposal_rejects_verifier_authority_mismatch() {
   let proposal_path = repository.path().join("authority-mismatch.json");
   fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
 
-  let output = repository.tenet(&[
-    "contract",
-    "propose",
-    "--file",
-    proposal_path.to_str().unwrap(),
-    "--json",
-  ]);
+  let output = repository.propose_file(Path::new(proposal_path.to_str().unwrap()));
   assert!(!output.status.success());
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert!(error["message"]
@@ -431,7 +609,7 @@ fn exact_revision_gate_returns_done_and_explains_persisted_evidence() {
   assert_eq!(gate["revision"], revision);
   assert_eq!(gate["authorityRevision"], revision);
   assert_eq!(gate["obligations"][0]["state"], "contract_satisfied");
-  let evidence = success_json(repository.tenet(&["evidence", "--revision", &revision, "--json"]));
+  let evidence = success_json(repository.evidence(&revision));
   assert_eq!(evidence["artifacts"][0]["revision"], revision);
   assert_eq!(evidence["artifacts"][0]["authorityRevision"], revision);
   assert_eq!(
@@ -462,7 +640,7 @@ fn exact_revision_gate_returns_done_and_explains_persisted_evidence() {
       .unwrap()
       .is_empty());
   }
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   assert_eq!(status["lastGatedAuthorityRevision"], revision);
 }
 
@@ -525,28 +703,13 @@ fn fresh_clone_gates_without_historical_local_state_or_credentials() {
     .expect("clone repository");
   assert!(output.status.success());
   assert!(!clone.path().join(".tenet/state.json").exists());
-  let gate = success_json(
-    Command::new(env!("CARGO_BIN_EXE_tenet"))
-      .arg("--cwd")
-      .arg(clone.path())
-      .args([
-        "gate",
-        "--authority-revision",
-        &authority_revision,
-        "--revision",
-        &revision,
-        "--json",
-      ])
-      .env_remove("OPENAI_API_KEY")
-      .env_remove("ANTHROPIC_API_KEY")
-      .output()
-      .expect("gate fresh clone"),
-  );
+  let clone_repository = Repository { directory: clone };
+  let gate = success_json(clone_repository.gate(&authority_revision, &revision));
   assert_eq!(gate["verdict"], "done");
 }
 
 #[test]
-fn cli_only_workflow_remains_functional_without_the_generated_skill() {
+fn mcp_workflow_remains_functional_without_the_generated_skill() {
   let repository = Repository::new();
   let authority_revision = repository.admitted(&["/usr/bin/true"]);
   fs::remove_file(repository.path().join(".agents/skills/tenet/SKILL.md")).unwrap();
@@ -647,7 +810,7 @@ fn authority_snapshot_oracle_runs_from_authority_and_records_git_identity() {
 
   let gate = success_json(repository.gate(&authority_revision, &revision));
   assert_eq!(gate["verdict"], "done");
-  let evidence = success_json(repository.tenet(&["evidence", "--revision", &revision, "--json"]));
+  let evidence = success_json(repository.evidence(&revision));
   let artifact = &evidence["artifacts"][0];
   assert_eq!(
     artifact["authority"],
@@ -732,7 +895,7 @@ authority = "project"
 "#,
   )
   .unwrap();
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   let proposal = json!({
     "schemaVersion": 2,
     "specDigest": status["specDigest"],
@@ -753,22 +916,11 @@ authority = "project"
   });
   let proposal_path = repository.path().join("isolation-proposal.json");
   fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
-  let proposed = success_json(repository.tenet(&[
-    "contract",
-    "propose",
-    "--file",
-    proposal_path.to_str().unwrap(),
-    "--json",
-  ]));
-  success_json(repository.tenet(&[
-    "contract",
-    "approve",
-    "--proposal",
+  let proposed = success_json(repository.propose_file(Path::new(proposal_path.to_str().unwrap())));
+  success_json(repository.approve(
     proposed["proposalId"].as_str().unwrap(),
-    "--digest",
     proposed["proposalDigest"].as_str().unwrap(),
-    "--json",
-  ]));
+  ));
   let revision = repository.commit("admit isolated verifiers");
 
   let gate = success_json(repository.gate(&revision, &revision));
@@ -806,9 +958,7 @@ fn protected_verifier_authority_is_not_a_valid_local_policy() {
     .replace("authority = \"project\"", "authority = \"protected\"");
   fs::write(path, policy).unwrap();
 
-  let output = repository.tenet(&["status", "--json"]);
-  assert_eq!(output.status.code(), Some(1));
-  let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+  let error = failure_json(repository.status(), 1);
   assert!(error["message"]
     .as_str()
     .unwrap()
@@ -900,7 +1050,7 @@ fn candidate_symlink_cannot_escape_verifier_working_directory() {
     .unwrap()
     .replace("cwd = \".\"", "cwd = \"checks\"");
   fs::write(policy_path, policy).unwrap();
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   repository.propose_and_approve(&status);
   let authority_revision = repository.commit("admit verifier working directory");
 
@@ -963,7 +1113,7 @@ fn status_never_executes_configured_verifiers() {
   repository.init();
   repository.configure(&["/bin/sh", "-c", "touch verifier-ran"]);
 
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   assert_eq!(status["initialized"], true);
   assert!(!repository.path().join("verifier-ran").exists());
 }
@@ -1004,36 +1154,17 @@ fn approval_requires_the_exact_proposal_identity_and_digest() {
   });
   let proposal_path = repository.path().join("proposal.json");
   fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
-  let proposed = success_json(repository.tenet(&[
-    "contract",
-    "propose",
-    "--file",
-    proposal_path.to_str().unwrap(),
-    "--json",
-  ]));
+  let proposed = success_json(repository.propose_file(Path::new(proposal_path.to_str().unwrap())));
 
-  let output = repository.tenet(&[
-    "contract",
-    "approve",
-    "--proposal",
+  let output = repository.approve(
     "proposal-wrong",
-    "--digest",
     proposed["proposalDigest"].as_str().unwrap(),
-    "--json",
-  ]);
+  );
   assert_eq!(output.status.code(), Some(1));
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert!(error["message"].as_str().unwrap().contains("identity"));
 
-  let output = repository.tenet(&[
-    "contract",
-    "approve",
-    "--proposal",
-    proposed["proposalId"].as_str().unwrap(),
-    "--digest",
-    "sha256:wrong",
-    "--json",
-  ]);
+  let output = repository.approve(proposed["proposalId"].as_str().unwrap(), "sha256:wrong");
   assert_eq!(output.status.code(), Some(1));
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert!(error["message"].as_str().unwrap().contains("not found"));
@@ -1062,13 +1193,8 @@ fn approval_revalidates_pending_proposals_after_specification_or_policy_changes(
     });
     let proposal_path = repository.path().join("proposal.json");
     fs::write(&proposal_path, serde_json::to_vec(&proposal).unwrap()).unwrap();
-    let proposed = success_json(repository.tenet(&[
-      "contract",
-      "propose",
-      "--file",
-      proposal_path.to_str().unwrap(),
-      "--json",
-    ]));
+    let proposed =
+      success_json(repository.propose_file(Path::new(proposal_path.to_str().unwrap())));
 
     match mutation {
       "specification" => {
@@ -1086,15 +1212,10 @@ fn approval_revalidates_pending_proposals_after_specification_or_policy_changes(
       _ => unreachable!(),
     }
 
-    let output = repository.tenet(&[
-      "contract",
-      "approve",
-      "--proposal",
+    let output = repository.approve(
       proposed["proposalId"].as_str().unwrap(),
-      "--digest",
       proposed["proposalDigest"].as_str().unwrap(),
-      "--json",
-    ]);
+    );
     assert_eq!(
       output.status.code(),
       Some(1),
@@ -1143,7 +1264,7 @@ fn verifier_timeout_terminates_the_process_group_and_returns_infrastructure_erro
     .unwrap()
     .replace("timeout_seconds = 10", "timeout_seconds = 1");
   fs::write(path, policy).unwrap();
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   repository.propose_and_approve(&status);
   let revision = repository.commit("admit timeout verifier");
 
@@ -1174,7 +1295,7 @@ authority = "project"
 "#,
   )
   .unwrap();
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   let proposal = json!({
     "schemaVersion": 2,
     "specDigest": status["specDigest"],
@@ -1200,13 +1321,7 @@ authority = "project"
   let path = repository.path().join("project-assurance.json");
   fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
 
-  let output = repository.tenet(&[
-    "contract",
-    "propose",
-    "--file",
-    path.to_str().unwrap(),
-    "--json",
-  ]);
+  let output = repository.propose_file(Path::new(path.to_str().unwrap()));
   assert!(!output.status.success());
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert!(error["message"]
@@ -1238,7 +1353,7 @@ oracle_path = "oracles/quality/"
 "#,
   )
   .unwrap();
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   let proposal = json!({
     "schemaVersion": 2,
     "specDigest": status["specDigest"],
@@ -1264,13 +1379,7 @@ oracle_path = "oracles/quality/"
   let path = repository.path().join("self-assurance.json");
   fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
 
-  let output = repository.tenet(&[
-    "contract",
-    "propose",
-    "--file",
-    path.to_str().unwrap(),
-    "--json",
-  ]);
+  let output = repository.propose_file(Path::new(path.to_str().unwrap()));
   assert!(!output.status.success());
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert!(error["message"]
@@ -1310,13 +1419,7 @@ fn nested_assurance_contract_is_rejected() {
   let path = repository.path().join("nested-assurance.json");
   fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
 
-  let output = repository.tenet(&[
-    "contract",
-    "propose",
-    "--file",
-    path.to_str().unwrap(),
-    "--json",
-  ]);
+  let output = repository.propose_file(Path::new(path.to_str().unwrap()));
   assert!(!output.status.success());
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
   assert!(error["message"].as_str().unwrap().contains("unknown field"));
@@ -1349,7 +1452,7 @@ oracle_path = "oracles/assurance"
 "#,
   )
   .unwrap();
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   let proposal = json!({
     "schemaVersion": 2,
     "specDigest": status["specDigest"],
@@ -1374,29 +1477,18 @@ oracle_path = "oracles/assurance"
   });
   let path = repository.path().join("assurance.json");
   fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
-  let proposed = success_json(repository.tenet(&[
-    "contract",
-    "propose",
-    "--file",
-    path.to_str().unwrap(),
-    "--json",
-  ]));
-  success_json(repository.tenet(&[
-    "contract",
-    "approve",
-    "--proposal",
+  let proposed = success_json(repository.propose_file(Path::new(path.to_str().unwrap())));
+  success_json(repository.approve(
     proposed["proposalId"].as_str().unwrap(),
-    "--digest",
     proposed["proposalDigest"].as_str().unwrap(),
-    "--json",
-  ]));
+  ));
   let revision = repository.commit("admit assured contract");
 
   let gate = failure_json(repository.gate(&revision, &revision), 2);
   assert_eq!(gate["verdict"], "not_done");
   assert_eq!(gate["obligations"][0]["state"], "unverifiable");
   assert_eq!(gate["blockers"][0]["code"], "oracle_assurance_failed");
-  let evidence = success_json(repository.tenet(&["evidence", "--revision", &revision, "--json"]));
+  let evidence = success_json(repository.evidence(&revision));
   assert_eq!(evidence["artifacts"][0]["evidenceKind"], "claim");
   assert_eq!(evidence["artifacts"][1]["evidenceKind"], "oracle_assurance");
   assert_eq!(
@@ -1431,13 +1523,13 @@ env = { ONLY_DECLARED = "yes" }
 "#,
   )
   .unwrap();
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   repository.propose_and_approve(&status);
   let revision = repository.commit("admit declared environment verifier");
 
   success_json(repository.gate(&revision, &revision));
   success_json(repository.gate(&revision, &revision));
-  let evidence = success_json(repository.tenet(&["evidence", "--revision", &revision, "--json"]));
+  let evidence = success_json(repository.evidence(&revision));
   assert_eq!(
     evidence["artifacts"][0]["execution"]["environmentMode"],
     "declared"
@@ -1470,7 +1562,7 @@ oracle_path = "oracles/missing"
 "#,
   )
   .unwrap();
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   let proposal = json!({
     "schemaVersion": 2,
     "specDigest": status["specDigest"],
@@ -1495,22 +1587,11 @@ oracle_path = "oracles/missing"
   });
   let path = repository.path().join("missing-assurance.json");
   fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
-  let proposed = success_json(repository.tenet(&[
-    "contract",
-    "propose",
-    "--file",
-    path.to_str().unwrap(),
-    "--json",
-  ]));
-  success_json(repository.tenet(&[
-    "contract",
-    "approve",
-    "--proposal",
+  let proposed = success_json(repository.propose_file(Path::new(path.to_str().unwrap())));
+  success_json(repository.approve(
     proposed["proposalId"].as_str().unwrap(),
-    "--digest",
     proposed["proposalDigest"].as_str().unwrap(),
-    "--json",
-  ]));
+  ));
   let revision = repository.commit("admit missing assurance bundle");
 
   let gate = failure_json(repository.gate(&revision, &revision), 4);
@@ -1551,7 +1632,7 @@ oracle_path = "oracles/quality"
 "#,
   )
   .unwrap();
-  let status = success_json(repository.tenet(&["status", "--json"]));
+  let status = success_json(repository.status());
   let proposal = json!({
     "schemaVersion": 2,
     "specDigest": status["specDigest"],
@@ -1579,22 +1660,11 @@ oracle_path = "oracles/quality"
   });
   let path = repository.path().join("symlink-assurance.json");
   fs::write(&path, serde_json::to_vec(&proposal).unwrap()).unwrap();
-  let proposed = success_json(repository.tenet(&[
-    "contract",
-    "propose",
-    "--file",
-    path.to_str().unwrap(),
-    "--json",
-  ]));
-  success_json(repository.tenet(&[
-    "contract",
-    "approve",
-    "--proposal",
+  let proposed = success_json(repository.propose_file(Path::new(path.to_str().unwrap())));
+  success_json(repository.approve(
     proposed["proposalId"].as_str().unwrap(),
-    "--digest",
     proposed["proposalDigest"].as_str().unwrap(),
-    "--json",
-  ]));
+  ));
   let revision = repository.commit("admit symlinked primary oracle");
 
   let gate = failure_json(repository.gate(&revision, &revision), 4);

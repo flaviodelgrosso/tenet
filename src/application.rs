@@ -2,11 +2,11 @@ use std::{
   collections::{BTreeMap, BTreeSet},
   fs,
   path::{Path, PathBuf},
-  process::ExitCode,
 };
 
 use anyhow::{bail, Context, Result};
-use schemars::schema_for;
+use schemars::{schema_for, JsonSchema, Schema};
+use serde::Deserialize;
 use tenet_domain::{
   completion::{
     derive_completion, derive_obligation_state, Blocker, BlockerCode, DerivationContext,
@@ -25,7 +25,6 @@ use tenet_domain::{
 
 use crate::{
   audit::AuditState,
-  cli::{Cli, Command, ContractCommand, PolicyCommand},
   repository::{
     self, atomic_write, discover_root, load_policy, policy_digest, specification_digest,
     MaterializedRevision, CONFIG_PATH, CONTRACT_PATH, SKILL_PATH, TENET_DIR,
@@ -37,34 +36,90 @@ use crate::{
   verifier::{run_verifier, ExecutedVerifier},
 };
 
-pub fn run(cli: Cli) -> Result<ExitCode> {
-  let cwd = cli.cwd.unwrap_or(std::env::current_dir()?);
-  match cli.command {
-    Command::Init { spec, json } => initialize(&cwd, &spec, json),
-    Command::Status { json } => status(&cwd, json),
-    Command::Contract { command } => contract(&cwd, command),
-    Command::Policy { command } => policy(command),
-    Command::Gate {
-      authority_revision,
-      revision,
-      json,
-    } => gate(&cwd, &authority_revision, &revision, json),
-    Command::Evidence { revision, json } => evidence(&cwd, revision.as_deref(), json),
+#[derive(Clone, Debug)]
+pub struct Tenet {
+  cwd: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InitializeRequest {
+  pub spec_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApproveRequest {
+  pub proposal_id: String,
+  pub proposal_digest: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GateRequest {
+  pub authority_revision: String,
+  pub revision: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceRequest {
+  pub revision: String,
+}
+
+impl Tenet {
+  pub fn new(cwd: PathBuf) -> Self {
+    Self { cwd }
+  }
+
+  pub fn initialize(&self, request: &InitializeRequest) -> Result<InitResult> {
+    initialize(&self.cwd, request.spec_path.as_deref())
+  }
+
+  pub fn status(&self) -> Result<StatusResult> {
+    status(&self.cwd)
+  }
+
+  pub fn contract_schema(&self) -> Schema {
+    schema_for!(ContractProposal)
+  }
+
+  pub fn policy_schema(&self) -> Schema {
+    schema_for!(RepositoryConfig)
+  }
+
+  pub fn propose(&self, proposal: ContractProposal) -> Result<ProposalResult> {
+    propose(&self.cwd, proposal)
+  }
+
+  pub fn approve(&self, request: &ApproveRequest) -> Result<ApprovalResult> {
+    approve(&self.cwd, &request.proposal_id, &request.proposal_digest)
+  }
+
+  pub fn gate(&self, request: &GateRequest) -> Result<GateResult> {
+    gate(&self.cwd, &request.authority_revision, &request.revision)
+  }
+
+  pub fn exact_evidence(&self, request: &EvidenceRequest) -> Result<EvidenceResult> {
+    let root = initialized_root(&self.cwd)?;
+    let revision = repository::resolve_revision(&root, &request.revision)
+      .context("resolve evidence candidate revision")?;
+    evidence(&self.cwd, Some(&revision))
   }
 }
 
-fn initialize(cwd: &Path, spec: &Path, json: bool) -> Result<ExitCode> {
+fn initialize(cwd: &Path, spec: Option<&Path>) -> Result<InitResult> {
   let root = discover_root(cwd)?;
-  let cwd = cwd
-    .canonicalize()
-    .context("canonicalize working directory")?;
-  let spec = if spec.is_absolute() {
-    spec.to_path_buf()
-  } else {
-    cwd.join(spec)
+  let spec = match spec {
+    Some(spec) if spec.is_absolute() => spec.to_path_buf(),
+    Some(spec) => cwd
+      .canonicalize()
+      .context("canonicalize working directory")?
+      .join(spec),
+    None => root.join("SPEC.md"),
   };
   let (policy, spec_digest, created) = repository::initialize(&root, &spec)?;
-  let result = InitResult {
+  Ok(InitResult {
     schema_version: 1,
     initialized: true,
     created,
@@ -76,20 +131,13 @@ fn initialize(cwd: &Path, spec: &Path, json: bool) -> Result<ExitCode> {
       ContractState::Missing
     },
     skill_path: SKILL_PATH.into(),
-  };
-  print_value(&result, json, |value| {
-    println!("initialized: {}", value.initialized);
-    println!("specification: {} ({})", value.spec_path, value.spec_digest);
-    println!("contract: {:?}", value.contract_state);
-    println!("skill: {}", value.skill_path);
-  })?;
-  Ok(ExitCode::SUCCESS)
+  })
 }
 
-fn status(cwd: &Path, json: bool) -> Result<ExitCode> {
+fn status(cwd: &Path) -> Result<StatusResult> {
   let root = discover_root(cwd)?;
   if !root.join(CONFIG_PATH).exists() {
-    let result = StatusResult {
+    return Ok(StatusResult {
       schema_version: 1,
       initialized: false,
       spec_path: None,
@@ -101,9 +149,7 @@ fn status(cwd: &Path, json: bool) -> Result<ExitCode> {
       last_gated_revision: None,
       last_verdict: None,
       unresolved_obligations: Vec::new(),
-    };
-    print_status(&result, json)?;
-    return Ok(ExitCode::from(2));
+    });
   }
   let policy = load_policy(&root)?;
   let current_spec_digest = specification_digest(&root, &policy)?;
@@ -138,7 +184,7 @@ fn status(cwd: &Path, json: bool) -> Result<ExitCode> {
         .collect()
     })
     .unwrap_or_default();
-  let result = StatusResult {
+  Ok(StatusResult {
     schema_version: 1,
     initialized: true,
     spec_path: Some(policy.spec_path),
@@ -150,46 +196,14 @@ fn status(cwd: &Path, json: bool) -> Result<ExitCode> {
     last_gated_revision: last.map(|gate| gate.revision.clone()),
     last_verdict: last.map(|gate| gate.verdict.clone()),
     unresolved_obligations,
-  };
-  print_status(&result, json)?;
-  Ok(ExitCode::SUCCESS)
+  })
 }
 
-fn contract(cwd: &Path, command: ContractCommand) -> Result<ExitCode> {
-  match command {
-    ContractCommand::Schema { .. } => {
-      let schema = schema_for!(ContractProposal);
-      println!("{}", serde_json::to_string_pretty(&schema)?);
-      Ok(ExitCode::SUCCESS)
-    }
-    ContractCommand::Propose { file, json } => propose(cwd, &file, json),
-    ContractCommand::Approve {
-      proposal,
-      digest,
-      json,
-    } => approve(cwd, &proposal, &digest, json),
-  }
-}
-
-fn policy(command: PolicyCommand) -> Result<ExitCode> {
-  match command {
-    PolicyCommand::Schema { .. } => {
-      let schema = schema_for!(RepositoryConfig);
-      println!("{}", serde_json::to_string_pretty(&schema)?);
-      Ok(ExitCode::SUCCESS)
-    }
-  }
-}
-
-fn propose(cwd: &Path, file: &Path, json: bool) -> Result<ExitCode> {
+fn propose(cwd: &Path, proposal: ContractProposal) -> Result<ProposalResult> {
   let root = initialized_root(cwd)?;
   let policy = load_policy(&root)?;
   let current_spec_digest = specification_digest(&root, &policy)?;
   let current_policy_digest = policy_digest(&policy)?;
-  let file = absolute_from(cwd, file);
-  let bytes = fs::read(&file).with_context(|| format!("read proposal {}", file.display()))?;
-  let proposal: ContractProposal =
-    serde_json::from_slice(&bytes).context("parse contract proposal")?;
   validate_proposal(&proposal, &policy).context("validate contract proposal")?;
   if proposal.spec_digest != current_spec_digest {
     bail!(
@@ -216,25 +230,19 @@ fn propose(cwd: &Path, file: &Path, json: bool) -> Result<ExitCode> {
   let mut encoded = serde_json::to_vec_pretty(&record)?;
   encoded.push(b'\n');
   atomic_write(&proposal_path(&root, &digest), &encoded)?;
-  let result = ProposalResult {
+  Ok(ProposalResult {
     schema_version: 1,
     proposal_id,
     proposal_digest: digest,
     approval_required: true,
-  };
-  print_value(&result, json, |value| {
-    println!("proposal: {}", value.proposal_id);
-    println!("digest: {}", value.proposal_digest);
-    println!("approval required: true");
-  })?;
-  Ok(ExitCode::SUCCESS)
+  })
 }
 
-fn approve(cwd: &Path, proposal_id: &str, digest: &str, json: bool) -> Result<ExitCode> {
+fn approve(cwd: &Path, proposal_id: &str, digest: &str) -> Result<ApprovalResult> {
   let root = initialized_root(cwd)?;
   let path = proposal_path(&root, digest);
   let bytes = fs::read(&path).with_context(|| {
-    format!("pending proposal `{digest}` not found; submit it with `tenet contract propose`")
+    format!("pending proposal `{digest}` not found; submit a contract proposal first")
   })?;
   let record: ProposalRecord = serde_json::from_slice(&bytes).context("parse pending proposal")?;
   if record.proposal_id != proposal_id || record.proposal_digest != digest {
@@ -258,22 +266,16 @@ fn approve(cwd: &Path, proposal_id: &str, digest: &str, json: bool) -> Result<Ex
   let mut encoded = serde_json::to_vec_pretty(&admitted)?;
   encoded.push(b'\n');
   atomic_write(&root.join(CONTRACT_PATH), &encoded)?;
-  let result = ApprovalResult {
+  Ok(ApprovalResult {
     schema_version: 1,
     proposal_id: admitted.proposal_id,
     proposal_digest: admitted.proposal_digest,
     contract_digest,
     contract_path: CONTRACT_PATH.into(),
-  };
-  print_value(&result, json, |value| {
-    println!("admitted proposal: {}", value.proposal_id);
-    println!("proposal digest: {}", value.proposal_digest);
-    println!("contract digest: {}", value.contract_digest);
-  })?;
-  Ok(ExitCode::SUCCESS)
+  })
 }
 
-fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Result<ExitCode> {
+fn gate(cwd: &Path, authority_revision: &str, revision: &str) -> Result<GateResult> {
   let root = discover_root(cwd)?;
   let authority_revision = repository::resolve_revision(&root, authority_revision)
     .context("resolve authority revision")?;
@@ -287,7 +289,7 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
       BlockerCode::AuthorityRevisionNotAncestor,
       "authority revision is not an ancestor of the candidate revision",
     );
-    return finish_gate(&root, result, Vec::new(), json);
+    return finish_gate(&root, result, Vec::new());
   }
 
   let Some(policy_bytes) = repository::read_revision_file(&root, &authority_revision, CONFIG_PATH)?
@@ -298,7 +300,7 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
       BlockerCode::RepositoryNotInitialized,
       "authority revision is not Tenet-enabled",
     );
-    return finish_gate(&root, result, Vec::new(), json);
+    return finish_gate(&root, result, Vec::new());
   };
   let policy_text = String::from_utf8(policy_bytes).context("authority policy is not UTF-8")?;
   let policy: VerificationPolicy =
@@ -326,7 +328,7 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
     );
     result.spec_digest = spec_digest;
     result.policy_digest = policy_digest;
-    return finish_gate(&root, result, Vec::new(), json);
+    return finish_gate(&root, result, Vec::new());
   };
   let contract: AdmittedContract =
     serde_json::from_slice(&contract_bytes).context("parse authority revision contract")?;
@@ -342,7 +344,7 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
       BlockerCode::SpecificationChanged,
       "authority specification digest differs from the admitted contract",
     );
-    return finish_gate(&root, result, Vec::new(), json);
+    return finish_gate(&root, result, Vec::new());
   }
   if contract.policy_digest != policy_digest {
     let result = mismatch_gate(
@@ -354,7 +356,7 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
       BlockerCode::PolicyChanged,
       "authority policy digest differs from the admitted contract",
     );
-    return finish_gate(&root, result, Vec::new(), json);
+    return finish_gate(&root, result, Vec::new());
   }
   validate_admitted_contract(&contract, &policy)?;
 
@@ -382,7 +384,7 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
       BlockerCode::AuthoritySurfaceChanged,
       &message,
     );
-    return finish_gate(&root, result, Vec::new(), json);
+    return finish_gate(&root, result, Vec::new());
   }
 
   let verifier_ids = contract
@@ -545,7 +547,7 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str, json: bool) -> Res
     obligations,
     blockers,
   };
-  finish_gate(&root, result, artifacts, json)
+  finish_gate(&root, result, artifacts)
 }
 fn execute_configured_verifier(
   root: &Path,
@@ -630,7 +632,7 @@ fn artifact_authority(authority: VerifierAuthority) -> ArtifactAuthority {
   }
 }
 
-fn evidence(cwd: &Path, revision: Option<&str>, json: bool) -> Result<ExitCode> {
+fn evidence(cwd: &Path, revision: Option<&str>) -> Result<EvidenceResult> {
   let root = initialized_root(cwd)?;
   let audit = AuditState::load(&root)?;
   let artifacts = audit
@@ -643,52 +645,24 @@ fn evidence(cwd: &Path, revision: Option<&str>, json: bool) -> Result<ExitCode> 
     .into_iter()
     .filter(|item| revision.is_none_or(|revision| item.revision == revision))
     .collect();
-  let result = EvidenceResult {
+  Ok(EvidenceResult {
     schema_version: 1,
     revision: revision.map(str::to_owned),
     artifacts,
     gates,
-  };
-  print_value(&result, json, |value| {
-    println!("revision: {}", value.revision.as_deref().unwrap_or("all"));
-    println!("artifacts: {}", value.artifacts.len());
-    for gate in &value.gates {
-      println!("gate: {} {:?}", gate.revision, gate.verdict);
-      for blocker in &gate.blockers {
-        println!("  {:?}: {}", blocker.code, blocker.message);
-      }
-    }
-  })?;
-  Ok(ExitCode::SUCCESS)
+  })
 }
 
 fn finish_gate(
   root: &Path,
   result: GateResult,
   artifacts: Vec<EvidenceArtifact>,
-  json: bool,
-) -> Result<ExitCode> {
+) -> Result<GateResult> {
   let mut audit = AuditState::load(root)?;
   audit.evidence.extend(artifacts);
   audit.gates.push(result.clone());
   audit.save(root)?;
-  print_value(&result, json, |value| {
-    println!("authority revision: {}", value.authority_revision);
-    println!("candidate revision: {}", value.revision);
-    println!("verdict: {:?}", value.verdict);
-    println!("specification: {}", value.spec_digest);
-    println!("contract: {}", value.contract_digest);
-    println!("policy: {}", value.policy_digest);
-    for blocker in &value.blockers {
-      println!("blocker {:?}: {}", blocker.code, blocker.message);
-    }
-  })?;
-  Ok(match result.verdict {
-    Verdict::Done => ExitCode::SUCCESS,
-    Verdict::NotDone => ExitCode::from(2),
-    Verdict::Inconclusive => ExitCode::from(3),
-    Verdict::InfrastructureError => ExitCode::from(4),
-  })
+  Ok(result)
 }
 
 fn control_plane_gate(
@@ -762,7 +736,7 @@ fn load_contract_optional(root: &Path) -> Result<Option<AdmittedContract>> {
 fn initialized_root(cwd: &Path) -> Result<PathBuf> {
   let root = discover_root(cwd)?;
   if !root.join(CONFIG_PATH).exists() {
-    bail!("repository is not initialized; run `tenet init --spec <path>`");
+    bail!("repository is not initialized")
   }
   Ok(root)
 }
@@ -784,46 +758,4 @@ fn has_pending_proposal(root: &Path) -> Result<bool> {
     return Ok(false);
   }
   Ok(fs::read_dir(directory)?.next().transpose()?.is_some())
-}
-
-fn absolute_from(cwd: &Path, path: &Path) -> PathBuf {
-  if path.is_absolute() {
-    path.to_path_buf()
-  } else {
-    cwd.join(path)
-  }
-}
-
-fn print_status(result: &StatusResult, json: bool) -> Result<()> {
-  print_value(result, json, |value| {
-    println!("initialized: {}", value.initialized);
-    println!("contract: {:?}", value.contract_state);
-    if let Some(spec_digest) = &value.spec_digest {
-      println!("specification: {spec_digest}");
-    }
-    if let Some(last_revision) = &value.last_gated_revision {
-      println!(
-        "last gate: {} under {} {:?}",
-        last_revision,
-        value
-          .last_gated_authority_revision
-          .as_deref()
-          .unwrap_or("unknown authority"),
-        value.last_verdict
-      );
-    }
-    println!(
-      "unresolved obligations: {}",
-      value.unresolved_obligations.len()
-    );
-  })
-}
-
-fn print_value<T: serde::Serialize>(value: &T, json: bool, human: impl FnOnce(&T)) -> Result<()> {
-  if json {
-    println!("{}", serde_json::to_string_pretty(value)?);
-  } else {
-    human(value);
-  }
-  Ok(())
 }
