@@ -1,0 +1,14 @@
+[package]
+name = "tenet-mcp"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+tenet-application.workspace = true
+tenet-domain.workspace = true
+tokio.workspace = true

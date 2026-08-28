@@ -84,10 +84,12 @@ Breaking changes are allowed during the MVP when they strengthen or simplify the
 
 ## Minimal architecture
 
-The project intentionally uses one Cargo package with a root `src/` folder:
+The project intentionally uses one Cargo workspace with four crates:
 
-- the library target contains contract validation, evidence types, and deterministic completion derivation;
-- the `tenet` binary contains repository initialization, Git object reads and candidate materialization, verifier execution, audit persistence, and CLI rendering.
+- `tenet-domain` contains contract validation, evidence types, and deterministic completion derivation;
+- `tenet-application` contains repository initialization, Git object reads, candidate materialization, verifier execution, and audit persistence;
+- `tenet-mcp` exposes the typed application interface over stdio MCP;
+- `tenet-cli` contains the `tenet` binary and CLI rendering.
 
 Prefer existing files and direct Git commands. Do not introduce provider integrations, model runtimes, general plugin systems, databases, generic rule engines, or speculative traits and frameworks. Add a dependency only for a concrete capability the existing stack cannot express cleanly.
 

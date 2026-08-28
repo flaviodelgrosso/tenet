@@ -6,13 +6,12 @@ use rmcp::{
   ServerHandler, ServiceExt,
 };
 use schemars::Schema;
-use tenet_domain::contract::ContractProposal;
-use tokio::sync::Mutex;
-
-use crate::{
+use tenet_application::{
   application::{ApproveRequest, EvidenceRequest, GateRequest, Tenet},
   response::{ApprovalResult, EvidenceResult, GateResult, ProposalResult, StatusResult},
 };
+use tenet_domain::contract::ContractProposal;
+use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
 pub struct TenetMcp {

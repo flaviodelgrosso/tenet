@@ -471,7 +471,7 @@ fn generated_skill_is_portable_concise_and_not_authoritative() {
   assert!(skill.contains("Inspect `tenet_policy_schema`"));
   assert!(skill.contains("never infer hidden capabilities or reverse-engineer the binary"));
   assert!(skill.lines().count() < 35);
-  assert_eq!(skill, include_str!("../.agents/skills/tenet/SKILL.md"));
+  assert_eq!(skill, include_str!("../../.agents/skills/tenet/SKILL.md"));
   for forbidden in [
     "Codex",
     "Claude",

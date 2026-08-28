@@ -229,9 +229,9 @@ Canonical completion semantics live in Git. A fresh clone containing authority c
 
 ## Architecture
 
-The project is a single Cargo package with a root `src/` folder. Its library target contains pure contract validation, evidence types, and deterministic completion derivation. The shared application layer contains repository initialization, authority Git-object reads, candidate materialization, verifier execution, and local audit persistence.
+The project is a four-crate Cargo workspace. `tenet-domain` contains pure contract validation, evidence types, and deterministic completion derivation. `tenet-application` contains repository initialization, authority Git-object reads, candidate materialization, verifier execution, and local audit persistence. `tenet-mcp` exposes typed application operations over stdio MCP. `tenet-cli` owns the `tenet` binary, including initialization output and the hidden MCP entrypoint.
 
-The MCP adapter calls typed application operations directly for normal post-initialization work. The CLI adapter calls only repository initialization; the hidden `mcp` entrypoint starts the stdio transport. Neither adapter duplicates domain semantics.
+Both adapters call their respective crate interfaces directly; neither duplicates domain semantics.
 
 The product boundary is strict: coding agents own reasoning, planning, editing, delegation, branches, worktrees, tests, and fixes. Tenet owns authority snapshots, admitted contracts, independent observations, evidence validity, and deterministic completion derivation for exact `(A, R)` pairs.
 

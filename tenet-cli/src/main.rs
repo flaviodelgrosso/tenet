@@ -1,20 +1,15 @@
-mod application;
-mod audit;
 mod cli;
-mod mcp;
-mod repository;
-mod response;
-mod verifier;
 
 use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::Parser;
-
-use crate::{
+use tenet_application::{
   application::{InitializeRequest, Tenet},
-  cli::{Cli, Command},
+  response::ErrorResult,
 };
+
+use crate::cli::{Cli, Command};
 
 fn main() -> ExitCode {
   let cli = Cli::parse();
@@ -44,12 +39,12 @@ fn run_command(cli: Cli) -> Result<()> {
       }
       Ok(())
     }
-    Command::Mcp => mcp::run(cwd),
+    Command::Mcp => tenet_mcp::run(cwd),
   }
 }
 
 fn report_error(error: anyhow::Error, json: bool) {
-  let error = response::ErrorResult {
+  let error = ErrorResult {
     schema_version: 1,
     code: "command_error".into(),
     message: format!("{error:#}"),

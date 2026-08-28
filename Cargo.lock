@@ -906,22 +906,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "tenet-application"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tenet-domain",
+ "toml",
+]
+
+[[package]]
 name = "tenet-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tenet-application",
+ "tenet-mcp",
+]
+
+[[package]]
+name = "tenet-domain"
+version = "0.1.0"
+dependencies = [
  "proptest",
- "rmcp",
  "schemars",
  "serde",
  "serde_json",
  "sha2",
- "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "tenet-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rmcp",
+ "schemars",
+ "tenet-application",
+ "tenet-domain",
  "tokio",
- "toml",
 ]
 
 [[package]]
