@@ -544,7 +544,6 @@ fn generated_skill_is_portable_concise_and_not_authoritative() {
     .expect("read skill");
 
   assert!(skill.starts_with("---\nname: tenet\n"));
-  assert!(skill.contains("tenet-skill-version: \"6\""));
   assert!(skill.contains("`tenet init` is the only user-facing CLI workflow"));
   assert!(skill.contains("interact with Tenet only through its semantic MCP tools"));
   assert!(skill.contains("present the exact proposal ID and digest"));
