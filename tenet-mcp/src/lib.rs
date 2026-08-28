@@ -8,7 +8,10 @@ use rmcp::{
 use schemars::Schema;
 use tenet_application::{
   application::{ApproveRequest, EvidenceRequest, GateRequest, Tenet},
-  response::{ApprovalResult, EvidenceResult, GateResult, ProposalResult, StatusResult},
+  response::{
+    ApprovalResult, AuthoritySealResult, CandidateCaptureResult, EvidenceResult, GateResult,
+    ProposalResult, StatusResult,
+  },
 };
 use tenet_domain::contract::ContractProposalInput;
 use tokio::sync::Mutex;
@@ -63,7 +66,7 @@ impl TenetMcp {
 
   #[tool(
     name = "tenet_policy_schema",
-    description = "Return the authoritative verification-policy schema generated from Tenet's Rust RepositoryConfig type."
+    description = "Return the authoritative Rust-derived policy schema. A project verifier executes from Candidate Snapshot R. An authority_snapshot verifier runs from a sealed Authority Capsule A bundle: oraclePath names the directory to seal, argv[0] directly names an executable inside that bundle (never a host interpreter), cwd is bundle-relative, and TENET_CANDIDATE_ROOT exposes R."
   )]
   async fn policy_schema(&self) -> Json<Schema> {
     Json(self.tenet.policy_schema())
@@ -98,8 +101,30 @@ impl TenetMcp {
   }
 
   #[tool(
+    name = "tenet_authority_seal",
+    description = "Seal the explicitly admitted current authority surface into an immutable content-addressed Authority Capsule. Validates specification, policy, contract, and every authority-snapshot bundle before returning authorityId. Present this exact ID to a human for explicit selection; Tenet never selects it."
+  )]
+  async fn authority_seal(&self) -> Result<Json<AuthoritySealResult>, String> {
+    self
+      .run_operation(|tenet| tenet.authority_seal())
+      .await
+      .map(Json)
+  }
+
+  #[tool(
+    name = "tenet_candidate_capture",
+    description = "Capture the current mutable project content as an immutable Candidate Snapshot and return candidateId. This excludes Tenet control and content-store state and never changes or reseals authority."
+  )]
+  async fn candidate_capture(&self) -> Result<Json<CandidateCaptureResult>, String> {
+    self
+      .run_operation(|tenet| tenet.candidate_capture())
+      .await
+      .map(Json)
+  }
+
+  #[tool(
     name = "tenet_gate",
-    description = "Evaluate one explicitly supplied exact candidate revision under one explicitly supplied exact authority revision. Returns the structured deterministic verdict, typed obligation results, and blockers; not_done, inconclusive, and infrastructure_error are normal Tenet outcomes rather than transport errors."
+    description = "Evaluate the explicitly supplied immutable Candidate Snapshot candidateId under explicitly supplied immutable Authority Capsule authorityId. Tenet integrity-checks both, loads all authority semantics only from A, and never reads mutable workspace control state during verification."
   )]
   async fn gate(
     &self,
@@ -113,7 +138,7 @@ impl TenetMcp {
 
   #[tool(
     name = "tenet_evidence",
-    description = "Return structured persisted evidence and gate decisions for the explicitly supplied exact candidate revision using Tenet's evidence model."
+    description = "Return structured persisted evidence and gate decisions for the explicitly supplied exact Candidate Snapshot candidateId."
   )]
   async fn evidence(
     &self,
@@ -129,7 +154,7 @@ impl TenetMcp {
 #[tool_handler(
   name = "tenet",
   version = "0.1.0",
-  instructions = "Tenet is an agent-neutral completion authority. Inspect status first, obtain explicit human approval before contract admission, pass exact authority and candidate revisions to gate, and claim completion only when the returned verdict is done."
+  instructions = "Tenet is an agent-neutral completion authority. Inspect status first, obtain explicit human approval before contract admission, seal the approved authority, present authorityId for explicit human selection, capture candidateId, and claim completion only when gate returns done for that exact pair."
 )]
 impl ServerHandler for TenetMcp {}
 

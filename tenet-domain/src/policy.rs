@@ -20,10 +20,12 @@ pub enum EnvironmentMode {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct RepositoryConfig {
+pub struct ProjectConfig {
   pub version: u32,
+  #[schemars(description = "Safe project-relative path to the authority specification.")]
   pub spec_path: String,
   #[serde(default)]
+  #[schemars(description = "Verifier definitions sealed into an Authority Capsule.")]
   pub verifiers: Vec<VerifierSpec>,
 }
 
@@ -31,8 +33,14 @@ pub struct RepositoryConfig {
 #[serde(deny_unknown_fields)]
 pub struct VerifierSpec {
   pub id: String,
+  #[schemars(
+    description = "Structured argv. For authority_snapshot, argv[0] directly names an executable inside oracle_path; Tenet never invokes a host interpreter implicitly."
+  )]
   pub argv: Vec<String>,
   #[serde(default = "default_cwd")]
+  #[schemars(
+    description = "Safe relative working directory. For authority_snapshot it is relative to the sealed oracle bundle."
+  )]
   pub cwd: String,
   #[serde(default = "default_timeout")]
   pub timeout_seconds: u64,
@@ -42,8 +50,14 @@ pub struct VerifierSpec {
   pub env: BTreeMap<String, String>,
   #[serde(default)]
   pub environment_mode: EnvironmentMode,
+  #[schemars(
+    description = "project executes in Candidate Snapshot R. authority_snapshot executes from a sealed Authority Capsule A bundle and receives R only through TENET_CANDIDATE_ROOT."
+  )]
   pub authority: VerifierAuthority,
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  #[schemars(
+    description = "Required only for authority_snapshot: safe project-relative directory to seal as the authority-owned oracle bundle."
+  )]
   pub oracle_path: Option<String>,
 }
 impl VerifierSpec {
@@ -58,7 +72,7 @@ impl VerifierSpec {
   }
 }
 
-pub type VerificationPolicy = RepositoryConfig;
+pub type VerificationPolicy = ProjectConfig;
 
 fn default_cwd() -> String {
   ".".into()
@@ -74,9 +88,9 @@ fn default_output_limit() -> usize {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PolicyError {
-  #[error("unsupported repository configuration version {0}")]
+  #[error("unsupported project configuration version {0}")]
   UnsupportedVersion(u32),
-  #[error("spec_path must name a repository-relative path")]
+  #[error("spec_path must name a project-relative path")]
   InvalidSpecPath,
   #[error("verifier identifier must not be blank")]
   BlankVerifierId,
@@ -92,10 +106,10 @@ pub enum PolicyError {
   InvalidOutputLimit(String),
   #[error("project verifier `{0}` must not configure oracle_path")]
   UnexpectedOraclePath(String),
-  #[error("authority_snapshot verifier `{0}` must configure a repository-relative oracle_path")]
+  #[error("authority_snapshot verifier `{0}` must configure a project-relative oracle_path")]
   InvalidOraclePath(String),
-  #[error("authority_snapshot verifier `{0}` executable must be relative to its oracle bundle")]
-  InvalidOracleExecutable(String),
+  #[error("verifier `{0}` executable must be a safe relative path")]
+  InvalidExecutable(String),
 }
 
 pub fn validate_policy(policy: &VerificationPolicy) -> Result<(), PolicyError> {
@@ -120,6 +134,9 @@ pub fn validate_policy(policy: &VerificationPolicy) -> Result<(), PolicyError> {
     {
       return Err(PolicyError::EmptyArgv(verifier.id.clone()));
     }
+    if !is_safe_relative_path(&verifier.argv[0]) {
+      return Err(PolicyError::InvalidExecutable(verifier.id.clone()));
+    }
     if !is_safe_relative_path(&verifier.cwd) {
       return Err(PolicyError::InvalidCwd(verifier.id.clone()));
     }
@@ -141,9 +158,6 @@ pub fn validate_policy(policy: &VerificationPolicy) -> Result<(), PolicyError> {
           .is_some_and(|path| path != "." && is_safe_relative_path(path));
         if !valid_oracle_path {
           return Err(PolicyError::InvalidOraclePath(verifier.id.clone()));
-        }
-        if !is_safe_relative_path(&verifier.argv[0]) {
-          return Err(PolicyError::InvalidOracleExecutable(verifier.id.clone()));
         }
       }
     }

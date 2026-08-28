@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tenet_domain::{
   completion::{Blocker, ObligationResult, Verdict},
   contract::{ContractProposal, ProposalWarning, VerificationProfile},
-  evidence::EvidenceArtifact,
+  evidence::{AuthorityId, CandidateId, EvidenceArtifact},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -17,7 +17,6 @@ pub struct InitResult {
   pub contract_state: ContractState,
   pub skill_path: String,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ContractState {
@@ -26,7 +25,6 @@ pub enum ContractState {
   Admitted,
   Stale,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProposalResult {
@@ -38,7 +36,6 @@ pub struct ProposalResult {
   pub verification_profile: VerificationProfile,
   pub warnings: Vec<ProposalWarning>,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovalResult {
@@ -48,7 +45,22 @@ pub struct ApprovalResult {
   pub contract_digest: String,
   pub contract_path: String,
 }
-
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthoritySealResult {
+  pub schema_version: u32,
+  pub authority_id: AuthorityId,
+  pub specification_digest: String,
+  pub policy_digest: String,
+  pub contract_digest: String,
+  pub oracle_bundle_paths: Vec<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateCaptureResult {
+  pub schema_version: u32,
+  pub candidate_id: CandidateId,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StatusResult {
@@ -59,18 +71,17 @@ pub struct StatusResult {
   pub policy_digest: Option<String>,
   pub contract_state: ContractState,
   pub contract_digest: Option<String>,
-  pub last_gated_authority_revision: Option<String>,
-  pub last_gated_revision: Option<String>,
+  pub last_gated_authority_id: Option<AuthorityId>,
+  pub last_gated_candidate_id: Option<CandidateId>,
   pub last_verdict: Option<Verdict>,
   pub unresolved_obligations: Vec<ObligationResult>,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GateResult {
   pub schema_version: u32,
-  pub authority_revision: String,
-  pub revision: String,
+  pub authority_id: AuthorityId,
+  pub candidate_id: CandidateId,
   pub spec_digest: String,
   pub contract_digest: String,
   pub policy_digest: String,
@@ -78,16 +89,14 @@ pub struct GateResult {
   pub obligations: Vec<ObligationResult>,
   pub blockers: Vec<Blocker>,
 }
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvidenceResult {
   pub schema_version: u32,
-  pub revision: Option<String>,
+  pub candidate_id: Option<CandidateId>,
   pub artifacts: Vec<EvidenceArtifact>,
   pub gates: Vec<GateResult>,
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ErrorResult {

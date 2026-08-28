@@ -929,7 +929,9 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tenet-application",
+ "tenet-domain",
  "tenet-mcp",
+ "toml",
 ]
 
 [[package]]

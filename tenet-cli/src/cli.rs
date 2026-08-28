@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
   name = "tenet",
-  about = "Evidence-backed completion authority for exact Git revisions"
+  about = "Evidence-backed completion authority for immutable content"
 )]
 pub struct Cli {
   #[arg(long, global = true, value_name = "DIR")]
@@ -16,7 +16,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-  /// Initialize repository-local Tenet policy and workflow instructions.
+  /// Initialize a Tenet project policy and workflow instructions.
   Init {
     #[arg(long, value_name = "PATH")]
     spec: Option<PathBuf>,

@@ -12,8 +12,8 @@ use serde::Serialize;
 use tenet_domain::{
   digest::canonical_digest,
   evidence::{
-    ExecutionEnvironmentIdentity, ExecutionProvenance, OracleIdentity, RunnerIdentity,
-    VerifierObservation,
+    AuthorityId, CandidateId, ExecutionEnvironmentIdentity, ExecutionProvenance, OracleIdentity,
+    RunnerIdentity, VerifierObservation,
   },
   policy::{EnvironmentMode, VerifierAuthority, VerifierSpec},
 };
@@ -24,19 +24,22 @@ pub struct ExecutedVerifier {
 }
 
 pub fn run_verifier(
-  candidate_checkout: &Path,
+  candidate_snapshot: &Path,
   oracle_bundle: Option<&Path>,
   verifier: &VerifierSpec,
-  authority_revision: &str,
-  revision: &str,
+  authority_id: &AuthorityId,
+  candidate_id: &CandidateId,
   oracle_identity: &OracleIdentity,
 ) -> Result<ExecutedVerifier> {
   let configured_executable = verifier.argv.first().context("verifier argv is empty")?;
-  let candidate_checkout = candidate_checkout
+  let candidate_snapshot = candidate_snapshot
     .canonicalize()
-    .context("canonicalize candidate checkout")?;
+    .context("canonicalize candidate snapshot")?;
   let (execution_root, executable) = match verifier.authority {
-    VerifierAuthority::Project => (candidate_checkout.clone(), configured_executable.into()),
+    VerifierAuthority::Project => (
+      candidate_snapshot.clone(),
+      candidate_snapshot.join(configured_executable),
+    ),
     VerifierAuthority::AuthoritySnapshot => {
       let bundle = oracle_bundle
         .context("authority_snapshot verifier has no materialized oracle bundle")?
@@ -60,15 +63,15 @@ pub fn run_verifier(
   command
     .args(&verifier.argv[1..])
     .envs(&verifier.env)
-    .env("TENET_AUTHORITY_REVISION", authority_revision)
-    .env("TENET_CANDIDATE_REVISION", revision)
+    .env("TENET_AUTHORITY_ID", &authority_id.0.0)
+    .env("TENET_CANDIDATE_ID", &candidate_id.0.0)
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
   if verifier.authority == VerifierAuthority::AuthoritySnapshot {
-    command.env("TENET_CANDIDATE_ROOT", &candidate_checkout);
+    command.env("TENET_CANDIDATE_ROOT", &candidate_snapshot);
   }
-  let execution = execution_provenance(verifier, authority_revision, revision, oracle_identity)?;
+  let execution = execution_provenance(verifier, authority_id, candidate_id, oracle_identity)?;
   #[cfg(unix)]
   let cwd_handle = open_verifier_cwd(&execution_root, &verifier.cwd)?;
   #[cfg(unix)]
@@ -170,8 +173,8 @@ struct ExecutionEnvironmentInputs<'a> {
 
 fn execution_provenance(
   verifier: &VerifierSpec,
-  authority_revision: &str,
-  revision: &str,
+  authority_id: &AuthorityId,
+  candidate_id: &CandidateId,
   oracle_identity: &OracleIdentity,
 ) -> Result<ExecutionProvenance> {
   let runner = RunnerAttributes {
@@ -182,8 +185,8 @@ fn execution_provenance(
   };
   let identity = execution_environment_identity(
     verifier,
-    authority_revision,
-    revision,
+    authority_id,
+    candidate_id,
     oracle_identity,
     runner,
   )?;
@@ -199,18 +202,17 @@ fn execution_provenance(
 
 fn execution_environment_identity(
   verifier: &VerifierSpec,
-  authority_revision: &str,
-  revision: &str,
+  authority_id: &AuthorityId,
+  candidate_id: &CandidateId,
   oracle_identity: &OracleIdentity,
   runner: RunnerAttributes<'_>,
 ) -> Result<String> {
   let mut tenet_inputs = BTreeMap::from([
-    ("TENET_AUTHORITY_REVISION", authority_revision),
-    ("TENET_CANDIDATE_REVISION", revision),
+    ("TENET_AUTHORITY_ID", authority_id.0.0.as_str()),
+    ("TENET_CANDIDATE_ID", candidate_id.0.0.as_str()),
   ]);
   if verifier.authority == VerifierAuthority::AuthoritySnapshot {
-    // The temporary path varies by run; its candidate-tree content is deterministically bound to R.
-    tenet_inputs.insert("TENET_CANDIDATE_ROOT_CONTENT_REVISION", revision);
+    tenet_inputs.insert("TENET_CANDIDATE_ROOT_CONTENT_ID", candidate_id.0.0.as_str());
   }
   canonical_digest(&ExecutionEnvironmentInputs {
     schema_version: 1,
@@ -306,16 +308,28 @@ mod tests {
   use std::collections::{BTreeMap, BTreeSet};
 
   use tenet_domain::{
-    evidence::OracleIdentity,
+    evidence::{AuthorityId, CandidateId, ContentObjectId, OracleIdentity},
     policy::{EnvironmentMode, VerifierAuthority, VerifierSpec},
   };
 
   use super::{RunnerAttributes, execution_environment_identity};
 
+  fn authority_id() -> AuthorityId {
+    AuthorityId(ContentObjectId(
+      "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+    ))
+  }
+
+  fn candidate_id() -> CandidateId {
+    CandidateId(ContentObjectId(
+      "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+    ))
+  }
+
   fn fixture() -> (VerifierSpec, OracleIdentity) {
     let verifier = VerifierSpec {
       id: "quality".into(),
-      argv: vec!["/usr/bin/true".into()],
+      argv: vec!["quality".into()],
       cwd: ".".into(),
       timeout_seconds: 1,
       max_output_bytes: 1024,
@@ -326,7 +340,7 @@ mod tests {
     };
     let oracle = OracleIdentity::Project {
       verifier_id: "quality".into(),
-      candidate_revision: "candidate".into(),
+      candidate_id: candidate_id(),
       definition_digest: "sha256:definition".into(),
     };
     (verifier, oracle)
@@ -341,10 +355,12 @@ mod tests {
       os: "os",
       architecture: "arch",
     };
+    let authority = authority_id();
+    let candidate = candidate_id();
     let first =
-      execution_environment_identity(&verifier, "authority", "candidate", &oracle, runner).unwrap();
+      execution_environment_identity(&verifier, &authority, &candidate, &oracle, runner).unwrap();
     let second =
-      execution_environment_identity(&verifier, "authority", "candidate", &oracle, runner).unwrap();
+      execution_environment_identity(&verifier, &authority, &candidate, &oracle, runner).unwrap();
     assert_eq!(first, second);
   }
 
@@ -383,11 +399,12 @@ mod tests {
         architecture: "other-arch",
       },
     ];
+    let authority = authority_id();
+    let candidate = candidate_id();
     let identities = runners
       .into_iter()
       .map(|runner| {
-        execution_environment_identity(&verifier, "authority", "candidate", &oracle, runner)
-          .unwrap()
+        execution_environment_identity(&verifier, &authority, &candidate, &oracle, runner).unwrap()
       })
       .collect::<BTreeSet<_>>();
     assert_eq!(identities.len(), runners.len());

@@ -10,20 +10,33 @@ use tenet_domain::{
     OracleAssuranceContract, Requirement, RequirementId, VerificationObligation,
   },
   evidence::{
-    ArtifactAuthority, ArtifactProvenance, ArtifactValidity, DependencySurface, EvidenceArtifact,
-    EvidenceEffect, ExecutionEnvironmentIdentity, ExecutionProvenance, GitObjectId, OracleIdentity,
-    RunnerIdentity, VerifierEvidence, VerifierObservation,
+    ArtifactAuthority, ArtifactProvenance, ArtifactValidity, AuthorityId, CandidateId,
+    ContentObjectId, DependencySurface, EvidenceArtifact, EvidenceEffect,
+    ExecutionEnvironmentIdentity, ExecutionProvenance, OracleIdentity, RunnerIdentity,
+    VerifierEvidence, VerifierObservation,
   },
-  policy::{EnvironmentMode, RepositoryConfig, VerifierAuthority, VerifierSpec},
+  policy::{EnvironmentMode, ProjectConfig, VerifierAuthority, VerifierSpec},
 };
+
+fn content(label: &str) -> ContentObjectId {
+  ContentObjectId(format!("sha256:{label:0<64}"))
+}
+
+fn authority_id() -> AuthorityId {
+  AuthorityId(content("authority"))
+}
+
+fn candidate_id() -> CandidateId {
+  CandidateId(content("candidate"))
+}
 
 fn snapshot_oracle(path: &str, object: &str) -> OracleIdentity {
   OracleIdentity::AuthoritySnapshot {
     verifier_id: path.into(),
-    authority_revision: "authority".into(),
+    authority_id: authority_id(),
     bundle_path: path.into(),
-    bundle_object_id: GitObjectId(object.into()),
-    executable_object_id: GitObjectId(format!("executable-{object}")),
+    bundle_content_id: content(object),
+    executable_content_id: content(&format!("executable-{object}")),
     definition_digest: format!("sha256:{path}"),
   }
 }
@@ -31,7 +44,7 @@ fn snapshot_oracle(path: &str, object: &str) -> OracleIdentity {
 fn project_oracle() -> OracleIdentity {
   OracleIdentity::Project {
     verifier_id: "quality".into(),
-    candidate_revision: "revision".into(),
+    candidate_id: candidate_id(),
     definition_digest: "sha256:quality".into(),
   }
 }
@@ -69,8 +82,8 @@ fn verifier_evidence(
 ) -> VerifierEvidence {
   VerifierEvidence {
     obligation_id: ObligationId("REQ-001/VO-001".into()),
-    authority_revision: "authority".into(),
-    revision: "revision".into(),
+    authority_id: authority_id(),
+    candidate_id: candidate_id(),
     verifier_id: verifier_id.into(),
     policy_digest: "policy".into(),
     spec_digest: "spec".into(),
@@ -81,7 +94,7 @@ fn verifier_evidence(
     execution: execution(EnvironmentMode::Ambient),
     effect,
     validity: ArtifactValidity::Valid,
-    dependency_surface: DependencySurface::RepositoryWide,
+    dependency_surface: DependencySurface::CandidateSnapshot,
     observation: VerifierObservation {
       exit_code: Some(0),
       stdout: String::new(),
@@ -95,7 +108,7 @@ fn fixture(
   with_assurance: bool,
 ) -> (
   AdmittedContract,
-  RepositoryConfig,
+  ProjectConfig,
   BTreeMap<String, OracleIdentity>,
   EvidenceArtifact,
   EvidenceArtifact,
@@ -131,7 +144,7 @@ fn fixture(
       }],
     }],
   };
-  let policy = RepositoryConfig {
+  let policy = ProjectConfig {
     version: 1,
     spec_path: "SPEC.md".into(),
     verifiers: vec![
@@ -173,15 +186,17 @@ fn fixture(
 
 fn derive_with(
   contract: &AdmittedContract,
-  policy: &RepositoryConfig,
+  policy: &ProjectConfig,
   oracle_identities: &BTreeMap<String, OracleIdentity>,
   infrastructure_errors: &BTreeMap<String, String>,
   evidence: &[EvidenceArtifact],
 ) -> tenet_domain::completion::ObligationResult {
+  let authority_id = authority_id();
+  let candidate_id = candidate_id();
   derive_obligation_state(
     &DerivationContext {
-      authority_revision: "authority",
-      revision: "revision",
+      authority_id: &authority_id,
+      candidate_id: &candidate_id,
       spec_digest: "spec",
       contract_digest: "contract",
       policy_digest: "policy",
@@ -333,7 +348,7 @@ fn changed_primary_oracle_invalidates_prior_assurance() {
 #[test]
 fn stale_primary_binding_cannot_satisfy() {
   let (contract, policy, oracles, mut claim, _) = fixture(false);
-  evidence_mut(&mut claim).authority_revision = "other".into();
+  evidence_mut(&mut claim).authority_id = AuthorityId(content("other"));
   let result = derive_with(&contract, &policy, &oracles, &BTreeMap::new(), &[claim]);
   assert_eq!(result.state, ObligationState::Stale);
 }

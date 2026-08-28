@@ -1,7 +1,7 @@
-//! Repository-backed Tenet application operations.
+//! Project-directory Tenet application operations.
 
 pub mod application;
 mod audit;
-mod repository;
+mod project;
 pub mod response;
 mod verifier;

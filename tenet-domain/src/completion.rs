@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
   contract::{AdmittedContract, ObligationId},
   evidence::{
-    ArtifactProvenance, ArtifactValidity, EvidenceArtifact, EvidenceEffect, OracleIdentity,
-    VerifierEvidence,
+    ArtifactProvenance, ArtifactValidity, AuthorityId, CandidateId, EvidenceArtifact,
+    EvidenceEffect, OracleIdentity, VerifierEvidence,
   },
   policy::{VerificationPolicy, VerifierAuthority},
 };
@@ -36,12 +36,10 @@ pub enum Verdict {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockerCode {
-  RepositoryNotInitialized,
+  ProjectNotInitialized,
   ContractMissing,
-  SpecificationChanged,
-  PolicyChanged,
-  AuthorityRevisionNotAncestor,
-  AuthoritySurfaceChanged,
+  SpecificationStale,
+  PolicyStale,
   VerifierNotConfigured,
   MissingEvidence,
   ContradictionObserved,
@@ -74,8 +72,8 @@ pub struct ObligationResult {
 }
 
 pub struct DerivationContext<'a> {
-  pub authority_revision: &'a str,
-  pub revision: &'a str,
+  pub authority_id: &'a AuthorityId,
+  pub candidate_id: &'a CandidateId,
   pub spec_digest: &'a str,
   pub contract_digest: &'a str,
   pub policy_digest: &'a str,
@@ -354,8 +352,8 @@ fn evaluate<'a>(
   let mut saw_contradiction = false;
   let mut saw_inconclusive = false;
   for artifact in artifacts {
-    let binding_matches = artifact.authority_revision == context.authority_revision
-      && artifact.revision == context.revision
+    let binding_matches = &artifact.authority_id == context.authority_id
+      && &artifact.candidate_id == context.candidate_id
       && artifact.spec_digest == context.spec_digest
       && artifact.contract_digest == context.contract_digest
       && artifact.policy_digest == context.policy_digest

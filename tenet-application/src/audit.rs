@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tenet_domain::evidence::EvidenceArtifact;
 
-use crate::{repository::atomic_write, response::GateResult};
+use crate::{project::atomic_write, response::GateResult};
 
 const AUDIT_SCHEMA_VERSION: u32 = 1;
 
@@ -18,7 +18,7 @@ pub struct AuditState {
 
 impl AuditState {
   pub fn load(root: &Path) -> Result<Self> {
-    let path = root.join(crate::repository::STATE_PATH);
+    let path = root.join(crate::project::STATE_PATH);
     if !path.exists() {
       return Ok(Self::empty());
     }
@@ -45,6 +45,6 @@ impl AuditState {
   pub fn save(&self, root: &Path) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(self)?;
     bytes.push(b'\n');
-    atomic_write(&root.join(crate::repository::STATE_PATH), &bytes)
+    atomic_write(&root.join(crate::project::STATE_PATH), &bytes)
   }
 }
