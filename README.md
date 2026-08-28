@@ -141,7 +141,7 @@ The primary verifier produces claim evidence. Every listed assurance verifier mu
 
 ### 3. Propose a completion contract
 
-The coding agent obtains the proposal schema from `tenet_contract_schema`, constructs a typed proposal, and submits it with `tenet_contract_propose`. A proposal binds claims and obligations to verifier IDs already present in repository policy; it cannot introduce executable commands.
+The coding agent obtains the semantic proposal input schema from `tenet_contract_schema`, then submits those fields with `tenet_contract_propose`. Tenet assigns the canonical persisted `schemaVersion` of `1`; agents never supply it. A proposal binds claims and obligations to verifier IDs already present in repository policy; it cannot introduce executable commands.
 
 Tenet returns an exact proposal ID and deterministic digest. `pending_approval` does not admit the contract.
 

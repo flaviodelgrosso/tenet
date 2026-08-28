@@ -3,7 +3,7 @@ name: tenet
 description: Use when the user asks to use Tenet or completion is governed by a Tenet contract.
 compatibility: Requires Tenet MCP tools and Git.
 metadata:
-  tenet-skill-version: "6"
+  tenet-skill-version: "1"
 ---
 
 # Tenet workflow

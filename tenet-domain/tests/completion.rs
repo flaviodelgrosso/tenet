@@ -107,7 +107,7 @@ fn fixture(
     authority: VerifierAuthority::AuthoritySnapshot,
   };
   let contract = AdmittedContract {
-    schema_version: 2,
+    schema_version: 1,
     proposal_id: "proposal-1".into(),
     proposal_digest: "proposal".into(),
     spec_digest: "spec".into(),

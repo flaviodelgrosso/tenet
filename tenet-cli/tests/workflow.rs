@@ -205,7 +205,6 @@ impl Repository {
 
   fn propose_and_approve_with_authority(&self, status: &Value, authority: &str) -> Value {
     let proposal = json!({
-      "schemaVersion": 2,
       "specDigest": status["specDigest"],
       "policyDigest": status["policyDigest"],
       "requirements": [{
@@ -627,7 +626,6 @@ fn proposal_cannot_introduce_an_unknown_verifier() {
   repository.init();
   let status = repository.configure(&["/usr/bin/true"]);
   let proposal = json!({
-    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -665,7 +663,6 @@ fn proposal_rejects_verifier_authority_mismatch() {
   repository.init();
   let status = repository.configure(&["/usr/bin/true"]);
   let proposal = json!({
-    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -1002,7 +999,6 @@ authority = "project"
   .unwrap();
   let status = success_json(repository.status());
   let proposal = json!({
-    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -1179,11 +1175,10 @@ fn candidate_symlink_cannot_escape_verifier_working_directory() {
 }
 
 #[test]
-fn disposable_legacy_audit_state_does_not_block_a_new_gate() {
+fn disposable_malformed_audit_state_does_not_block_a_new_gate() {
   let repository = Repository::new();
   let revision = repository.admitted(&["/usr/bin/true"]);
-  let legacy = json!({
-    "schemaVersion": 3,
+  let malformed = json!({
     "evidence": [],
     "gates": [{
       "schemaVersion": 1,
@@ -1198,7 +1193,7 @@ fn disposable_legacy_audit_state_does_not_block_a_new_gate() {
   });
   fs::write(
     repository.path().join(".tenet/state.json"),
-    serde_json::to_vec_pretty(&legacy).unwrap(),
+    serde_json::to_vec_pretty(&malformed).unwrap(),
   )
   .unwrap();
 
@@ -1250,7 +1245,6 @@ fn approval_requires_the_exact_proposal_identity_and_digest() {
   repository.init();
   let status = repository.configure(&["/usr/bin/true"]);
   let proposal = json!({
-    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -1289,7 +1283,6 @@ fn approval_revalidates_pending_proposals_after_specification_or_policy_changes(
     repository.init();
     let status = repository.configure(&["/usr/bin/true"]);
     let proposal = json!({
-      "schemaVersion": 2,
       "specDigest": status["specDigest"],
       "policyDigest": status["policyDigest"],
       "requirements": [{
@@ -1410,7 +1403,6 @@ authority = "project"
   .unwrap();
   let status = success_json(repository.status());
   let proposal = json!({
-    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -1470,7 +1462,6 @@ oracle_path = "oracles/quality/"
   .unwrap();
   let status = success_json(repository.status());
   let proposal = json!({
-    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -1511,7 +1502,6 @@ fn nested_assurance_contract_is_rejected() {
   repository.init();
   let status = repository.configure(&["/usr/bin/true"]);
   let proposal = json!({
-    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -1571,7 +1561,6 @@ oracle_path = "oracles/assurance"
   .unwrap();
   let status = success_json(repository.status());
   let proposal = json!({
-    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -1681,7 +1670,6 @@ oracle_path = "oracles/missing"
   .unwrap();
   let status = success_json(repository.status());
   let proposal = json!({
-    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{
@@ -1751,7 +1739,6 @@ oracle_path = "oracles/quality"
   .unwrap();
   let status = success_json(repository.status());
   let proposal = json!({
-    "schemaVersion": 2,
     "specDigest": status["specDigest"],
     "policyDigest": status["policyDigest"],
     "requirements": [{

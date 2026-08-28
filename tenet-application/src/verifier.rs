@@ -213,7 +213,7 @@ fn execution_environment_identity(
     tenet_inputs.insert("TENET_CANDIDATE_ROOT_CONTENT_REVISION", revision);
   }
   canonical_digest(&ExecutionEnvironmentInputs {
-    schema_version: 2,
+    schema_version: 1,
     runner,
     environment_mode: verifier.environment_mode,
     configured_environment: &verifier.env,

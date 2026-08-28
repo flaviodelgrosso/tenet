@@ -12,7 +12,9 @@ use tenet_domain::{
     Blocker, BlockerCode, DerivationContext, ObligationState, Verdict, derive_completion,
     derive_obligation_state,
   },
-  contract::{AdmittedContract, ContractProposal, ProposalRecord, validate_proposal},
+  contract::{
+    AdmittedContract, ContractProposal, ContractProposalInput, ProposalRecord, validate_proposal,
+  },
   digest::{bytes_digest, canonical_digest},
   evidence::{
     ArtifactAuthority, ArtifactProvenance, ArtifactValidity, DependencySurface, EvidenceArtifact,
@@ -81,15 +83,15 @@ impl Tenet {
   }
 
   pub fn contract_schema(&self) -> Schema {
-    schema_for!(ContractProposal)
+    schema_for!(ContractProposalInput)
   }
 
   pub fn policy_schema(&self) -> Schema {
     schema_for!(RepositoryConfig)
   }
 
-  pub fn propose(&self, proposal: ContractProposal) -> Result<ProposalResult> {
-    propose(&self.cwd, proposal)
+  pub fn propose(&self, input: ContractProposalInput) -> Result<ProposalResult> {
+    propose(&self.cwd, input.into())
   }
 
   pub fn approve(&self, request: &ApproveRequest) -> Result<ApprovalResult> {

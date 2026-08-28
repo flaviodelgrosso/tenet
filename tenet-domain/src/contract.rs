@@ -8,16 +8,30 @@ use crate::policy::{VerificationPolicy, VerifierAuthority};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
-pub struct RequirementId(pub String);
+pub struct RequirementId(#[schemars(length(min = 1))] pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
-pub struct ObligationId(pub String);
+pub struct ObligationId(#[schemars(length(min = 1))] pub String);
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
-pub struct AssuranceId(pub String);
+pub struct AssuranceId(#[schemars(length(min = 1))] pub String);
+
+pub const CONTRACT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContractProposalInput {
+  #[schemars(length(min = 1))]
+  pub spec_digest: String,
+  #[schemars(length(min = 1))]
+  pub policy_digest: String,
+  #[schemars(length(min = 1))]
+  pub requirements: Vec<Requirement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContractProposal {
   pub schema_version: u32,
@@ -26,11 +40,24 @@ pub struct ContractProposal {
   pub requirements: Vec<Requirement>,
 }
 
+impl From<ContractProposalInput> for ContractProposal {
+  fn from(input: ContractProposalInput) -> Self {
+    Self {
+      schema_version: CONTRACT_SCHEMA_VERSION,
+      spec_digest: input.spec_digest,
+      policy_digest: input.policy_digest,
+      requirements: input.requirements,
+    }
+  }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Requirement {
   pub id: RequirementId,
+  #[schemars(length(min = 1))]
   pub statement: String,
+  #[schemars(length(min = 1))]
   pub obligations: Vec<VerificationObligation>,
 }
 
@@ -38,6 +65,7 @@ pub struct Requirement {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VerificationObligation {
   pub id: ObligationId,
+  #[schemars(length(min = 1))]
   pub statement: String,
   pub evidence_contract: EvidenceContract,
 }
@@ -53,6 +81,7 @@ pub struct EvidenceContract {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimEvidenceContract {
+  #[schemars(length(min = 1))]
   pub verifier_id: String,
   pub authority: VerifierAuthority,
 }
@@ -61,7 +90,9 @@ pub struct ClaimEvidenceContract {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OracleAssuranceContract {
   pub id: AssuranceId,
+  #[schemars(length(min = 1))]
   pub criterion: String,
+  #[schemars(length(min = 1))]
   pub verifier_id: String,
   pub authority: VerifierAuthority,
 }
@@ -154,7 +185,7 @@ pub fn validate_proposal(
   proposal: &ContractProposal,
   policy: &VerificationPolicy,
 ) -> Result<(), ContractError> {
-  if proposal.schema_version != 2 {
+  if proposal.schema_version != CONTRACT_SCHEMA_VERSION {
     return Err(ContractError::UnsupportedVersion(proposal.schema_version));
   }
   if proposal.requirements.is_empty() {

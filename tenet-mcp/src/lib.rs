@@ -10,7 +10,7 @@ use tenet_application::{
   application::{ApproveRequest, EvidenceRequest, GateRequest, Tenet},
   response::{ApprovalResult, EvidenceResult, GateResult, ProposalResult, StatusResult},
 };
-use tenet_domain::contract::ContractProposal;
+use tenet_domain::contract::ContractProposalInput;
 use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
@@ -55,7 +55,7 @@ impl TenetMcp {
 
   #[tool(
     name = "tenet_contract_schema",
-    description = "Return the authoritative completion-contract proposal schema generated from Tenet's Rust ContractProposal type."
+    description = "Return the Rust-derived schema for semantic fields agents supply to tenet_contract_propose. Tenet assigns canonical persisted fields such as schemaVersion internally."
   )]
   async fn contract_schema(&self) -> Json<Schema> {
     Json(self.tenet.contract_schema())
@@ -71,11 +71,11 @@ impl TenetMcp {
 
   #[tool(
     name = "tenet_contract_propose",
-    description = "Validate and store a typed completion-contract proposal bound to the current specification and policy. Returns its exact deterministic proposal ID and digest pending human approval."
+    description = "Validate and store a completion-contract proposal bound to the current specification and policy. Supply the semantic proposal fields from tenet_contract_schema; Tenet assigns its canonical schema version. Returns its exact deterministic proposal ID and digest pending human approval."
   )]
   async fn contract_propose(
     &self,
-    Parameters(proposal): Parameters<ContractProposal>,
+    Parameters(proposal): Parameters<ContractProposalInput>,
   ) -> Result<Json<ProposalResult>, String> {
     self
       .run_operation(move |tenet| tenet.propose(proposal))

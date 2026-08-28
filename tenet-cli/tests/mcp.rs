@@ -107,7 +107,6 @@ impl Repository {
 
   fn proposal(&self, status: &Value) -> Value {
     json!({
-      "schemaVersion": 2,
       "specDigest": status["specDigest"],
       "policyDigest": status["policyDigest"],
       "requirements": [{
@@ -261,6 +260,18 @@ fn stdio_server_discovers_all_tenet_tools_with_required_fields() {
     .find(|tool| tool["name"] == "tenet_evidence")
     .expect("evidence tool");
   assert_eq!(evidence["inputSchema"]["required"], json!(["revision"]));
+  let propose = tools
+    .iter()
+    .find(|tool| tool["name"] == "tenet_contract_propose")
+    .expect("proposal tool");
+  let proposal_properties = propose["inputSchema"]["properties"]
+    .as_object()
+    .expect("proposal input properties");
+  assert!(!proposal_properties.contains_key("schemaVersion"));
+  assert_eq!(
+    propose["inputSchema"]["required"],
+    json!(["specDigest", "policyDigest", "requirements"])
+  );
   let approve = tools
     .iter()
     .find(|tool| tool["name"] == "tenet_contract_approve")
@@ -274,12 +285,20 @@ fn stdio_server_discovers_all_tenet_tools_with_required_fields() {
 }
 
 #[test]
-fn schema_tools_return_canonical_rust_derived_shapes() {
+fn schema_tools_return_agent_constructible_rust_derived_shapes() {
   let repository = Repository::new();
-  let contract = repository.mcp_tool("tenet_contract_schema", json!({}));
+  let contract = structured(&repository.mcp_tool("tenet_contract_schema", json!({}))).clone();
+  assert!(
+    !contract["properties"]
+      .as_object()
+      .expect("properties")
+      .contains_key("schemaVersion")
+  );
+  assert_eq!(contract["properties"]["requirements"]["type"], "array");
+  assert_eq!(contract["properties"]["requirements"]["minItems"], 1);
   assert_eq!(
-    structured(&contract)["properties"]["requirements"]["type"],
-    "array"
+    contract["$defs"]["Requirement"]["properties"]["obligations"]["minItems"],
+    1
   );
   let policy = repository.mcp_tool("tenet_policy_schema", json!({}));
   assert!(
@@ -320,7 +339,7 @@ fn contract_proposal_is_deterministic_through_mcp() {
 }
 
 #[test]
-fn post_initialization_workflow_runs_through_mcp() {
+fn proposal_input_schema_succeeds_without_agent_version_selection() {
   let repository = Repository::new();
   repository.initialize();
   fs::write(
@@ -333,27 +352,36 @@ fn post_initialization_workflow_runs_through_mcp() {
   let proposed = repository.mcp_tool("tenet_contract_propose", proposal);
   let proposal_id = structured(&proposed)["proposalId"].clone();
   let proposal_digest = structured(&proposed)["proposalDigest"].clone();
+  let pending_path = fs::read_dir(repository.path().join(".tenet/proposals"))
+    .expect("read pending proposals")
+    .next()
+    .expect("stored proposal")
+    .expect("read stored proposal")
+    .path();
+  let pending: Value = serde_json::from_slice(&fs::read(pending_path).expect("read proposal"))
+    .expect("parse proposal");
+  assert_eq!(pending["schemaVersion"], 1);
   let approved = repository.mcp_tool(
     "tenet_contract_approve",
     json!({ "proposalId": proposal_id, "proposalDigest": proposal_digest }),
   );
   assert_eq!(structured(&approved)["proposalId"], proposal_id);
+  let contract: Value = serde_json::from_slice(
+    &fs::read(repository.path().join(".tenet/contract.json")).expect("read contract"),
+  )
+  .expect("parse contract");
+  assert_eq!(contract["schemaVersion"], 1);
   let authority = repository.commit("admit contract through MCP");
-  fs::write(repository.path().join("implementation.txt"), "complete\n")
-    .expect("write implementation");
-  let revision = repository.commit("implement contract");
   let gate = repository.mcp_tool(
     "tenet_gate",
-    json!({ "authorityRevision": authority, "revision": revision }),
+    json!({ "authorityRevision": authority, "revision": authority }),
   );
   assert_eq!(structured(&gate)["verdict"], "done");
-  let evidence = repository.mcp_tool("tenet_evidence", json!({ "revision": revision }));
-  assert!(
-    !structured(&evidence)["artifacts"]
-      .as_array()
-      .expect("evidence artifacts")
-      .is_empty()
-  );
+  let audit: Value = serde_json::from_slice(
+    &fs::read(repository.path().join(".tenet/state.json")).expect("read audit state"),
+  )
+  .expect("parse audit state");
+  assert_eq!(audit["schemaVersion"], 1);
 }
 
 #[test]
