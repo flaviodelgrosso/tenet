@@ -55,7 +55,7 @@ impl TenetMcp {
 
   #[tool(
     name = "tenet_contract_schema",
-    description = "Return the Rust-derived schema for semantic fields agents supply to tenet_contract_propose. Tenet assigns canonical persisted fields such as schemaVersion internally."
+    description = "Return the Rust-derived schema for semantic fields agents supply to tenet_contract_propose. Callers reference verifier IDs only; Tenet derives canonical verifier authorities from policy."
   )]
   async fn contract_schema(&self) -> Json<Schema> {
     Json(self.tenet.contract_schema())
@@ -71,7 +71,7 @@ impl TenetMcp {
 
   #[tool(
     name = "tenet_contract_propose",
-    description = "Validate and store a completion-contract proposal bound to the current specification and policy. Supply the semantic proposal fields from tenet_contract_schema; Tenet assigns its canonical schema version. Returns its exact deterministic proposal ID and digest pending human approval."
+    description = "Validate and store a completion-contract proposal bound to the current specification and policy. Tenet derives verifier authorities from policy and returns the exact persisted canonical proposal, deterministic verification profile, warnings, proposal ID, and digest for human approval."
   )]
   async fn contract_propose(
     &self,
@@ -85,7 +85,7 @@ impl TenetMcp {
 
   #[tool(
     name = "tenet_contract_approve",
-    description = "Admit the exact pending proposal identified by proposalId and proposalDigest. MUST NOT be called unless the human explicitly approved that exact current proposal after seeing its ID, digest, requirements, obligations, verifier mappings, and assurances. Silence, generic acknowledgement, or approval of an earlier proposal is not approval. Tenet revalidates identity, digest, specification, policy, and contract semantics before admission."
+    description = "Admit the exact pending proposal identified by proposalId and proposalDigest. MUST NOT be called unless the human explicitly approved that exact current proposal after seeing Tenet's returned canonical proposal, ID, digest, verifier mappings, verification profile, and warnings. Silence, generic acknowledgement, or approval of an earlier proposal is not approval. Tenet revalidates identity, digest, specification, policy, and contract semantics before admission."
   )]
   async fn contract_approve(
     &self,

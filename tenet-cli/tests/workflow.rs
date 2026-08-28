@@ -200,10 +200,6 @@ impl Repository {
   }
 
   fn propose_and_approve(&self, status: &Value) -> Value {
-    self.propose_and_approve_with_authority(status, "project")
-  }
-
-  fn propose_and_approve_with_authority(&self, status: &Value, authority: &str) -> Value {
     let proposal = json!({
       "specDigest": status["specDigest"],
       "policyDigest": status["policyDigest"],
@@ -213,11 +209,11 @@ impl Repository {
         "obligations": [{
           "id": "REQ-001/VO-001",
           "statement": "The configured verifier succeeds",
-          "evidenceContract": { "claim": { "verifierId": "quality", "authority": authority } }
+          "evidenceContract": { "claim": { "verifierId": "quality" } }
         }, {
           "id": "REQ-001/VO-002",
           "statement": "The configured verifier confirms the candidate",
-          "evidenceContract": { "claim": { "verifierId": "quality", "authority": authority } }
+          "evidenceContract": { "claim": { "verifierId": "quality" } }
         }]
       }]
     });
@@ -545,10 +541,12 @@ fn generated_skill_is_portable_concise_and_not_authoritative() {
   assert!(skill.starts_with("---\nname: tenet\n"));
   assert!(skill.contains("`tenet init` is the only user-facing CLI workflow"));
   assert!(skill.contains("interact with Tenet only through its semantic MCP tools"));
-  assert!(skill.contains("present the exact proposal ID and digest"));
-  assert!(skill.contains("every requirement and obligation ID and statement"));
-  assert!(skill.contains("every primary verifier and authority mapping"));
-  assert!(skill.contains("every oracle-assurance ID, criterion, verifier, and authority mapping"));
+  assert!(skill.contains("present the exact canonical proposal returned by Tenet"));
+  assert!(skill.contains("without reconstructing it from agent memory"));
+  assert!(skill.contains("its proposal ID and digest"));
+  assert!(skill.contains("every primary and oracle-assurance verifier mapping"));
+  assert!(skill.contains("the complete verification profile"));
+  assert!(skill.contains("every Tenet warning"));
   assert!(skill.contains("Never self-approve or infer approval from silence"));
   assert!(skill.contains("Only after explicit approval, call `tenet_contract_approve`"));
   assert!(skill.contains("content, specification, policy, ID, or digest changed"));
@@ -634,7 +632,7 @@ fn proposal_cannot_introduce_an_unknown_verifier() {
       "obligations": [{
         "id": "REQ-001/VO-001",
         "statement": "oracle",
-        "evidenceContract": { "claim": { "verifierId": "agent-selected-shell", "authority": "project" } }
+        "evidenceContract": { "claim": { "verifierId": "agent-selected-shell" } }
       }]
     }]
   });
@@ -658,7 +656,7 @@ fn proposal_cannot_introduce_an_unknown_verifier() {
 }
 
 #[test]
-fn proposal_rejects_verifier_authority_mismatch() {
+fn proposal_rejects_caller_selected_verifier_authority() {
   let repository = Repository::new();
   repository.init();
   let status = repository.configure(&["/usr/bin/true"]);
@@ -685,7 +683,7 @@ fn proposal_rejects_verifier_authority_mismatch() {
     error["message"]
       .as_str()
       .unwrap()
-      .contains("requires verifier authority")
+      .contains("unknown field `authority`")
   );
 }
 
@@ -901,7 +899,7 @@ fn authority_snapshot_oracle_runs_from_authority_and_records_git_identity() {
   );
   let status =
     repository.configure_with_authority(&["verify"], "authority_snapshot", Some("oracles/quality"));
-  repository.propose_and_approve_with_authority(&status, "authority_snapshot");
+  repository.propose_and_approve(&status);
   let authority_revision = repository.commit("admit authority snapshot oracle");
   fs::write(repository.path().join("implemented.txt"), "implemented\n").unwrap();
   let revision = repository.commit("implement required behavior");
@@ -960,7 +958,7 @@ fn candidate_cannot_alter_authority_snapshot_oracle_that_authorizes_done() {
   write_executable(&executable, "#!/bin/sh\nexit 1\n");
   let status =
     repository.configure_with_authority(&["verify"], "authority_snapshot", Some("oracles/quality"));
-  repository.propose_and_approve_with_authority(&status, "authority_snapshot");
+  repository.propose_and_approve(&status);
   let authority_revision = repository.commit("admit rejecting authority oracle");
   write_executable(&executable, "#!/bin/sh\nexit 0\n");
   let revision = repository.commit("candidate replaces oracle");
@@ -1007,11 +1005,11 @@ authority = "project"
       "obligations": [{
         "id": "REQ-001/VO-001",
         "statement": "first verifier runs",
-        "evidenceContract": { "claim": { "verifierId": "contaminator", "authority": "project" } }
+        "evidenceContract": { "claim": { "verifierId": "contaminator" } }
       }, {
         "id": "REQ-001/VO-002",
         "statement": "second verifier sees a fresh tree",
-        "evidenceContract": { "claim": { "verifierId": "observer", "authority": "project" } }
+        "evidenceContract": { "claim": { "verifierId": "observer" } }
       }]
     }]
   });
@@ -1253,7 +1251,7 @@ fn approval_requires_the_exact_proposal_identity_and_digest() {
       "obligations": [{
         "id": "REQ-001/VO-001",
         "statement": "oracle",
-        "evidenceContract": { "claim": { "verifierId": "quality", "authority": "project" } }
+        "evidenceContract": { "claim": { "verifierId": "quality" } }
       }]
     }]
   });
@@ -1291,7 +1289,7 @@ fn approval_revalidates_pending_proposals_after_specification_or_policy_changes(
         "obligations": [{
           "id": "REQ-001/VO-001",
           "statement": "oracle",
-          "evidenceContract": { "claim": { "verifierId": "quality", "authority": "project" } }
+          "evidenceContract": { "claim": { "verifierId": "quality" } }
         }]
       }]
     });
@@ -1412,12 +1410,11 @@ authority = "project"
         "id": "REQ-001/VO-001",
         "statement": "quality passes",
         "evidenceContract": {
-          "claim": { "verifierId": "quality", "authority": "project" },
-          "assurances": [{
+          "claim": { "verifierId": "quality" },
+          "oracleAssurances": [{
             "id": "ASSURE-001",
             "criterion": "the primary oracle rejects a seeded defect",
-            "verifierId": "candidate-assurance",
-            "authority": "project"
+            "verifierId": "candidate-assurance"
           }]
         }
       }]
@@ -1471,12 +1468,11 @@ oracle_path = "oracles/quality/"
         "id": "REQ-001/VO-001",
         "statement": "quality passes",
         "evidenceContract": {
-          "claim": { "verifierId": "snapshot-quality", "authority": "authority_snapshot" },
-          "assurances": [{
+          "claim": { "verifierId": "snapshot-quality" },
+          "oracleAssurances": [{
             "id": "ASSURE-001",
             "criterion": "the primary oracle rejects a seeded defect",
-            "verifierId": "same-oracle-assurance",
-            "authority": "authority_snapshot"
+            "verifierId": "same-oracle-assurance"
           }]
         }
       }]
@@ -1511,12 +1507,11 @@ fn nested_assurance_contract_is_rejected() {
         "id": "REQ-001/VO-001",
         "statement": "quality passes",
         "evidenceContract": {
-          "claim": { "verifierId": "quality", "authority": "project" },
-          "assurances": [{
+          "claim": { "verifierId": "quality" },
+          "oracleAssurances": [{
             "id": "ASSURE-001",
             "criterion": "criterion",
             "verifierId": "quality",
-            "authority": "project",
             "assurances": []
           }]
         }
@@ -1570,12 +1565,11 @@ oracle_path = "oracles/assurance"
         "id": "REQ-001/VO-001",
         "statement": "quality passes",
         "evidenceContract": {
-          "claim": { "verifierId": "quality", "authority": "project" },
-          "assurances": [{
+          "claim": { "verifierId": "quality" },
+          "oracleAssurances": [{
             "id": "ASSURE-001",
             "criterion": "the primary oracle rejects a seeded defect",
-            "verifierId": "mutation-assurance",
-            "authority": "authority_snapshot"
+            "verifierId": "mutation-assurance"
           }]
         }
       }]
@@ -1679,12 +1673,11 @@ oracle_path = "oracles/missing"
         "id": "REQ-001/VO-001",
         "statement": "quality passes",
         "evidenceContract": {
-          "claim": { "verifierId": "quality", "authority": "project" },
-          "assurances": [{
+          "claim": { "verifierId": "quality" },
+          "oracleAssurances": [{
             "id": "ASSURE-001",
             "criterion": "the primary oracle rejects a seeded defect",
-            "verifierId": "missing-assurance",
-            "authority": "authority_snapshot"
+            "verifierId": "missing-assurance"
           }]
         }
       }]
@@ -1749,14 +1742,12 @@ oracle_path = "oracles/quality"
         "statement": "quality passes",
         "evidenceContract": {
           "claim": {
-            "verifierId": "snapshot-quality",
-            "authority": "authority_snapshot"
+            "verifierId": "snapshot-quality"
           },
-          "assurances": [{
+          "oracleAssurances": [{
             "id": "ASSURE-001",
             "criterion": "the primary oracle rejects a seeded defect",
-            "verifierId": "same-executable-assurance",
-            "authority": "authority_snapshot"
+            "verifierId": "same-executable-assurance"
           }]
         }
       }]

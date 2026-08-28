@@ -2,6 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tenet_domain::{
   completion::{Blocker, ObligationResult, Verdict},
+  contract::{ContractProposal, ProposalWarning, VerificationProfile},
   evidence::EvidenceArtifact,
 };
 
@@ -33,6 +34,9 @@ pub struct ProposalResult {
   pub proposal_id: String,
   pub proposal_digest: String,
   pub approval_required: bool,
+  pub proposal: ContractProposal,
+  pub verification_profile: VerificationProfile,
+  pub warnings: Vec<ProposalWarning>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

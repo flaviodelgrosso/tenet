@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -28,27 +28,60 @@ pub struct ContractProposalInput {
   #[schemars(length(min = 1))]
   pub policy_digest: String,
   #[schemars(length(min = 1))]
-  pub requirements: Vec<Requirement>,
+  pub requirements: Vec<RequirementInput>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequirementInput {
+  pub id: RequirementId,
+  #[schemars(length(min = 1))]
+  pub statement: String,
+  #[schemars(length(min = 1))]
+  pub obligations: Vec<VerificationObligationInput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VerificationObligationInput {
+  pub id: ObligationId,
+  #[schemars(length(min = 1))]
+  pub statement: String,
+  pub evidence_contract: EvidenceContractInput,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceContractInput {
+  pub claim: ClaimEvidenceContractInput,
+  #[serde(default)]
+  pub oracle_assurances: Vec<OracleAssuranceContractInput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaimEvidenceContractInput {
+  #[schemars(length(min = 1))]
+  pub verifier_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OracleAssuranceContractInput {
+  pub id: AssuranceId,
+  #[schemars(length(min = 1))]
+  pub criterion: String,
+  #[schemars(length(min = 1))]
+  pub verifier_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContractProposal {
   pub schema_version: u32,
   pub spec_digest: String,
   pub policy_digest: String,
   pub requirements: Vec<Requirement>,
-}
-
-impl From<ContractProposalInput> for ContractProposal {
-  fn from(input: ContractProposalInput) -> Self {
-    Self {
-      schema_version: CONTRACT_SCHEMA_VERSION,
-      spec_digest: input.spec_digest,
-      policy_digest: input.policy_digest,
-      requirements: input.requirements,
-    }
-  }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -135,6 +168,40 @@ impl AdmittedContract {
     self.requirements.iter().flat_map(|item| &item.obligations)
   }
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VerificationProfile {
+  pub obligation_count: usize,
+  pub primary_verifier_count: usize,
+  pub configured_verifier_count: usize,
+  pub used_verifier_count: usize,
+  pub project_authority_obligations: usize,
+  pub authority_snapshot_obligations: usize,
+  pub oracle_assured_obligations: usize,
+  pub oracle_assurance_count: usize,
+  pub primary_verifier_obligations: BTreeMap<String, usize>,
+  pub unused_configured_verifiers: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProposalWarningCode {
+  ProjectOracleOnly,
+  OracleConcentration,
+  NoOracleAssurance,
+  UnusedVerifier,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProposalWarning {
+  pub code: ProposalWarningCode,
+  pub message: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub verifier_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub affected_obligation_count: Option<usize>,
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ContractError {
@@ -179,6 +246,166 @@ pub enum ContractError {
   },
   #[error("proposal contains no requirements")]
   MissingRequirements,
+}
+pub fn canonicalize_proposal(
+  input: ContractProposalInput,
+  policy: &VerificationPolicy,
+) -> Result<ContractProposal, ContractError> {
+  let mut requirements = Vec::with_capacity(input.requirements.len());
+  for requirement in input.requirements {
+    let mut obligations = Vec::with_capacity(requirement.obligations.len());
+    for obligation in requirement.obligations {
+      let primary = configured_verifier(
+        &obligation.id.0,
+        &obligation.evidence_contract.claim.verifier_id,
+        policy,
+      )?;
+      let claim = ClaimEvidenceContract {
+        verifier_id: obligation.evidence_contract.claim.verifier_id,
+        authority: primary.authority,
+      };
+      let mut assurances = Vec::with_capacity(obligation.evidence_contract.oracle_assurances.len());
+      for assurance in obligation.evidence_contract.oracle_assurances {
+        let verifier = configured_verifier(&obligation.id.0, &assurance.verifier_id, policy)?;
+        if verifier.authority != VerifierAuthority::AuthoritySnapshot {
+          return Err(ContractError::AssuranceNotIndependent {
+            obligation: obligation.id.0,
+            assurance: assurance.id.0,
+          });
+        }
+        assurances.push(OracleAssuranceContract {
+          id: assurance.id,
+          criterion: assurance.criterion,
+          verifier_id: assurance.verifier_id,
+          authority: verifier.authority,
+        });
+      }
+      obligations.push(VerificationObligation {
+        id: obligation.id,
+        statement: obligation.statement,
+        evidence_contract: EvidenceContract { claim, assurances },
+      });
+    }
+    requirements.push(Requirement {
+      id: requirement.id,
+      statement: requirement.statement,
+      obligations,
+    });
+  }
+  let proposal = ContractProposal {
+    schema_version: CONTRACT_SCHEMA_VERSION,
+    spec_digest: input.spec_digest,
+    policy_digest: input.policy_digest,
+    requirements,
+  };
+  validate_proposal(&proposal, policy)?;
+  Ok(proposal)
+}
+
+pub fn analyze_verification(
+  proposal: &ContractProposal,
+  policy: &VerificationPolicy,
+) -> (VerificationProfile, Vec<ProposalWarning>) {
+  let mut primary_verifier_obligations = BTreeMap::<String, usize>::new();
+  let mut used_verifiers = BTreeSet::new();
+  let mut obligation_count = 0;
+  let mut project_authority_obligations = 0;
+  let mut authority_snapshot_obligations = 0;
+  let mut oracle_assured_obligations = 0;
+  let mut oracle_assurance_count = 0;
+
+  for requirement in &proposal.requirements {
+    for obligation in &requirement.obligations {
+      obligation_count += 1;
+      let claim = &obligation.evidence_contract.claim;
+      *primary_verifier_obligations
+        .entry(claim.verifier_id.clone())
+        .or_default() += 1;
+      used_verifiers.insert(claim.verifier_id.as_str());
+      match claim.authority {
+        VerifierAuthority::Project => project_authority_obligations += 1,
+        VerifierAuthority::AuthoritySnapshot => authority_snapshot_obligations += 1,
+      }
+      if !obligation.evidence_contract.assurances.is_empty() {
+        oracle_assured_obligations += 1;
+      }
+      oracle_assurance_count += obligation.evidence_contract.assurances.len();
+      used_verifiers.extend(
+        obligation
+          .evidence_contract
+          .assurances
+          .iter()
+          .map(|assurance| assurance.verifier_id.as_str()),
+      );
+    }
+  }
+
+  let unused_configured_verifiers = policy
+    .verifiers
+    .iter()
+    .map(|verifier| verifier.id.as_str())
+    .filter(|verifier| !used_verifiers.contains(verifier))
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>()
+    .into_iter()
+    .collect::<Vec<_>>();
+  let profile = VerificationProfile {
+    obligation_count,
+    primary_verifier_count: primary_verifier_obligations.len(),
+    configured_verifier_count: policy.verifiers.len(),
+    used_verifier_count: used_verifiers.len(),
+    project_authority_obligations,
+    authority_snapshot_obligations,
+    oracle_assured_obligations,
+    oracle_assurance_count,
+    primary_verifier_obligations,
+    unused_configured_verifiers,
+  };
+
+  let mut warnings = Vec::new();
+  if obligation_count > 0 && project_authority_obligations == obligation_count {
+    warnings.push(ProposalWarning {
+      code: ProposalWarningCode::ProjectOracleOnly,
+      message: format!(
+        "All {obligation_count} obligations use project-authority primary verifiers; candidate content may influence both implementation and its primary oracle."
+      ),
+      verifier_id: None,
+      affected_obligation_count: Some(obligation_count),
+    });
+  }
+  if let Some((verifier_id, affected)) = profile
+    .primary_verifier_obligations
+    .iter()
+    .max_by_key(|(_, count)| **count)
+    && affected.saturating_mul(5) >= obligation_count.saturating_mul(4)
+  {
+    warnings.push(ProposalWarning {
+      code: ProposalWarningCode::OracleConcentration,
+      message: format!(
+        "Primary verifier `{verifier_id}` is used by {affected} of {obligation_count} obligations."
+      ),
+      verifier_id: Some(verifier_id.clone()),
+      affected_obligation_count: Some(*affected),
+    });
+  }
+  if oracle_assured_obligations == 0 {
+    warnings.push(ProposalWarning {
+      code: ProposalWarningCode::NoOracleAssurance,
+      message: "No obligation has an authority-snapshot oracle assurance.".into(),
+      verifier_id: None,
+      affected_obligation_count: Some(obligation_count),
+    });
+  }
+  for verifier_id in &profile.unused_configured_verifiers {
+    warnings.push(ProposalWarning {
+      code: ProposalWarningCode::UnusedVerifier,
+      message: format!("Configured verifier `{verifier_id}` is unused by this proposal."),
+      verifier_id: Some(verifier_id.clone()),
+      affected_obligation_count: Some(0),
+    });
+  }
+
+  (profile, warnings)
 }
 
 pub fn validate_proposal(
@@ -269,16 +496,7 @@ fn validate_verifier_mapping<'a>(
   authority: VerifierAuthority,
   policy: &'a VerificationPolicy,
 ) -> Result<&'a crate::policy::VerifierSpec, ContractError> {
-  let Some(verifier) = policy
-    .verifiers
-    .iter()
-    .find(|verifier| verifier.id == verifier_id)
-  else {
-    return Err(ContractError::UnknownVerifier {
-      obligation: obligation.into(),
-      verifier: verifier_id.into(),
-    });
-  };
+  let verifier = configured_verifier(obligation, verifier_id, policy)?;
   if authority != verifier.authority {
     return Err(ContractError::VerifierAuthorityMismatch {
       obligation: obligation.into(),
@@ -288,6 +506,21 @@ fn validate_verifier_mapping<'a>(
     });
   }
   Ok(verifier)
+}
+
+fn configured_verifier<'a>(
+  obligation: &str,
+  verifier_id: &str,
+  policy: &'a VerificationPolicy,
+) -> Result<&'a crate::policy::VerifierSpec, ContractError> {
+  policy
+    .verifiers
+    .iter()
+    .find(|verifier| verifier.id == verifier_id)
+    .ok_or_else(|| ContractError::UnknownVerifier {
+      obligation: obligation.into(),
+      verifier: verifier_id.into(),
+    })
 }
 fn same_relative_path(left: &Option<String>, right: &Option<String>) -> bool {
   match (left, right) {

@@ -116,45 +116,44 @@ Verifier exit semantics:
 
 `authority = "project"` identifies a repository-owned check executed from R, so candidate content may influence both implementation and oracle. `authority = "authority_snapshot"` identifies an oracle bundle loaded from A and executed with R only as explicit candidate input. It establishes provenance and candidate independence of the admitted oracle bundle; it does not establish oracle adequacy, protected execution, semantic correctness, or complete coverage of the associated claim.
 
-An obligation may require explicit assurance of its primary oracle. Each assurance entry names one criterion and an independent `authority_snapshot` verifier:
+An obligation may require explicit assurance of its primary oracle. In the agent-facing proposal, each `oracleAssurances` entry names one criterion and a verifier; Tenet derives both primary and assurance authority from policy:
 
 ```json
 {
   "evidenceContract": {
     "claim": {
-      "verifierId": "quality",
-      "authority": "project"
+      "verifierId": "quality"
     },
-    "assurances": [
+    "oracleAssurances": [
       {
         "id": "ASSURE-001",
         "criterion": "the primary oracle rejects the admitted seeded defect set",
-        "verifierId": "mutation-assurance",
-        "authority": "authority_snapshot"
+        "verifierId": "mutation-assurance"
       }
     ]
   }
 }
 ```
 
-The primary verifier produces claim evidence. Every listed assurance verifier must separately support its stated criterion for the exact primary `OracleIdentity`. Assurance is one level only: project verifiers cannot provide it, an oracle cannot assure itself, and an assurance entry cannot require further assurance. This is a fixed all-required contract, not a weighted or `any_of` rule system.
+The primary verifier produces claim evidence. Every listed assurance verifier must be configured with `authority = "authority_snapshot"` and separately support its stated criterion for the exact primary `OracleIdentity`. Assurance is one level only: project verifiers cannot provide it, an oracle cannot assure itself, and an assurance entry cannot require further assurance. This is a fixed all-required contract, not a weighted or `any_of` rule system.
 
 ### 3. Propose a completion contract
 
-The coding agent obtains the semantic proposal input schema from `tenet_contract_schema`, then submits those fields with `tenet_contract_propose`. Tenet assigns the canonical persisted `schemaVersion` of `1`; agents never supply it. A proposal binds claims and obligations to verifier IDs already present in repository policy; it cannot introduce executable commands.
+The coding agent obtains the semantic proposal input schema from `tenet_contract_schema`, then submits those fields with `tenet_contract_propose`. Tenet assigns the canonical persisted `schemaVersion` of `1` and derives verifier authorities from the current policy; agents supply neither. A proposal binds claims and obligations to verifier IDs already present in repository policy; it cannot introduce executable commands or choose their authority.
 
-Tenet returns an exact proposal ID and deterministic digest. `pending_approval` does not admit the contract.
+Tenet returns the exact canonical proposal it persisted, its proposal ID and deterministic digest, a deterministic `verificationProfile`, non-blocking structural `warnings`, and `approvalRequired`. `pending_approval` does not admit the contract.
 
 ### 4. Obtain explicit human approval and admit the contract
 
-Before calling `tenet_contract_approve`, the coding agent must present:
+Before calling `tenet_contract_approve`, the coding agent must present Tenet's returned representation without reconstructing it from memory:
 
+- the exact canonical proposal;
 - the exact proposal ID and digest;
-- every requirement and obligation ID and statement;
-- every obligation's primary verifier ID and authority mapping; and
-- every oracle-assurance ID, criterion, verifier ID, and authority mapping.
+- every primary and oracle-assurance verifier and resolved authority mapping;
+- the complete verification profile, including authority counts, verifier concentration, assurance counts, and unused configured verifiers; and
+- every Tenet warning.
 
-The human must explicitly approve that exact proposal. The agent must not self-approve or infer approval from silence, a generic acknowledgement, continuation, or an earlier approval. `tenet_contract_approve` receives the exact `proposalId` and `proposalDigest`, then revalidates stored content plus the current specification and policy before writing `.tenet/contract.json`.
+The human must explicitly approve that exact proposal ID and digest after reviewing this information. The agent must not self-approve or infer approval from silence, a generic acknowledgement, continuation, or an earlier approval. `tenet_contract_approve` receives the exact `proposalId` and `proposalDigest`, then revalidates stored content plus the current specification and policy before writing `.tenet/contract.json`.
 
 A proposal-content change creates a new digest and ID. A specification or policy change makes the proposal stale. Either change invalidates earlier approval and requires the agent to present the current proposal and request fresh explicit approval.
 

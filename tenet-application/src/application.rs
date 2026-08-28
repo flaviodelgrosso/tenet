@@ -13,7 +13,8 @@ use tenet_domain::{
     derive_obligation_state,
   },
   contract::{
-    AdmittedContract, ContractProposal, ContractProposalInput, ProposalRecord, validate_proposal,
+    AdmittedContract, ContractProposal, ContractProposalInput, ProposalRecord,
+    analyze_verification, canonicalize_proposal, validate_proposal,
   },
   digest::{bytes_digest, canonical_digest},
   evidence::{
@@ -91,7 +92,7 @@ impl Tenet {
   }
 
   pub fn propose(&self, input: ContractProposalInput) -> Result<ProposalResult> {
-    propose(&self.cwd, input.into())
+    propose(&self.cwd, input)
   }
 
   pub fn approve(&self, request: &ApproveRequest) -> Result<ApprovalResult> {
@@ -201,12 +202,12 @@ fn status(cwd: &Path) -> Result<StatusResult> {
   })
 }
 
-fn propose(cwd: &Path, proposal: ContractProposal) -> Result<ProposalResult> {
+fn propose(cwd: &Path, input: ContractProposalInput) -> Result<ProposalResult> {
   let root = initialized_root(cwd)?;
   let policy = load_policy(&root)?;
   let current_spec_digest = specification_digest(&root, &policy)?;
   let current_policy_digest = policy_digest(&policy)?;
-  validate_proposal(&proposal, &policy).context("validate contract proposal")?;
+  let proposal = canonicalize_proposal(input, &policy).context("validate contract proposal")?;
   if proposal.spec_digest != current_spec_digest {
     bail!(
       "proposal specification digest `{}` does not match current `{current_spec_digest}`",
@@ -232,11 +233,15 @@ fn propose(cwd: &Path, proposal: ContractProposal) -> Result<ProposalResult> {
   let mut encoded = serde_json::to_vec_pretty(&record)?;
   encoded.push(b'\n');
   atomic_write(&proposal_path(&root, &digest), &encoded)?;
+  let (verification_profile, warnings) = analyze_verification(&record.proposal, &policy);
   Ok(ProposalResult {
     schema_version: 1,
     proposal_id,
     proposal_digest: digest,
     approval_required: true,
+    proposal: record.proposal,
+    verification_profile,
+    warnings,
   })
 }
 

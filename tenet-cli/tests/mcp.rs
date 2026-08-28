@@ -116,7 +116,7 @@ impl Repository {
           "id": "REQ-001/VO-001",
           "statement": "The configured verifier succeeds",
           "evidenceContract": {
-            "claim": { "verifierId": "quality", "authority": "project" }
+            "claim": { "verifierId": "quality" }
           }
         }]
       }]
@@ -297,8 +297,19 @@ fn schema_tools_return_agent_constructible_rust_derived_shapes() {
   assert_eq!(contract["properties"]["requirements"]["type"], "array");
   assert_eq!(contract["properties"]["requirements"]["minItems"], 1);
   assert_eq!(
-    contract["$defs"]["Requirement"]["properties"]["obligations"]["minItems"],
+    contract["$defs"]["RequirementInput"]["properties"]["obligations"]["minItems"],
     1
+  );
+  let evidence_properties = contract["$defs"]["EvidenceContractInput"]["properties"]
+    .as_object()
+    .expect("evidence contract properties");
+  assert!(evidence_properties.contains_key("oracleAssurances"));
+  assert!(!evidence_properties.contains_key("assurances"));
+  assert!(
+    !contract["$defs"]["ClaimEvidenceContractInput"]["properties"]
+      .as_object()
+      .expect("claim properties")
+      .contains_key("authority")
   );
   let policy = repository.mcp_tool("tenet_policy_schema", json!({}));
   assert!(
@@ -337,6 +348,25 @@ fn contract_proposal_is_deterministic_through_mcp() {
   assert_eq!(structured(&first), structured(&second));
   assert_eq!(structured(&first)["approvalRequired"], true);
 }
+#[test]
+fn proposal_rejects_agent_supplied_verifier_authority() {
+  let repository = Repository::new();
+  repository.initialize();
+  let status = repository.configure(0);
+  let mut proposal = repository.proposal(&status);
+  proposal["requirements"][0]["obligations"][0]["evidenceContract"]["claim"]["authority"] =
+    json!("project");
+
+  let response = repository.mcp_tool("tenet_contract_propose", proposal);
+
+  assert_eq!(response["result"]["isError"], true);
+  assert!(
+    response["result"]["content"][0]["text"]
+      .as_str()
+      .expect("proposal error")
+      .contains("unknown field `authority`")
+  );
+}
 
 #[test]
 fn proposal_input_schema_succeeds_without_agent_version_selection() {
@@ -349,9 +379,9 @@ fn proposal_input_schema_succeeds_without_agent_version_selection() {
   .expect("write verification policy");
   let status = repository.mcp_tool("tenet_status", json!({}));
   let proposal = repository.proposal(structured(&status));
-  let proposed = repository.mcp_tool("tenet_contract_propose", proposal);
-  let proposal_id = structured(&proposed)["proposalId"].clone();
-  let proposal_digest = structured(&proposed)["proposalDigest"].clone();
+  let proposed = structured(&repository.mcp_tool("tenet_contract_propose", proposal)).clone();
+  let proposal_id = proposed["proposalId"].clone();
+  let proposal_digest = proposed["proposalDigest"].clone();
   let pending_path = fs::read_dir(repository.path().join(".tenet/proposals"))
     .expect("read pending proposals")
     .next()
@@ -360,7 +390,20 @@ fn proposal_input_schema_succeeds_without_agent_version_selection() {
     .path();
   let pending: Value = serde_json::from_slice(&fs::read(pending_path).expect("read proposal"))
     .expect("parse proposal");
-  assert_eq!(pending["schemaVersion"], 1);
+  let mut persisted_proposal = pending.clone();
+  persisted_proposal
+    .as_object_mut()
+    .expect("proposal record")
+    .remove("proposalId");
+  persisted_proposal
+    .as_object_mut()
+    .expect("proposal record")
+    .remove("proposalDigest");
+  assert_eq!(proposed["proposal"], persisted_proposal);
+  assert_eq!(
+    proposed["proposal"]["requirements"][0]["obligations"][0]["evidenceContract"]["claim"]["authority"],
+    "project"
+  );
   let approved = repository.mcp_tool(
     "tenet_contract_approve",
     json!({ "proposalId": proposal_id, "proposalDigest": proposal_digest }),
@@ -382,6 +425,94 @@ fn proposal_input_schema_succeeds_without_agent_version_selection() {
   )
   .expect("parse audit state");
   assert_eq!(audit["schemaVersion"], 1);
+}
+
+#[test]
+fn project_only_contract_reports_profile_warnings_and_remains_admissible() {
+  let repository = Repository::new();
+  repository.initialize();
+  fs::write(
+    repository.path().join(".tenet/tenet.toml"),
+    r#"version = 1
+spec_path = "SPEC.md"
+
+[[verifiers]]
+id = "go-test"
+argv = ["/usr/bin/true"]
+authority = "project"
+
+[[verifiers]]
+id = "go-vet"
+argv = ["/usr/bin/true"]
+authority = "project"
+"#,
+  )
+  .expect("write verification policy");
+  let status = structured(&repository.mcp_tool("tenet_status", json!({}))).clone();
+  let obligations = (1..=7)
+    .map(|index| {
+      json!({
+        "id": format!("REQ-001/VO-{index:03}"),
+        "statement": format!("go-test verifies claim {index}"),
+        "evidenceContract": { "claim": { "verifierId": "go-test" } }
+      })
+    })
+    .collect::<Vec<_>>();
+  let proposed = repository.propose(json!({
+    "specDigest": status["specDigest"],
+    "policyDigest": status["policyDigest"],
+    "requirements": [{
+      "id": "REQ-001",
+      "statement": "all required claims",
+      "obligations": obligations
+    }]
+  }));
+
+  assert_eq!(proposed["verificationProfile"]["obligationCount"], 7);
+  assert_eq!(proposed["verificationProfile"]["primaryVerifierCount"], 1);
+  assert_eq!(
+    proposed["verificationProfile"]["projectAuthorityObligations"],
+    7
+  );
+  assert_eq!(
+    proposed["verificationProfile"]["authoritySnapshotObligations"],
+    0
+  );
+  assert_eq!(
+    proposed["verificationProfile"]["oracleAssuredObligations"],
+    0
+  );
+  assert_eq!(
+    proposed["verificationProfile"]["primaryVerifierObligations"]["go-test"],
+    7
+  );
+  assert_eq!(
+    proposed["verificationProfile"]["unusedConfiguredVerifiers"],
+    json!(["go-vet"])
+  );
+  let warning_codes = proposed["warnings"]
+    .as_array()
+    .expect("proposal warnings")
+    .iter()
+    .map(|warning| warning["code"].as_str().expect("warning code"))
+    .collect::<Vec<_>>();
+  assert_eq!(
+    warning_codes,
+    [
+      "PROJECT_ORACLE_ONLY",
+      "ORACLE_CONCENTRATION",
+      "NO_ORACLE_ASSURANCE",
+      "UNUSED_VERIFIER"
+    ]
+  );
+  assert_eq!(proposed["warnings"][1]["verifierId"], "go-test");
+  assert_eq!(proposed["warnings"][1]["affectedObligationCount"], 7);
+  assert_eq!(proposed["warnings"][2]["affectedObligationCount"], 7);
+  assert_eq!(proposed["warnings"][3]["verifierId"], "go-vet");
+
+  let approved = repository.approve(&proposed);
+  assert_eq!(approved["proposalId"], proposed["proposalId"]);
+  assert!(repository.path().join(".tenet/contract.json").exists());
 }
 
 #[test]
