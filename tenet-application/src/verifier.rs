@@ -310,7 +310,7 @@ mod tests {
     policy::{EnvironmentMode, VerifierAuthority, VerifierSpec},
   };
 
-  use super::{execution_environment_identity, RunnerAttributes};
+  use super::{RunnerAttributes, execution_environment_identity};
 
   fn fixture() -> (VerifierSpec, OracleIdentity) {
     let verifier = VerifierSpec {

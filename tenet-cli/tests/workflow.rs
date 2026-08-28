@@ -6,7 +6,7 @@ use std::{
   time::{Duration, Instant},
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct Repository {
   directory: tempfile::TempDir,
@@ -351,13 +351,75 @@ fn failure_json(output: impl TestOutput, expected_code: i32) -> Value {
 }
 
 #[test]
-fn init_is_idempotent_and_generates_only_repository_local_tenet_files() {
+fn init_creates_valid_portable_mcp_configuration() {
+  let repository = Repository::new();
+
+  repository.init();
+
+  let configuration: Value = serde_json::from_slice(
+    &fs::read(repository.path().join(".mcp.json")).expect("read MCP configuration"),
+  )
+  .expect("parse MCP configuration");
+  assert_eq!(
+    configuration,
+    json!({
+      "mcpServers": {
+        "tenet": {
+          "command": "tenet",
+          "args": ["mcp"]
+        }
+      }
+    })
+  );
+  for vendor_configuration in [".omp/mcp.json", ".cursor/mcp.json"] {
+    assert!(
+      !repository.path().join(vendor_configuration).exists(),
+      "created vendor-specific configuration {vendor_configuration}"
+    );
+  }
+}
+
+#[test]
+fn init_merges_tenet_mcp_server_without_discarding_existing_configuration() {
+  let repository = Repository::new();
+  fs::write(
+    repository.path().join(".mcp.json"),
+    r#"{
+  "metadata": { "preserve": true },
+  "mcpServers": {
+    "other": { "command": "other", "args": ["serve"], "env": { "MODE": "test" } }
+  }
+}"#,
+  )
+  .expect("write MCP configuration");
+
+  repository.init();
+
+  let configuration: Value = serde_json::from_slice(
+    &fs::read(repository.path().join(".mcp.json")).expect("read MCP configuration"),
+  )
+  .expect("parse merged MCP configuration");
+  assert_eq!(
+    configuration,
+    json!({
+      "metadata": { "preserve": true },
+      "mcpServers": {
+        "other": { "command": "other", "args": ["serve"], "env": { "MODE": "test" } },
+        "tenet": { "command": "tenet", "args": ["mcp"] }
+      }
+    })
+  );
+}
+
+#[test]
+fn init_is_idempotent_when_tenet_mcp_server_is_already_registered() {
   let repository = Repository::new();
   let agents_before = fs::read(repository.path().join("AGENTS.md")).expect("read AGENTS");
   let claude_before = fs::read(repository.path().join("CLAUDE.md")).expect("read CLAUDE");
 
   let first = repository.init();
   let config_before = fs::read(repository.path().join(".tenet/tenet.toml")).expect("read config");
+  let mcp_before = fs::read(repository.path().join(".mcp.json")).expect("read MCP configuration");
   let skill_before =
     fs::read(repository.path().join(".agents/skills/tenet/SKILL.md")).expect("read skill");
   let second = repository.init();
@@ -368,6 +430,10 @@ fn init_is_idempotent_and_generates_only_repository_local_tenet_files() {
   assert_eq!(
     config_before,
     fs::read(repository.path().join(".tenet/tenet.toml")).unwrap()
+  );
+  assert_eq!(
+    mcp_before,
+    fs::read(repository.path().join(".mcp.json")).unwrap()
   );
   assert_eq!(
     skill_before,
@@ -381,7 +447,31 @@ fn init_is_idempotent_and_generates_only_repository_local_tenet_files() {
     claude_before,
     fs::read(repository.path().join("CLAUDE.md")).unwrap()
   );
-  assert!(!repository.path().join(".mcp.json").exists());
+}
+
+#[test]
+fn init_rejects_conflicting_tenet_mcp_server_without_overwriting_it() {
+  let repository = Repository::new();
+  let mcp_path = repository.path().join(".mcp.json");
+  fs::write(
+    &mcp_path,
+    r#"{ "mcpServers": { "tenet": { "command": "custom-tenet", "args": ["mcp"] } } }"#,
+  )
+  .expect("write conflicting MCP configuration");
+  let before = fs::read(&mcp_path).expect("read conflicting MCP configuration");
+
+  let output = repository.tenet(&["init"]);
+
+  assert!(!output.status.success());
+  assert!(
+    String::from_utf8(output.stderr)
+      .expect("UTF-8 error output")
+      .contains("conflicting `tenet` MCP server entry")
+  );
+  assert_eq!(
+    before,
+    fs::read(mcp_path).expect("read retained MCP configuration")
+  );
 }
 
 #[test]
@@ -561,10 +651,12 @@ fn proposal_cannot_introduce_an_unknown_verifier() {
   ));
   assert!(!output.status.success());
   let error: Value = serde_json::from_slice(&output.stdout).expect("typed JSON error");
-  assert!(error["message"]
-    .as_str()
-    .unwrap()
-    .contains("unknown verifier"));
+  assert!(
+    error["message"]
+      .as_str()
+      .unwrap()
+      .contains("unknown verifier")
+  );
   assert!(!repository.path().join(".tenet/contract.json").exists());
 }
 
@@ -593,10 +685,12 @@ fn proposal_rejects_verifier_authority_mismatch() {
   let output = repository.propose_file(Path::new(proposal_path.to_str().unwrap()));
   assert!(!output.status.success());
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
-  assert!(error["message"]
-    .as_str()
-    .unwrap()
-    .contains("requires verifier authority"));
+  assert!(
+    error["message"]
+      .as_str()
+      .unwrap()
+      .contains("requires verifier authority")
+  );
 }
 
 #[test]
@@ -635,10 +729,12 @@ fn exact_revision_gate_returns_done_and_explains_persisted_evidence() {
     "architecture",
     "executionEnvironmentIdentity",
   ] {
-    assert!(!evidence["artifacts"][0]["execution"][field]
-      .as_str()
-      .unwrap()
-      .is_empty());
+    assert!(
+      !evidence["artifacts"][0]["execution"][field]
+        .as_str()
+        .unwrap()
+        .is_empty()
+    );
   }
   let status = success_json(repository.status());
   assert_eq!(status["lastGatedAuthorityRevision"], revision);
@@ -652,11 +748,13 @@ fn failed_verifier_returns_not_done_with_contradiction() {
   let gate = failure_json(repository.gate(&revision, &revision), 2);
   assert_eq!(gate["verdict"], "not_done");
   assert_eq!(gate["obligations"][0]["state"], "contradicted");
-  assert!(gate["blockers"]
-    .as_array()
-    .unwrap()
-    .iter()
-    .any(|item| item["code"] == "contradiction_observed"));
+  assert!(
+    gate["blockers"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .any(|item| item["code"] == "contradiction_observed")
+  );
 }
 
 #[test]
@@ -745,10 +843,12 @@ fn candidate_cannot_replace_authority_policy_and_contract_with_trivial_verifier(
 
   let gate = failure_json(repository.gate(&authority_revision, &revision), 2);
   assert_eq!(gate["blockers"][0]["code"], "authority_surface_changed");
-  assert!(gate["blockers"][0]["message"]
-    .as_str()
-    .unwrap()
-    .contains(".tenet/tenet.toml"));
+  assert!(
+    gate["blockers"][0]["message"]
+      .as_str()
+      .unwrap()
+      .contains(".tenet/tenet.toml")
+  );
 }
 
 #[test]
@@ -773,10 +873,12 @@ fn candidate_cannot_replace_authority_contract_with_one_trivial_obligation() {
 
   let gate = failure_json(repository.gate(&authority_revision, &revision), 2);
   assert_eq!(gate["blockers"][0]["code"], "authority_surface_changed");
-  assert!(gate["blockers"][0]["message"]
-    .as_str()
-    .unwrap()
-    .contains(".tenet/contract.json"));
+  assert!(
+    gate["blockers"][0]["message"]
+      .as_str()
+      .unwrap()
+      .contains(".tenet/contract.json")
+  );
 }
 
 #[test]
@@ -826,10 +928,12 @@ fn authority_snapshot_oracle_runs_from_authority_and_records_git_identity() {
   );
   assert_eq!(artifact["oracleIdentity"]["bundlePath"], "oracles/quality");
   assert_eq!(artifact["oracleIdentity"]["verifierId"], "quality");
-  assert!(artifact["oracleIdentity"]["definitionDigest"]
-    .as_str()
-    .unwrap()
-    .starts_with("sha256:"));
+  assert!(
+    artifact["oracleIdentity"]["definitionDigest"]
+      .as_str()
+      .unwrap()
+      .starts_with("sha256:")
+  );
   let object = git_output(
     repository.path(),
     &[
@@ -868,10 +972,12 @@ fn candidate_cannot_alter_authority_snapshot_oracle_that_authorizes_done() {
   let gate = failure_json(repository.gate(&authority_revision, &revision), 2);
   assert_eq!(gate["verdict"], "not_done");
   assert_eq!(gate["blockers"][0]["code"], "authority_surface_changed");
-  assert!(gate["blockers"][0]["message"]
-    .as_str()
-    .unwrap()
-    .contains("oracles/quality"));
+  assert!(
+    gate["blockers"][0]["message"]
+      .as_str()
+      .unwrap()
+      .contains("oracles/quality")
+  );
 }
 
 #[test]
@@ -959,10 +1065,12 @@ fn protected_verifier_authority_is_not_a_valid_local_policy() {
   fs::write(path, policy).unwrap();
 
   let error = failure_json(repository.status(), 1);
-  assert!(error["message"]
-    .as_str()
-    .unwrap()
-    .contains("unknown variant"));
+  assert!(
+    error["message"]
+      .as_str()
+      .unwrap()
+      .contains("unknown variant")
+  );
 }
 
 #[test]
@@ -973,10 +1081,12 @@ fn symbolic_authority_revision_is_rejected() {
   let output = repository.gate("HEAD", &revision);
   assert_eq!(output.status.code(), Some(1));
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
-  assert!(error["message"]
-    .as_str()
-    .unwrap()
-    .contains("resolve authority revision"));
+  assert!(
+    error["message"]
+      .as_str()
+      .unwrap()
+      .contains("resolve authority revision")
+  );
 }
 
 #[test]
@@ -1061,10 +1171,12 @@ fn candidate_symlink_cannot_escape_verifier_working_directory() {
 
   let gate = failure_json(repository.gate(&authority_revision, &revision), 4);
   assert_eq!(gate["verdict"], "infrastructure_error");
-  assert!(gate["blockers"][0]["message"]
-    .as_str()
-    .unwrap()
-    .contains("inside candidate checkout"));
+  assert!(
+    gate["blockers"][0]["message"]
+      .as_str()
+      .unwrap()
+      .contains("inside candidate checkout")
+  );
 }
 
 #[test]
@@ -1247,10 +1359,12 @@ fn gate_rejects_symbolic_or_abbreviated_revisions() {
     let output = repository.gate(&authority_revision, revision);
     assert_eq!(output.status.code(), Some(1));
     let error: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(error["message"]
-      .as_str()
-      .unwrap()
-      .contains("full immutable Git commit ID"));
+    assert!(
+      error["message"]
+        .as_str()
+        .unwrap()
+        .contains("full immutable Git commit ID")
+    );
   }
 }
 
@@ -1324,10 +1438,12 @@ authority = "project"
   let output = repository.propose_file(Path::new(path.to_str().unwrap()));
   assert!(!output.status.success());
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
-  assert!(error["message"]
-    .as_str()
-    .unwrap()
-    .contains("authority_snapshot"));
+  assert!(
+    error["message"]
+      .as_str()
+      .unwrap()
+      .contains("authority_snapshot")
+  );
 }
 
 #[test]
@@ -1382,10 +1498,12 @@ oracle_path = "oracles/quality/"
   let output = repository.propose_file(Path::new(path.to_str().unwrap()));
   assert!(!output.status.success());
   let error: Value = serde_json::from_slice(&output.stdout).unwrap();
-  assert!(error["message"]
-    .as_str()
-    .unwrap()
-    .contains("cannot use the primary oracle"));
+  assert!(
+    error["message"]
+      .as_str()
+      .unwrap()
+      .contains("cannot use the primary oracle")
+  );
 }
 
 #[test]

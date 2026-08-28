@@ -138,7 +138,9 @@ pub enum ContractError {
     obligation: String,
     assurance: String,
   },
-  #[error("assurance `{assurance}` for obligation `{obligation}` cannot use the primary oracle `{verifier}`")]
+  #[error(
+    "assurance `{assurance}` for obligation `{obligation}` cannot use the primary oracle `{verifier}`"
+  )]
   OracleSelfCertification {
     obligation: String,
     assurance: String,

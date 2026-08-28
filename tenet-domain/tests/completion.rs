@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use tenet_domain::{
   completion::{
-    derive_completion, derive_obligation_state, BlockerCode, DerivationContext, ObligationState,
-    Verdict,
+    BlockerCode, DerivationContext, ObligationState, Verdict, derive_completion,
+    derive_obligation_state,
   },
   contract::{
     AdmittedContract, AssuranceId, ClaimEvidenceContract, EvidenceContract, ObligationId,

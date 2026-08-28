@@ -6,10 +6,10 @@ use std::{
   process::{Command, Stdio},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tenet_domain::{
   digest::{bytes_digest, canonical_digest},
-  policy::{validate_policy, RepositoryConfig, VerificationPolicy},
+  policy::{RepositoryConfig, VerificationPolicy, validate_policy},
 };
 
 pub const TENET_DIR: &str = ".tenet";
@@ -17,6 +17,7 @@ pub const CONFIG_PATH: &str = ".tenet/tenet.toml";
 pub const CONTRACT_PATH: &str = ".tenet/contract.json";
 pub const STATE_PATH: &str = ".tenet/state.json";
 pub const SKILL_PATH: &str = ".agents/skills/tenet/SKILL.md";
+pub const MCP_CONFIG_PATH: &str = ".mcp.json";
 
 const DEFAULT_SPECIFICATION: &str = "# Tenet completion specification\n\nDescribe the required behavior and acceptance criteria for this repository.\n";
 
@@ -81,13 +82,13 @@ pub fn initialize(root: &Path, spec: &Path) -> Result<(RepositoryConfig, String,
     Ok(path) => path,
     Err(error) if error.kind() == ErrorKind::NotFound => {
       let requested_spec_path = specification_path(&canonical_root, &spec)?;
-      if let Some(existing) = &existing {
-        if existing.spec_path != requested_spec_path {
-          bail!(
-            "repository is already initialized for specification `{}`",
-            existing.spec_path
-          );
-        }
+      if let Some(existing) = &existing
+        && existing.spec_path != requested_spec_path
+      {
+        bail!(
+          "repository is already initialized for specification `{}`",
+          existing.spec_path
+        );
       }
       create_default_specification(&canonical_root, &spec)?;
       spec
@@ -95,11 +96,12 @@ pub fn initialize(root: &Path, spec: &Path) -> Result<(RepositoryConfig, String,
         .with_context(|| format!("canonicalize created specification {}", spec.display()))?
     }
     Err(error) => {
-      return Err(error).with_context(|| format!("read specification {}", spec.display()))
+      return Err(error).with_context(|| format!("read specification {}", spec.display()));
     }
   };
   let spec_path = specification_path(&canonical_root, &canonical_spec)?;
 
+  initialize_mcp_configuration(root)?;
   fs::create_dir_all(root.join(TENET_DIR)).context("create .tenet directory")?;
   fs::create_dir_all(root.join(".agents/skills/tenet")).context("create Tenet Skill directory")?;
 
@@ -129,6 +131,42 @@ pub fn initialize(root: &Path, spec: &Path) -> Result<(RepositoryConfig, String,
   atomic_write(&root.join(SKILL_PATH), SKILL.as_bytes())?;
   let spec_digest = specification_digest(root, &config)?;
   Ok((config, spec_digest, created))
+}
+fn initialize_mcp_configuration(root: &Path) -> Result<()> {
+  let path = root.join(MCP_CONFIG_PATH);
+  let tenet = serde_json::json!({
+    "command": "tenet",
+    "args": ["mcp"]
+  });
+
+  let mut configuration = match fs::read(&path) {
+    Ok(bytes) => serde_json::from_slice(&bytes)
+      .with_context(|| format!("parse MCP configuration {}", path.display()))?,
+    Err(error) if error.kind() == ErrorKind::NotFound => serde_json::json!({}),
+    Err(error) => {
+      return Err(error).with_context(|| format!("read MCP configuration {}", path.display()));
+    }
+  };
+
+  let configuration = configuration
+    .as_object_mut()
+    .context("MCP configuration must be a JSON object")?;
+  let servers = configuration
+    .entry("mcpServers")
+    .or_insert_with(|| serde_json::json!({}))
+    .as_object_mut()
+    .context("MCP configuration field `mcpServers` must be a JSON object")?;
+
+  match servers.get("tenet") {
+    Some(server) if server == &tenet => return Ok(()),
+    Some(_) => bail!("conflicting `tenet` MCP server entry in {}", path.display()),
+    None => {
+      servers.insert("tenet".into(), tenet);
+    }
+  }
+
+  let encoded = serde_json::to_string_pretty(&configuration)?;
+  atomic_write(&path, format!("{encoded}\n").as_bytes())
 }
 
 fn specification_path(canonical_root: &Path, spec: &Path) -> Result<String> {

@@ -4,36 +4,36 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use anyhow::{bail, Context, Result};
-use schemars::{schema_for, JsonSchema, Schema};
+use anyhow::{Context, Result, bail};
+use schemars::{JsonSchema, Schema, schema_for};
 use serde::Deserialize;
 use tenet_domain::{
   completion::{
-    derive_completion, derive_obligation_state, Blocker, BlockerCode, DerivationContext,
-    ObligationState, Verdict,
+    Blocker, BlockerCode, DerivationContext, ObligationState, Verdict, derive_completion,
+    derive_obligation_state,
   },
-  contract::{validate_proposal, AdmittedContract, ContractProposal, ProposalRecord},
+  contract::{AdmittedContract, ContractProposal, ProposalRecord, validate_proposal},
   digest::{bytes_digest, canonical_digest},
   evidence::{
     ArtifactAuthority, ArtifactProvenance, ArtifactValidity, DependencySurface, EvidenceArtifact,
     EvidenceEffect, GitObjectId, OracleIdentity, VerifierEvidence,
   },
   policy::{
-    validate_policy, RepositoryConfig, VerificationPolicy, VerifierAuthority, VerifierSpec,
+    RepositoryConfig, VerificationPolicy, VerifierAuthority, VerifierSpec, validate_policy,
   },
 };
 
 use crate::{
   audit::AuditState,
   repository::{
-    self, atomic_write, discover_root, load_policy, policy_digest, specification_digest,
-    MaterializedRevision, CONFIG_PATH, CONTRACT_PATH, SKILL_PATH, TENET_DIR,
+    self, CONFIG_PATH, CONTRACT_PATH, MaterializedRevision, SKILL_PATH, TENET_DIR, atomic_write,
+    discover_root, load_policy, policy_digest, specification_digest,
   },
   response::{
     ApprovalResult, ContractState, EvidenceResult, GateResult, InitResult, ProposalResult,
     StatusResult,
   },
-  verifier::{run_verifier, ExecutedVerifier},
+  verifier::{ExecutedVerifier, run_verifier},
 };
 
 #[derive(Clone, Debug)]
@@ -431,37 +431,37 @@ fn gate(cwd: &Path, authority_revision: &str, revision: &str) -> Result<GateResu
   let mut artifacts = Vec::new();
   for obligation in contract.obligations() {
     let claim = &obligation.evidence_contract.claim;
-    if let Some(executed) = observations.get(&claim.verifier_id) {
-      if executed.observation.exit_code != Some(125) {
-        let verifier = policy
-          .verifiers
-          .iter()
-          .find(|item| item.id == claim.verifier_id)
-          .context("validated verifier disappeared")?;
-        let oracle_identity = oracle_identities
-          .get(&claim.verifier_id)
-          .context("executed verifier has no oracle identity")?
-          .clone();
-        artifacts.push(EvidenceArtifact::Claim {
-          evidence: VerifierEvidence {
-            obligation_id: obligation.id.clone(),
-            authority_revision: authority_revision.clone(),
-            revision: revision.clone(),
-            verifier_id: claim.verifier_id.clone(),
-            policy_digest: policy_digest.clone(),
-            spec_digest: spec_digest.clone(),
-            contract_digest: contract_digest.clone(),
-            authority: artifact_authority(verifier.authority),
-            oracle_identity,
-            provenance: ArtifactProvenance::TenetLocalVerifier,
-            execution: executed.execution.clone(),
-            effect: evidence_effect(executed.observation.exit_code),
-            validity: ArtifactValidity::Valid,
-            dependency_surface: DependencySurface::RepositoryWide,
-            observation: executed.observation.clone(),
-          },
-        });
-      }
+    if let Some(executed) = observations.get(&claim.verifier_id)
+      && executed.observation.exit_code != Some(125)
+    {
+      let verifier = policy
+        .verifiers
+        .iter()
+        .find(|item| item.id == claim.verifier_id)
+        .context("validated verifier disappeared")?;
+      let oracle_identity = oracle_identities
+        .get(&claim.verifier_id)
+        .context("executed verifier has no oracle identity")?
+        .clone();
+      artifacts.push(EvidenceArtifact::Claim {
+        evidence: VerifierEvidence {
+          obligation_id: obligation.id.clone(),
+          authority_revision: authority_revision.clone(),
+          revision: revision.clone(),
+          verifier_id: claim.verifier_id.clone(),
+          policy_digest: policy_digest.clone(),
+          spec_digest: spec_digest.clone(),
+          contract_digest: contract_digest.clone(),
+          authority: artifact_authority(verifier.authority),
+          oracle_identity,
+          provenance: ArtifactProvenance::TenetLocalVerifier,
+          execution: executed.execution.clone(),
+          effect: evidence_effect(executed.observation.exit_code),
+          validity: ArtifactValidity::Valid,
+          dependency_surface: DependencySurface::RepositoryWide,
+          observation: executed.observation.clone(),
+        },
+      });
     }
     let Some(qualified_oracle_identity) = oracle_identities.get(&claim.verifier_id).cloned() else {
       continue;

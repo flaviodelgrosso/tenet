@@ -2,8 +2,8 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use rmcp::{
-  handler::server::wrapper::Parameters, tool, tool_handler, tool_router, transport::stdio, Json,
-  ServerHandler, ServiceExt,
+  Json, ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool, tool_handler,
+  tool_router, transport::stdio,
 };
 use schemars::Schema;
 use tenet_application::{
@@ -176,10 +176,12 @@ mod tests {
         .await
         .expect("first blocking operation started");
       first.abort();
-      assert!(first
-        .await
-        .expect_err("request task should abort")
-        .is_cancelled());
+      assert!(
+        first
+          .await
+          .expect_err("request task should abort")
+          .is_cancelled()
+      );
 
       let (second_started_sender, mut second_started) = tokio::sync::oneshot::channel();
       let second = tokio::spawn(async move {

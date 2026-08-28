@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 struct Repository {
   directory: tempfile::TempDir,
@@ -265,10 +265,12 @@ fn stdio_server_discovers_all_tenet_tools_with_required_fields() {
     .iter()
     .find(|tool| tool["name"] == "tenet_contract_approve")
     .expect("approval tool");
-  assert!(approve["description"]
-    .as_str()
-    .expect("approval description")
-    .contains("MUST NOT be called unless the human explicitly approved"));
+  assert!(
+    approve["description"]
+      .as_str()
+      .expect("approval description")
+      .contains("MUST NOT be called unless the human explicitly approved")
+  );
 }
 
 #[test]
@@ -280,10 +282,12 @@ fn schema_tools_return_canonical_rust_derived_shapes() {
     "array"
   );
   let policy = repository.mcp_tool("tenet_policy_schema", json!({}));
-  assert!(structured(&policy)["$defs"]["VerifierSpec"]["properties"]
-    .as_object()
-    .expect("verifier properties")
-    .contains_key("environment_mode"));
+  assert!(
+    structured(&policy)["$defs"]["VerifierSpec"]["properties"]
+      .as_object()
+      .expect("verifier properties")
+      .contains_key("environment_mode")
+  );
 }
 
 #[test]
@@ -344,10 +348,12 @@ fn post_initialization_workflow_runs_through_mcp() {
   );
   assert_eq!(structured(&gate)["verdict"], "done");
   let evidence = repository.mcp_tool("tenet_evidence", json!({ "revision": revision }));
-  assert!(!structured(&evidence)["artifacts"]
-    .as_array()
-    .expect("evidence artifacts")
-    .is_empty());
+  assert!(
+    !structured(&evidence)["artifacts"]
+      .as_array()
+      .expect("evidence artifacts")
+      .is_empty()
+  );
 }
 
 #[test]
@@ -370,10 +376,12 @@ fn gate_and_evidence_preserve_typed_domain_results() {
   assert!(decoded.blockers.is_empty());
 
   let evidence = repository.mcp_tool("tenet_evidence", json!({ "revision": revision }));
-  assert!(!structured(&evidence)["artifacts"]
-    .as_array()
-    .expect("evidence artifacts")
-    .is_empty());
+  assert!(
+    !structured(&evidence)["artifacts"]
+      .as_array()
+      .expect("evidence artifacts")
+      .is_empty()
+  );
 }
 
 #[test]
