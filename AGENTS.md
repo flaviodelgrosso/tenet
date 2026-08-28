@@ -82,6 +82,28 @@ Use semantic ID newtypes when identity confusion matters. Use `thiserror` for do
 
 Breaking changes are allowed during the MVP when they strengthen or simplify the architecture. Update every in-repository caller, test, example, fixture, and active document in the same change. Remove obsolete variants and compatibility paths rather than maintaining competing designs.
 
+## MVP versioning policy
+
+Tenet is unreleased MVP software. Until the first public release establishes a compatibility boundary, all Tenet-owned schema and format versions remain `1`.
+
+Do not increment a Tenet-owned version because of a breaking change made during MVP development.
+
+This applies to current Tenet-owned persisted and serialized formats, including contract, proposal, policy, evidence, state, protocol-facing schema identifiers, fixtures, examples, and equivalent version markers where the value represents a Tenet format.
+
+During the unreleased MVP:
+
+- breaking changes are explicitly allowed without a version increment;
+- every current Tenet-owned schema or format version must remain `1`;
+- the current repository state defines the only supported form of each format;
+- earlier unreleased development variants do not require backward compatibility;
+- do not add migrations or compatibility branches for obsolete unreleased variants;
+- remove obsolete structures and update all callers, tests, fixtures, generated schemas, and documentation in the same change;
+- never introduce version `2` or higher in anticipation of future compatibility needs.
+
+A version increment becomes appropriate only after a public release has established a format that Tenet intentionally continues to recognize or distinguish from a later incompatible format.
+
+Do not apply this rule to versions owned by external protocols, dependencies, standards, or libraries. Their versions must follow the requirements of those external systems.
+
 ## Minimal architecture
 
 The project intentionally uses one Cargo workspace with four crates:
@@ -129,4 +151,3 @@ This checks formatting, the package, Clippy with warnings denied, and all tests.
 6. Report any remaining unverifiable invariant explicitly; never weaken completion semantics to obtain a green result.
 
 > Coding agents perform engineering. Trusted authority revision A defines the contract. Tenet observes candidate revision R and derives `DONE(A, R)`.
-
