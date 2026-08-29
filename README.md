@@ -20,10 +20,14 @@ Tenet knows content, not source-control history. It requires no Git repository, 
 
 ## Workflow
 
+Keep authority construction separate from candidate engineering:
+
 ```text
 tenet init
   ↓
-inspect policy and specification
+inspect specification and tenet_status
+  ↓
+construct verification authority if needed
   ↓
 tenet_contract_propose
   ↓
@@ -35,15 +39,16 @@ tenet_authority_seal → authorityId A
   ↓
 human explicitly selects A
   ↓
-engineering
+candidate engineering
   ↓
 tenet_candidate_capture → candidateId R
   ↓
 tenet_gate({ authorityId: A, candidateId: R })
 ```
 
-A successful proposal is not an authority capsule. Modifying authority source later requires a new proposal/approval where stale, a new sealed A, and fresh human selection. Candidate implementation present in the workspace is not included in A because sealing captures only the authority surface.
+Before `tenet_contract_propose`, the policy must contain suitable verifier definitions for the evidence contracts required by the specification. If no suitable verifier exists, inspect the specification, use `tenet_policy_schema` as the authoritative policy format, edit `.tenet/tenet.toml`, create authority-owned oracle assets for any `authority_snapshot` verifier, re-read `tenet_status`, and then propose using the configured verifier IDs. Editing verification policy and creating authority-owned oracle assets are authority-definition work allowed before A is sealed. Do not implement candidate product behavior during this phase. Project-authority verifiers remain valid; weak verification configurations are reported through the verification profile and warnings rather than rejected merely for being weak.
 
+A successful proposal is not an authority capsule. Modifying authority source later requires a new proposal/approval where stale, a new sealed A, and fresh human selection. Candidate implementation present in the workspace is not included in A because sealing captures only the authority surface.
 ## Initialization
 
 `tenet init` works from an ordinary directory. It initializes that directory as the project root and writes `.tenet/tenet.toml`, a starter specification when necessary, an MCP entry, and a local Tenet Skill. Later operations find the nearest enclosing `.tenet/tenet.toml`; nested initialized roots therefore resolve deterministically to the nearest root.

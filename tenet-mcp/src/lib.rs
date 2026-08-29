@@ -8,8 +8,8 @@ use schemars::Schema;
 use tenet_application::{
   application::{ApproveRequest, CandidateCaptureRequest, EvidenceRequest, GateRequest, Tenet},
   response::{
-    ApprovalResult, CandidateCaptureResult, EvidenceResult, GateResult, ProposalResult,
-    StatusResult, TenetError,
+    ApprovalResult, AuthoritySealResult, CandidateCaptureResult, EvidenceResult, GateResult,
+    ProposalResult, StatusResult, TenetError,
   },
 };
 use tenet_domain::contract::ContractProposalInput;
@@ -58,7 +58,7 @@ impl TenetMcp {
 impl TenetMcp {
   #[tool(
     name = "tenet_status",
-    description = "Inspect current Tenet initialization, specification, contract, digest, last-gate, verdict, and unresolved-obligation state without executing verifiers."
+    description = "Inspect Tenet status first. It reports specification, contract, policy, and unresolved-obligation state; when the contract is missing and no verifiers are configured, construct verification authority before candidate engineering."
   )]
   async fn status(&self) -> Result<Json<StatusResult>, ErrorData> {
     self.run_operation(|tenet| tenet.status()).await.map(Json)
@@ -73,7 +73,8 @@ impl TenetMcp {
   }
 
   #[tool(
-    description = "Return the authoritative Rust-derived policy schema. A project verifier executes from Candidate Snapshot R; argv[0] is passed directly to the operating system process launcher, with relative paths resolved from verifier cwd and ordinary PATH/absolute-path semantics. An authority_snapshot verifier runs from a sealed Authority Capsule A bundle: oracle_path names the directory to seal, argv[0] directly names an executable inside that bundle (never a host interpreter), cwd is bundle-relative, and TENET_CANDIDATE_ROOT exposes R."
+    name = "tenet_policy_schema",
+    description = "Return the authoritative Rust-derived policy schema. Before proposing a contract, inspect the specification and use this schema to define suitable verifier(s) in .tenet/tenet.toml when the current policy has none. Editing policy and creating authority-owned oracle assets for authority_snapshot are authority-definition work allowed before sealing A. Project verifiers execute from Candidate Snapshot R; authority_snapshot verifiers execute from a sealed A bundle, with argv[0] naming a bundled executable and TENET_CANDIDATE_ROOT exposing R."
   )]
   async fn policy_schema(&self) -> Json<Schema> {
     Json(self.tenet.policy_schema())
@@ -81,7 +82,7 @@ impl TenetMcp {
 
   #[tool(
     name = "tenet_contract_propose",
-    description = "Validate and store a completion-contract proposal bound to the current specification and policy. Tenet derives verifier authorities from policy and returns the exact persisted canonical proposal, deterministic verification profile, warnings, proposal ID, and digest for human approval."
+    description = "Before calling this tool, construct verification authority: inspect the specification, ensure .tenet/tenet.toml contains suitable verifier definitions, use tenet_policy_schema for its format, create authority-owned oracle assets for authority_snapshot verifiers, and re-read tenet_status after changes. Then validate and store a proposal bound to the current specification and policy. Project-authority verifiers remain valid; do not implement candidate product behavior merely because no verifier is configured. Tenet returns the verification profile and warnings for weak configurations."
   )]
   async fn contract_propose(
     &self,
@@ -107,8 +108,18 @@ impl TenetMcp {
       .map(Json)
   }
   #[tool(
+    name = "tenet_authority_seal",
+    description = "Seal the approved authority definition into Authority Capsule A and return authorityId. Call only after exact human approval admitted the current contract. The returned authorityId requires explicit human selection before candidate engineering or candidate capture."
+  )]
+  async fn authority_seal(&self) -> Result<Json<AuthoritySealResult>, ErrorData> {
+    self
+      .run_operation(|tenet| tenet.authority_seal())
+      .await
+      .map(Json)
+  }
+  #[tool(
     name = "tenet_candidate_capture",
-    description = "Capture the mutable candidate root selected by the exact sealed authorityId as an immutable Candidate Snapshot. The capture policy comes only from that Authority Capsule, excludes Tenet administration and common source-control administration by default, rejects symlinks, and returns candidateId."
+    description = "Capture the candidate root only after a human explicitly selected the exact sealed authorityId and candidate engineering is complete. The capture policy comes only from that Authority Capsule, excludes Tenet administration and common source-control administration by default, rejects symlinks, and returns candidateId."
   )]
   async fn candidate_capture(
     &self,
@@ -152,7 +163,7 @@ impl TenetMcp {
 #[tool_handler(
   name = "tenet",
   version = "0.1.0",
-  instructions = "Tenet is an agent-neutral completion authority. Inspect status first, obtain explicit human approval before contract admission, seal the approved authority, present authorityId for explicit human selection, capture candidateId, and claim completion only when gate returns done for that exact pair."
+  instructions = "Tenet is an agent-neutral completion authority. Keep authority construction separate from candidate engineering: inspect the specification and tenet_status, ensure suitable verifier definitions exist before tenet_contract_propose, and if none exist use tenet_policy_schema, edit .tenet/tenet.toml, create authority-owned oracle assets for authority_snapshot, and re-read tenet_status. This policy and oracle work is allowed before A is sealed; project-authority verifiers remain valid; do not implement candidate product behavior first. Then obtain explicit human approval, seal A, present authorityId for explicit human selection, engineer and capture R, and claim completion only when tenet_gate returns done for that exact pair."
 )]
 impl ServerHandler for TenetMcp {}
 

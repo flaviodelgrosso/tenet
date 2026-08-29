@@ -174,7 +174,51 @@ pub fn resolve_relative_path(
   }
   Ok(current)
 }
-pub const SKILL: &str = "---\nname: tenet\ndescription: Use when completion is governed by a Tenet contract.\ncompatibility: Requires Tenet MCP tools.\nmetadata:\n  tenet-skill-version: \"1\"\n---\n\n# Tenet workflow\n\nTenet judges immutable Candidate Snapshot R under independently sealed Authority Capsule A. Propose a contract, obtain explicit human approval, seal authority, present authorityId for explicit human selection, capture candidateId, and gate that exact pair. Project verifiers execute in R with argv[0] passed to the operating system process launcher. authority_snapshot verifiers execute from A-owned oracle_path; argv[0] directly names a bundled executable, cwd is bundle-relative, and TENET_CANDIDATE_ROOT exposes R.\n";
+pub const SKILL: &str = r#"---
+name: tenet
+description: Use when completion is governed by a Tenet contract.
+compatibility: Requires Tenet MCP tools.
+metadata:
+  tenet-skill-version: "1"
+---
+
+# Tenet workflow
+
+Tenet judges immutable Candidate Snapshot R under independently sealed Authority Capsule A. Keep **authority construction** separate from **candidate engineering**.
+
+## Authority construction (before A is sealed)
+
+1. Inspect the specification and call `tenet_status`.
+2. Before `tenet_contract_propose`, ensure `.tenet/tenet.toml` contains suitable verifier definitions for the evidence contracts the specification requires.
+3. If no suitable verifier exists:
+   - inspect the specification to determine the required observations;
+   - call `tenet_policy_schema` and use its Rust-derived schema as the authoritative policy format;
+   - edit `.tenet/tenet.toml` to define the required verifier(s);
+   - when using `authority_snapshot`, create the required authority-owned oracle assets;
+   - re-read `tenet_status` after every authority change;
+   - propose the contract using those verifier IDs.
+
+Editing verification policy and creating authority-owned oracle assets are **authority-definition work** and are allowed before A is sealed. Do not implement candidate product behavior during authority construction. Project-authority verifiers remain valid; choose verifier authority based on the evidence contract, not on a hard-coded technology stack. A weak configuration is surfaced through the returned verification profile and warnings; it is not a reason to invent stack-specific verifier choices or to implement the candidate first.
+
+## Sealed-authority lifecycle
+
+```text
+inspect specification
+→ construct verification authority if needed
+→ tenet_contract_propose
+→ explicit human approval of the exact proposal
+→ tenet_contract_approve
+→ tenet_authority_seal → authorityId A
+→ explicit human selection of A
+→ candidate engineering
+→ tenet_candidate_capture → candidateId R
+→ tenet_gate({ authorityId: A, candidateId: R })
+```
+
+Never claim completion until `tenet_gate` returns `done` for that exact `(A, R)` pair.
+
+Project verifiers execute in R with `argv[0]` passed to the operating system process launcher. `authority_snapshot` verifiers execute from A-owned `oracle_path`; `argv[0]` directly names a bundled executable, `cwd` is bundle-relative, and `TENET_CANDIDATE_ROOT` exposes R.
+"#;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
