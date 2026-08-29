@@ -19,11 +19,50 @@ pub enum EnvironmentMode {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateCapturePolicy {
+  #[serde(default = "default_candidate_root")]
+  #[schemars(description = "Safe project-relative root whose contents form Candidate Snapshot R.")]
+  pub root: String,
+  #[serde(default = "default_candidate_exclusions")]
+  #[schemars(
+    description = "Deterministic project-relative exclusion rules. A trailing `/**` excludes a directory and all descendants."
+  )]
+  pub exclude: Vec<String>,
+}
+
+impl Default for CandidateCapturePolicy {
+  fn default() -> Self {
+    Self {
+      root: default_candidate_root(),
+      exclude: default_candidate_exclusions(),
+    }
+  }
+}
+
+impl CandidateCapturePolicy {
+  pub fn excludes(&self, path: &str) -> bool {
+    let path = path.replace('\\', "/");
+    path == ".tenet"
+      || path.starts_with(".tenet/")
+      || self.exclude.iter().any(|rule| {
+        rule.strip_suffix("/**").map_or(rule == &path, |prefix| {
+          path == prefix
+            || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+        })
+      })
+  }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectConfig {
   pub version: u32,
   #[schemars(description = "Safe project-relative path to the authority specification.")]
   pub spec_path: String,
+  #[serde(default)]
+  #[schemars(description = "Authority-defined Candidate Snapshot capture boundary.")]
+  pub candidate: CandidateCapturePolicy,
   #[serde(default)]
   #[schemars(description = "Verifier definitions sealed into an Authority Capsule.")]
   pub verifiers: Vec<VerifierSpec>,
@@ -73,11 +112,40 @@ impl VerifierSpec {
 }
 
 pub type VerificationPolicy = ProjectConfig;
+fn default_candidate_root() -> String {
+  ".".into()
+}
+
+fn default_candidate_exclusions() -> Vec<String> {
+  vec![
+    ".tenet/**".into(),
+    ".mcp.json".into(),
+    ".agents/**".into(),
+    ".git/**".into(),
+    ".hg/**".into(),
+    ".svn/**".into(),
+  ]
+}
+
+fn valid_candidate_rule(value: &str) -> bool {
+  let base = value.strip_suffix("/**").unwrap_or(value);
+  !(base == "."
+    || base.contains('*')
+    || base.contains("//")
+    || base.starts_with("./")
+    || base.contains("/./")
+    || base.ends_with("/.")
+    || base.ends_with('/')
+    || !is_safe_relative_path(base))
+}
+
+fn valid_project_executable(value: &str) -> bool {
+  !value.trim().is_empty() && !value.contains('\0')
+}
 
 fn default_cwd() -> String {
   ".".into()
 }
-
 fn default_timeout() -> u64 {
   300
 }
@@ -92,6 +160,10 @@ pub enum PolicyError {
   UnsupportedVersion(u32),
   #[error("spec_path must name a project-relative path")]
   InvalidSpecPath,
+  #[error("candidate root must name a safe project-relative directory")]
+  InvalidCandidateRoot,
+  #[error("candidate exclusion rule `{0}` is invalid")]
+  InvalidCandidateExclusion(String),
   #[error("verifier identifier must not be blank")]
   BlankVerifierId,
   #[error("duplicate verifier identifier `{0}`")]
@@ -119,6 +191,27 @@ pub fn validate_policy(policy: &VerificationPolicy) -> Result<(), PolicyError> {
   if !is_safe_relative_path(&policy.spec_path) {
     return Err(PolicyError::InvalidSpecPath);
   }
+  if !is_safe_relative_path(&policy.candidate.root)
+    || policy.candidate.root == ".tenet"
+    || policy.candidate.root.starts_with(".tenet/")
+  {
+    return Err(PolicyError::InvalidCandidateRoot);
+  }
+  if policy
+    .candidate
+    .exclude
+    .iter()
+    .any(|rule| !valid_candidate_rule(rule))
+  {
+    let rule = policy
+      .candidate
+      .exclude
+      .iter()
+      .find(|rule| !valid_candidate_rule(rule))
+      .map(String::as_str)
+      .unwrap_or("<invalid>");
+    return Err(PolicyError::InvalidCandidateExclusion(rule.into()));
+  }
   let mut ids = BTreeSet::new();
   for verifier in &policy.verifiers {
     if verifier.id.trim().is_empty() {
@@ -130,11 +223,13 @@ pub fn validate_policy(policy: &VerificationPolicy) -> Result<(), PolicyError> {
     if verifier
       .argv
       .first()
-      .is_none_or(|item| item.trim().is_empty())
+      .is_none_or(|item| !valid_project_executable(item))
     {
       return Err(PolicyError::EmptyArgv(verifier.id.clone()));
     }
-    if !is_safe_relative_path(&verifier.argv[0]) {
+    if verifier.authority == VerifierAuthority::AuthoritySnapshot
+      && !is_safe_relative_path(&verifier.argv[0])
+    {
       return Err(PolicyError::InvalidExecutable(verifier.id.clone()));
     }
     if !is_safe_relative_path(&verifier.cwd) {
@@ -152,10 +247,12 @@ pub fn validate_policy(policy: &VerificationPolicy) -> Result<(), PolicyError> {
       }
       VerifierAuthority::Project => {}
       VerifierAuthority::AuthoritySnapshot => {
-        let valid_oracle_path = verifier
-          .oracle_path
-          .as_deref()
-          .is_some_and(|path| path != "." && is_safe_relative_path(path));
+        let valid_oracle_path = verifier.oracle_path.as_deref().is_some_and(|path| {
+          path != "."
+            && path != ".tenet"
+            && !path.starts_with(".tenet/store")
+            && is_safe_relative_path(path)
+        });
         if !valid_oracle_path {
           return Err(PolicyError::InvalidOraclePath(verifier.id.clone()));
         }
@@ -168,8 +265,79 @@ pub fn validate_policy(policy: &VerificationPolicy) -> Result<(), PolicyError> {
 fn is_safe_relative_path(value: &str) -> bool {
   let path = std::path::Path::new(value);
   !value.trim().is_empty()
+    && !value.contains('\\')
     && !path.is_absolute()
     && path
       .components()
       .all(|component| !matches!(component, std::path::Component::ParentDir))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn policy(candidate: CandidateCapturePolicy) -> ProjectConfig {
+    ProjectConfig {
+      version: 1,
+      spec_path: "SPEC.md".into(),
+      candidate,
+      verifiers: Vec::new(),
+    }
+  }
+
+  #[test]
+  fn candidate_exclusions_match_only_declared_relative_rules() {
+    let candidate = CandidateCapturePolicy {
+      root: ".".into(),
+      exclude: vec!["build/**".into(), "notes.txt".into()],
+    };
+    assert!(candidate.excludes(".tenet/state.json"));
+    assert!(candidate.excludes("build/cache/result"));
+    assert!(candidate.excludes("notes.txt"));
+    assert!(!candidate.excludes("build-output/result"));
+    assert!(!candidate.excludes("notes.txt.bak"));
+  }
+
+  #[test]
+  fn candidate_boundary_rejects_unsafe_paths_and_rules() {
+    assert_eq!(
+      validate_policy(&policy(CandidateCapturePolicy {
+        root: ".tenet".into(),
+        ..CandidateCapturePolicy::default()
+      })),
+      Err(PolicyError::InvalidCandidateRoot)
+    );
+    assert_eq!(
+      validate_policy(&policy(CandidateCapturePolicy {
+        exclude: vec!["../outside/**".into()],
+        ..CandidateCapturePolicy::default()
+      })),
+      Err(PolicyError::InvalidCandidateExclusion(
+        "../outside/**".into()
+      ))
+    );
+    assert_eq!(
+      validate_policy(&policy(CandidateCapturePolicy {
+        exclude: vec!["./build/**".into()],
+        ..CandidateCapturePolicy::default()
+      })),
+      Err(PolicyError::InvalidCandidateExclusion("./build/**".into()))
+    );
+    assert_eq!(
+      validate_policy(&policy(CandidateCapturePolicy {
+        exclude: vec!["build//cache".into()],
+        ..CandidateCapturePolicy::default()
+      })),
+      Err(PolicyError::InvalidCandidateExclusion(
+        "build//cache".into()
+      ))
+    );
+    assert_eq!(
+      validate_policy(&policy(CandidateCapturePolicy {
+        exclude: vec![".".into()],
+        ..CandidateCapturePolicy::default()
+      })),
+      Err(PolicyError::InvalidCandidateExclusion(".".into()))
+    );
+  }
 }

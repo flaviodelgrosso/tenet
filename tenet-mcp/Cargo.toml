@@ -11,4 +11,5 @@ rmcp.workspace = true
 schemars.workspace = true
 tenet-application.workspace = true
 tenet-domain.workspace = true
+serde_json.workspace = true
 tokio.workspace = true

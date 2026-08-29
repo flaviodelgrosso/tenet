@@ -13,7 +13,7 @@ use tenet_domain::{
     derive_obligation_state,
   },
   contract::{
-    AdmittedContract, ContractProposal, ContractProposalInput, ProposalRecord,
+    AdmittedContract, ContractError, ContractProposal, ContractProposalInput, ProposalRecord,
     analyze_verification, canonicalize_proposal, validate_proposal,
   },
   digest::{bytes_digest, canonical_digest},
@@ -22,19 +22,19 @@ use tenet_domain::{
     ContentObjectId, DependencySurface, EvidenceArtifact, EvidenceEffect, OracleIdentity,
     VerifierEvidence,
   },
-  policy::{VerificationPolicy, VerifierAuthority, VerifierSpec, validate_policy},
+  policy::{PolicyError, VerificationPolicy, VerifierAuthority, VerifierSpec, validate_policy},
 };
 
 use crate::{
   audit::AuditState,
   project::{
-    self, CONFIG_PATH, CONTRACT_PATH, ContentStore, EntryKind, MaterializedSnapshot, SKILL_PATH,
-    TENET_DIR, atomic_write, discover_root, load_policy, policy_digest, specification_digest,
-    validate_relative,
+    self, CONFIG_PATH, CONTRACT_PATH, ContentStore, ContentStoreError, EntryKind,
+    MaterializedSnapshot, SKILL_PATH, TENET_DIR, atomic_write, discover_root, load_policy,
+    policy_digest, specification_digest,
   },
   response::{
     ApprovalResult, AuthoritySealResult, CandidateCaptureResult, ContractState, EvidenceResult,
-    GateResult, InitResult, ProposalResult, StatusResult,
+    GateResult, InitResult, ProposalResult, StatusResult, TenetError,
   },
   verifier::{ExecutedVerifier, run_verifier},
 };
@@ -62,10 +62,15 @@ pub struct GateRequest {
 }
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CandidateCaptureRequest {
+  pub authority_id: AuthorityId,
+}
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvidenceRequest {
+  pub authority_id: AuthorityId,
   pub candidate_id: CandidateId,
 }
-
 #[expect(
   dead_code,
   reason = "Rust-derived MCP schema types are never instantiated."
@@ -75,12 +80,15 @@ struct PolicySchema {
   version: u32,
   #[schemars(description = "Safe project-relative authority specification path.")]
   spec_path: String,
+  #[schemars(
+    description = "Authority-defined candidate root and deterministic exclusions. Symlinks are unsupported."
+  )]
+  candidate: tenet_domain::policy::CandidateCapturePolicy,
   verifiers: Vec<PolicyVerifierSchema>,
 }
-
 #[expect(
   dead_code,
-  reason = "Rust-derived MCP schema types are never instantiated."
+  reason = "Rust-derived MCP schema variants are never instantiated."
 )]
 #[derive(JsonSchema)]
 #[schemars(
@@ -89,7 +97,7 @@ struct PolicySchema {
 #[serde(tag = "authority", rename_all = "snake_case")]
 enum PolicyVerifierSchema {
   #[schemars(
-    description = "Execution root is Candidate Snapshot R. Candidate content can influence the executable. oracle_path is forbidden."
+    description = "Execution root is Candidate Snapshot R. argv[0] is passed directly to the operating system process launcher; relative paths resolve from the verifier cwd and ordinary PATH/absolute-path semantics apply. oracle_path is forbidden."
   )]
   Project {
     id: String,
@@ -114,15 +122,101 @@ enum PolicyVerifierSchema {
     oracle_path: String,
   },
 }
+pub type AppResult<T> = std::result::Result<T, TenetError>;
+
+fn public_error(error: anyhow::Error) -> TenetError {
+  if let Some(typed) = error
+    .chain()
+    .find_map(|cause| cause.downcast_ref::<TenetError>().cloned())
+  {
+    return typed;
+  }
+  if let Some(path_error) = error
+    .chain()
+    .find_map(|cause| cause.downcast_ref::<project::PathResolutionError>())
+  {
+    return TenetError::new(path_error_code(path_error), path_error.to_string()).with_context(
+      None,
+      path_error_path(path_error),
+      None,
+    );
+  }
+  if let Some(content_error) = error
+    .chain()
+    .find_map(|cause| cause.downcast_ref::<ContentStoreError>())
+  {
+    return TenetError::new(content_error_code(content_error), content_error.to_string());
+  }
+  if let Some(policy_error) = error
+    .chain()
+    .find_map(|cause| cause.downcast_ref::<PolicyError>())
+  {
+    return TenetError::new("policy_invalid", policy_error.to_string());
+  }
+  if error
+    .chain()
+    .any(|cause| cause.downcast_ref::<toml::de::Error>().is_some())
+  {
+    return TenetError::new("policy_invalid", "verification policy is not valid TOML");
+  }
+  if let Some(contract_error) = error
+    .chain()
+    .find_map(|cause| cause.downcast_ref::<ContractError>())
+  {
+    return TenetError::new("contract_invalid", contract_error.to_string());
+  }
+  TenetError::new("internal_error", error.to_string())
+}
+
+fn path_error_code(error: &project::PathResolutionError) -> &'static str {
+  match error {
+    project::PathResolutionError::UnsupportedSymlink { .. } => "unsupported_symlink",
+    project::PathResolutionError::PathEscape { .. } | project::PathResolutionError::Invalid => {
+      "path_escape"
+    }
+    project::PathResolutionError::Missing { .. } => "path_missing",
+    project::PathResolutionError::NotDirectory { .. } => "path_not_directory",
+    project::PathResolutionError::NotFile { .. } => "path_not_file",
+    project::PathResolutionError::Special { .. } => "unsupported_filesystem_entry",
+    project::PathResolutionError::Io { .. } => "internal_error",
+  }
+}
+
+fn path_error_path(error: &project::PathResolutionError) -> Option<String> {
+  match error {
+    project::PathResolutionError::Invalid => None,
+    project::PathResolutionError::PathEscape { path }
+    | project::PathResolutionError::UnsupportedSymlink { path }
+    | project::PathResolutionError::Missing { path }
+    | project::PathResolutionError::NotDirectory { path }
+    | project::PathResolutionError::NotFile { path }
+    | project::PathResolutionError::Special { path }
+    | project::PathResolutionError::Io { path, .. } => Some(path.clone()),
+  }
+}
+
+fn content_error_code(error: &ContentStoreError) -> &'static str {
+  match error {
+    ContentStoreError::Missing { .. } => "content_object_missing",
+    ContentStoreError::Integrity { .. } => "content_integrity_failure",
+    ContentStoreError::Materialization { .. }
+    | ContentStoreError::MaterializationMessage { .. } => "content_materialization_failed",
+  }
+}
+
+fn app_result<T>(result: Result<T>) -> AppResult<T> {
+  result.map_err(public_error)
+}
+
 impl Tenet {
   pub fn new(cwd: PathBuf) -> Self {
     Self { cwd }
   }
-  pub fn initialize(&self, request: &InitializeRequest) -> Result<InitResult> {
-    initialize(&self.cwd, request.spec_path.as_deref())
+  pub fn initialize(&self, request: &InitializeRequest) -> AppResult<InitResult> {
+    app_result(initialize(&self.cwd, request.spec_path.as_deref()))
   }
-  pub fn status(&self) -> Result<StatusResult> {
-    status(&self.cwd)
+  pub fn status(&self) -> AppResult<StatusResult> {
+    app_result(status(&self.cwd))
   }
   pub fn contract_schema(&self) -> Schema {
     schema_for!(ContractProposalInput)
@@ -130,27 +224,38 @@ impl Tenet {
   pub fn policy_schema(&self) -> Schema {
     schema_for!(PolicySchema)
   }
-  pub fn propose(&self, input: ContractProposalInput) -> Result<ProposalResult> {
-    propose(&self.cwd, input)
+  pub fn propose(&self, input: ContractProposalInput) -> AppResult<ProposalResult> {
+    app_result(propose(&self.cwd, input))
   }
-  pub fn approve(&self, request: &ApproveRequest) -> Result<ApprovalResult> {
-    approve(&self.cwd, &request.proposal_id, &request.proposal_digest)
+  pub fn approve(&self, request: &ApproveRequest) -> AppResult<ApprovalResult> {
+    app_result(approve(
+      &self.cwd,
+      &request.proposal_id,
+      &request.proposal_digest,
+    ))
   }
-  pub fn authority_seal(&self) -> Result<AuthoritySealResult> {
-    authority_seal(&self.cwd)
+  pub fn authority_seal(&self) -> AppResult<AuthoritySealResult> {
+    app_result(authority_seal(&self.cwd))
   }
-  pub fn candidate_capture(&self) -> Result<CandidateCaptureResult> {
-    candidate_capture(&self.cwd)
+  pub fn candidate_capture(
+    &self,
+    request: &CandidateCaptureRequest,
+  ) -> AppResult<CandidateCaptureResult> {
+    app_result(candidate_capture(&self.cwd, request.authority_id.clone()))
   }
-  pub fn gate(&self, request: &GateRequest) -> Result<GateResult> {
-    gate(
+  pub fn gate(&self, request: &GateRequest) -> AppResult<GateResult> {
+    app_result(gate(
       &self.cwd,
       request.authority_id.clone(),
       request.candidate_id.clone(),
-    )
+    ))
   }
-  pub fn exact_evidence(&self, request: &EvidenceRequest) -> Result<EvidenceResult> {
-    evidence(&self.cwd, Some(&request.candidate_id))
+  pub fn exact_evidence(&self, request: &EvidenceRequest) -> AppResult<EvidenceResult> {
+    app_result(evidence(
+      &self.cwd,
+      &request.authority_id,
+      &request.candidate_id,
+    ))
   }
 }
 
@@ -164,17 +269,19 @@ fn initialize(cwd: &Path, spec: Option<&Path>) -> Result<InitResult> {
     None => root.join("SPEC.md"),
   };
   let (policy, spec_digest, created) = project::initialize(&root, &spec)?;
+  let contract_state =
+    match project::resolve_relative_path(&root, CONTRACT_PATH, project::ExpectedEntry::File) {
+      Ok(_) => ContractState::Admitted,
+      Err(project::PathResolutionError::Missing { .. }) => ContractState::Missing,
+      Err(error) => return Err(anyhow::Error::new(error)),
+    };
   Ok(InitResult {
     schema_version: 1,
     initialized: true,
     created,
     spec_path: policy.spec_path,
     spec_digest,
-    contract_state: if root.join(CONTRACT_PATH).exists() {
-      ContractState::Admitted
-    } else {
-      ContractState::Missing
-    },
+    contract_state,
     skill_path: SKILL_PATH.into(),
   })
 }
@@ -228,18 +335,29 @@ fn propose(cwd: &Path, input: ContractProposalInput) -> Result<ProposalResult> {
   validate_authority_sources(&root, &policy)?;
   let spec_digest = specification_digest(&root, &policy)?;
   let policy_digest = policy_digest(&policy)?;
-  let proposal = canonicalize_proposal(input, &policy).context("validate contract proposal")?;
+  let proposal = canonicalize_proposal(input, &policy).map_err(|error| {
+    anyhow::Error::new(TenetError::new(
+      "proposal_invalid",
+      format!("contract proposal is invalid: {error}"),
+    ))
+  })?;
   if proposal.spec_digest != spec_digest {
-    bail!(
-      "proposal specification digest `{}` does not match current `{spec_digest}`",
-      proposal.spec_digest
-    );
+    return Err(anyhow::Error::new(TenetError::new(
+      "specification_stale",
+      format!(
+        "proposal specification digest `{}` does not match current `{spec_digest}`",
+        proposal.spec_digest
+      ),
+    )));
   }
   if proposal.policy_digest != policy_digest {
-    bail!(
-      "proposal policy digest `{}` does not match current `{policy_digest}`",
-      proposal.policy_digest
-    );
+    return Err(anyhow::Error::new(TenetError::new(
+      "policy_stale",
+      format!(
+        "proposal policy digest `{}` does not match current `{policy_digest}`",
+        proposal.policy_digest
+      ),
+    )));
   }
   let proposal_digest = canonical_digest(&proposal)?;
   let proposal_id = format!(
@@ -256,6 +374,8 @@ fn propose(cwd: &Path, input: ContractProposalInput) -> Result<ProposalResult> {
   };
   let mut encoded = serde_json::to_vec_pretty(&record)?;
   encoded.push(b'\n');
+  let proposals = project::prepare_relative_directory(&root, ".tenet/proposals")?;
+  fs::create_dir_all(proposals)?;
   atomic_write(&proposal_path(&root, &proposal_digest), &encoded)?;
   let (verification_profile, warnings) = analyze_verification(&record.proposal, &policy);
   Ok(ProposalResult {
@@ -271,16 +391,32 @@ fn propose(cwd: &Path, input: ContractProposalInput) -> Result<ProposalResult> {
 
 fn approve(cwd: &Path, proposal_id: &str, digest: &str) -> Result<ApprovalResult> {
   let root = initialized_root(cwd)?;
-  let record: ProposalRecord =
-    serde_json::from_slice(&fs::read(proposal_path(&root, digest)).with_context(|| {
-      format!("pending proposal `{digest}` not found; submit a contract proposal first")
-    })?)
-    .context("parse pending proposal")?;
+  let relative = proposal_relative_path(digest)?;
+  let proposal =
+    match project::resolve_relative_path(&root, &relative, project::ExpectedEntry::File) {
+      Ok(path) => path,
+      Err(project::PathResolutionError::Missing { .. }) => {
+        return Err(anyhow::Error::new(TenetError::new(
+          "proposal_missing",
+          format!("pending proposal `{digest}` not found; submit a contract proposal first"),
+        )));
+      }
+      Err(error) => return Err(anyhow::Error::new(error)),
+    };
+  let record: ProposalRecord = serde_json::from_slice(&fs::read(proposal)?).map_err(|error| {
+    anyhow::Error::new(TenetError::new(
+      "proposal_invalid",
+      format!("pending proposal is invalid: {error}"),
+    ))
+  })?;
   if record.proposal_id != proposal_id
     || record.proposal_digest != digest
     || canonical_digest(&record.proposal)? != digest
   {
-    bail!("approval identity does not match the stored proposal");
+    return Err(anyhow::Error::new(TenetError::new(
+      "approval_identity_mismatch",
+      "approval identity does not match the stored proposal",
+    )));
   }
   let policy = load_policy(&root)?;
   validate_authority_sources(&root, &policy)?;
@@ -288,9 +424,10 @@ fn approve(cwd: &Path, proposal_id: &str, digest: &str) -> Result<ApprovalResult
   if record.proposal.spec_digest != specification_digest(&root, &policy)?
     || record.proposal.policy_digest != policy_digest(&policy)?
   {
-    bail!(
-      "contract_stale: proposal is stale because the specification or verification policy changed"
-    );
+    return Err(anyhow::Error::new(TenetError::new(
+      "contract_stale",
+      "proposal is stale because the specification or verification policy changed",
+    )));
   }
   let admitted = AdmittedContract::from(record);
   let contract_digest = canonical_digest(&admitted)?;
@@ -309,34 +446,65 @@ fn approve(cwd: &Path, proposal_id: &str, digest: &str) -> Result<ApprovalResult
 fn authority_seal(cwd: &Path) -> Result<AuthoritySealResult> {
   let root = initialized_root(cwd)?;
   let policy = load_policy(&root)?;
-  let contract =
-    load_contract_optional(&root)?.context("contract_stale: no admitted completion contract")?;
+  let Some(contract) = load_contract_optional(&root)? else {
+    return Err(anyhow::Error::new(TenetError::new(
+      "contract_stale",
+      "no admitted completion contract",
+    )));
+  };
   let spec_digest = specification_digest(&root, &policy)?;
-  let policy_digest = policy_digest(&policy)?;
+  let policy_digest_value = policy_digest(&policy)?;
   if contract.spec_digest != spec_digest {
-    bail!("specification_stale: admitted contract does not match current specification");
+    return Err(anyhow::Error::new(TenetError::new(
+      "specification_stale",
+      "admitted contract does not match current specification",
+    )));
   }
-  if contract.policy_digest != policy_digest {
-    bail!("policy_stale: admitted contract does not match current policy");
+  if contract.policy_digest != policy_digest_value {
+    return Err(anyhow::Error::new(TenetError::new(
+      "policy_stale",
+      "admitted contract does not match current policy",
+    )));
   }
   validate_admitted_contract(&contract, &policy)?;
   validate_authority_sources(&root, &policy)?;
+  let contract_digest = canonical_digest(&contract)?;
   let store = ContentStore::open(&root)?;
+  let store_root =
+    project::resolve_relative_path(&root, ".tenet/store", project::ExpectedEntry::Directory)
+      .map_err(anyhow::Error::new)?;
   let stage = tempfile::Builder::new()
     .prefix("authority-")
-    .tempdir_in(root.join(TENET_DIR).join("store"))?;
+    .tempdir_in(store_root)?;
   copy_authority_surface(&root, stage.path(), &policy)?;
-  validate_authority_sources(stage.path(), &policy)?;
-  let snapshot_id = store.capture(stage.path(), &BTreeSet::new())?;
+  let sealed_policy = load_policy(stage.path())?;
+  let sealed_spec_digest = specification_digest(stage.path(), &sealed_policy)?;
+  let sealed_contract = load_contract_optional(stage.path())?.ok_or_else(|| {
+    anyhow::Error::new(TenetError::new(
+      "authority_surface_changed",
+      "admitted contract disappeared while sealing authority",
+    ))
+  })?;
+  let sealed_contract_digest = canonical_digest(&sealed_contract)?;
+  if policy_digest(&sealed_policy)? != policy_digest_value
+    || sealed_spec_digest != spec_digest
+    || sealed_contract_digest != contract_digest
+  {
+    return Err(anyhow::Error::new(TenetError::new(
+      "authority_surface_changed",
+      "authority policy, specification, or contract changed while sealing",
+    )));
+  }
+  validate_authority_sources(stage.path(), &sealed_policy)?;
+  let snapshot_id = store.capture(stage.path(), |_| false)?;
   let authority_id = AuthorityId(snapshot_id);
-  let contract_digest = canonical_digest(&contract)?;
   Ok(AuthoritySealResult {
     schema_version: 1,
     authority_id,
     specification_digest: spec_digest,
-    policy_digest,
+    policy_digest: policy_digest_value,
     contract_digest,
-    oracle_bundle_paths: policy
+    oracle_bundle_paths: sealed_policy
       .verifiers
       .iter()
       .filter_map(|verifier| verifier.oracle_path.clone())
@@ -344,13 +512,40 @@ fn authority_seal(cwd: &Path) -> Result<AuthoritySealResult> {
   })
 }
 
-fn candidate_capture(cwd: &Path) -> Result<CandidateCaptureResult> {
+fn candidate_capture(cwd: &Path, authority_id: AuthorityId) -> Result<CandidateCaptureResult> {
   let root = initialized_root(cwd)?;
   let store = ContentStore::open(&root)?;
-  let excluded = BTreeSet::from([TENET_DIR, ".mcp.json", ".agents"]);
+  let authority = store
+    .materialize(&authority_id.0)
+    .map_err(anyhow::Error::new)?;
+  let policy_path =
+    project::resolve_relative_path(authority.path(), CONFIG_PATH, project::ExpectedEntry::File)
+      .map_err(anyhow::Error::new)?;
+  let policy_text = fs::read_to_string(policy_path)?;
+  let policy: VerificationPolicy = toml::from_str(&policy_text).map_err(|error| {
+    anyhow::Error::new(TenetError::new(
+      "policy_invalid",
+      format!("sealed authority policy is invalid: {error}"),
+    ))
+  })?;
+  validate_policy(&policy).map_err(|error| {
+    anyhow::Error::new(TenetError::new(
+      "policy_invalid",
+      format!("sealed authority policy is invalid: {error}"),
+    ))
+  })?;
+  let candidate_root = project::resolve_relative_path(
+    &root,
+    &policy.candidate.root,
+    project::ExpectedEntry::Directory,
+  )
+  .map_err(anyhow::Error::new)?;
+  let capture_policy = policy.candidate;
   Ok(CandidateCaptureResult {
     schema_version: 1,
-    candidate_id: CandidateId(store.capture(&root, &excluded)?),
+    candidate_id: CandidateId(
+      store.capture(&candidate_root, |path| capture_policy.excludes(path))?,
+    ),
   })
 }
 
@@ -360,14 +555,10 @@ fn gate(cwd: &Path, authority_id: AuthorityId, candidate_id: CandidateId) -> Res
   let authority = match store.materialize(&authority_id.0) {
     Ok(snapshot) => snapshot,
     Err(error) => {
+      let (code, message) = content_failure(&error);
       return finish_gate(
         &root,
-        control_plane_gate(
-          authority_id,
-          candidate_id,
-          BlockerCode::ProjectNotInitialized,
-          &format!("authority capsule unavailable or corrupt: {error:#}"),
-        ),
+        infrastructure_gate(authority_id, candidate_id, code, &message),
         Vec::new(),
       );
     }
@@ -375,14 +566,10 @@ fn gate(cwd: &Path, authority_id: AuthorityId, candidate_id: CandidateId) -> Res
   let candidate = match store.materialize(&candidate_id.0) {
     Ok(snapshot) => snapshot,
     Err(error) => {
+      let (code, message) = content_failure(&error);
       return finish_gate(
         &root,
-        control_plane_gate(
-          authority_id,
-          candidate_id,
-          BlockerCode::MissingEvidence,
-          &format!("candidate snapshot unavailable or corrupt: {error:#}"),
-        ),
+        infrastructure_gate(authority_id, candidate_id, code, &message),
         Vec::new(),
       );
     }
@@ -794,71 +981,72 @@ fn validate_authority_sources(root: &Path, policy: &VerificationPolicy) -> Resul
     let bundle_path = verifier
       .oracle_path
       .as_deref()
-      .context("oracle_bundle_missing: authority_snapshot verifier has no oracle_path")?;
-    let bundle = root.join(bundle_path);
-    let metadata = fs::symlink_metadata(&bundle).map_err(|_| {
-      anyhow::anyhow!(
-        "oracle_bundle_missing: verifierId={} path={bundle_path}",
-        verifier.id
-      )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-      bail!(
-        "oracle_bundle_not_directory: verifierId={} path={bundle_path}",
-        verifier.id
-      );
-    }
-    let executable = bundle.join(&verifier.argv[0]);
-    let metadata = fs::symlink_metadata(&executable).map_err(|_| {
-      anyhow::anyhow!(
-        "oracle_executable_missing: verifierId={} path={}",
-        verifier.id,
-        verifier.argv[0]
-      )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-      bail!(
-        "oracle_executable_not_file: verifierId={} path={}",
-        verifier.id,
-        verifier.argv[0]
-      );
-    }
+      .context("authority_snapshot verifier has no oracle_path")?;
+    let bundle =
+      project::resolve_relative_path(root, bundle_path, project::ExpectedEntry::Directory)
+        .map_err(|error| authority_path_error(verifier, bundle_path, "oracle_bundle", error))?;
+    let executable =
+      project::resolve_relative_path(&bundle, &verifier.argv[0], project::ExpectedEntry::File)
+        .map_err(|error| {
+          authority_path_error(verifier, &verifier.argv[0], "oracle_executable", error)
+        })?;
     #[cfg(unix)]
     {
       use std::os::unix::fs::PermissionsExt;
-      if metadata.permissions().mode() & 0o111 == 0 {
-        bail!(
-          "oracle_executable_not_executable: verifierId={} path={}",
-          verifier.id,
-          verifier.argv[0]
-        );
+      if fs::symlink_metadata(&executable)?.permissions().mode() & 0o111 == 0 {
+        return Err(anyhow::Error::new(
+          TenetError::new(
+            "oracle_executable_not_executable",
+            format!("oracle executable `{}` is not executable", verifier.argv[0]),
+          )
+          .with_context(
+            Some(verifier.id.clone()),
+            Some(verifier.argv[0].clone()),
+            None,
+          ),
+        ));
       }
     }
-    let cwd = bundle.join(&verifier.cwd);
-    let metadata = fs::symlink_metadata(&cwd).map_err(|_| {
-      anyhow::anyhow!(
-        "oracle_cwd_missing: verifierId={} path={}",
-        verifier.id,
-        verifier.cwd
-      )
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-      bail!(
-        "oracle_cwd_not_directory: verifierId={} path={}",
-        verifier.id,
-        verifier.cwd
-      );
-    }
-    let bundle = bundle.canonicalize()?;
-    if !executable.canonicalize()?.starts_with(&bundle) || !cwd.canonicalize()?.starts_with(&bundle)
-    {
-      bail!(
-        "oracle bundle path escapes configured bundle: verifierId={}",
-        verifier.id
-      );
-    }
+    let _cwd =
+      project::resolve_relative_path(&bundle, &verifier.cwd, project::ExpectedEntry::Directory)
+        .map_err(|error| authority_path_error(verifier, &verifier.cwd, "oracle_cwd", error))?;
   }
   Ok(())
+}
+
+fn authority_path_error(
+  verifier: &VerifierSpec,
+  path: &str,
+  role: &str,
+  error: project::PathResolutionError,
+) -> anyhow::Error {
+  let code = match (&error, role) {
+    (project::PathResolutionError::Missing { .. }, "oracle_bundle") => "oracle_bundle_missing",
+    (project::PathResolutionError::NotDirectory { .. }, "oracle_bundle") => {
+      "oracle_bundle_not_directory"
+    }
+    (project::PathResolutionError::Missing { .. }, "oracle_executable") => {
+      "oracle_executable_missing"
+    }
+    (project::PathResolutionError::NotFile { .. }, "oracle_executable")
+    | (project::PathResolutionError::Special { .. }, "oracle_executable") => {
+      "oracle_executable_not_file"
+    }
+    (project::PathResolutionError::Missing { .. }, "oracle_cwd") => "oracle_cwd_missing",
+    (project::PathResolutionError::NotDirectory { .. }, "oracle_cwd")
+    | (project::PathResolutionError::Special { .. }, "oracle_cwd") => "oracle_cwd_not_directory",
+    (project::PathResolutionError::UnsupportedSymlink { .. }, _) => "unsupported_symlink",
+    (project::PathResolutionError::PathEscape { .. }, _)
+    | (project::PathResolutionError::Invalid, _) => "path_escape",
+    _ => "internal_error",
+  };
+  anyhow::Error::new(
+    TenetError::new(code, format!("{role} path `{path}` is invalid: {error}")).with_context(
+      Some(verifier.id.clone()),
+      Some(path.into()),
+      None,
+    ),
+  )
 }
 
 fn copy_authority_surface(root: &Path, stage: &Path, policy: &VerificationPolicy) -> Result<()> {
@@ -874,15 +1062,12 @@ fn copy_authority_surface(root: &Path, stage: &Path, policy: &VerificationPolicy
   }
   Ok(())
 }
+
 fn copy_authority_path(root: &Path, stage: &Path, path: &str) -> Result<()> {
-  validate_relative(path)?;
-  let source = root.join(path);
-  let metadata =
-    fs::symlink_metadata(&source).with_context(|| format!("authority path missing: {path}"))?;
-  if metadata.file_type().is_symlink() {
-    bail!("unsupported authority symlink: {path}");
-  }
+  let source = project::resolve_relative_path(root, path, project::ExpectedEntry::Any)
+    .map_err(|error| authority_copy_path_error(path, error))?;
   let destination = stage.join(path);
+  let metadata = fs::symlink_metadata(&source)?;
   if metadata.is_file() {
     fs::create_dir_all(
       destination
@@ -891,50 +1076,95 @@ fn copy_authority_path(root: &Path, stage: &Path, path: &str) -> Result<()> {
     )?;
     fs::copy(source, destination)?;
   } else if metadata.is_dir() {
-    copy_directory(&source, &destination)?;
+    copy_directory(root, path, &destination)?;
   } else {
-    bail!("unsupported authority filesystem entry: {path}");
+    return Err(authority_copy_path_error(
+      path,
+      project::PathResolutionError::Special { path: path.into() },
+    ));
   }
   Ok(())
 }
-fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
+
+fn copy_directory(root: &Path, relative: &str, destination: &Path) -> Result<()> {
+  let source = project::resolve_relative_path(root, relative, project::ExpectedEntry::Directory)
+    .map_err(|error| authority_copy_path_error(relative, error))?;
   fs::create_dir_all(destination)?;
-  for item in fs::read_dir(source)? {
-    let item = item?;
-    let source_path = item.path();
-    let metadata = fs::symlink_metadata(&source_path)?;
-    if metadata.file_type().is_symlink() {
-      bail!("unsupported authority symlink: {}", source_path.display());
-    }
-    let destination_path = destination.join(item.file_name());
-    if metadata.is_dir() {
-      copy_directory(&source_path, &destination_path)?;
-    } else if metadata.is_file() {
-      fs::copy(source_path, destination_path)?;
+  let mut items = fs::read_dir(&source)?.collect::<std::result::Result<Vec<_>, _>>()?;
+  items.sort_by_key(|item| item.file_name());
+  for item in items {
+    let name = item
+      .file_name()
+      .to_str()
+      .context("authority paths must be UTF-8")?
+      .to_owned();
+    let child = if relative == "." {
+      name.clone()
     } else {
-      bail!("unsupported authority filesystem entry");
+      format!("{relative}/{name}")
+    };
+    let child_source = project::resolve_relative_path(root, &child, project::ExpectedEntry::Any)
+      .map_err(|error| authority_copy_path_error(&child, error))?;
+    let child_destination = destination.join(&name);
+    let metadata = fs::symlink_metadata(&child_source)?;
+    if metadata.is_dir() {
+      copy_directory(root, &child, &child_destination)?;
+    } else if metadata.is_file() {
+      fs::copy(child_source, child_destination)?;
+    } else {
+      return Err(authority_copy_path_error(
+        &child,
+        project::PathResolutionError::Special {
+          path: child.clone(),
+        },
+      ));
     }
   }
   Ok(())
 }
 
-fn evidence(cwd: &Path, candidate_id: Option<&CandidateId>) -> Result<EvidenceResult> {
+fn authority_copy_path_error(path: &str, error: project::PathResolutionError) -> anyhow::Error {
+  let code = match error {
+    project::PathResolutionError::UnsupportedSymlink { .. } => "unsupported_symlink",
+    project::PathResolutionError::PathEscape { .. } | project::PathResolutionError::Invalid => {
+      "path_escape"
+    }
+    project::PathResolutionError::Missing { .. } => "content_object_missing",
+    project::PathResolutionError::Special { .. } => "unsupported_filesystem_entry",
+    _ => "internal_error",
+  };
+  anyhow::Error::new(
+    TenetError::new(
+      code,
+      format!("authority path `{path}` cannot be sealed: {error}"),
+    )
+    .with_context(None, Some(path.into()), None),
+  )
+}
+
+fn evidence(
+  cwd: &Path,
+  authority_id: &AuthorityId,
+  candidate_id: &CandidateId,
+) -> Result<EvidenceResult> {
   let root = initialized_root(cwd)?;
   let audit = AuditState::load(&root)?;
   Ok(EvidenceResult {
     schema_version: 1,
-    candidate_id: candidate_id.cloned(),
+    authority_id: authority_id.clone(),
+    candidate_id: candidate_id.clone(),
     artifacts: audit
       .evidence
       .into_iter()
       .filter(|item| {
-        candidate_id.is_none_or(|candidate| item.evidence().candidate_id == *candidate)
+        let evidence = item.evidence();
+        evidence.authority_id == *authority_id && evidence.candidate_id == *candidate_id
       })
       .collect(),
     gates: audit
       .gates
       .into_iter()
-      .filter(|item| candidate_id.is_none_or(|candidate| item.candidate_id == *candidate))
+      .filter(|item| item.authority_id == *authority_id && item.candidate_id == *candidate_id)
       .collect(),
   })
 }
@@ -965,6 +1195,33 @@ fn control_plane_gate(
     message,
   )
 }
+fn content_failure(error: &ContentStoreError) -> (BlockerCode, String) {
+  let code = match error {
+    ContentStoreError::Missing { .. } => BlockerCode::ContentObjectMissing,
+    ContentStoreError::Integrity { .. } => BlockerCode::ContentIntegrityFailure,
+    ContentStoreError::Materialization { .. }
+    | ContentStoreError::MaterializationMessage { .. } => BlockerCode::ContentMaterializationFailed,
+  };
+  (code, error.to_string())
+}
+
+fn infrastructure_gate(
+  authority_id: AuthorityId,
+  candidate_id: CandidateId,
+  code: BlockerCode,
+  message: &str,
+) -> GateResult {
+  mismatch_gate_with_verdict(
+    authority_id,
+    candidate_id,
+    String::new(),
+    String::new(),
+    String::new(),
+    code,
+    message,
+    Verdict::InfrastructureError,
+  )
+}
 fn mismatch_gate(
   authority_id: AuthorityId,
   candidate_id: CandidateId,
@@ -974,6 +1231,32 @@ fn mismatch_gate(
   code: BlockerCode,
   message: &str,
 ) -> GateResult {
+  mismatch_gate_with_verdict(
+    authority_id,
+    candidate_id,
+    spec_digest,
+    contract_digest,
+    policy_digest,
+    code,
+    message,
+    Verdict::NotDone,
+  )
+}
+
+#[expect(
+  clippy::too_many_arguments,
+  reason = "Gate metadata and blocker fields are kept explicit at this boundary."
+)]
+fn mismatch_gate_with_verdict(
+  authority_id: AuthorityId,
+  candidate_id: CandidateId,
+  spec_digest: String,
+  contract_digest: String,
+  policy_digest: String,
+  code: BlockerCode,
+  message: &str,
+  verdict: Verdict,
+) -> GateResult {
   GateResult {
     schema_version: 1,
     authority_id,
@@ -981,7 +1264,7 @@ fn mismatch_gate(
     spec_digest,
     contract_digest,
     policy_digest,
-    verdict: Verdict::NotDone,
+    verdict,
     obligations: Vec::new(),
     blockers: vec![Blocker {
       code,
@@ -1007,17 +1290,31 @@ fn validate_admitted_contract(
   .context("validate admitted contract")
 }
 fn load_contract_optional(root: &Path) -> Result<Option<AdmittedContract>> {
-  let path = root.join(CONTRACT_PATH);
-  if !path.exists() {
-    return Ok(None);
-  }
-  serde_json::from_slice(&fs::read(&path)?)
+  let path = match project::resolve_relative_path(root, CONTRACT_PATH, project::ExpectedEntry::File)
+  {
+    Ok(path) => path,
+    Err(project::PathResolutionError::Missing { .. }) => return Ok(None),
+    Err(error) => return Err(anyhow::Error::new(error)),
+  };
+  serde_json::from_slice(&fs::read(path)?)
     .context("parse admitted completion contract")
     .map(Some)
 }
 fn initialized_root(cwd: &Path) -> Result<PathBuf> {
   discover_root(cwd)
 }
+fn proposal_relative_path(digest: &str) -> Result<String> {
+  let normalized = ContentObjectId::new(digest.to_owned())
+    .map_err(|message| anyhow::Error::new(TenetError::new("proposal_digest_invalid", message)))?;
+  if normalized.0 != digest {
+    return Err(anyhow::Error::new(TenetError::new(
+      "proposal_digest_invalid",
+      "proposal digest must use lowercase canonical sha256 form",
+    )));
+  }
+  Ok(format!("{TENET_DIR}/proposals/{}.json", digest_key(digest)))
+}
+
 fn proposal_path(root: &Path, digest: &str) -> PathBuf {
   root
     .join(TENET_DIR)
@@ -1028,6 +1325,14 @@ fn digest_key(digest: &str) -> &str {
   digest.strip_prefix("sha256:").unwrap_or(digest)
 }
 fn has_pending_proposal(root: &Path) -> Result<bool> {
-  let directory = root.join(TENET_DIR).join("proposals");
-  Ok(directory.exists() && fs::read_dir(directory)?.next().transpose()?.is_some())
+  let directory = match project::resolve_relative_path(
+    root,
+    ".tenet/proposals",
+    project::ExpectedEntry::Directory,
+  ) {
+    Ok(directory) => directory,
+    Err(project::PathResolutionError::Missing { .. }) => return Ok(false),
+    Err(error) => return Err(anyhow::Error::new(error)),
+  };
+  Ok(fs::read_dir(directory)?.next().transpose()?.is_some())
 }

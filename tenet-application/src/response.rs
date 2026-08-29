@@ -1,3 +1,5 @@
+use std::fmt;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tenet_domain::{
@@ -5,6 +7,57 @@ use tenet_domain::{
   contract::{ContractProposal, ProposalWarning, VerificationProfile},
   evidence::{AuthorityId, CandidateId, EvidenceArtifact},
 };
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TenetError {
+  pub code: String,
+  pub message: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub verifier_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub path: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub details: Option<Box<serde_json::Value>>,
+}
+
+impl TenetError {
+  pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    Self {
+      code: code.into(),
+      message: message.into(),
+      verifier_id: None,
+      path: None,
+      details: None,
+    }
+  }
+
+  pub fn with_context(
+    mut self,
+    verifier_id: Option<String>,
+    path: Option<String>,
+    details: Option<serde_json::Value>,
+  ) -> Self {
+    self.verifier_id = verifier_id;
+    self.path = path;
+    self.details = details.map(Box::new);
+    self
+  }
+}
+
+impl fmt::Display for TenetError {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(formatter, "{}: {}", self.code, self.message)
+  }
+}
+
+impl std::error::Error for TenetError {}
+
+impl From<anyhow::Error> for TenetError {
+  fn from(error: anyhow::Error) -> Self {
+    Self::new("internal_error", error.to_string())
+  }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -93,7 +146,8 @@ pub struct GateResult {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvidenceResult {
   pub schema_version: u32,
-  pub candidate_id: Option<CandidateId>,
+  pub authority_id: AuthorityId,
+  pub candidate_id: CandidateId,
   pub artifacts: Vec<EvidenceArtifact>,
   pub gates: Vec<GateResult>,
 }
@@ -103,4 +157,23 @@ pub struct ErrorResult {
   pub schema_version: u32,
   pub code: String,
   pub message: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub verifier_id: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub path: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub details: Option<serde_json::Value>,
+}
+
+impl From<TenetError> for ErrorResult {
+  fn from(error: TenetError) -> Self {
+    Self {
+      schema_version: 1,
+      code: error.code,
+      message: error.message,
+      verifier_id: error.verifier_id,
+      path: error.path,
+      details: error.details.map(|details| *details),
+    }
+  }
 }

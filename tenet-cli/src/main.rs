@@ -6,7 +6,7 @@ use anyhow::Result;
 use clap::Parser;
 use tenet_application::{
   application::{InitializeRequest, Tenet},
-  response::ErrorResult,
+  response::{ErrorResult, TenetError},
 };
 
 use crate::cli::{Cli, Command};
@@ -44,11 +44,11 @@ fn run_command(cli: Cli) -> Result<()> {
 }
 
 fn report_error(error: anyhow::Error, json: bool) {
-  let error = ErrorResult {
-    schema_version: 1,
-    code: "command_error".into(),
-    message: format!("{error:#}"),
-  };
+  let typed = error
+    .chain()
+    .find_map(|cause| cause.downcast_ref::<TenetError>().cloned())
+    .unwrap_or_else(|| TenetError::new("internal_error", error.to_string()));
+  let error: ErrorResult = typed.into();
   if json {
     match serde_json::to_string_pretty(&error) {
       Ok(encoded) => println!("{encoded}"),

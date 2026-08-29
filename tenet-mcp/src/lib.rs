@@ -1,16 +1,15 @@
 use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Result;
 use rmcp::{
-  Json, ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool, tool_handler,
-  tool_router, transport::stdio,
+  ErrorData, Json, ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool,
+  tool_handler, tool_router, transport::stdio,
 };
 use schemars::Schema;
 use tenet_application::{
-  application::{ApproveRequest, EvidenceRequest, GateRequest, Tenet},
+  application::{ApproveRequest, CandidateCaptureRequest, EvidenceRequest, GateRequest, Tenet},
   response::{
-    ApprovalResult, AuthoritySealResult, CandidateCaptureResult, EvidenceResult, GateResult,
-    ProposalResult, StatusResult,
+    ApprovalResult, CandidateCaptureResult, EvidenceResult, GateResult, ProposalResult,
+    StatusResult, TenetError,
   },
 };
 use tenet_domain::contract::ContractProposalInput;
@@ -32,17 +31,26 @@ impl TenetMcp {
 
   async fn run_operation<T: Send + 'static>(
     &self,
-    operation: impl FnOnce(Tenet) -> Result<T> + Send + 'static,
-  ) -> Result<T, String> {
+    operation: impl FnOnce(Tenet) -> std::result::Result<T, TenetError> + Send + 'static,
+  ) -> Result<T, ErrorData> {
     let guard = self.operation_lock.clone().lock_owned().await;
     let tenet = self.tenet.clone();
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
       let _guard = guard;
       operation(tenet)
     })
     .await
-    .map_err(|error| format!("Tenet operation task failed: {error}"))?
-    .map_err(|error| format!("{error:#}"))
+    .map_err(|error| {
+      ErrorData::internal_error(format!("Tenet operation task failed: {error}"), None)
+    })?;
+    result.map_err(|error| {
+      let data = serde_json::to_value(&error).ok();
+      if error.code == "internal_error" {
+        ErrorData::internal_error(error.message, data)
+      } else {
+        ErrorData::invalid_params(error.message, data)
+      }
+    })
   }
 }
 
@@ -52,7 +60,7 @@ impl TenetMcp {
     name = "tenet_status",
     description = "Inspect current Tenet initialization, specification, contract, digest, last-gate, verdict, and unresolved-obligation state without executing verifiers."
   )]
-  async fn status(&self) -> Result<Json<StatusResult>, String> {
+  async fn status(&self) -> Result<Json<StatusResult>, ErrorData> {
     self.run_operation(|tenet| tenet.status()).await.map(Json)
   }
 
@@ -65,8 +73,7 @@ impl TenetMcp {
   }
 
   #[tool(
-    name = "tenet_policy_schema",
-    description = "Return the authoritative Rust-derived policy schema. A project verifier executes from Candidate Snapshot R. An authority_snapshot verifier runs from a sealed Authority Capsule A bundle: oraclePath names the directory to seal, argv[0] directly names an executable inside that bundle (never a host interpreter), cwd is bundle-relative, and TENET_CANDIDATE_ROOT exposes R."
+    description = "Return the authoritative Rust-derived policy schema. A project verifier executes from Candidate Snapshot R; argv[0] is passed directly to the operating system process launcher, with relative paths resolved from verifier cwd and ordinary PATH/absolute-path semantics. An authority_snapshot verifier runs from a sealed Authority Capsule A bundle: oracle_path names the directory to seal, argv[0] directly names an executable inside that bundle (never a host interpreter), cwd is bundle-relative, and TENET_CANDIDATE_ROOT exposes R."
   )]
   async fn policy_schema(&self) -> Json<Schema> {
     Json(self.tenet.policy_schema())
@@ -79,7 +86,7 @@ impl TenetMcp {
   async fn contract_propose(
     &self,
     Parameters(proposal): Parameters<ContractProposalInput>,
-  ) -> Result<Json<ProposalResult>, String> {
+  ) -> Result<Json<ProposalResult>, ErrorData> {
     self
       .run_operation(move |tenet| tenet.propose(proposal))
       .await
@@ -93,31 +100,22 @@ impl TenetMcp {
   async fn contract_approve(
     &self,
     Parameters(request): Parameters<ApproveRequest>,
-  ) -> Result<Json<ApprovalResult>, String> {
+  ) -> Result<Json<ApprovalResult>, ErrorData> {
     self
       .run_operation(move |tenet| tenet.approve(&request))
       .await
       .map(Json)
   }
-
-  #[tool(
-    name = "tenet_authority_seal",
-    description = "Seal the explicitly admitted current authority surface into an immutable content-addressed Authority Capsule. Validates specification, policy, contract, and every authority-snapshot bundle before returning authorityId. Present this exact ID to a human for explicit selection; Tenet never selects it."
-  )]
-  async fn authority_seal(&self) -> Result<Json<AuthoritySealResult>, String> {
-    self
-      .run_operation(|tenet| tenet.authority_seal())
-      .await
-      .map(Json)
-  }
-
   #[tool(
     name = "tenet_candidate_capture",
-    description = "Capture the current mutable project content as an immutable Candidate Snapshot and return candidateId. This excludes Tenet control and content-store state and never changes or reseals authority."
+    description = "Capture the mutable candidate root selected by the exact sealed authorityId as an immutable Candidate Snapshot. The capture policy comes only from that Authority Capsule, excludes Tenet administration and common source-control administration by default, rejects symlinks, and returns candidateId."
   )]
-  async fn candidate_capture(&self) -> Result<Json<CandidateCaptureResult>, String> {
+  async fn candidate_capture(
+    &self,
+    Parameters(request): Parameters<CandidateCaptureRequest>,
+  ) -> Result<Json<CandidateCaptureResult>, ErrorData> {
     self
-      .run_operation(|tenet| tenet.candidate_capture())
+      .run_operation(move |tenet| tenet.candidate_capture(&request))
       .await
       .map(Json)
   }
@@ -129,7 +127,7 @@ impl TenetMcp {
   async fn gate(
     &self,
     Parameters(request): Parameters<GateRequest>,
-  ) -> Result<Json<GateResult>, String> {
+  ) -> Result<Json<GateResult>, ErrorData> {
     self
       .run_operation(move |tenet| tenet.gate(&request))
       .await
@@ -138,12 +136,12 @@ impl TenetMcp {
 
   #[tool(
     name = "tenet_evidence",
-    description = "Return structured persisted evidence and gate decisions for the explicitly supplied exact Candidate Snapshot candidateId."
+    description = "Return structured persisted evidence and gate decisions for the explicitly supplied exact authorityId and candidateId pair."
   )]
   async fn evidence(
     &self,
     Parameters(request): Parameters<EvidenceRequest>,
-  ) -> Result<Json<EvidenceResult>, String> {
+  ) -> Result<Json<EvidenceResult>, ErrorData> {
     self
       .run_operation(move |tenet| tenet.exact_evidence(&request))
       .await
@@ -158,7 +156,7 @@ impl TenetMcp {
 )]
 impl ServerHandler for TenetMcp {}
 
-pub fn run(cwd: PathBuf) -> Result<()> {
+pub fn run(cwd: PathBuf) -> anyhow::Result<()> {
   tokio::runtime::Builder::new_current_thread()
     .enable_all()
     .build()?
@@ -172,6 +170,7 @@ pub fn run(cwd: PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use rmcp::model::ErrorCode;
 
   #[test]
   fn aborted_request_holds_lock_until_blocking_operation_finishes() {
@@ -234,6 +233,51 @@ mod tests {
         .await
         .expect("join second request")
         .expect("run second operation");
+    });
+  }
+
+  #[test]
+  fn structured_application_error_survives_mcp_boundary() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+      .enable_all()
+      .build()
+      .expect("build test runtime");
+    runtime.block_on(async {
+      let server = TenetMcp::new(PathBuf::new());
+      let error = server
+        .run_operation(|_| {
+          Err::<(), _>(
+            TenetError::new("oracle_executable_missing", "oracle executable is missing")
+              .with_context(
+                Some("acceptance".into()),
+                Some("verify.sh".into()),
+                Some(serde_json::json!({"kind": "missing"})),
+              ),
+          )
+        })
+        .await
+        .expect_err("operation should fail");
+      assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+      let data = error.data.expect("structured error data");
+      assert_eq!(
+        data.get("code").and_then(serde_json::Value::as_str),
+        Some("oracle_executable_missing")
+      );
+      assert_eq!(
+        data.get("verifierId").and_then(serde_json::Value::as_str),
+        Some("acceptance")
+      );
+      assert_eq!(
+        data.get("path").and_then(serde_json::Value::as_str),
+        Some("verify.sh")
+      );
+      assert_eq!(
+        data
+          .get("details")
+          .and_then(|value| value.get("kind"))
+          .and_then(serde_json::Value::as_str),
+        Some("missing")
+      );
     });
   }
 }

@@ -147,6 +147,7 @@ fn fixture(
   let policy = ProjectConfig {
     version: 1,
     spec_path: "SPEC.md".into(),
+    candidate: Default::default(),
     verifiers: vec![
       verifier("quality", VerifierAuthority::Project, None),
       verifier(

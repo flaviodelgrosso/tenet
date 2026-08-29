@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tenet_domain::evidence::EvidenceArtifact;
 
-use crate::{project::atomic_write, response::GateResult};
+use crate::{
+  project::{self, ExpectedEntry, atomic_write},
+  response::GateResult,
+};
 
 const AUDIT_SCHEMA_VERSION: u32 = 1;
 
@@ -18,10 +21,12 @@ pub struct AuditState {
 
 impl AuditState {
   pub fn load(root: &Path) -> Result<Self> {
-    let path = root.join(crate::project::STATE_PATH);
-    if !path.exists() {
-      return Ok(Self::empty());
-    }
+    let path = match project::resolve_relative_path(root, project::STATE_PATH, ExpectedEntry::File)
+    {
+      Ok(path) => path,
+      Err(project::PathResolutionError::Missing { .. }) => return Ok(Self::empty()),
+      Err(error) => return Err(anyhow::Error::new(error)),
+    };
     let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     let value: serde_json::Value =
       serde_json::from_slice(&bytes).context("parse local Tenet audit state")?;

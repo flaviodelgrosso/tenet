@@ -50,6 +50,9 @@ pub enum BlockerCode {
   OracleAssuranceMissing,
   OracleAssuranceFailed,
   OracleAssuranceStale,
+  ContentObjectMissing,
+  ContentIntegrityFailure,
+  ContentMaterializationFailed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

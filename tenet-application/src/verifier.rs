@@ -18,6 +18,8 @@ use tenet_domain::{
   policy::{EnvironmentMode, VerifierAuthority, VerifierSpec},
 };
 
+use crate::project::{self, ExpectedEntry};
+
 pub struct ExecutedVerifier {
   pub observation: VerifierObservation,
   pub execution: ExecutionProvenance,
@@ -32,30 +34,25 @@ pub fn run_verifier(
   oracle_identity: &OracleIdentity,
 ) -> Result<ExecutedVerifier> {
   let configured_executable = verifier.argv.first().context("verifier argv is empty")?;
-  let candidate_snapshot = candidate_snapshot
-    .canonicalize()
-    .context("canonicalize candidate snapshot")?;
+  let candidate_snapshot =
+    project::resolve_relative_path(candidate_snapshot, ".", ExpectedEntry::Directory)
+      .map_err(anyhow::Error::new)?;
   let (execution_root, executable) = match verifier.authority {
-    VerifierAuthority::Project => (
-      candidate_snapshot.clone(),
-      candidate_snapshot.join(configured_executable),
-    ),
+    VerifierAuthority::Project => (candidate_snapshot.clone(), configured_executable.into()),
     VerifierAuthority::AuthoritySnapshot => {
-      let bundle = oracle_bundle
-        .context("authority_snapshot verifier has no materialized oracle bundle")?
-        .canonicalize()
-        .context("canonicalize authority oracle bundle")?;
-      let executable = bundle
-        .join(configured_executable)
-        .canonicalize()
-        .context("resolve authority oracle executable")?;
-      if !executable.starts_with(&bundle) || !executable.is_file() {
-        anyhow::bail!("authority oracle executable must be a file inside its bundle");
-      }
+      let bundle =
+        oracle_bundle.context("authority_snapshot verifier has no materialized oracle bundle")?;
+      let bundle = project::resolve_relative_path(bundle, ".", ExpectedEntry::Directory)
+        .map_err(anyhow::Error::new)?;
+      let executable =
+        project::resolve_relative_path(&bundle, configured_executable, ExpectedEntry::File)
+          .map_err(anyhow::Error::new)?;
       (bundle, executable)
     }
   };
-  let cwd = execution_root.join(&verifier.cwd);
+  let cwd =
+    project::resolve_relative_path(&execution_root, &verifier.cwd, ExpectedEntry::Directory)
+      .map_err(anyhow::Error::new)?;
   let mut command = Command::new(&executable);
   if verifier.environment_mode == EnvironmentMode::Declared {
     command.env_clear();
@@ -94,15 +91,6 @@ pub fn run_verifier(
   }
   #[cfg(not(unix))]
   {
-    let cwd = cwd
-      .canonicalize()
-      .with_context(|| format!("resolve verifier working directory `{}`", verifier.cwd))?;
-    if !cwd.starts_with(&execution_root) {
-      anyhow::bail!(
-        "verifier working directory `{}` escapes its execution root",
-        verifier.cwd
-      );
-    }
     command.current_dir(cwd);
   }
   let mut child = command
@@ -230,20 +218,20 @@ fn execution_environment_identity(
 }
 
 #[cfg(unix)]
-fn open_verifier_cwd(checkout: &Path, relative: &str) -> Result<std::fs::File> {
+fn open_verifier_cwd(candidate_root: &Path, relative: &str) -> Result<std::fs::File> {
   use std::{
     ffi::CString,
     os::{fd::FromRawFd, unix::ffi::OsStrExt},
     path::Component,
   };
 
-  let mut directory = std::fs::File::open(checkout).context("open candidate checkout")?;
+  let mut directory = std::fs::File::open(candidate_root).context("open candidate snapshot")?;
   for component in Path::new(relative).components() {
     let Component::Normal(name) = component else {
       if component == Component::CurDir {
         continue;
       }
-      anyhow::bail!("verifier working directory must remain relative to the candidate checkout");
+      anyhow::bail!("verifier working directory must remain relative to the candidate snapshot");
     };
     let name = CString::new(name.as_bytes()).context("verifier working directory contains NUL")?;
     // SAFETY: `directory` is an open directory descriptor, `name` is NUL-terminated, and the
@@ -258,7 +246,7 @@ fn open_verifier_cwd(checkout: &Path, relative: &str) -> Result<std::fs::File> {
     if descriptor < 0 {
       return Err(std::io::Error::last_os_error()).with_context(|| {
         format!(
-          "securely open verifier working directory component {} inside candidate checkout",
+          "securely open verifier working directory component {} inside candidate snapshot",
           name.to_string_lossy()
         )
       });

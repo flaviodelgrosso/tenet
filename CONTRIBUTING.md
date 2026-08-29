@@ -1,6 +1,6 @@
 # Contributing to tenet
 
-Thank you for helping improve `tenet`. Contributions that test its assumptions are especially valuable: adversarial contract cases, deterministic verification, evidence validity, revision binding, documentation, and negative results.
+Thank you for helping improve `tenet`. Contributions that test its assumptions are especially valuable: adversarial contract cases, deterministic verification, evidence validity, exact authority/candidate snapshot binding, documentation, and negative results.
 
 Please read the [Code of Conduct](CODE_OF_CONDUCT.md) before participating.
 
@@ -46,7 +46,7 @@ If you change Rust source, run `make fmt` and include only the formatting change
 
 1. Create a branch from the current default branch.
 2. Read the relevant code, tests, README sections, and completion-authority requirements before changing behavior.
-3. Preserve deterministic completion derivation, explicit authority/candidate revision binding, authority-surface immutability, and fail-closed evidence semantics.
+3. Preserve deterministic completion derivation, explicit authority/candidate snapshot binding, authority-surface immutability, and fail-closed evidence semantics.
 4. Add or update tests when a change introduces or alters observable behavior.
 5. Update documentation and examples when commands, configuration, or user-visible behavior changes.
 6. Run the applicable checks, preferably `make ci`.

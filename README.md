@@ -48,7 +48,7 @@ A successful proposal is not an authority capsule. Modifying authority source la
 
 `tenet init` works from an ordinary directory. It initializes that directory as the project root and writes `.tenet/tenet.toml`, a starter specification when necessary, an MCP entry, and a local Tenet Skill. Later operations find the nearest enclosing `.tenet/tenet.toml`; nested initialized roots therefore resolve deterministically to the nearest root.
 
-Tenet excludes `.tenet` from Candidate Snapshot capture, including its content store, proposals, and audit state.
+The admitted policy's `candidate.root` selects the project-relative Candidate Snapshot capture root. Its `candidate.exclude` rules are deterministic exact paths or directory rules ending in `/**`; Tenet administration and common source-control administration remain excluded by default. Candidate capture uses this policy from the explicitly selected authority capsule, never the mutable current policy.
 
 ## Snapshot semantics
 
@@ -59,8 +59,7 @@ Symlinks and special filesystem entries are rejected. Capture never follows an e
 ## Verifier policy
 
 `tenet_policy_schema` is the agent-facing authority for the policy format.
-
-- `project` verifier: command definition comes from sealed A; execution root is Candidate Snapshot R. Candidate content can therefore influence the executable.
+- `project` verifier: command definition comes from sealed A; execution root is Candidate Snapshot R. Tenet passes `argv[0]` directly to the operating system process launcher, so relative paths resolve from verifier `cwd` and ordinary PATH/absolute-path semantics apply. Candidate content can therefore influence a relative executable.
 - `authority_snapshot` verifier: `oracle_path` names an A-owned directory to seal; `argv[0]` directly names a regular executable inside that bundle; `cwd` is relative to the bundle. The candidate is only exposed as `TENET_CANDIDATE_ROOT`.
 
 For example, this is invalid unless the sealed bundle contains an executable file named `sh`:

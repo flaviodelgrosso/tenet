@@ -916,6 +916,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tenet-domain",
+ "thiserror",
  "toml",
 ]
 
@@ -953,6 +954,7 @@ dependencies = [
  "anyhow",
  "rmcp",
  "schemars",
+ "serde_json",
  "tenet-application",
  "tenet-domain",
  "tokio",
