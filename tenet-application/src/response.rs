@@ -122,6 +122,7 @@ pub struct StatusResult {
   pub spec_path: Option<String>,
   pub spec_digest: Option<String>,
   pub policy_digest: Option<String>,
+  pub candidate_surface_configured: bool,
   pub contract_state: ContractState,
   pub contract_digest: Option<String>,
   pub last_gated_authority_id: Option<AuthorityId>,

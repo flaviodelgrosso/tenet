@@ -22,11 +22,18 @@ pub enum EnvironmentMode {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CandidateCapturePolicy {
   #[serde(default = "default_candidate_root")]
-  #[schemars(description = "Safe project-relative root whose contents form Candidate Snapshot R.")]
-  pub root: String,
-  #[serde(default = "default_candidate_exclusions")]
   #[schemars(
-    description = "Deterministic project-relative exclusion rules. A trailing `/**` excludes a directory and all descendants."
+    description = "Safe project-relative root under which candidate selectors are resolved."
+  )]
+  pub root: String,
+  #[serde(default)]
+  #[schemars(
+    description = "Explicit positive Candidate Snapshot R surface. Selectors are exact paths, `path/to/directory/**`, or the explicit root selector `**`; an empty list means the surface is not configured."
+  )]
+  pub include: Vec<String>,
+  #[serde(default)]
+  #[schemars(
+    description = "Selectors removed from the positive Candidate Snapshot R surface. These refine `include` and use the same exact-path or trailing-`/**` selector language."
   )]
   pub exclude: Vec<String>,
 }
@@ -35,7 +42,8 @@ impl Default for CandidateCapturePolicy {
   fn default() -> Self {
     Self {
       root: default_candidate_root(),
-      exclude: default_candidate_exclusions(),
+      include: Vec::new(),
+      exclude: Vec::new(),
     }
   }
 }
@@ -43,15 +51,65 @@ impl Default for CandidateCapturePolicy {
 impl CandidateCapturePolicy {
   pub fn excludes(&self, path: &str) -> bool {
     let path = path.replace('\\', "/");
-    path == ".tenet"
-      || path.starts_with(".tenet/")
-      || self.exclude.iter().any(|rule| {
-        rule.strip_suffix("/**").map_or(rule == &path, |prefix| {
-          path == prefix
-            || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
-        })
-      })
+    is_tenet_path(&path)
+      || self
+        .exclude
+        .iter()
+        .any(|rule| selector_matches(rule, &path))
   }
+}
+pub fn validate_candidate_surface(candidate: &CandidateCapturePolicy) -> Result<(), PolicyError> {
+  if candidate.include.is_empty() {
+    return Err(PolicyError::CandidateSurfaceUnconfigured);
+  }
+  Ok(())
+}
+
+fn is_tenet_path(path: &str) -> bool {
+  path == ".tenet" || path.starts_with(".tenet/")
+}
+
+fn selector_matches(selector: &str, path: &str) -> bool {
+  let selector = selector.replace('\\', "/");
+  if selector == "**" {
+    return true;
+  }
+  selector
+    .strip_suffix("/**")
+    .map_or(selector == path, |prefix| {
+      path == prefix
+        || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+    })
+}
+fn valid_candidate_selector(value: &str) -> bool {
+  if value == "**" {
+    return true;
+  }
+  let base = value.strip_suffix("/**").unwrap_or(value);
+  !(base.is_empty()
+    || base == "."
+    || base.contains('*')
+    || base.contains("//")
+    || base.starts_with("./")
+    || base.contains("/./")
+    || base.ends_with("/.")
+    || base.ends_with('/')
+    || is_tenet_path(base)
+    || !is_safe_relative_path(base))
+}
+
+fn validate_candidate_selectors(selectors: &[String], inclusion: bool) -> Result<(), PolicyError> {
+  if let Some(selector) = selectors
+    .iter()
+    .find(|selector| !valid_candidate_selector(selector))
+  {
+    return Err(if inclusion {
+      PolicyError::InvalidCandidateInclusion(selector.clone())
+    } else {
+      PolicyError::InvalidCandidateExclusion(selector.clone())
+    });
+  }
+  Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -116,29 +174,6 @@ fn default_candidate_root() -> String {
   ".".into()
 }
 
-fn default_candidate_exclusions() -> Vec<String> {
-  vec![
-    ".tenet/**".into(),
-    ".mcp.json".into(),
-    ".agents/**".into(),
-    ".git/**".into(),
-    ".hg/**".into(),
-    ".svn/**".into(),
-  ]
-}
-
-fn valid_candidate_rule(value: &str) -> bool {
-  let base = value.strip_suffix("/**").unwrap_or(value);
-  !(base == "."
-    || base.contains('*')
-    || base.contains("//")
-    || base.starts_with("./")
-    || base.contains("/./")
-    || base.ends_with("/.")
-    || base.ends_with('/')
-    || !is_safe_relative_path(base))
-}
-
 fn valid_project_executable(value: &str) -> bool {
   !value.trim().is_empty() && !value.contains('\0')
 }
@@ -162,7 +197,11 @@ pub enum PolicyError {
   InvalidSpecPath,
   #[error("candidate root must name a safe project-relative directory")]
   InvalidCandidateRoot,
-  #[error("candidate exclusion rule `{0}` is invalid")]
+  #[error("candidate surface include must not be empty")]
+  CandidateSurfaceUnconfigured,
+  #[error("candidate include rule `{0}` is invalid")]
+  InvalidCandidateInclusion(String),
+  #[error("candidate exclude rule `{0}` is invalid")]
   InvalidCandidateExclusion(String),
   #[error("verifier identifier must not be blank")]
   BlankVerifierId,
@@ -197,21 +236,8 @@ pub fn validate_policy(policy: &VerificationPolicy) -> Result<(), PolicyError> {
   {
     return Err(PolicyError::InvalidCandidateRoot);
   }
-  if policy
-    .candidate
-    .exclude
-    .iter()
-    .any(|rule| !valid_candidate_rule(rule))
-  {
-    let rule = policy
-      .candidate
-      .exclude
-      .iter()
-      .find(|rule| !valid_candidate_rule(rule))
-      .map(String::as_str)
-      .unwrap_or("<invalid>");
-    return Err(PolicyError::InvalidCandidateExclusion(rule.into()));
-  }
+  validate_candidate_selectors(&policy.candidate.include, true)?;
+  validate_candidate_selectors(&policy.candidate.exclude, false)?;
   let mut ids = BTreeSet::new();
   for verifier in &policy.verifiers {
     if verifier.id.trim().is_empty() {
@@ -289,6 +315,7 @@ mod tests {
   fn candidate_exclusions_match_only_declared_relative_rules() {
     let candidate = CandidateCapturePolicy {
       root: ".".into(),
+      include: vec!["build/**".into()],
       exclude: vec!["build/**".into(), "notes.txt".into()],
     };
     assert!(candidate.excludes(".tenet/state.json"));
@@ -338,6 +365,55 @@ mod tests {
         ..CandidateCapturePolicy::default()
       })),
       Err(PolicyError::InvalidCandidateExclusion(".".into()))
+    );
+  }
+
+  #[test]
+  fn candidate_surface_allows_missing_future_paths_but_requires_explicit_include() {
+    assert_eq!(
+      validate_candidate_surface(&CandidateCapturePolicy::default()),
+      Err(PolicyError::CandidateSurfaceUnconfigured)
+    );
+    assert!(
+      validate_policy(&policy(CandidateCapturePolicy {
+        include: vec!["Cargo.toml".into(), "src/**".into()],
+        ..CandidateCapturePolicy::default()
+      }))
+      .is_ok()
+    );
+  }
+
+  #[test]
+  fn candidate_selectors_reject_unsafe_and_tenet_paths() {
+    for selector in [
+      "../outside",
+      "./src",
+      "src/*",
+      "src/**/generated",
+      ".tenet/**",
+    ] {
+      assert_eq!(
+        validate_policy(&policy(CandidateCapturePolicy {
+          include: vec![selector.into()],
+          ..CandidateCapturePolicy::default()
+        })),
+        Err(PolicyError::InvalidCandidateInclusion(selector.into()))
+      );
+    }
+    assert_eq!(
+      validate_policy(&policy(CandidateCapturePolicy {
+        exclude: vec![".tenet/**".into()],
+        ..CandidateCapturePolicy::default()
+      })),
+      Err(PolicyError::InvalidCandidateExclusion(".tenet/**".into()))
+    );
+    assert!(
+      validate_policy(&policy(CandidateCapturePolicy {
+        include: vec!["**".into()],
+        exclude: vec!["build/**".into(), "notes.txt".into()],
+        ..CandidateCapturePolicy::default()
+      }))
+      .is_ok()
     );
   }
 }

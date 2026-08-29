@@ -37,8 +37,26 @@ fn policy_schema_documents_distinct_verifier_execution_roots() {
   let encoded = serde_json::to_string(&schema).expect("serialize policy schema");
   assert!(encoded.contains("ordinary PATH/absolute-path semantics apply"));
   assert!(encoded.contains("sealed oracle bundle"));
+  assert!(encoded.contains("Explicit positive Candidate Snapshot R surface"));
+  assert!(encoded.contains("empty list means the surface is not configured"));
 }
 
+#[test]
+fn contract_schema_teaches_semantic_claim_and_evidence_separation() {
+  let schema = Tenet::new(std::path::PathBuf::new()).contract_schema();
+  let encoded = serde_json::to_string(&schema).expect("serialize contract schema");
+  for description in [
+    "Semantic requirement derived from the specification",
+    "independently falsifiable property of Candidate Snapshot R",
+    "Primary verifier mechanism used to obtain evidence",
+    "Criterion about the primary oracle or evidence quality",
+  ] {
+    assert!(
+      encoded.contains(description),
+      "missing contract schema description: {description}"
+    );
+  }
+}
 #[test]
 fn fresh_empty_verifier_project_skill_constructs_authority_before_candidate() {
   let directory = tempfile::tempdir().expect("project");
@@ -76,6 +94,12 @@ fn fresh_empty_verifier_project_skill_constructs_authority_before_candidate() {
     "Editing verification policy and creating authority-owned oracle assets are **authority-definition work** and are allowed before A is sealed",
     "weak configuration is surfaced through the returned verification profile and warnings",
     "Project-authority verifiers remain valid",
+    "candidate.include` is a positive namespace",
+    "derive semantic requirements from the specification",
+    "independently falsifiable completion claims",
+    "multiple obligations may share one verifier",
+    "keep oracle-assurance criteria about the oracle",
+    "present the exact proposal, verification profile, and warnings",
   ] {
     assert!(
       skill.contains(instruction),

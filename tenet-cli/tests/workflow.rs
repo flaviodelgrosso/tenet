@@ -51,7 +51,13 @@ fn proposal(tenet: &Tenet) -> ContractProposalInput {
 }
 
 fn configure_project_verifier(root: &Path) {
-  configure_project_verifier_with_candidate(root, CandidateCapturePolicy::default());
+  configure_project_verifier_with_candidate(
+    root,
+    CandidateCapturePolicy {
+      include: vec!["**".into()],
+      ..CandidateCapturePolicy::default()
+    },
+  );
 }
 
 fn configure_project_verifier_with_candidate(root: &Path, candidate: CandidateCapturePolicy) {
@@ -95,7 +101,10 @@ fn configure_authority_verifier(root: &Path, oracle_path: &str, argv: &str, cwd:
   let policy = ProjectConfig {
     version: 1,
     spec_path: "SPEC.md".into(),
-    candidate: Default::default(),
+    candidate: CandidateCapturePolicy {
+      include: vec!["**".into()],
+      ..CandidateCapturePolicy::default()
+    },
     verifiers: vec![VerifierSpec {
       id: "quality".into(),
       argv: vec![argv.into()],
@@ -114,6 +123,42 @@ fn configure_authority_verifier(root: &Path, oracle_path: &str, argv: &str, cwd:
   );
 }
 
+#[test]
+fn candidate_surface_is_required_for_proposal_and_revalidated_for_sealing() {
+  let directory = tempfile::tempdir().expect("plain directory");
+  let root = directory.path();
+  let tenet = Tenet::new(root.to_path_buf());
+  tenet
+    .initialize(&InitializeRequest { spec_path: None })
+    .expect("init");
+  assert!(!tenet.status().expect("status").candidate_surface_configured);
+  configure_project_verifier_with_candidate(root, CandidateCapturePolicy::default());
+  let error = tenet
+    .propose(proposal(&tenet))
+    .expect_err("unconfigured candidate surface must fail proposal");
+  assert_eq!(error.code, "candidate_surface_unconfigured");
+
+  configure_project_verifier(root);
+  let proposed = tenet.propose(proposal(&tenet)).expect("proposal");
+  tenet
+    .approve(&ApproveRequest {
+      proposal_id: proposed.proposal_id,
+      proposal_digest: proposed.proposal_digest,
+    })
+    .expect("approval");
+  let policy_path = root.join(".tenet/tenet.toml");
+  let mut policy: ProjectConfig =
+    toml::from_str(&fs::read_to_string(&policy_path).expect("read policy")).expect("parse policy");
+  policy.candidate.include.clear();
+  write(
+    &policy_path,
+    &toml::to_string_pretty(&policy).expect("unconfigured policy"),
+  );
+  let error = tenet
+    .authority_seal()
+    .expect_err("seal must independently reject unconfigured surface");
+  assert_eq!(error.code, "candidate_surface_unconfigured");
+}
 #[test]
 fn plain_directory_workflow_seals_and_gates_exact_content() {
   let directory = tempfile::tempdir().expect("plain directory");
@@ -328,7 +373,6 @@ fn candidate_capture_excludes_tenet_administration_and_binds_candidate_content()
   tenet
     .initialize(&InitializeRequest { spec_path: None })
     .expect("init");
-  configure_project_verifier(root);
   write(&root.join("verify.sh"), "#!/bin/sh\nexit 0\n");
   executable(&root.join("verify.sh"));
   write(&root.join(".git/objects/pack"), "ignored one");
@@ -337,6 +381,18 @@ fn candidate_capture_excludes_tenet_administration_and_binds_candidate_content()
   write(
     &root.join(".github/workflows/check.yml"),
     "tracked workflow",
+  );
+  configure_project_verifier_with_candidate(
+    root,
+    CandidateCapturePolicy {
+      include: vec![
+        "verify.sh".into(),
+        "candidate".into(),
+        ".gitignore".into(),
+        ".github/**".into(),
+      ],
+      ..CandidateCapturePolicy::default()
+    },
   );
   let proposed = tenet.propose(proposal(&tenet)).expect("proposal");
   tenet
@@ -406,6 +462,7 @@ fn candidate_capture_uses_the_selected_authority_boundary() {
     root,
     CandidateCapturePolicy {
       root: "candidate".into(),
+      include: vec!["verify.sh".into(), "subject".into()],
       exclude: vec!["ignored/**".into()],
     },
   );

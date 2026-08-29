@@ -22,7 +22,10 @@ use tenet_domain::{
     ContentObjectId, DependencySurface, EvidenceArtifact, EvidenceEffect, OracleIdentity,
     VerifierEvidence,
   },
-  policy::{PolicyError, VerificationPolicy, VerifierAuthority, VerifierSpec, validate_policy},
+  policy::{
+    PolicyError, VerificationPolicy, VerifierAuthority, VerifierSpec, validate_candidate_surface,
+    validate_policy,
+  },
 };
 
 use crate::{
@@ -81,7 +84,7 @@ struct PolicySchema {
   #[schemars(description = "Safe project-relative authority specification path.")]
   spec_path: String,
   #[schemars(
-    description = "Authority-defined candidate root and deterministic exclusions. Symlinks are unsupported."
+    description = "Authority-defined positive candidate surface: include selects the namespace and exclude only refines it. Symlinks are unsupported."
   )]
   candidate: tenet_domain::policy::CandidateCapturePolicy,
   verifiers: Vec<PolicyVerifierSchema>,
@@ -151,7 +154,11 @@ fn public_error(error: anyhow::Error) -> TenetError {
     .chain()
     .find_map(|cause| cause.downcast_ref::<PolicyError>())
   {
-    return TenetError::new("policy_invalid", policy_error.to_string());
+    let code = match policy_error {
+      PolicyError::CandidateSurfaceUnconfigured => "candidate_surface_unconfigured",
+      _ => "policy_invalid",
+    };
+    return TenetError::new(code, policy_error.to_string());
   }
   if error
     .chain()
@@ -314,6 +321,7 @@ fn status(cwd: &Path) -> Result<StatusResult> {
     contract_state,
     contract_digest,
     last_gated_authority_id: last.map(|gate| gate.authority_id.clone()),
+    candidate_surface_configured: !policy.candidate.include.is_empty(),
     last_gated_candidate_id: last.map(|gate| gate.candidate_id.clone()),
     last_verdict: last.map(|gate| gate.verdict.clone()),
     unresolved_obligations: last
@@ -333,6 +341,7 @@ fn propose(cwd: &Path, input: ContractProposalInput) -> Result<ProposalResult> {
   let root = initialized_root(cwd)?;
   let policy = load_policy(&root)?;
   validate_authority_sources(&root, &policy)?;
+  validate_candidate_surface(&policy.candidate)?;
   let spec_digest = specification_digest(&root, &policy)?;
   let policy_digest = policy_digest(&policy)?;
   let proposal = canonicalize_proposal(input, &policy).map_err(|error| {
@@ -446,6 +455,7 @@ fn approve(cwd: &Path, proposal_id: &str, digest: &str) -> Result<ApprovalResult
 fn authority_seal(cwd: &Path) -> Result<AuthoritySealResult> {
   let root = initialized_root(cwd)?;
   let policy = load_policy(&root)?;
+  validate_candidate_surface(&policy.candidate)?;
   let Some(contract) = load_contract_optional(&root)? else {
     return Err(anyhow::Error::new(TenetError::new(
       "contract_stale",
@@ -534,18 +544,21 @@ fn candidate_capture(cwd: &Path, authority_id: AuthorityId) -> Result<CandidateC
       format!("sealed authority policy is invalid: {error}"),
     ))
   })?;
+  validate_candidate_surface(&policy.candidate)?;
   let candidate_root = project::resolve_relative_path(
     &root,
     &policy.candidate.root,
     project::ExpectedEntry::Directory,
   )
   .map_err(anyhow::Error::new)?;
-  let capture_policy = policy.candidate;
+  let candidate_id = store.capture_selected(
+    &candidate_root,
+    &policy.candidate.include,
+    &policy.candidate.exclude,
+  )?;
   Ok(CandidateCaptureResult {
     schema_version: 1,
-    candidate_id: CandidateId(
-      store.capture(&candidate_root, |path| capture_policy.excludes(path))?,
-    ),
+    candidate_id: CandidateId(candidate_id),
   })
 }
 

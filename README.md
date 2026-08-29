@@ -46,14 +46,23 @@ tenet_candidate_capture → candidateId R
 tenet_gate({ authorityId: A, candidateId: R })
 ```
 
-Before `tenet_contract_propose`, the policy must contain suitable verifier definitions for the evidence contracts required by the specification. If no suitable verifier exists, inspect the specification, use `tenet_policy_schema` as the authoritative policy format, edit `.tenet/tenet.toml`, create authority-owned oracle assets for any `authority_snapshot` verifier, re-read `tenet_status`, and then propose using the configured verifier IDs. Editing verification policy and creating authority-owned oracle assets are authority-definition work allowed before A is sealed. Do not implement candidate product behavior during this phase. Project-authority verifiers remain valid; weak verification configurations are reported through the verification profile and warnings rather than rejected merely for being weak.
+Before `tenet_contract_propose`, explicitly design the positive candidate surface and ensure the policy contains suitable verifier definitions for the evidence contracts required by the specification. `candidate.include` selects exact paths, `path/to/directory/**`, or the explicit root selector `**`; `candidate.exclude` only refines that surface. An empty include is valid after initialization but blocks proposal and sealing. If no suitable verifier exists, inspect the specification, use `tenet_policy_schema` as the authoritative Rust-derived policy format, edit `.tenet/tenet.toml`, create authority-owned oracle assets for any `authority_snapshot` verifier, re-read `tenet_status`, and then propose using the configured verifier IDs. Editing verification policy and creating authority-owned oracle assets are authority-definition work allowed before A is sealed. Do not implement candidate product behavior during this phase. Project-authority verifiers remain valid; weak verification configurations are reported through the verification profile and warnings.
 
 A successful proposal is not an authority capsule. Modifying authority source later requires a new proposal/approval where stale, a new sealed A, and fresh human selection. Candidate implementation present in the workspace is not included in A because sealing captures only the authority surface.
 ## Initialization
 
 `tenet init` works from an ordinary directory. It initializes that directory as the project root and writes `.tenet/tenet.toml`, a starter specification when necessary, an MCP entry, and a local Tenet Skill. Later operations find the nearest enclosing `.tenet/tenet.toml`; nested initialized roots therefore resolve deterministically to the nearest root.
 
-The admitted policy's `candidate.root` selects the project-relative Candidate Snapshot capture root. Its `candidate.exclude` rules are deterministic exact paths or directory rules ending in `/**`; Tenet administration and common source-control administration remain excluded by default. Candidate capture uses this policy from the explicitly selected authority capsule, never the mutable current policy.
+The admitted policy's `candidate.root` selects the project-relative root under which the positive `candidate.include` surface is resolved. Include selectors define the complete Candidate Snapshot namespace; excludes only prune that namespace. Missing selected paths are allowed so future candidate paths can be declared before implementation. Tenet administration is never captured, and no VCS or ecosystem-specific exclusions are inferred. Candidate capture uses this policy from the explicitly selected authority capsule, never the mutable current policy.
+
+Contract authoring separates semantic claims from evidence mechanisms:
+
+- a requirement states what the specification requires;
+- a verification obligation states one independently falsifiable property Candidate Snapshot R must satisfy;
+- an evidence contract states how Tenet obtains evidence for that property;
+- an oracle assurance criterion concerns the oracle or evidence quality, not candidate behavior.
+
+Separate obligations when acceptance properties can fail independently and that distinction matters to completion or diagnosis. Multiple obligations may share one verifier; decomposition is semantic, not one obligation per verifier, sentence, or specification bullet.
 
 ## Snapshot semantics
 

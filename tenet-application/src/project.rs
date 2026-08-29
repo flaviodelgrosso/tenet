@@ -189,8 +189,17 @@ Tenet judges immutable Candidate Snapshot R under independently sealed Authority
 ## Authority construction (before A is sealed)
 
 1. Inspect the specification and call `tenet_status`.
-2. Before `tenet_contract_propose`, ensure `.tenet/tenet.toml` contains suitable verifier definitions for the evidence contracts the specification requires.
-3. If no suitable verifier exists:
+2. Design the candidate surface explicitly in `.tenet/tenet.toml`: `candidate.include` is a positive namespace of exact paths, `path/to/directory/**`, or explicit root `**`; `candidate.exclude` only refines that surface. An empty include is unconfigured and must be fixed before proposing.
+3. Before `tenet_contract_propose`, ensure `.tenet/tenet.toml` contains suitable verifier definitions for the evidence contracts the specification requires.
+4. Construct the contract semantically:
+   - derive semantic requirements from the specification;
+   - identify independently falsifiable completion claims;
+   - create separate obligations where independent failure should be visible in the completion decision or diagnosis;
+   - write each obligation statement only in terms of candidate/system behavior;
+   - assign the appropriate verifier through the evidence contract;
+   - multiple obligations may share one verifier; decomposition is semantic, not one obligation per verifier, sentence, or specification bullet;
+   - keep oracle-assurance criteria about the oracle or evidence quality, not candidate behavior.
+5. If no suitable verifier exists:
    - inspect the specification to determine the required observations;
    - call `tenet_policy_schema` and use its Rust-derived schema as the authoritative policy format;
    - edit `.tenet/tenet.toml` to define the required verifier(s);
@@ -198,14 +207,31 @@ Tenet judges immutable Candidate Snapshot R under independently sealed Authority
    - re-read `tenet_status` after every authority change;
    - propose the contract using those verifier IDs.
 
+Bad obligation statement:
+
+```text
+Automated project verification demonstrates that title and language customization work.
+```
+
+Good independently falsifiable obligations:
+
+```text
+The CLI applies the requested title when producing a greeting.
+The CLI produces the greeting in the requested supported language.
+```
+
+The verifier belongs in `evidenceContract.claim.verifierId`; it is the evidence mechanism, not the semantic claim.
+
 Editing verification policy and creating authority-owned oracle assets are **authority-definition work** and are allowed before A is sealed. Do not implement candidate product behavior during authority construction. Project-authority verifiers remain valid; choose verifier authority based on the evidence contract, not on a hard-coded technology stack. A weak configuration is surfaced through the returned verification profile and warnings; it is not a reason to invent stack-specific verifier choices or to implement the candidate first.
 
 ## Sealed-authority lifecycle
 
 ```text
 inspect specification
-→ construct verification authority if needed
+→ design positive candidate surface and verification authority
+→ construct semantic requirements and independently falsifiable obligations
 → tenet_contract_propose
+→ present the exact proposal, verification profile, and warnings for explicit human approval
 → explicit human approval of the exact proposal
 → tenet_contract_approve
 → tenet_authority_seal → authorityId A
@@ -217,7 +243,7 @@ inspect specification
 
 Never claim completion until `tenet_gate` returns `done` for that exact `(A, R)` pair.
 
-Project verifiers execute in R with `argv[0]` passed to the operating system process launcher. `authority_snapshot` verifiers execute from A-owned `oracle_path`; `argv[0]` directly names a bundled executable, `cwd` is bundle-relative, and `TENET_CANDIDATE_ROOT` exposes R.
+Project verifiers execute in R with `argv[0]` passed to the operating system process launcher. `authority_snapshot` verifiers execute from A-owned `oracle_path`; `argv[0]` directly names a bundled executable, `cwd` is bundle-relative, and `TENET_CANDIDATE_ROOT` exposes R. Candidate capture uses the policy sealed in A, not the live workspace policy.
 "#;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -302,16 +328,33 @@ impl ContentStore {
   where
     F: Fn(&str) -> bool,
   {
-    let source_metadata = fs::symlink_metadata(source)?;
-    if source_metadata.file_type().is_symlink() {
-      bail!("unsupported symlink in snapshot root");
-    }
-    if !source_metadata.is_dir() {
-      bail!("snapshot capture root must be a directory");
-    }
-    let source = source.canonicalize()?;
+    let source = capture_root(source)?;
     let mut entries = Vec::new();
     collect(&source, &source, &excluded, &mut entries)?;
+    self.capture_entries(&source, entries)
+  }
+
+  pub fn capture_selected(
+    &self,
+    source: &Path,
+    includes: &[String],
+    excludes: &[String],
+  ) -> Result<ContentObjectId> {
+    let source = capture_root(source)?;
+    let mut entries = BTreeSet::new();
+    for selector in includes {
+      collect_selector(&source, selector, excludes, &mut entries)?;
+    }
+    entries.retain(|path| {
+      !is_tenet_path(path)
+        && !excludes
+          .iter()
+          .any(|selector| selector_matches(selector, path))
+    });
+    let entries = materialize_ancestors(&source, entries)?;
+    self.capture_entries(&source, entries)
+  }
+  fn capture_entries(&self, source: &Path, mut entries: Vec<TreeEntry>) -> Result<ContentObjectId> {
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let manifest = TreeManifest {
       version: 1,
@@ -644,6 +687,179 @@ fn collect_tree_paths(directory: &Path, prefix: &str, paths: &mut BTreeSet<Strin
     }
   }
   Ok(())
+}
+fn capture_root(source: &Path) -> Result<PathBuf> {
+  let metadata = fs::symlink_metadata(source)?;
+  if metadata.file_type().is_symlink() {
+    bail!("unsupported symlink in snapshot root");
+  }
+  if !metadata.is_dir() {
+    bail!("snapshot capture root must be a directory");
+  }
+  Ok(source.canonicalize()?)
+}
+fn collect_selector(
+  root: &Path,
+  selector: &str,
+  excludes: &[String],
+  entries: &mut BTreeSet<String>,
+) -> Result<()> {
+  if selector == "**" {
+    return collect_selected_tree(root, root, excludes, entries);
+  }
+  let recursive = selector.ends_with("/**");
+  let relative = selector.strip_suffix("/**").unwrap_or(selector);
+  if excluded_subtree(relative, excludes)
+    || excludes
+      .iter()
+      .any(|exclude| !recursive && exclude == relative)
+  {
+    return Ok(());
+  }
+  let Some(path) = resolve_selected_path(root, relative, recursive)? else {
+    return Ok(());
+  };
+  if recursive {
+    collect_selected_tree(root, &path, excludes, entries)?;
+  } else {
+    entries.insert(relative.into());
+  }
+  Ok(())
+}
+
+fn collect_selected_tree(
+  root: &Path,
+  directory: &Path,
+  excludes: &[String],
+  entries: &mut BTreeSet<String>,
+) -> Result<()> {
+  let mut children = fs::read_dir(directory)?.collect::<std::result::Result<Vec<_>, _>>()?;
+  children.sort_by_key(|item| item.file_name());
+  for child in children {
+    let relative = normalized_relative(child.path().strip_prefix(root)?)?;
+    if excluded_subtree(&relative, excludes) {
+      continue;
+    }
+    let metadata = fs::symlink_metadata(child.path())?;
+    if excludes.iter().any(|exclude| exclude == &relative) {
+      if metadata.is_dir() {
+        collect_selected_tree(root, &child.path(), excludes, entries)?;
+      }
+      continue;
+    }
+    if metadata.file_type().is_symlink() {
+      bail!("unsupported symlink in selected candidate path: {relative}");
+    }
+    if metadata.is_dir() {
+      entries.insert(relative.clone());
+      collect_selected_tree(root, &child.path(), excludes, entries)?;
+    } else if metadata.is_file() {
+      entries.insert(relative);
+    } else {
+      bail!("unsupported filesystem entry in selected candidate path");
+    }
+  }
+  Ok(())
+}
+
+fn excluded_subtree(path: &str, excludes: &[String]) -> bool {
+  is_tenet_path(path)
+    || excludes
+      .iter()
+      .any(|exclude| exclude.ends_with("/**") && selector_matches(exclude, path))
+}
+
+fn resolve_selected_path(root: &Path, relative: &str, recursive: bool) -> Result<Option<PathBuf>> {
+  let mut current = root.to_path_buf();
+  for component in Path::new(relative).components() {
+    let Component::Normal(name) = component else {
+      continue;
+    };
+    current.push(name);
+    let metadata = match fs::symlink_metadata(&current) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+      Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+      bail!("unsupported symlink in selected candidate path: {relative}");
+    }
+    if !metadata.is_dir()
+      && current
+        .strip_prefix(root)
+        .ok()
+        .is_some_and(|path| path.to_string_lossy() != relative)
+    {
+      bail!("selected candidate path has a non-directory ancestor: {relative}");
+    }
+  }
+  let metadata = fs::symlink_metadata(&current)?;
+  if recursive && !metadata.is_dir() {
+    return Ok(None);
+  }
+  if !metadata.is_dir() && !metadata.is_file() {
+    bail!("unsupported filesystem entry in selected candidate path: {relative}");
+  }
+  Ok(Some(current))
+}
+
+fn materialize_ancestors(root: &Path, paths: BTreeSet<String>) -> Result<Vec<TreeEntry>> {
+  let mut all = paths.clone();
+  for path in paths {
+    let mut parent = Path::new(&path).parent();
+    while let Some(path) = parent.filter(|path| !path.as_os_str().is_empty()) {
+      let relative = normalized_relative(path)?;
+      if relative != "." {
+        all.insert(relative);
+      }
+      parent = path.parent();
+    }
+  }
+  all
+    .into_iter()
+    .map(|path| tree_entry(root, &path))
+    .collect()
+}
+
+fn tree_entry(root: &Path, relative: &str) -> Result<TreeEntry> {
+  let path = root.join(relative);
+  let metadata = fs::symlink_metadata(&path)?;
+  if metadata.file_type().is_symlink() {
+    bail!("unsupported symlink in selected candidate path: {relative}");
+  }
+  if metadata.is_dir() {
+    Ok(TreeEntry {
+      path: relative.into(),
+      kind: EntryKind::Directory,
+      content_id: None,
+      executable: false,
+    })
+  } else if metadata.is_file() {
+    Ok(TreeEntry {
+      path: relative.into(),
+      kind: EntryKind::File,
+      content_id: Some(content_id(bytes_digest(&fs::read(path)?))?),
+      executable: executable(&metadata),
+    })
+  } else {
+    bail!("unsupported filesystem entry in selected candidate path: {relative}");
+  }
+}
+
+fn is_tenet_path(path: &str) -> bool {
+  path == TENET_DIR || path.starts_with(&format!("{TENET_DIR}/"))
+}
+
+fn selector_matches(selector: &str, path: &str) -> bool {
+  if selector == "**" {
+    return true;
+  }
+  selector
+    .strip_suffix("/**")
+    .map_or(selector == path, |prefix| {
+      path == prefix
+        || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+    })
 }
 
 fn collect<F>(
@@ -998,7 +1214,117 @@ mod tests {
         .expect("capture mutation")
     );
   }
+
+  #[test]
+  fn selected_capture_is_positive_and_materializes_ancestors() {
+    let project = tempfile::tempdir().expect("project");
+    let source = tempfile::tempdir().expect("source");
+    fs::create_dir_all(source.path().join("src/nested")).expect("source tree");
+    fs::write(source.path().join("exact.txt"), "one").expect("exact");
+    fs::write(source.path().join("src/main.rs"), "main").expect("main");
+    fs::write(source.path().join("src/nested/feature.rs"), "feature").expect("feature");
+    fs::write(source.path().join("outside"), "outside").expect("outside");
+    fs::create_dir_all(source.path().join("target")).expect("target");
+    fs::write(source.path().join("target/output"), "generated").expect("generated");
+    fs::create_dir_all(source.path().join(".tenet")).expect("administration");
+    fs::write(source.path().join(".tenet/state.json"), "state").expect("state");
+    let store = ContentStore::open(project.path()).expect("store");
+    let includes = vec!["exact.txt".into(), "src/**".into(), "future/file".into()];
+    let excludes = vec!["src/nested/**".into()];
+    let first = store
+      .capture_selected(source.path(), &includes, &excludes)
+      .expect("selected capture");
+    let manifest = store.manifest(&first).expect("manifest");
+    assert_eq!(
+      manifest
+        .entries
+        .iter()
+        .map(|entry| entry.path.as_str())
+        .collect::<Vec<_>>(),
+      vec!["exact.txt", "src", "src/main.rs"]
+    );
+
+    fs::write(source.path().join("outside"), "outside changed").expect("outside mutation");
+    fs::write(source.path().join("target/output"), "generated changed")
+      .expect("generated mutation");
+    assert_eq!(
+      first,
+      store
+        .capture_selected(source.path(), &includes, &excludes)
+        .expect("unchanged selected capture")
+    );
+    fs::write(source.path().join("src/main.rs"), "main changed").expect("selected mutation");
+    let changed = store
+      .capture_selected(source.path(), &includes, &excludes)
+      .expect("changed selected capture");
+    assert_ne!(first, changed);
+    fs::write(source.path().join("src/new.rs"), "new").expect("new selected file");
+    let added = store
+      .capture_selected(source.path(), &includes, &excludes)
+      .expect("added selected capture");
+    assert_ne!(changed, added);
+    fs::remove_file(source.path().join("src/main.rs")).expect("delete selected file");
+    let deleted = store
+      .capture_selected(source.path(), &includes, &excludes)
+      .expect("deleted selected capture");
+    assert_ne!(added, deleted);
+  }
+
+  #[test]
+  fn selected_capture_root_selector_is_explicit_and_deterministic() {
+    let project = tempfile::tempdir().expect("project");
+    let left = tempfile::tempdir().expect("left");
+    let right = tempfile::tempdir().expect("right");
+    for source in [left.path(), right.path()] {
+      fs::create_dir_all(source.join("src")).expect("src");
+      fs::write(source.join("src/main"), "same").expect("main");
+      fs::create_dir_all(source.join(".tenet")).expect("administration");
+      fs::write(source.join(".tenet/state"), "ignored").expect("state");
+    }
+    let store = ContentStore::open(project.path()).expect("store");
+    let includes = vec!["**".into()];
+    let excludes = Vec::new();
+    let left_id = store
+      .capture_selected(left.path(), &includes, &excludes)
+      .expect("left capture");
+    let right_id = store
+      .capture_selected(right.path(), &includes, &excludes)
+      .expect("right capture");
+    assert_eq!(left_id, right_id);
+    fs::write(right.path().join("src/main"), "changed").expect("mutation");
+    assert_ne!(
+      left_id,
+      store
+        .capture_selected(right.path(), &includes, &excludes)
+        .expect("changed right capture")
+    );
+  }
+
   #[cfg(unix)]
+  #[test]
+  fn selected_capture_rejects_selected_symlinks_but_not_excluded_symlinks() {
+    let project = tempfile::tempdir().expect("project");
+    let source = tempfile::tempdir().expect("source");
+    fs::create_dir_all(source.path().join("src/generated")).expect("source tree");
+    std::os::unix::fs::symlink("/outside", source.path().join("src/generated/link"))
+      .expect("excluded link");
+    let store = ContentStore::open(project.path()).expect("store");
+    assert!(
+      store
+        .capture_selected(
+          source.path(),
+          &["src/**".into()],
+          &["src/generated/**".into()],
+        )
+        .is_ok()
+    );
+    std::os::unix::fs::symlink("/outside", source.path().join("src/link")).expect("selected link");
+    assert!(
+      store
+        .capture_selected(source.path(), &["src/**".into()], &[])
+        .is_err()
+    );
+  }
   #[test]
   fn executable_state_and_path_change_snapshot_identity() {
     use std::os::unix::fs::PermissionsExt;

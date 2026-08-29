@@ -35,7 +35,10 @@ pub struct ContractProposalInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RequirementInput {
   pub id: RequirementId,
-  #[schemars(length(min = 1))]
+  #[schemars(
+    length(min = 1),
+    description = "Semantic requirement derived from the specification: state what the product or system must do, not how Tenet will verify it."
+  )]
   pub statement: String,
   #[schemars(length(min = 1))]
   pub obligations: Vec<VerificationObligationInput>,
@@ -45,7 +48,10 @@ pub struct RequirementInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VerificationObligationInput {
   pub id: ObligationId,
-  #[schemars(length(min = 1))]
+  #[schemars(
+    length(min = 1),
+    description = "One independently falsifiable property of Candidate Snapshot R required for completion. Describe candidate or system behavior only; do not describe tests, verifier execution, or evidence collection."
+  )]
   pub statement: String,
   pub evidence_contract: EvidenceContractInput,
 }
@@ -53,15 +59,24 @@ pub struct VerificationObligationInput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvidenceContractInput {
+  #[schemars(
+    description = "Evidence mechanism for the semantic obligation: declares how Tenet obtains evidence for the property, separately from the obligation statement."
+  )]
   pub claim: ClaimEvidenceContractInput,
   #[serde(default)]
+  #[schemars(
+    description = "Optional assurance mechanisms and criteria about evidence quality or the primary oracle; these are not additional statements of candidate behavior."
+  )]
   pub oracle_assurances: Vec<OracleAssuranceContractInput>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimEvidenceContractInput {
-  #[schemars(length(min = 1))]
+  #[schemars(
+    length(min = 1),
+    description = "Primary verifier mechanism used to obtain evidence for the obligation. This identifies evidence collection, not the semantic claim about Candidate Snapshot R."
+  )]
   pub verifier_id: String,
 }
 
@@ -69,7 +84,10 @@ pub struct ClaimEvidenceContractInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OracleAssuranceContractInput {
   pub id: AssuranceId,
-  #[schemars(length(min = 1))]
+  #[schemars(
+    length(min = 1),
+    description = "Criterion about the primary oracle or evidence quality, not another statement of candidate or system behavior."
+  )]
   pub criterion: String,
   #[schemars(length(min = 1))]
   pub verifier_id: String,

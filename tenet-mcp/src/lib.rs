@@ -58,7 +58,7 @@ impl TenetMcp {
 impl TenetMcp {
   #[tool(
     name = "tenet_status",
-    description = "Inspect Tenet status first. It reports specification, contract, policy, and unresolved-obligation state; when the contract is missing and no verifiers are configured, construct verification authority before candidate engineering."
+    description = "Inspect Tenet status first. It reports specification, contract, policy, candidate-surface configuration, and unresolved-obligation state; an empty candidate include surface is allowed during initialization but must be designed before proposal."
   )]
   async fn status(&self) -> Result<Json<StatusResult>, ErrorData> {
     self.run_operation(|tenet| tenet.status()).await.map(Json)
@@ -82,7 +82,7 @@ impl TenetMcp {
 
   #[tool(
     name = "tenet_contract_propose",
-    description = "Before calling this tool, construct verification authority: inspect the specification, ensure .tenet/tenet.toml contains suitable verifier definitions, use tenet_policy_schema for its format, create authority-owned oracle assets for authority_snapshot verifiers, and re-read tenet_status after changes. Then validate and store a proposal bound to the current specification and policy. Project-authority verifiers remain valid; do not implement candidate product behavior merely because no verifier is configured. Tenet returns the verification profile and warnings for weak configurations."
+    description = "Before calling this tool, explicitly design candidate.include as the authority-approved positive surface; an empty include is rejected. Then construct semantic requirements and independently falsifiable obligation statements about candidate/system behavior, keeping tests, verifier execution, and evidence collection in evidence contracts. Multiple obligations may share one verifier. Ensure .tenet/tenet.toml contains suitable verifier definitions, use tenet_policy_schema for its format, create authority-owned oracle assets for authority_snapshot verifiers, and re-read tenet_status after changes. Tenet returns the exact proposal, verification profile, and warnings for explicit human approval."
   )]
   async fn contract_propose(
     &self,
@@ -119,7 +119,7 @@ impl TenetMcp {
   }
   #[tool(
     name = "tenet_candidate_capture",
-    description = "Capture the candidate root only after a human explicitly selected the exact sealed authorityId and candidate engineering is complete. The capture policy comes only from that Authority Capsule, excludes Tenet administration and common source-control administration by default, rejects symlinks, and returns candidateId."
+    description = "Capture Candidate Snapshot R only after a human explicitly selected the exact sealed authorityId and candidate engineering is complete. The positive include/exclude capture policy comes only from that Authority Capsule; it selects no incidental workspace state, never includes Tenet administration, rejects unsupported selected filesystem entries, and returns candidateId."
   )]
   async fn candidate_capture(
     &self,
@@ -163,7 +163,7 @@ impl TenetMcp {
 #[tool_handler(
   name = "tenet",
   version = "0.1.0",
-  instructions = "Tenet is an agent-neutral completion authority. Keep authority construction separate from candidate engineering: inspect the specification and tenet_status, ensure suitable verifier definitions exist before tenet_contract_propose, and if none exist use tenet_policy_schema, edit .tenet/tenet.toml, create authority-owned oracle assets for authority_snapshot, and re-read tenet_status. This policy and oracle work is allowed before A is sealed; project-authority verifiers remain valid; do not implement candidate product behavior first. Then obtain explicit human approval, seal A, present authorityId for explicit human selection, engineer and capture R, and claim completion only when tenet_gate returns done for that exact pair."
+  instructions = "Tenet is an agent-neutral completion authority. Keep authority construction separate from candidate engineering: inspect the specification and tenet_status, explicitly design the positive candidate.include surface before tenet_contract_propose, and ensure suitable verifier definitions exist. Contract requirements state semantic specification needs; obligations state independently falsifiable candidate/system properties; evidence contracts state how evidence is obtained; oracle assurances concern oracle or evidence quality. Separate obligations when independent failure should be visible, allow multiple obligations to share a verifier, and do not prescribe a technology stack. If no verifier exists use tenet_policy_schema, edit .tenet/tenet.toml, create authority-owned oracle assets for authority_snapshot, and re-read tenet_status. This policy and oracle work is allowed before A is sealed; project-authority verifiers remain valid; do not implement candidate product behavior first. Present the exact proposal, profile, and warnings for explicit human approval, then seal A, present authorityId for explicit human selection, engineer and capture R, and claim completion only when tenet_gate returns done for that exact pair."
 )]
 impl ServerHandler for TenetMcp {}
 
