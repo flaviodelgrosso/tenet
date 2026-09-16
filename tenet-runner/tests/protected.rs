@@ -8,9 +8,10 @@
 
 #![cfg(unix)]
 
-use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
-use tenet_application::ports::{ExecutedVerifier, VerifierRun, VerifierRunner};
+use sha2::{Digest, Sha256};
+use tenet_application::ports::{ExecutedVerifier, VerifierRun, VerifierRunner, ViewDigest};
 use tenet_domain::{
   algebra::{EvidenceResult, LOCAL_V1, PROTECTED_V1},
   evidence::{AuthorityId, CandidateId, ContentObjectId, OracleIdentity},
@@ -23,6 +24,50 @@ use tenet_runner::{LocalProcessRunner, protection_backend_available};
 
 fn content(byte: char) -> ContentObjectId {
   ContentObjectId(format!("sha256:{}", byte.to_string().repeat(64)))
+}
+
+/// Walks a staged root and records the exact file expectations the private
+/// namespace backend builds and verifies its copy from.
+fn walk_view(
+  root: &Path,
+  prefix: &str,
+  digests: &mut Vec<ViewDigest>,
+  directories: &mut Vec<String>,
+) {
+  for entry in fs::read_dir(root).expect("read view root") {
+    let entry = entry.expect("view entry");
+    let path = entry.path();
+    let view_path = format!(
+      "{prefix}/{}",
+      path
+        .strip_prefix(root)
+        .expect("relative path")
+        .to_string_lossy()
+    );
+    if path.is_dir() {
+      directories.push(view_path);
+      walk_view(&path, prefix, digests, directories);
+    } else {
+      let mut hasher = Sha256::new();
+      hasher.update(fs::read(&path).expect("view file"));
+      let executable = entry
+        .metadata()
+        .expect("view metadata")
+        .permissions()
+        .mode()
+        & 0o111
+        != 0;
+      digests.push(ViewDigest {
+        path: view_path,
+        sha256_hex: hasher
+          .finalize()
+          .iter()
+          .map(|byte| format!("{byte:02x}"))
+          .collect(),
+        executable,
+      });
+    }
+  }
 }
 
 fn exit_policy() -> ExitCodePolicy {
@@ -89,6 +134,19 @@ impl Sandbox {
       candidate_id: candidate_id.clone(),
       definition_digest: "sha256:definition".into(),
     };
+    let (mut digests, mut directories) = (Vec::new(), Vec::new());
+    walk_view(
+      self.candidate.path(),
+      "candidate",
+      &mut digests,
+      &mut directories,
+    );
+    walk_view(
+      self.authority.path(),
+      "authority",
+      &mut digests,
+      &mut directories,
+    );
     LocalProcessRunner
       .run(&VerifierRun {
         candidate_root: self.candidate.path(),
@@ -99,6 +157,8 @@ impl Sandbox {
         authority_id: &AuthorityId(content('a')),
         candidate_id: &candidate_id,
         oracle_identity: &oracle,
+        view_digests: &digests,
+        view_directories: &directories,
       })
       .expect("run verifier")
   }

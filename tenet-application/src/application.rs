@@ -817,6 +817,11 @@ impl Tenet {
     request: &RequirementCheckRequest,
   ) -> Result<RequirementCheckResult> {
     let root = self.initialized_root()?;
+    // Authoritative verification loads the active Admission through the
+    // trusted path: the grant mac is re-verified under the trusted secret, so
+    // a process without it fails closed instead of running verifiers under a
+    // possibly forged persisted authority.
+    self.trusted_admission_secret()?;
     let chain = self.load_active(&root)?;
     self.require_current_spec(&root, &chain.loaded.spec)?;
     let candidate_id = self.capture_candidate(&root, &chain.loaded.policy)?;
@@ -848,6 +853,9 @@ impl Tenet {
 
   fn verify_inner(&self) -> Result<VerifyResult> {
     let root = self.initialized_root()?;
+    // `DONE` may only be derived from an Admission whose grant mac verifies
+    // under the trusted secret; a process without the secret fails closed.
+    self.trusted_admission_secret()?;
     let chain = self.load_active(&root)?;
     self.require_current_spec(&root, &chain.loaded.spec)?;
     let candidate_id = self.capture_candidate(&root, &chain.loaded.policy)?;
@@ -891,6 +899,9 @@ impl Tenet {
 
   fn receipt_verify_inner(&self, receipt_id: &EvaluationId) -> Result<ReceiptVerificationResult> {
     let root = self.initialized_root()?;
+    // Receipt `DONE` re-derives completion from the historical Admission, so
+    // it loads through the trusted mac-revalidating path.
+    self.trusted_admission_secret()?;
     let evaluation: Evaluation = self.load_object(&root, &receipt_id.0)?;
     if !matches!(evaluation.scope, EvaluationScope::Final) {
       return Err(
@@ -1152,10 +1163,46 @@ impl Tenet {
     verifier: &VerifierSpec,
   ) -> Result<tenet_domain::algebra::VerifierRun> {
     let definition_digest = canonical_digest(verifier)?;
-    let candidate = self.repository.materialize(root, &candidate_id.0)?;
-    let authority_view = self
-      .repository
-      .materialize(root, &chain.loaded.authority.surface)?;
+    // Protected execution reads through a privately staged view whose
+    // immutability the operating system enforces against other processes;
+    // local execution keeps the ordinary materialized snapshots.
+    let protected_view = if verifier.protection == VerifierProtection::Protected {
+      Some(
+        self
+          .repository
+          .stage_protected_view(root, &candidate_id.0, &chain.loaded.authority.surface)
+          .context("stage protected verifier view")?,
+      )
+    } else {
+      None
+    };
+    let local_candidate = if protected_view.is_none() {
+      Some(self.repository.materialize(root, &candidate_id.0)?)
+    } else {
+      None
+    };
+    let local_authority = if protected_view.is_none() {
+      Some(
+        self
+          .repository
+          .materialize(root, &chain.loaded.authority.surface)?,
+      )
+    } else {
+      None
+    };
+    let (candidate_root, authority_root) = match &protected_view {
+      Some(view) => (view.candidate_root(), view.authority_root()),
+      None => (
+        local_candidate
+          .as_ref()
+          .expect("local candidate view")
+          .path(),
+        local_authority
+          .as_ref()
+          .expect("local authority view")
+          .path(),
+      ),
+    };
     let scratch = self.repository.fresh_scratch(root)?;
     let output = self.repository.fresh_output(root)?;
     let identity = match verifier.authority {
@@ -1190,34 +1237,80 @@ impl Tenet {
         }
       }
     };
+    let view_digests = protected_view
+      .as_ref()
+      .map_or(&[][..], |view| view.view_digests());
+    let view_directories = protected_view
+      .as_ref()
+      .map_or(&[][..], |view| view.view_directories());
+    if let Some(view) = &protected_view {
+      // The verifier must only ever observe bytes already proven equal to
+      // the admitted identities at this instant. On macOS this closes the
+      // image-create-to-mount window: a hostiles write to the backing image
+      // either precedes this check (rejected here as infrastructure) or
+      // finds an unlinked file. Namespace backends verify inside the
+      // private copy before exec.
+      if !view.verify_intact(&candidate_id.0, &chain.loaded.authority.surface)? {
+        return infrastructure_run(
+          chain.id.clone(),
+          chain.admission.authority.clone(),
+          chain.loaded.authority.contract.clone(),
+          chain.loaded.contract.policy.clone(),
+          candidate_id.clone(),
+          verifier,
+          "protected view did not match the admitted identities before execution".into(),
+        );
+      }
+    }
     let executed: ExecutedVerifier = self.runner.run(&VerifierRun {
-      candidate_root: candidate.path(),
-      authority_root: authority_view.path(),
+      candidate_root,
+      authority_root,
       scratch_root: scratch.path(),
       output_root: output.path(),
       verifier,
       authority_id: &chain.admission.authority,
       candidate_id,
       oracle_identity: &identity,
+      view_digests,
+      view_directories,
     })?;
     validate_executed_verifier(verifier, &identity, &executed)?;
-    let candidate_include = ["**".to_owned()];
-    let observed_candidate =
-      self
-        .repository
-        .capture_selected(root, candidate.path(), &candidate_include, &[])?;
-    let observed_authority = self.repository.capture(root, authority_view.path())?;
-    if observed_candidate != candidate_id.0 || observed_authority != chain.loaded.authority.surface
-    {
-      return infrastructure_run(
-        chain.id.clone(),
-        chain.admission.authority.clone(),
-        chain.loaded.authority.contract.clone(),
-        chain.loaded.contract.policy.clone(),
-        candidate_id.clone(),
-        verifier,
-        "verifier mutated its immutable Candidate or Authority view".into(),
-      );
+    if let Some(view) = &protected_view {
+      // The enforcing boundary belongs to the protected view; the staging
+      // directory is not the verifier's read surface on namespace backends,
+      // so integrity is proven by the view itself, not by a generic
+      // recapture of a mutable directory.
+      if !view.verify_intact(&candidate_id.0, &chain.loaded.authority.surface)? {
+        return infrastructure_run(
+          chain.id.clone(),
+          chain.admission.authority.clone(),
+          chain.loaded.authority.contract.clone(),
+          chain.loaded.contract.policy.clone(),
+          candidate_id.clone(),
+          verifier,
+          "protected view boundary changed during verification".into(),
+        );
+      }
+    } else {
+      let candidate_include = ["**".to_owned()];
+      let observed_candidate =
+        self
+          .repository
+          .capture_selected(root, candidate_root, &candidate_include, &[])?;
+      let observed_authority = self.repository.capture(root, authority_root)?;
+      if observed_candidate != candidate_id.0
+        || observed_authority != chain.loaded.authority.surface
+      {
+        return infrastructure_run(
+          chain.id.clone(),
+          chain.admission.authority.clone(),
+          chain.loaded.authority.contract.clone(),
+          chain.loaded.contract.policy.clone(),
+          candidate_id.clone(),
+          verifier,
+          "verifier mutated its immutable Candidate or Authority view".into(),
+        );
+      }
     }
     Ok(executed.domain_run(
       chain.id.clone(),
@@ -1347,6 +1440,22 @@ impl Tenet {
       &loaded.authority,
       &loaded.spec,
     )?;
+    // Structural binding alone never authenticates a persisted Admission:
+    // any process with repository write access can hand-construct a
+    // content-addressed chain. A process holding the trusted secret re-verifies
+    // the grant mac on every load, so a forged or tampered persisted chain can
+    // never participate in verification or completion. Processes without the
+    // secret load structurally for informational reads only; every path that
+    // can influence verification or `DONE` requires the secret first.
+    if let Some(secret) = self.admission_secret.as_deref() {
+      grant::verify_grant(
+        secret,
+        &admission.grant,
+        &admission.proposal,
+        &admission.authority,
+      )
+      .map_err(|error| TenetError::new("admission_grant_invalid", error.to_string()))?;
+    }
     validate_completion_admission(
       &loaded.contract,
       &AdmissionChain {

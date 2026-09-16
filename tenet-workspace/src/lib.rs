@@ -15,8 +15,10 @@ use tenet_domain::{
 };
 
 mod project;
+mod protected;
 
 use project::ContentStore;
+pub use protected::protected_materialization_available;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalWorkspace;
@@ -281,6 +283,16 @@ impl Repository for LocalWorkspace {
       blob_count,
       ref_count: refs.len(),
     })
+  }
+
+  fn stage_protected_view(
+    &self,
+    root: &Path,
+    candidate: &ContentObjectId,
+    authority: &ContentObjectId,
+  ) -> Result<Box<dyn tenet_application::ports::ProtectedView>> {
+    let store = ContentStore::open(root)?;
+    protected::stage(&store, root, candidate, authority)
   }
 }
 

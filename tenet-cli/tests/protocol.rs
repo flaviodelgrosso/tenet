@@ -200,6 +200,13 @@ fn admission_secret() -> Vec<u8> {
   b"trusted-admission-secret-0123456789abcdef".to_vec()
 }
 
+fn hex_secret() -> String {
+  admission_secret()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
 impl Fixture {
   fn new(mutate_on_call: Option<usize>) -> Self {
     Self::configured(mutate_on_call, false)
@@ -525,6 +532,7 @@ fn receipt_verification_is_available_to_non_mcp_process_callers() {
   let output = ProcessCommand::new(env!("CARGO_BIN_EXE_tenet"))
     .arg("--cwd")
     .arg(fixture.root())
+    .env("TENET_ADMISSION_SECRET", hex_secret())
     .arg("doctor")
     .arg("--receipt")
     .arg(&verified.evaluation_id.0.0)
@@ -792,7 +800,7 @@ fn runner_errors_are_persisted_for_every_required_verifier() {
     fixture.root().to_path_buf(),
     Arc::new(LocalWorkspace),
     runner.clone(),
-    None,
+    Some(admission_secret()),
   );
   let result = tenet.verify().unwrap();
   assert_eq!(result.verdict, Verdict::InfrastructureError);
@@ -817,7 +825,7 @@ fn inconsistent_runner_claim_cannot_produce_done() {
     fixture.root().to_path_buf(),
     Arc::new(LocalWorkspace),
     Arc::new(InconsistentRunner),
-    None,
+    Some(admission_secret()),
   );
   assert_eq!(
     tenet.verify().unwrap().verdict,
@@ -1108,10 +1116,152 @@ fn runner_cannot_overclaim_protected_v1_for_local_spec() {
     fixture.root().to_path_buf(),
     Arc::new(LocalWorkspace),
     Arc::new(OverclaimingRunner),
-    None,
+    Some(admission_secret()),
   );
   assert_eq!(
     tenet.verify().unwrap().verdict,
     Verdict::InfrastructureError
+  );
+}
+
+/// A process holding the trusted secret re-verifies the persisted grant mac
+/// on every load that can influence verification or `DONE`.
+fn trusted_reader(fixture: &Fixture, secret: Option<Vec<u8>>) -> Tenet {
+  Tenet::new(
+    fixture.root().to_path_buf(),
+    Arc::new(LocalWorkspace),
+    Arc::new(RecordingRunner::default()),
+    secret,
+  )
+}
+
+fn active_admission(fixture: &Fixture) -> tenet_domain::authority::Admission {
+  let root = fixture.root().canonicalize().unwrap();
+  let active_id = LocalWorkspace
+    .read_ref(&root, "active-admission")
+    .expect("read ref")
+    .expect("active admission");
+  let bytes = LocalWorkspace
+    .load_object(&root, &active_id)
+    .expect("admission object");
+  serde_json::from_slice(&bytes).expect("admission")
+}
+
+fn replace_active_admission(fixture: &Fixture, admission: &tenet_domain::authority::Admission) {
+  let root = fixture.root().canonicalize().unwrap();
+  let forged = LocalWorkspace
+    .store_object(&root, &serde_json::to_vec(admission).unwrap())
+    .expect("store forged admission");
+  LocalWorkspace
+    .write_ref(&root, "active-admission", &forged)
+    .expect("write forged ref");
+}
+
+#[test]
+fn tampered_grant_mac_on_persisted_admission_cannot_verify() {
+  let fixture = Fixture::new(None);
+  fixture.admit();
+  assert_eq!(
+    fixture.tenet.verify().expect("verify").verdict,
+    Verdict::Done,
+    "the valid persisted Admission must be accepted on reload"
+  );
+  let mut admission = active_admission(&fixture);
+  let mut mac = admission.grant.mac.clone();
+  mac.replace_range(63..64, if &mac[63..64] == "0" { "1" } else { "0" });
+  admission.grant.mac = mac;
+  replace_active_admission(&fixture, &admission);
+  // Structurally well-formed and internally canonical: only the mac betrays it.
+  assert_eq!(
+    fixture.tenet.verify().unwrap_err().code,
+    "admission_grant_invalid"
+  );
+  assert_eq!(
+    fixture
+      .tenet
+      .requirement_check(&RequirementCheckRequest {
+        requirement_id: RequirementId("R1".into()),
+      })
+      .unwrap_err()
+      .code,
+    "admission_grant_invalid"
+  );
+  assert_eq!(
+    fixture.tenet.context().unwrap().phase,
+    WorkflowPhase::Incompatible
+  );
+}
+
+#[test]
+fn manually_forged_admission_in_repository_state_is_rejected() {
+  let fixture = Fixture::new(None);
+  let (proposal_id, authority_id) = staged_pair(&fixture);
+  let reconciliation_id = reconciliation_id(&fixture);
+  // A producer with repository write access hand-constructs a complete
+  // content-addressed Admission whose chain and grant binding are exact; only
+  // the mac was never issued under the trusted secret.
+  let forged = tenet_domain::authority::Admission {
+    schema_version: 1,
+    proposal: proposal_id.clone(),
+    reconciliation: reconciliation_id,
+    authority: authority_id.clone(),
+    grant: tenet_domain::authority::AdmissionGrant {
+      schema_version: 1,
+      semantics: tenet_domain::authority::ADMISSION_GRANT_SEMANTICS_V1.into(),
+      proposal: proposal_id,
+      authority: authority_id,
+      mac: "e".repeat(64),
+    },
+  };
+  replace_active_admission(&fixture, &forged);
+  assert_eq!(
+    fixture.tenet.verify().unwrap_err().code,
+    "admission_grant_invalid"
+  );
+  assert_eq!(
+    fixture
+      .tenet
+      .requirement_check(&RequirementCheckRequest {
+        requirement_id: RequirementId("R1".into()),
+      })
+      .unwrap_err()
+      .code,
+    "admission_grant_invalid"
+  );
+}
+
+#[test]
+fn wrong_or_missing_secret_cannot_derive_completion_from_persisted_state() {
+  let fixture = Fixture::new(None);
+  fixture.admit();
+  // A different trusted secret cannot authenticate the stored grant.
+  let wrong = trusted_reader(
+    &fixture,
+    Some(b"other-trusted-secret-0123456789abcdef".to_vec()),
+  );
+  assert_eq!(wrong.verify().unwrap_err().code, "admission_grant_invalid");
+  // No secret at all: the mac cannot be re-verified, so verification fails
+  // closed instead of trusting the persisted chain.
+  let none = trusted_reader(&fixture, None);
+  assert_eq!(
+    none.verify().unwrap_err().code,
+    "admission_secret_unavailable"
+  );
+  assert_eq!(
+    none
+      .requirement_check(&RequirementCheckRequest {
+        requirement_id: RequirementId("R1".into()),
+      })
+      .unwrap_err()
+      .code,
+    "admission_secret_unavailable"
+  );
+  // The valid chain still completes for the holder of the real secret.
+  assert_eq!(
+    trusted_reader(&fixture, Some(admission_secret()))
+      .verify()
+      .expect("trusted verify")
+      .verdict,
+    Verdict::Done
   );
 }

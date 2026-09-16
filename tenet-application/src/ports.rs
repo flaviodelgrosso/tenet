@@ -160,6 +160,58 @@ pub trait Repository: Send + Sync {
   fn remove_ref(&self, root: &Path, name: &str) -> Result<()>;
   fn list_refs(&self, root: &Path, prefix: &str) -> Result<Vec<(String, ContentObjectId)>>;
   fn inspect_integrity(&self, root: &Path) -> Result<IntegrityObservation>;
+  /// Materialize an exact Candidate and Authority surface into a private
+  /// view for `PROTECTED_V1` execution. The view must enforce, through an OS
+  /// boundary rather than detection, that no process other than the confined
+  /// verifier can observe transiently different bytes than the captured
+  /// identities while the verifier runs. A platform that cannot enforce this
+  /// returns an error; the caller then yields an infrastructure result and
+  /// never downgrades assurance.
+  fn stage_protected_view(
+    &self,
+    root: &Path,
+    candidate: &ContentObjectId,
+    authority: &ContentObjectId,
+  ) -> Result<Box<dyn ProtectedView>>;
+}
+
+/// One expected file inside a protected view: path, exact bytes, and mode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViewDigest {
+  /// View-relative path: `candidate/<relative>` or `authority/<relative>`.
+  pub path: String,
+  /// Lowercase sha256 hex of the expected bytes.
+  pub sha256_hex: String,
+  /// Expected executable flag of the view file.
+  pub executable: bool,
+}
+
+/// A protected Candidate/Authority view for one verifier run. The runner
+/// executes the verifier against `candidate_root`/`authority_root`; the
+/// workspace enforces immutability of those roots against external processes
+/// (macOS: a read-only mounted volume whose backing store is unlinked). On
+/// platforms where the runner creates the private namespace (Linux
+/// Bubblewrap), `view_digests`/`view_directories` are the trusted
+/// expectations the runner must materialize and verify inside that namespace
+/// before the verifier observes anything, and `verify_intact` is trivially
+/// true because the namespace itself is the boundary.
+pub trait ProtectedView: Send {
+  fn candidate_root(&self) -> &Path;
+  fn authority_root(&self) -> &Path;
+  fn view_digests(&self) -> &[ViewDigest];
+  /// View-relative paths of expected directories (including empty ones).
+  fn view_directories(&self) -> &[String];
+  /// Post-run check that the enforcing boundary still holds and that the
+  /// view's bytes still hash to the expected identities. `false` means the
+  /// run cannot contribute admissible evidence. On platforms where the
+  /// runner materialized a private namespace copy verified against
+  /// `view_digests`, the namespace itself is the boundary and this is
+  /// trivially true because the staging source is transient by design.
+  fn verify_intact(
+    &self,
+    expected_candidate: &ContentObjectId,
+    expected_authority: &ContentObjectId,
+  ) -> Result<bool>;
 }
 
 pub struct ExecutedVerifier {
@@ -208,6 +260,13 @@ pub struct VerifierRun<'a> {
   pub authority_id: &'a AuthorityId,
   pub candidate_id: &'a CandidateId,
   pub oracle_identity: &'a OracleIdentity,
+  /// Trusted expectations for every file in the protected view; empty for
+  /// local runs. A namespace-creating runner must build its private copy
+  /// exactly from these expectations and verify it before exec'ing the
+  /// verifier.
+  pub view_digests: &'a [ViewDigest],
+  /// Expected view directories, including empty ones.
+  pub view_directories: &'a [String],
 }
 
 pub trait VerifierRunner: Send + Sync {

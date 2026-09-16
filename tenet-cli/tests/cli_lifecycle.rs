@@ -416,6 +416,40 @@ fn grant_and_admission_without_the_secret_fail_closed() {
 }
 
 #[test]
+fn verification_without_the_secret_fails_closed_after_admission() {
+  let repo = Repo::new("pass");
+  repo.admit();
+  // A producer process without the trusted secret cannot derive completion
+  // from persisted state: the grant mac cannot be re-verified, so every
+  // verification-affecting operation fails closed instead of trusting the
+  // persisted chain.
+  for args in [
+    vec!["verify", "--json"],
+    vec!["requirement", "check", "--id", "R1", "--json"],
+  ] {
+    let output = tenet_with_secret(repo.root(), &args, None);
+    assert_eq!(
+      output.status.code(),
+      Some(1),
+      "args {args:?} must fail closed"
+    );
+    let error: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(error["code"], "admission_secret_unavailable");
+  }
+  // A receipt is the historical `DONE` surface; it also requires the secret.
+  let verified = ok_json(repo.root(), &["verify", "--json"]);
+  let evaluation_id = verified["evaluationId"].as_str().expect("evaluation id");
+  let receipt = tenet_with_secret(
+    repo.root(),
+    &["receipt", "verify", "--id", evaluation_id, "--json"],
+    None,
+  );
+  assert_eq!(receipt.status.code(), Some(1));
+  let error: serde_json::Value = serde_json::from_slice(&receipt.stdout).expect("JSON");
+  assert_eq!(error["code"], "admission_secret_unavailable");
+}
+
+#[test]
 fn forged_grant_via_cli_is_rejected_with_the_trusted_secret() {
   let repo = Repo::new("pass");
   let root = repo.root();
@@ -486,9 +520,12 @@ fn mcp_verify_matches_the_cli_completion_derivation() {
 
   // A separate MCP process over the same repository derives the same verdict
   // and Candidate identity: adapters share kernel semantics, not state.
+  // The MCP server is a trusted operator process: deriving `DONE` re-verifies
+  // the persisted grant mac, so the operator supplies the trusted secret to it.
   let mut child = Command::new(env!("CARGO_BIN_EXE_tenet"))
     .arg("--cwd")
     .arg(repo.root())
+    .env("TENET_ADMISSION_SECRET", SECRET)
     .arg("mcp")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())

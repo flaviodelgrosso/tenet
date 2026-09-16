@@ -43,7 +43,7 @@ Authority construction uses `tenet_authority_submit` with the exact staged lifec
 PROPOSAL → RECONCILIATION → CLARIFICATION (when needed) → ADMISSION
 ```
 
-Each transition binds exact content identities. Existence, a mutable ref, MCP user input, or an agent assertion is not admission. `ADMISSION` additionally requires a trusted admission grant bound to the exact proposal and authority; the producer cannot mint it, and a process without the trusted admission secret cannot admit.
+Each transition binds exact content identities. Existence, a mutable ref, MCP user input, or an agent assertion is not admission. `ADMISSION` additionally requires a trusted admission grant bound to the exact proposal and authority; the producer cannot mint it, and a process without the trusted admission secret cannot admit. Every persisted Admission is cryptographically revalidated under the trusted secret on each load that can influence verification, so a hand-edited or forged Admission in repository state fails closed.
 
 During implementation, call `tenet_requirement_check` for one requirement. Its Candidate-specific Evaluation is development evidence only and cannot establish terminal completion.
 
@@ -54,9 +54,9 @@ The complete lifecycle is also available through the `tenet` CLI with identical 
 Trust boundaries:
 
 - `LOCAL_V1` is not same-user tamper resistance.
-- `PROTECTED_V1` means the runner enforced read-only Candidate/Authority views, separate writable scratch, and controlled output; the runner fails closed with an infrastructure result when the platform cannot enforce it and never downgrades to `LOCAL_V1`.
+- `PROTECTED_V1` means verification ran only against an OS-enforced immutable Candidate/Authority view (a read-only volume whose backing store is unlinked on macOS, or a private namespace copy verified against trusted digests before exec on Linux) with separate writable scratch and controlled output; a same-user producer cannot transiently mutate what the verifier observes, and the runner fails closed with an infrastructure result when the platform cannot enforce it and never downgrades to `LOCAL_V1`.
 - `AuthorityBound` is not independent authorship.
-- fresh materialization is not sandboxing.
+- fresh materialization inside the repository is not sandboxing and not protection against an external hostile producer.
 - content addressing is not writer authentication.
 - MCP user input is not cryptographic human identity.
 - verifier `Pass` is not task completion; only kernel evaluation of the full admitted contract can produce `DONE`.
@@ -81,6 +81,10 @@ pub struct ContentStore {
 }
 
 impl ContentStore {
+  pub fn project_root(&self) -> &Path {
+    &self.project_root
+  }
+
   pub fn open(project_root: &Path) -> Result<Self> {
     let project_root = project_root.canonicalize()?;
     for relative in [
@@ -224,7 +228,6 @@ impl ContentStore {
     &self,
     id: &ContentObjectId,
   ) -> std::result::Result<MaterializedSnapshot, ContentStoreError> {
-    let manifest = self.manifest(id)?;
     let temp_root = self.project_root.join(".tenet/tmp/materialized");
     ensure_directory_without_symlinks(&temp_root)
       .map_err(|error| ContentStoreError::materialization(id, error.to_string()))?;
@@ -232,8 +235,19 @@ impl ContentStore {
       .prefix("snapshot-")
       .tempdir_in(temp_root)
       .map_err(|source| ContentStoreError::materialization_io(id, source))?;
+    self.materialize_into(directory.path(), id)?;
+    Ok(MaterializedSnapshot { directory })
+  }
+
+  /// Materialize a verified snapshot into an existing empty directory.
+  pub fn materialize_into(
+    &self,
+    directory: &Path,
+    id: &ContentObjectId,
+  ) -> std::result::Result<(), ContentStoreError> {
+    let manifest = self.manifest(id)?;
     for entry in manifest.entries {
-      let destination = directory.path().join(&entry.path);
+      let destination = directory.join(&entry.path);
       match entry.kind {
         EntryKind::Directory => fs::create_dir_all(&destination)
           .map_err(|source| ContentStoreError::materialization_io(id, source))?,
@@ -254,7 +268,7 @@ impl ContentStore {
         }
       }
     }
-    Ok(MaterializedSnapshot { directory })
+    Ok(())
   }
 }
 
