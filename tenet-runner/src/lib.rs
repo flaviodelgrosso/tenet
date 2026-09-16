@@ -34,12 +34,16 @@ use tenet_kernel::digest::canonical_digest;
 
 /// Private namespace paths inside the Bubblewrap sandbox. The tmpfs-backed
 /// view is invisible to processes outside the namespace, so the digest-
-/// verified copy the verifier reads cannot be transiently mutated.
-const PRIVATE_VIEW_ROOT: &str = "/tenet-view";
-const PRIVATE_CHECKS_ROOT: &str = "/tenet-private";
-const PRIVATE_CHECKS_PATH: &str = "/tenet-private/checks";
-const PRIVATE_DIRECTORIES_PATH: &str = "/tenet-private/directories";
-const PRIVATE_MODES_PATH: &str = "/tenet-private/modes";
+/// verified copy the verifier reads cannot be transiently mutated. The whole
+/// filesystem is read-bound first, so bwrap cannot create mount points under
+/// the root; the view and expectation tmpfses therefore live under `/mnt`,
+/// an existing directory covered by a fresh writable tmpfs so its subpaths
+/// can be created.
+const PRIVATE_VIEW_ROOT: &str = "/mnt/tenet-view";
+const PRIVATE_CHECKS_ROOT: &str = "/mnt/tenet-private";
+const PRIVATE_CHECKS_PATH: &str = "/mnt/tenet-private/checks";
+const PRIVATE_DIRECTORIES_PATH: &str = "/mnt/tenet-private/directories";
+const PRIVATE_MODES_PATH: &str = "/mnt/tenet-private/modes";
 /// Exit code used when the in-namespace digest verification fails; it is not
 /// part of any admitted exit-code policy, so the run yields infrastructure.
 const PRIVATE_VIEW_CHECK_FAILED_EXIT: &str = "70";
@@ -442,6 +446,8 @@ fn bubblewrap_command(request: &VerifierRun<'_>, script: &str, inputs: &PrivateI
     .arg("/dev")
     .arg("--proc")
     .arg("/proc")
+    .arg("--tmpfs")
+    .arg("/mnt")
     .arg("--tmpfs")
     .arg(PRIVATE_VIEW_ROOT)
     .arg("--tmpfs")
@@ -1208,11 +1214,11 @@ mod tests {
     assert!(script.contains("cp -p \"$SRC_CANDIDATE/"));
     assert!(script.contains("mkdir -p \"$line\""));
     assert!(script.contains("chmod \"$mode\" \"$path\""));
-    assert!(script.contains("sha256sum -c /tenet-private/checks"));
+    assert!(script.contains("sha256sum -c /mnt/tenet-private/checks"));
     assert!(script.contains("|| exit 70"));
-    assert!(script.contains("cd '/tenet-view/candidate'"));
+    assert!(script.contains("cd '/mnt/tenet-view/candidate'"));
     assert!(script.contains(
-      "exec '/tenet-view/candidate/verify.sh' '--flag' '/tenet-view/candidate/input.txt'"
+      "exec '/mnt/tenet-view/candidate/verify.sh' '--flag' '/mnt/tenet-view/candidate/input.txt'"
     ));
     assert!(!script.contains(&format!("exec '{}'", candidate.path().display())));
   }

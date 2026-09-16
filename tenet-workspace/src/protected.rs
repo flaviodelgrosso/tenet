@@ -24,10 +24,11 @@
 //! Any failure to establish the boundary is an error: callers yield an
 //! infrastructure result and never downgrade assurance.
 
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use std::{
   fs,
   path::{Path, PathBuf},
-  process::Command,
 };
 
 use anyhow::{Context, Result};
@@ -124,6 +125,9 @@ fn view_expectations(
 }
 #[cfg(not(target_os = "macos"))]
 struct StagedDirectory {
+  // Held solely so the staging directory lives exactly as long as the view;
+  // the runner's private namespace copy, not this directory, is the boundary.
+  #[allow(dead_code)]
   staging: tempfile::TempDir,
   candidate: PathBuf,
   authority: PathBuf,

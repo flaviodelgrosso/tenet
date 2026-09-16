@@ -81,6 +81,7 @@ pub struct ContentStore {
 }
 
 impl ContentStore {
+  #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
   pub fn project_root(&self) -> &Path {
     &self.project_root
   }

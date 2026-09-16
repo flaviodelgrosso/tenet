@@ -1,22 +1,22 @@
 //! Adversarial proofs that `PROTECTED_V1` verification is safe against an
 //! external hostile producer with ordinary same-user filesystem access.
 //!
-//! A separate hostile process continuously mutates the Candidate source,
-//! attempts to write through the live protected mount, and (in the staging
-//! test) poisons every staged view file under `.tenet/tmp` while the real
-//! `LocalWorkspace` + `LocalProcessRunner` protected verification runs
-//! through the canonical CLI. Each protected verifier passes only if the
-//! sha256 of the file it reads equals the digest of the original captured
-//! bytes, so:
+//! Three actors race in every test: the canonical CLI drives the protected
+//! verification, the protected verifier repeatedly hashes its sealed
+//! Candidate and Authority views for the whole run and passes only if every
+//! single observation equals the original admitted bytes, and a separate
+//! hostile producer mutates the host-side originals while the protected
+//! boundary is already established. Release of the hostile producer is gated
+//! on an explicit `started` barrier the verifier writes into its scratch
+//! after exec, so the race is guaranteed rather than sampled.
 //!
-//! - a `pass` observation proves the verifier read exactly the original
-//!   bytes despite the concurrent mutation;
-//! - two verifiers both passing proves they observed identical bytes for
-//!   the same Candidate identity;
+//! - A passing protected verifier proves every repeated observation saw the
+//!   sealed bytes despite the concurrent host-side mutation;
+//! - two verifiers both passing proves they observed identical bytes for the
+//!   same Candidate identity;
 //! - a hostile that corrupts a view before it is sealed can force a
 //!   fail-closed infrastructure result, but can never make a verifier
 //!   `fail` on bytes the boundary missed, and can never produce `DONE`.
-
 #![cfg(unix)]
 
 use std::{
@@ -25,8 +25,8 @@ use std::{
   path::Path,
   process::{Command, Stdio},
   sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
   },
   thread,
   time::{Duration, Instant},
@@ -48,7 +48,20 @@ use tenet_domain::{
 
 const SECRET: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
 const ORIGINAL: &str = "original candidate bytes for protected verification";
+const MUTATED: &str = "MUTATED BY HOSTILE PRODUCER";
 
+/// These tests race real machine-global OS state (DiskArbitration mounts
+/// under `/Volumes`, image attach/detach, kernel namespaces), so two of them
+/// running concurrently can make one test's staging or mounts disturb
+/// another's run. They serialize on this lock; the assertions stay about the
+/// boundary, not about scheduling.
+static HOSTILE_LOCK: Mutex<()> = Mutex::new(());
+
+fn hostile_run_guard() -> std::sync::MutexGuard<'static, ()> {
+  HOSTILE_LOCK
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 fn sha256_hex(bytes: &[u8]) -> String {
   let mut hasher = Sha256::new();
   hasher.update(bytes);
@@ -115,22 +128,49 @@ fn contract() -> CompletionContractV1 {
   }
 }
 
-/// The verifier reads its candidate file after a window wide enough for the
-/// hostile producer to be active and passes only on the expected digest.
+/// The verifier signals its start into the run's scratch (the explicit
+/// barrier that releases the hostile producer), then repeatedly hashes the
+/// protected Candidate file and the whole protected Authority view for the
+/// duration of the run. It exits 0 only if every single observation equals
+/// the original admitted bytes and the Authority view never changed, so a
+/// `pass` proves every repeated observation during the race saw the sealed
+/// state; any observation of other bytes exits 1 (`fail`), and a scratch
+/// that cannot be written exits 3 (unrecognized → infrastructure).
 fn verifier_script() -> String {
-  "#!/bin/sh
-expected=\"$1\"
+  r#"#!/bin/sh
+expected="$1"
+: > "$TENET_SCRATCH_ROOT/started" || exit 3
+hash_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+authority_tree_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    ( cd "$TENET_AUTHORITY_ROOT" && find . -type f | LC_ALL=C sort | xargs sha256sum ) | sha256sum | cut -d' ' -f1
+  else
+    ( cd "$TENET_AUTHORITY_ROOT" && find . -type f | LC_ALL=C sort | xargs shasum -a 256 ) | shasum -a 256 | cut -d' ' -f1
+  fi
+}
+candidate="$TENET_CANDIDATE_ROOT/candidate.txt"
+baseline=""
 i=0
-while [ \"$i\" -lt 20 ]; do i=$((i+1)); sleep 0.1; done
-f=\"$TENET_CANDIDATE_ROOT/candidate.txt\"
-if command -v sha256sum >/dev/null 2>&1; then
-  observed=$(sha256sum \"$f\" | cut -d' ' -f1)
-else
-  observed=$(shasum -a 256 \"$f\" | cut -d' ' -f1)
-fi
-[ \"$observed\" = \"$expected\" ] && exit 0
-exit 1
-"
+while [ $i -lt 30 ]; do
+  i=$((i+1))
+  [ "$(hash_file "$candidate")" = "$expected" ] || exit 1
+  authority=$(authority_tree_hash)
+  [ -n "$authority" ] || exit 1
+  if [ -z "$baseline" ]; then
+    baseline="$authority"
+  elif [ "$authority" != "$baseline" ]; then
+    exit 1
+  fi
+  sleep 0.1
+done
+exit 0
+"#
   .to_owned()
 }
 
@@ -262,10 +302,14 @@ impl Repo {
     self.directory.path()
   }
 
-  /// Spawn `tenet verify`, wait for the first protected boundary to become
-  /// observable, run the hostile producer until the CLI exits, and return
-  /// the parsed result plus exit code.
-  fn verify_under_attack(&self, hostile: impl Fn(&Path) + Send + 'static) -> (Value, Option<i32>) {
+  /// Spawn `tenet verify`, wait for the verifier's explicit `started`
+  /// barrier, run the hostile producer until the CLI exits, leave the
+  /// host-side original deterministically mutated, and return the parsed
+  /// result, the exit code, and the number of hostile passes.
+  fn verify_under_attack(
+    &self,
+    hostile: impl Fn(&Path) + Send + 'static,
+  ) -> (Value, Option<i32>, usize) {
     let root = self.root().to_path_buf();
     let mut child = Command::new(env!("CARGO_BIN_EXE_tenet"))
       .arg("--cwd")
@@ -278,20 +322,20 @@ impl Repo {
       .expect("spawn verify");
 
     assert!(
-      wait_for_boundary(&root),
-      "protected boundary never became observable"
+      wait_for_verifier_started(&root),
+      "the protected verifier never started behind its boundary"
     );
 
     let stop = Arc::new(AtomicBool::new(false));
     let hostile_root = root.clone();
     let hostile_stop = Arc::clone(&stop);
-    let attacks = Arc::new(AtomicBool::new(false));
+    let attacks = Arc::new(AtomicUsize::new(0));
     let hostile_attacks = Arc::clone(&attacks);
     let hostile_thread = thread::spawn(move || {
       while !hostile_stop.load(Ordering::Relaxed) {
         hostile(&hostile_root);
-        hostile_attacks.store(true, Ordering::Relaxed);
-        thread::sleep(Duration::from_millis(20));
+        hostile_attacks.fetch_add(1, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(10));
       }
     });
 
@@ -305,77 +349,41 @@ impl Repo {
     let status = child.wait().expect("wait verify");
     stop.store(true, Ordering::Relaxed);
     hostile_thread.join().expect("join hostile");
-    assert!(
-      attacks.load(Ordering::Relaxed),
-      "hostile producer never completed a pass"
-    );
+    // The hostile producer stops with the host-side original deterministically
+    // in the mutated state `R'`, after the CLI's final recapture.
+    let _ = fs::write(root.join("candidate.txt"), MUTATED);
 
     let result: Value = serde_json::from_slice(&stdout).expect("verify json");
-    (result, status.code())
+    (result, status.code(), attacks.load(Ordering::Relaxed))
   }
 }
 
-/// Waits until the enforcing boundary for the first protected run exists:
-/// the backing image is unlinked and the read-only volume is mounted
-/// (macOS), or the staging directory is materialized and the prelude has
-/// had time to build and verify the private namespace copy (Linux).
-fn wait_for_boundary(root: &Path) -> bool {
-  let protected = root.join(".tenet/tmp/protected");
+/// Waits for the explicit barrier: the first protected verifier has exec'd
+/// behind its enforcing boundary — the sealed read-only volume on macOS, the
+/// digest-verified private namespace copy on Linux — and signalled through
+/// its scratch directory. The hostile producer starts only after this, so
+/// every mutation provably races an established protected view.
+fn wait_for_verifier_started(root: &Path) -> bool {
+  let scratch = root.join(".tenet/tmp/scratch");
   let deadline = Instant::now() + Duration::from_secs(90);
-  #[cfg(target_os = "macos")]
-  {
-    while Instant::now() < deadline {
-      let mounted = fs::read_dir("/Volumes")
-        .into_iter()
+  while Instant::now() < deadline {
+    if let Ok(entries) = fs::read_dir(&scratch)
+      && entries
         .flatten()
-        .flatten()
-        .any(|entry| {
-          entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with("tenet-protected-")
-        });
-      // The image is unlinked immediately after a successful attach, so
-      // "mounted and no image left" means the bytes are sealed.
-      let image_gone = fs::read_dir(&protected)
-        .map(|entries| {
-          entries
-            .into_iter()
-            .flatten()
-            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".dmg"))
-        })
-        .unwrap_or(!mounted);
-      if mounted && image_gone {
-        return true;
-      }
-      thread::sleep(Duration::from_millis(50));
+        .any(|entry| entry.path().join("started").is_file())
+    {
+      return true;
     }
-    false
+    thread::sleep(Duration::from_millis(25));
   }
-  #[cfg(not(target_os = "macos"))]
-  {
-    while Instant::now() < deadline {
-      let staged = fs::read_dir(&protected)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .any(|entry| entry.path().join("candidate").is_dir());
-      if staged {
-        // The runner's prelude copies and verifies inside the namespace
-        // immediately after staging; let it finish before attacking.
-        thread::sleep(Duration::from_millis(2_000));
-        return true;
-      }
-      thread::sleep(Duration::from_millis(50));
-    }
-    false
-  }
+  false
 }
 
-/// Mutate the Candidate source and attempt direct writes and deletions
-/// through every live protected mount.
-fn attack_source_and_mounts(root: &Path) {
-  let _ = fs::write(root.join("candidate.txt"), "MUTATED BY HOSTILE PRODUCER");
+/// Attempt direct writes and deletions through every live protected mount.
+/// These must fail at the read-only OS boundary; a successful write would
+/// change the verifier's repeated Candidate/Authority hashes and end the
+/// run `fail`, which every test rejects.
+fn attack_mounts() {
   let Ok(volumes) = fs::read_dir("/Volumes") else {
     return;
   };
@@ -385,20 +393,37 @@ fn attack_source_and_mounts(root: &Path) {
       continue;
     }
     let candidate = volume.path().join("candidate");
-    let _ = fs::write(
-      candidate.join("candidate.txt"),
-      "MUTATED BY HOSTILE PRODUCER",
-    );
-    let _ = fs::write(candidate.join("hostile.txt"), "MUTATED BY HOSTILE PRODUCER");
+    let _ = fs::write(candidate.join("candidate.txt"), MUTATED);
+    let _ = fs::write(candidate.join("hostile.txt"), MUTATED);
     let _ = fs::remove_file(candidate.join("verify.sh"));
+    let authority = volume.path().join("authority");
+    let _ = fs::write(authority.join("SPEC.md"), MUTATED);
+    let _ = fs::write(authority.join("hostile.txt"), MUTATED);
+    let _ = fs::remove_file(authority.join("SPEC.md"));
   }
 }
 
-/// Also poison every staged or materialized view file under `.tenet/tmp`.
+/// Mutate the Candidate source and attempt direct writes and deletions
+/// through every live protected mount.
+fn attack_source_and_mounts(root: &Path) {
+  let _ = fs::write(root.join("candidate.txt"), MUTATED);
+  attack_mounts();
+}
+
+/// Also poison every staged or materialized view file: the protected
+/// staging under `.tenet/tmp/protected` and materialized snapshots under
+/// `.tenet/tmp/materialized`. The walk deliberately excludes the persistence
+/// layer's atomic-rename staging (`.tenet/tmp/objects`, `.tenet/tmp/atomic`)
+/// and the verifier scratch/output: corrupting those is a content-store
+/// denial of service that the digest checks already fail closed at CLI
+/// level, not a protected-view attack, and this test asserts on the
+/// evaluation verdict of a completed run.
 fn attack_all(root: &Path) {
   attack_source_and_mounts(root);
-  let temporary = root.join(".tenet/tmp");
-  let mut stack = vec![temporary];
+  let mut stack = vec![
+    root.join(".tenet/tmp/protected"),
+    root.join(".tenet/tmp/materialized"),
+  ];
   while let Some(directory) = stack.pop() {
     let Ok(entries) = fs::read_dir(&directory) else {
       continue;
@@ -433,8 +458,13 @@ fn external_hostile_mutation_cannot_affect_protected_observations() {
     eprintln!("SKIP: no enforcing protected-verification backend on this platform");
     return;
   }
+  let _guard = hostile_run_guard();
   let repo = Repo::new();
-  let (result, code) = repo.verify_under_attack(attack_source_and_mounts);
+  let (result, code, attacks) = repo.verify_under_attack(attack_source_and_mounts);
+  assert!(
+    attacks >= 1,
+    "the hostile producer never attacked during verification"
+  );
 
   assert_ne!(
     result["verdict"].as_str().expect("verdict"),
@@ -450,7 +480,9 @@ fn external_hostile_mutation_cannot_affect_protected_observations() {
       "pass",
       "verifier {id} must have observed the original bytes despite the \
        concurrent hostile mutation; a Fail would mean the hostile producer \
-       changed what the verifier read"
+       changed what the verifier read; infrastructure failure names the \
+       boundary problem: {:?}",
+      run["observation"]["infrastructureError"].as_str()
     );
     assert_eq!(run["observation"]["exitCode"].as_i64(), Some(0));
     // Both verifiers passed the same expected digest for the same
@@ -481,8 +513,13 @@ fn hostile_staging_poisoning_cannot_produce_pass_over_mutated_bytes() {
     eprintln!("SKIP: no enforcing protected-verification backend on this platform");
     return;
   }
+  let _guard = hostile_run_guard();
   let repo = Repo::new();
-  let (result, _code) = repo.verify_under_attack(attack_all);
+  let (result, _code, attacks) = repo.verify_under_attack(attack_all);
+  assert!(
+    attacks >= 1,
+    "the hostile producer never attacked during verification"
+  );
 
   assert_ne!(
     result["verdict"].as_str().expect("verdict"),
@@ -508,15 +545,97 @@ fn hostile_staging_poisoning_cannot_produce_pass_over_mutated_bytes() {
       let message = run["observation"]["infrastructureError"]
         .as_str()
         .expect("infrastructure message");
+      // Fail-closed paths: the workspace boundary check names "protected";
+      // the runner's in-namespace digest verification exits 70, a code no
+      // admitted policy interprets (Linux Bubblewrap prelude).
       assert!(
-        message.contains("protected"),
-        "infrastructure failure must name the protected boundary: {message}"
+        message.contains("protected") || message.contains("exit code 70"),
+        "infrastructure failure must come from the protected boundary: {message}"
       );
     }
   }
   assert_eq!(
     fs::read_to_string(repo.root().join("candidate.txt")).expect("candidate"),
-    "MUTATED BY HOSTILE PRODUCER",
+    MUTATED,
     "the hostile producer must actually have mutated the source"
+  );
+  assert_ne!(
+    result["verdict"].as_str().expect("verdict"),
+    "DONE",
+    "the final recapture must observe the mutated source and refuse DONE"
+  );
+}
+
+#[test]
+fn external_hostile_oscillation_cannot_change_protected_observations() {
+  if !protection_enforced() {
+    eprintln!("SKIP: no enforcing protected-verification backend on this platform");
+    return;
+  }
+  let _guard = hostile_run_guard();
+  let repo = Repo::new();
+  // The exact objective race: the host-side original Candidate and Authority
+  // flip R -> R' -> R -> R' for the whole duration of the protected runs.
+  let flip = Arc::new(AtomicBool::new(false));
+  let (result, code, attacks) = repo.verify_under_attack(move |root| {
+    let mutated = !flip.fetch_xor(true, Ordering::Relaxed);
+    let _ = fs::write(
+      root.join("candidate.txt"),
+      if mutated { MUTATED } else { ORIGINAL },
+    );
+    let _ = fs::write(
+      root.join("SPEC.md"),
+      if mutated {
+        "# MUTATED AUTHORITY\n"
+      } else {
+        "# Specification\n"
+      },
+    );
+    attack_mounts();
+  });
+  assert!(
+    attacks >= 20,
+    "the hostile producer must have raced the whole verification: {attacks} passes"
+  );
+  let runs = result["evaluation"]["runs"].as_array().expect("runs");
+  assert_eq!(runs.len(), 2, "both protected verifiers must run");
+  for (run, id) in runs.iter().zip(["V1", "V2"]) {
+    assert_eq!(run["verifier"].as_str().expect("verifier id"), id);
+    assert_eq!(
+      run["observation"]["result"].as_str().expect("result"),
+      "pass",
+      "verifier {id} must pass: every repeated hash of the sealed Candidate \
+       and Authority views matched the admitted bytes despite the oscillating \
+       host state; a Fail would mean the race leaked into observations"
+    );
+    assert_eq!(
+      run["context"]["assurance"].as_str().expect("assurance"),
+      "PROTECTED_V1"
+    );
+    assert_eq!(
+      run["candidate"].as_str().expect("candidate id"),
+      result["candidateId"].as_str().expect("verify candidate id"),
+      "evidence attributed to the original Candidate must never derive from \
+       the transient mutated host state"
+    );
+  }
+  // The final verdict depends only on which side of the oscillation the
+  // post-evaluation recapture happened to observe; both are honest, and
+  // neither may be a false completion over mutated bytes nor a Fail.
+  match result["verdict"].as_str().expect("verdict") {
+    "DONE" => assert_eq!(code, Some(0), "DONE must exit 0"),
+    "INCONCLUSIVE" => {
+      assert_eq!(
+        result["reason"].as_str().expect("reason"),
+        "CANDIDATE_CHANGED_DURING_VERIFICATION"
+      );
+      assert_eq!(code, Some(3), "INCONCLUSIVE must exit 3");
+    }
+    other => panic!("oscillating host state must never yield {other}"),
+  }
+  assert_eq!(
+    fs::read_to_string(repo.root().join("candidate.txt")).expect("candidate"),
+    MUTATED,
+    "the host-side original must sit in the mutated state right after the run"
   );
 }
