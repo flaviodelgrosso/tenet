@@ -11,12 +11,13 @@ use tenet_domain::{
   algebra::{
     AssuranceProfileId, CompletionContractV1, CompletionState, Evaluation, EvaluationId,
     EvaluationScope, EvidenceResult, ExecutionContext, ExecutionObservation, LOCAL_V1,
-    PlatformInformation, RUNNER_SEMANTICS_V1, RunnerSemanticsId, VerifierId, VerifierMaterial,
+    PROTECTED_V1, PlatformInformation, RUNNER_SEMANTICS_V1, RunnerSemanticsId, VerifierId,
+    VerifierMaterial,
   },
   authority::{
-    Admission, AdmissionError, AdmissionId, Authority, AuthorityProposal, Clarification,
-    ClarificationId, Finding, Issue, ProposalId, ReconciliationReport, ReconciliationReportId,
-    SpecSnapshot, SpecSnapshotId,
+    Admission, AdmissionError, AdmissionGrant, AdmissionId, Authority, AuthorityProposal,
+    Clarification, ClarificationId, Finding, Issue, ProposalId, ReconciliationReport,
+    ReconciliationReportId, SpecSnapshot, SpecSnapshotId,
   },
   completion::Verdict,
   contract::RequirementId,
@@ -25,14 +26,17 @@ use tenet_domain::{
     OracleIdentity, RunnerIdentity,
   },
   paths::{CONTRACT_PATH, SKILL_PATH},
-  policy::{CommandCwd, PolicyError, VerificationPolicy, VerifierAuthority, VerifierSpec},
+  policy::{
+    CommandCwd, PolicyError, VerificationPolicy, VerifierAuthority, VerifierProtection,
+    VerifierSpec,
+  },
   protocol::{ContextFacts, WorkflowPhase},
 };
 use tenet_kernel::{
   algebra::{AdmissionChain, evaluate, validate_completion_admission, validate_contract},
   authority::validate_admission,
   digest::{bytes_digest, canonical_digest},
-  identity,
+  grant, identity,
   policy::validate_candidate_surface,
   protocol::derive_phase,
 };
@@ -43,8 +47,10 @@ use crate::{
     Repository, VerifierRun, VerifierRunner,
   },
   response::{
-    AuthoritySubmissionResult, ContextResult, DoctorCheck, DoctorResult, InitResult,
-    ReceiptVerificationResult, RequirementCheckResult, RequirementStatus, TenetError, VerifyResult,
+    ActiveAdmissionInspection, AuthorityInspectionResult, AuthoritySubmissionResult, Blocker,
+    BlockersResult, ContextResult, DoctorCheck, DoctorResult, EvidenceReport, InitResult,
+    ProposalInspection, ReceiptVerificationResult, ReconciliationInspection,
+    RequirementCheckResult, RequirementStatus, TenetError, VerifyResult,
   },
 };
 
@@ -59,6 +65,7 @@ pub struct Tenet {
   cwd: PathBuf,
   repository: Arc<dyn Repository>,
   runner: Arc<dyn VerifierRunner>,
+  admission_secret: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -93,6 +100,10 @@ pub enum AuthoritySubmitRequest {
     proposal_id: ProposalId,
     reconciliation_id: ReconciliationReportId,
     authority_id: AuthorityId,
+    #[schemars(
+      description = "Trusted admission grant bound to the exact proposal and authority identities. The producer cannot mint this capability without the trusted secret."
+    )]
+    grant: AdmissionGrant,
   },
 }
 
@@ -190,12 +201,48 @@ impl Tenet {
     cwd: PathBuf,
     repository: Arc<dyn Repository>,
     runner: Arc<dyn VerifierRunner>,
+    admission_secret: Option<Vec<u8>>,
   ) -> Self {
     Self {
       cwd,
       repository,
       runner,
+      admission_secret,
     }
+  }
+
+  /// The trusted admission secret, when the operator process provides one.
+  /// Admitting or minting an authority without it fails closed; the secret is
+  /// never persisted, logged, or returned.
+  pub fn has_admission_secret(&self) -> bool {
+    self.admission_secret.is_some()
+  }
+
+  fn trusted_admission_secret(&self) -> Result<&[u8]> {
+    self.admission_secret.as_deref().ok_or_else(|| {
+      anyhow::Error::from(TenetError::new(
+        "admission_secret_unavailable",
+        "authority admission requires the trusted admission secret in this process",
+      ))
+    })
+  }
+
+  /// Mint a trusted admission grant for one exact proposal/authority pair.
+  /// Only a process possessing the trusted secret can produce a valid grant;
+  /// the candidate producer normally cannot.
+  pub fn mint_admission_grant(
+    &self,
+    proposal_id: &ProposalId,
+    authority_id: &AuthorityId,
+  ) -> AppResult<AdmissionGrant> {
+    let secret = self.admission_secret.as_deref().ok_or_else(|| {
+      TenetError::new(
+        "admission_secret_unavailable",
+        "grant minting requires the trusted admission secret in this process",
+      )
+    })?;
+    grant::mint_grant(secret, proposal_id, authority_id)
+      .map_err(|error| TenetError::new("admission_grant_invalid", error.to_string()))
   }
 
   pub fn initialize(&self, request: &InitializeRequest) -> AppResult<InitResult> {
@@ -254,6 +301,141 @@ impl Tenet {
       let _lock = self.repository.acquire_lock(&root)?;
       self.doctor_inner()
     })())
+  }
+
+  /// Inspect the exact authority lifecycle state: proposal, reconciliation,
+  /// and the active admitted chain. Identical through every adapter.
+  pub fn authority_inspect(&self) -> AppResult<AuthorityInspectionResult> {
+    app_result((|| {
+      let root = self.initialized_root()?;
+      let _lock = self.repository.acquire_lock(&root)?;
+      self.authority_inspect_inner(&root)
+    })())
+  }
+
+  /// Derive the current blocking items from persisted facts and the derived
+  /// phase. Informational; cannot establish or deny completion.
+  pub fn blockers(&self) -> AppResult<BlockersResult> {
+    let context = self.context()?;
+    Ok(blockers_from_context(&context))
+  }
+
+  /// Read persisted evidence for the final or one requirement-scoped
+  /// Evaluation and re-derive its kernel evaluation. Evidence is never a
+  /// completion decision.
+  pub fn evidence(&self, requirement_id: Option<&RequirementId>) -> AppResult<EvidenceReport> {
+    app_result((|| {
+      let root = self.initialized_root()?;
+      let _lock = self.repository.acquire_lock(&root)?;
+      self.evidence_inner(&root, requirement_id)
+    })())
+  }
+
+  fn authority_inspect_inner(&self, root: &Path) -> Result<AuthorityInspectionResult> {
+    let proposal = self
+      .repository
+      .read_ref(root, PROPOSAL_REF)?
+      .map(|id| {
+        let (proposal, _loaded) = self.load_proposed(root, &ProposalId(id.clone()))?;
+        Ok::<_, anyhow::Error>(ProposalInspection {
+          proposal_id: ProposalId(id),
+          authority_id: proposal.authority,
+          issues: proposal.issues,
+        })
+      })
+      .transpose()?;
+    let reconciliation = self
+      .repository
+      .read_ref(root, RECONCILIATION_REF)?
+      .map(|id| {
+        let report: ReconciliationReport = self.load_object(root, &id)?;
+        Ok::<_, anyhow::Error>(ReconciliationInspection {
+          reconciliation_id: ReconciliationReportId(id),
+          proposal_id: report.proposal,
+          findings: report.findings,
+        })
+      })
+      .transpose()?;
+    let active = self
+      .repository
+      .read_ref(root, ACTIVE_ADMISSION_REF)?
+      .map(|id| {
+        let chain = self.load_admission(root, &AdmissionId(id.clone()))?;
+        Ok::<_, anyhow::Error>(ActiveAdmissionInspection {
+          admission_id: AdmissionId(id),
+          authority_id: chain.admission.authority,
+          spec_path: chain.loaded.spec.path,
+          spec_digest: bytes_digest(&chain.loaded.spec.content),
+          contract_digest: chain.loaded.authority.contract,
+          completion_policy_id: chain.loaded.contract.policy,
+          verifiers: chain
+            .loaded
+            .policy
+            .verifiers
+            .iter()
+            .map(|verifier| verifier.id.clone())
+            .collect(),
+          grant_proposal: chain.admission.grant.proposal,
+          grant_authority: chain.admission.grant.authority,
+        })
+      })
+      .transpose()?;
+    Ok(AuthorityInspectionResult {
+      schema_version: 1,
+      proposal,
+      reconciliation,
+      active,
+    })
+  }
+
+  fn evidence_inner(
+    &self,
+    root: &Path,
+    requirement_id: Option<&RequirementId>,
+  ) -> Result<EvidenceReport> {
+    let chain = self.load_active(root)?;
+    let id = match requirement_id {
+      Some(requirement) => self
+        .repository
+        .read_ref(root, &requirement_ref_name(requirement)?)?
+        .ok_or_else(|| {
+          TenetError::new(
+            "evidence_missing",
+            format!(
+              "no persisted Evaluation for requirement `{}`",
+              requirement.0
+            ),
+          )
+        })?,
+      None => self
+        .repository
+        .read_ref(root, FINAL_REF)?
+        .ok_or_else(|| TenetError::new("evidence_missing", "no persisted Final Evaluation"))?,
+    };
+    let evaluation: Evaluation = self.load_object(root, &id)?;
+    if evaluation.admission != chain.id
+      || evaluation.authority != chain.admission.authority
+      || evaluation.candidate.0.0.trim().is_empty()
+    {
+      return Err(
+        TenetError::new(
+          "evidence_stale",
+          "persisted Evaluation does not belong to the active admission",
+        )
+        .into(),
+      );
+    }
+    let result = evaluate(
+      &chain.loaded.contract,
+      &chain.as_kernel_chain(),
+      &evaluation,
+    )?;
+    Ok(EvidenceReport {
+      schema_version: 1,
+      evaluation_id: EvaluationId(id),
+      evaluation,
+      result,
+    })
   }
 
   fn initialize_inner(&self, spec: Option<&Path>) -> Result<InitResult> {
@@ -582,7 +764,11 @@ impl Tenet {
         proposal_id,
         reconciliation_id,
         authority_id,
+        grant,
       } => {
+        let secret = self.trusted_admission_secret()?;
+        grant::verify_grant(secret, &grant, &proposal_id, &authority_id)
+          .map_err(|error| TenetError::new("admission_grant_invalid", error.to_string()))?;
         let (proposal, loaded) = self.load_proposed(&root, &proposal_id)?;
         let report: ReconciliationReport = self.load_object(&root, &reconciliation_id.0)?;
         let admission = Admission {
@@ -590,6 +776,7 @@ impl Tenet {
           proposal: proposal_id,
           reconciliation: reconciliation_id,
           authority: authority_id.clone(),
+          grant,
         };
         validate_admission(
           &admission,
@@ -970,6 +1157,7 @@ impl Tenet {
       .repository
       .materialize(root, &chain.loaded.authority.surface)?;
     let scratch = self.repository.fresh_scratch(root)?;
+    let output = self.repository.fresh_output(root)?;
     let identity = match verifier.authority {
       VerifierAuthority::Project => OracleIdentity::Project {
         verifier_id: verifier.id.clone(),
@@ -1006,6 +1194,7 @@ impl Tenet {
       candidate_root: candidate.path(),
       authority_root: authority_view.path(),
       scratch_root: scratch.path(),
+      output_root: output.path(),
       verifier,
       authority_id: &chain.admission.authority,
       candidate_id,
@@ -1342,7 +1531,8 @@ fn validate_executed_verifier(
   if executed.result != expected {
     anyhow::bail!("runner result disagrees with the admitted exit-code policy");
   }
-  if executed.context.assurance.0 != LOCAL_V1
+  if !assurance_matches_protection(verifier, executed)
+    || (executed.context.assurance.0 != LOCAL_V1 && executed.context.assurance.0 != PROTECTED_V1)
     || executed.context.runner_semantics.0 != RUNNER_SEMANTICS_V1
     || executed.execution.assurance != executed.context.assurance
     || executed.execution.runner_semantics != executed.context.runner_semantics
@@ -1361,6 +1551,18 @@ fn validate_executed_verifier(
     anyhow::bail!("runner context and provenance are inconsistent or unsupported");
   }
   Ok(())
+}
+
+/// A protected verifier must report `PROTECTED_V1`; an infrastructure failure
+/// may report `LOCAL_V1` because no protected execution occurred. A local
+/// verifier must never over-claim `PROTECTED_V1`.
+fn assurance_matches_protection(verifier: &VerifierSpec, executed: &ExecutedVerifier) -> bool {
+  match verifier.protection {
+    VerifierProtection::Local => executed.context.assurance.0 == LOCAL_V1,
+    VerifierProtection::Protected => {
+      executed.context.assurance.0 == PROTECTED_V1 || executed.infrastructure_error.is_some()
+    }
+  }
 }
 
 fn infrastructure_run(
@@ -1462,5 +1664,75 @@ fn context_for_phase(
     current_candidate_id,
     requirement_checks,
     next_action: next_action.into(),
+  }
+}
+
+fn blocker(code: &str, message: impl Into<String>) -> Blocker {
+  Blocker {
+    code: code.into(),
+    message: message.into(),
+  }
+}
+
+fn blockers_from_context(context: &ContextResult) -> BlockersResult {
+  let mut blockers = Vec::new();
+  match context.phase {
+    WorkflowPhase::SpecRequired => blockers.push(blocker(
+      "spec_missing",
+      "The admitted specification file is missing; create it, then run tenet init.",
+    )),
+    WorkflowPhase::Incompatible => blockers.push(blocker(
+      "state_incompatible",
+      "Persisted Tenet state is unsupported or corrupt; run tenet doctor.",
+    )),
+    WorkflowPhase::AuthorityRequired => blockers.push(blocker(
+      "authority_proposal_missing",
+      "No authority proposal exists for the current specification; submit a PROPOSAL.",
+    )),
+    WorkflowPhase::AuthorityReconciliation => blockers.push(blocker(
+      "reconciliation_missing",
+      "The active proposal has no reconciliation report; submit RECONCILIATION.",
+    )),
+    WorkflowPhase::AuthorityClarification => blockers.push(blocker(
+      "blocking_findings",
+      "Blocking issues or findings require CLARIFICATION or a revised PROPOSAL.",
+    )),
+    WorkflowPhase::AuthorityAdmission => blockers.push(blocker(
+      "admission_missing",
+      "Admission requires a trusted grant bound to the exact proposal and authority; ask the trusted operator to mint a grant and admit.",
+    )),
+    WorkflowPhase::AuthorityStale => blockers.push(blocker(
+      "authority_stale",
+      "The admitted authority no longer matches the current specification; admit a new authority.",
+    )),
+    WorkflowPhase::Implementation => {
+      if context.requirement_checks.is_empty() {
+        blockers.push(blocker(
+          "verification_missing",
+          "No requirement checks are recorded for the active admission.",
+        ));
+      }
+      for check in &context.requirement_checks {
+        if check.state != CompletionState::Satisfied {
+          blockers.push(blocker(
+            "requirement_not_satisfied",
+            format!(
+              "requirement `{}` derived {}",
+              check.requirement_id.0,
+              serde_json::to_value(check.state)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unsatisfied".into())
+            ),
+          ));
+        }
+      }
+    }
+    WorkflowPhase::Completed => {}
+  }
+  BlockersResult {
+    schema_version: 1,
+    phase: context.phase,
+    blockers,
   }
 }

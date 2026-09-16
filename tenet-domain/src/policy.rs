@@ -10,6 +10,20 @@ pub enum VerifierAuthority {
   Project,
   AuthoritySnapshot,
 }
+
+/// Enforcement level the runner must provide for a verifier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifierProtection {
+  /// Unenforced execution; assurance is `LOCAL_V1` (detection only).
+  #[default]
+  Local,
+  /// Enforced read-only Candidate/Authority views with separate writable
+  /// scratch and controlled output; assurance is `PROTECTED_V1`. The runner
+  /// must fail closed with an infrastructure result when the platform cannot
+  /// enforce the boundary; it must never downgrade to `LOCAL_V1`.
+  Protected,
+}
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnvironmentSpec {
@@ -164,6 +178,11 @@ pub struct VerifierSpec {
     description = "Required only for authority_snapshot: safe project-relative directory sealed as the authority-owned oracle bundle."
   )]
   pub oracle_path: Option<String>,
+  #[serde(default)]
+  #[schemars(
+    description = "local executes without an enforcement boundary (LOCAL_V1). protected requires the runner to enforce read-only Candidate/Authority views, separate writable scratch, and controlled output (PROTECTED_V1), or fail closed."
+  )]
+  pub protection: VerifierProtection,
 }
 
 impl VerifierSpec {

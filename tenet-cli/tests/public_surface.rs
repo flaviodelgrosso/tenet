@@ -4,17 +4,43 @@ use std::{
 };
 
 #[test]
-fn cli_exposes_only_initial_commands() {
+fn cli_exposes_the_canonical_lifecycle_commands() {
   let output = Command::new(env!("CARGO_BIN_EXE_tenet"))
     .arg("--help")
     .output()
     .unwrap();
   assert!(output.status.success());
   let help = String::from_utf8(output.stdout).unwrap();
-  for command in ["init", "doctor", "mcp", "version"] {
-    assert!(help.contains(command), "missing `{command}` in {help}");
+  for command in [
+    "init",
+    "doctor",
+    "status",
+    "authority",
+    "requirement",
+    "verify",
+    "blockers",
+    "evidence",
+    "receipt",
+    "mcp",
+    "version",
+  ] {
+    assert!(
+      help
+        .lines()
+        .any(|line| line.trim_start().starts_with(command)),
+      "missing `{command}` in {help}"
+    );
   }
-  for legacy in ["gate", "candidate", "contract", "authority"] {
+  for legacy in [
+    "gate",
+    "candidate",
+    "contract",
+    "propose",
+    "approve",
+    "seal",
+    "select",
+    "capture",
+  ] {
     assert!(
       !help
         .lines()

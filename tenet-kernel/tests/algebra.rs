@@ -10,7 +10,7 @@ use tenet_domain::{
   },
   policy::{
     CandidateCapturePolicy, CommandArgument, CommandCwd, CommandSpec, EnvironmentSpec,
-    ExitCodePolicy, ProjectConfig, VerifierAuthority, VerifierSpec,
+    ExitCodePolicy, ProjectConfig, VerifierAuthority, VerifierProtection, VerifierSpec,
   },
   snapshot::{EntryKind, TreeEntry},
 };
@@ -38,6 +38,7 @@ fn definition(id: &str) -> VerifierSpec {
     max_output_bytes: 1_024,
     authority: VerifierAuthority::Project,
     oracle_path: None,
+    protection: VerifierProtection::default(),
   }
 }
 
@@ -51,7 +52,6 @@ struct Fixture {
   proposal: AuthorityProposal,
   report: ReconciliationReport,
   admission: Admission,
-  contract: CompletionContractV1,
   policy: ProjectConfig,
 }
 
@@ -78,11 +78,18 @@ impl Fixture {
       proposal: proposal_id(&proposal).unwrap(),
       findings: vec![],
     };
+    let proposal_id = proposal_id(&proposal).unwrap();
     let admission = Admission {
       schema_version: 1,
-      proposal: proposal_id(&proposal).unwrap(),
+      proposal: proposal_id.clone(),
       reconciliation: reconciliation_report_id(&report).unwrap(),
       authority: authority_id(&authority).unwrap(),
+      grant: tenet_kernel::grant::mint_grant(
+        b"s".repeat(48).as_slice(),
+        &proposal_id,
+        &authority_id(&authority).unwrap(),
+      )
+      .unwrap(),
     };
     let policy = ProjectConfig {
       version: 1,
@@ -102,7 +109,6 @@ impl Fixture {
       proposal,
       report,
       admission,
-      contract: contract.clone(),
       policy,
     }
   }
@@ -807,6 +813,7 @@ fn authority_bundle_oracle_must_match_sealed_contents() {
     max_output_bytes: 1_024,
     authority: VerifierAuthority::AuthoritySnapshot,
     oracle_path: Some("oracle".into()),
+    protection: VerifierProtection::default(),
   };
   let definition_digest = tenet_kernel::digest::canonical_digest(&definition).unwrap();
   fixture.policy.verifiers = vec![definition];

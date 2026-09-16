@@ -1,5 +1,5 @@
 use tenet_domain::{authority::*, evidence::ContentObjectId};
-use tenet_kernel::authority::*;
+use tenet_kernel::{authority::*, grant};
 
 fn fixture() -> (
   SpecSnapshot,
@@ -34,11 +34,18 @@ fn fixture() -> (
 }
 
 fn admission(proposal: &AuthorityProposal, report: &ReconciliationReport) -> Admission {
+  let proposal_id = proposal_id(proposal).unwrap();
   Admission {
     schema_version: 1,
-    proposal: proposal_id(proposal).unwrap(),
+    proposal: proposal_id.clone(),
     reconciliation: reconciliation_report_id(report).unwrap(),
     authority: proposal.authority.clone(),
+    grant: grant::mint_grant(
+      b"s".repeat(48).as_slice(),
+      &proposal_id,
+      &proposal.authority,
+    )
+    .unwrap(),
   }
 }
 

@@ -19,6 +19,23 @@ identity!(ReconciliationReportId);
 identity!(ClarificationId);
 identity!(AdmissionId);
 
+/// Semantics identifier for producer-unforgeable admission grants.
+pub const ADMISSION_GRANT_SEMANTICS_V1: &str = "tenet:admission-grant:v1";
+
+/// Trusted authorization to admit one exact proposal/authority pair. The `mac`
+/// binds the grant to those exact identities under a secret the candidate
+/// producer cannot possess; an admitted chain without a bound grant is invalid.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmissionGrant {
+  pub schema_version: u32,
+  pub semantics: String,
+  pub proposal: ProposalId,
+  pub authority: AuthorityId,
+  #[schemars(description = "Lowercase hex HMAC-SHA256 over the canonical grant payload.")]
+  pub mac: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SpecSnapshot {
@@ -83,6 +100,7 @@ pub struct Admission {
   pub proposal: ProposalId,
   pub reconciliation: ReconciliationReportId,
   pub authority: AuthorityId,
+  pub grant: AdmissionGrant,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -101,4 +119,6 @@ pub enum AdmissionError {
   SpecificationMismatch,
   #[error("blocking issues or reconciliation findings prevent admission")]
   BlockingFindings,
+  #[error("admission grant is not bound to the exact admitted proposal and authority")]
+  GrantBindingInvalid,
 }

@@ -165,6 +165,15 @@ impl Repository for LocalWorkspace {
     Ok(Box::new(project::retain_snapshot(directory)))
   }
 
+  fn fresh_output(&self, project_root: &Path) -> Result<Box<dyn SnapshotHandle>> {
+    let temporary_root = project_root.join(".tenet/tmp/output");
+    fs::create_dir_all(&temporary_root)?;
+    let directory = tempfile::Builder::new()
+      .prefix("verifier-")
+      .tempdir_in(temporary_root)?;
+    Ok(Box::new(project::retain_snapshot(directory)))
+  }
+
   fn manifest(
     &self,
     project_root: &Path,

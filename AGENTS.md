@@ -19,11 +19,11 @@ tenet_requirement_check
 tenet_verify
 ```
 
-The initial CLI surface is exactly `init`, `doctor`, `mcp`, and `version`. Do not reintroduce public propose/approve/seal/select/capture/gate workflows.
+The CLI is the canonical process surface and drives the complete lifecycle with identical application and kernel semantics: `init`, `status`, `authority prepare|reconcile|clarify|grant|admit|inspect`, `requirement check`, `verify`, `blockers`, `evidence`, `receipt verify`, `doctor`, `mcp`, `version`. Exit codes distinguish success/`DONE` (0), invalid input (1), `NOT_DONE` (2), `INCONCLUSIVE` (3), and infrastructure failure (4). Do not reintroduce public propose/approve/seal/select/capture/gate workflows, and do not add completion semantics to the CLI beyond the shared application use cases.
 
 `tenet_context` derives phase from persisted facts. Never persist workflow phase. `COMPLETED` requires a successful Final Evaluation for the active Admission and Authority whose Candidate equals a fresh current capture.
 
-`tenet_authority_submit` implements `PROPOSAL`, `RECONCILIATION`, `CLARIFICATION`, and `ADMISSION`. Every transition binds exact identities. Clarification never admits. Admission validates the complete exact chain.
+`tenet_authority_submit` implements `PROPOSAL`, `RECONCILIATION`, `CLARIFICATION`, and `ADMISSION`. Every transition binds exact identities. Clarification never admits. Admission validates the complete exact chain and requires an `AdmissionGrant` bound to the exact proposal and authority. The grant mac is verified by the kernel under the trusted admission secret (`TENET_ADMISSION_SECRET`, hex, at least 32 bytes) held only by the trusted operator process; grant minting is CLI-only and never exposed through MCP. A process without the secret fails closed with `admission_secret_unavailable`. Load paths enforce the grant's structural binding (semantics version and exact proposal/authority identity) so a hand-edited persisted Admission cannot silently carry a foreign or unknown grant.
 
 `tenet_requirement_check` captures one Candidate, reruns all verifiers for one Requirement using a fresh Candidate view per verifier, persists a Requirement-scoped Evaluation, and updates its ref. It cannot establish terminal completion.
 
@@ -52,13 +52,15 @@ Candidate-controlled evidence is admissible only when explicitly permitted by th
 Never collapse these boundaries:
 
 - `LOCAL_V1` is not same-user tamper resistance.
+- `PROTECTED_V1` is not independent authorship.
+- a valid admission grant is not a cryptographic human identity; it authenticates possession of the trusted secret.
 - `AuthorityBound` is not independent authorship.
-- fresh materialization is not sandboxing.
+- fresh materialization is not sandboxing; only `protected` verifier protection adds the OS enforcement boundary.
 - content addressing is not writer authentication.
 - MCP user input is not cryptographic human identity.
 - verifier `Pass` is not task completion.
 
-Do not add passwords, HMACs, keychains, signatures, privileged services, or mandatory containers to imply guarantees the current same-user local boundary does not provide.
+Admitted `VerifierSpec.protection` is either `local` (`LOCAL_V1`) or `protected` (`PROTECTED_V1`). Protected execution must enforce read-only Candidate and Authority views, separate writable scratch, and a controlled output directory through standard OS primitives (macOS Seatbelt, Linux Bubblewrap), redirect `TMPDIR` into scratch, and fail closed with an explicit infrastructure result when the platform cannot enforce the boundary; never downgrade assurance. Keep the admission trust anchor the smallest mechanism that works: one HMAC capability grant verified deterministically by the kernel. Do not add PKI, signatures, keychains, privileged services, or mandatory containers to imply guarantees the same-user local boundary does not provide.
 
 ## Persistence
 
@@ -116,15 +118,18 @@ Prefer existing files and direct primitives. Do not add provider integrations, m
 Architectural changes require deterministic offline adversarial tests. Preserve coverage for:
 
 - producer assertions cannot create `DONE`;
+- a producer without the trusted admission secret cannot mint a grant or admit;
+- a grant cannot admit across proposal or authority identities, a tampered mac cannot admit, and unknown grant semantics fail closed on load;
 - candidate-controlled verifier trust requires explicit Authority policy;
 - evidence cannot transfer across Candidate or Authority identities;
 - reconciliation and admission cannot transfer across identities;
 - missing or duplicate runs cannot hide missing evidence;
 - `LOCAL_V1` cannot satisfy `Protected`;
+- a protected verifier cannot write the Candidate or Authority view, scratch and output stay writable, and a protected run without a capable backend returns infrastructure failure rather than `PROTECTED_V1`;
 - every verifier gets a fresh Candidate view;
 - mutation during final verification cannot produce `DONE` for the new state;
 - unknown semantic versions fail closed;
-- CLI and MCP cannot redefine kernel completion semantics.
+- CLI and MCP cannot redefine kernel completion semantics; the CLI completes the full lifecycle without MCP and derives identical verdicts.
 
 Before completion, run:
 

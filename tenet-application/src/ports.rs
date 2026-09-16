@@ -142,6 +142,8 @@ pub trait Repository: Send + Sync {
     id: &ContentObjectId,
   ) -> std::result::Result<Box<dyn SnapshotHandle>, ContentStoreError>;
   fn fresh_scratch(&self, project_root: &Path) -> Result<Box<dyn SnapshotHandle>>;
+  /// Fresh controlled output directory for verifier artifacts.
+  fn fresh_output(&self, project_root: &Path) -> Result<Box<dyn SnapshotHandle>>;
   fn manifest(
     &self,
     project_root: &Path,
@@ -201,6 +203,7 @@ pub struct VerifierRun<'a> {
   pub candidate_root: &'a Path,
   pub authority_root: &'a Path,
   pub scratch_root: &'a Path,
+  pub output_root: &'a Path,
   pub verifier: &'a VerifierSpec,
   pub authority_id: &'a AuthorityId,
   pub candidate_id: &'a CandidateId,

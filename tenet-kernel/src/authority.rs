@@ -9,7 +9,7 @@ use tenet_domain::{
   evidence::{AuthorityId, ContentObjectId},
 };
 
-use crate::digest::canonical_digest;
+use crate::{digest::canonical_digest, grant::validate_grant_binding};
 
 macro_rules! identity {
   ($function:ident, $object:ty, $id:ident) => {
@@ -70,5 +70,7 @@ pub fn validate_admission(
   {
     return Err(AdmissionError::BlockingFindings);
   }
+  validate_grant_binding(&admission.grant, &admission.proposal, &admission.authority)
+    .map_err(|_| AdmissionError::GrantBindingInvalid)?;
   Ok(())
 }

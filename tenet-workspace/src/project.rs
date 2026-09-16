@@ -43,15 +43,18 @@ Authority construction uses `tenet_authority_submit` with the exact staged lifec
 PROPOSAL → RECONCILIATION → CLARIFICATION (when needed) → ADMISSION
 ```
 
-Each transition binds exact content identities. Existence, a mutable ref, MCP user input, or an agent assertion is not admission.
+Each transition binds exact content identities. Existence, a mutable ref, MCP user input, or an agent assertion is not admission. `ADMISSION` additionally requires a trusted admission grant bound to the exact proposal and authority; the producer cannot mint it, and a process without the trusted admission secret cannot admit.
 
 During implementation, call `tenet_requirement_check` for one requirement. Its Candidate-specific Evaluation is development evidence only and cannot establish terminal completion.
 
 Call `tenet_verify` for final verification. It captures one Candidate, reruns every required verifier with a fresh Candidate materialization per verifier, persists one Final Evaluation, and alone may return `DONE`. If the repository changes after successful verification, the successful Evaluation remains historical for the verified Candidate and the protocol returns `INCONCLUSIVE` with `CANDIDATE_CHANGED_DURING_VERIFICATION`.
 
+The complete lifecycle is also available through the `tenet` CLI with identical kernel semantics; MCP is an optional adapter.
+
 Trust boundaries:
 
 - `LOCAL_V1` is not same-user tamper resistance.
+- `PROTECTED_V1` means the runner enforced read-only Candidate/Authority views, separate writable scratch, and controlled output; the runner fails closed with an infrastructure result when the platform cannot enforce it and never downgrades to `LOCAL_V1`.
 - `AuthorityBound` is not independent authorship.
 - fresh materialization is not sandboxing.
 - content addressing is not writer authentication.

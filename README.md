@@ -8,14 +8,32 @@ Tenet persists immutable objects and derives workflow and completion state. Agen
 
 ## CLI
 
+The CLI is the canonical process surface. It drives the complete lifecycle with the same application use cases and kernel semantics as MCP; MCP is an optional adapter.
+
 ```text
 tenet init [--spec PATH] [--json]
+tenet status [--json]
+tenet authority prepare --contract FILE [--issues FILE] [--json]
+tenet authority reconcile --proposal PROPOSAL_ID [--findings FILE] [--json]
+tenet authority clarify --proposal PROPOSAL_ID --text TEXT [--json]
+tenet authority grant --proposal PROPOSAL_ID --authority AUTHORITY_ID [--json]
+tenet authority admit --proposal PROPOSAL_ID --reconciliation RECONCILIATION_ID --authority AUTHORITY_ID --grant FILE [--json]
+tenet authority inspect [--json]
+tenet requirement check --id REQUIREMENT_ID [--json]
+tenet verify [--json]
+tenet blockers [--json]
+tenet evidence [--requirement REQUIREMENT_ID] [--json]
+tenet receipt verify --id EVALUATION_ID [--json]
 tenet doctor [--receipt EVALUATION_ID] [--json]
 tenet mcp
 tenet version
 ```
 
-`tenet init` creates repository-contained state, a starter `SPEC.md` when needed, MCP configuration, and the Tenet Skill. `tenet doctor` validates repository root discovery, `SPEC.md`, repository format, object/blob/ref integrity, the active Admission chain, supported semantic versions, repository-write scope, and integration consistency. `tenet doctor --receipt <EvaluationId> --json` verifies a canonical Final Evaluation receipt and its referenced Admission, Authority, Candidate, contract, policy, evidence set, and execution-environment identities.
+`tenet init` creates repository-contained state, a starter `SPEC.md` when needed, MCP configuration, and the Tenet Skill. `tenet doctor` validates repository root discovery, `SPEC.md`, repository format, object/blob/ref integrity, the active Admission chain, supported semantic versions, repository-write scope, and integration consistency.
+
+Exit codes are part of the machine contract: `0` success or `DONE`, `1` invalid input or error, `2` `NOT_DONE`, `3` `INCONCLUSIVE`, `4` infrastructure failure. `tenet doctor --receipt <EvaluationId> --json` (and `tenet receipt verify`) verifies a canonical Final Evaluation receipt and its referenced Admission, Authority, Candidate, contract, policy, evidence set, and execution-environment identities; an incomplete receipt exits `2`.
+
+`tenet authority grant` is the trusted-side operation. It requires the trusted admission secret in the process environment (`TENET_ADMISSION_SECRET`, hexadecimal, at least 32 bytes) and is intentionally absent from the MCP surface. The candidate producer normally never holds this secret.
 
 ## Four-operation protocol
 
@@ -50,7 +68,9 @@ Submit one exact lifecycle stage:
 PROPOSAL → RECONCILIATION → CLARIFICATION (when needed) → ADMISSION
 ```
 
-A Proposal captures the specification, `CompletionContractV1`, policy, and authority-owned verifier material into an immutable Authority. Reconciliation binds one exact Proposal. Clarification records information without admitting anything. Admission binds the exact Proposal, Reconciliation, and Authority. A ref has no authority independent of the referenced immutable object and validated chain.
+A Proposal captures the specification, `CompletionContractV1`, policy, and authority-owned verifier material into an immutable Authority. Reconciliation binds one exact Proposal. Clarification records information without admitting anything. Admission binds the exact Proposal, Reconciliation, and Authority **and a trusted admission grant**. A ref has no authority independent of the referenced immutable object and validated chain.
+
+`ADMISSION` requires an `AdmissionGrant` bound to the exact proposal and authority identities. The grant's mac is verified by the kernel under the trusted admission secret, which the candidate producer cannot possess; a process without the secret fails closed with `admission_secret_unavailable`. The grant is embedded in the immutable Admission object, so it is part of the Admission's content identity and cannot be swapped afterwards.
 
 Example request shape:
 
@@ -60,7 +80,14 @@ Example request shape:
     "stage": "ADMISSION",
     "proposalId": "sha256:…",
     "reconciliationId": "sha256:…",
-    "authorityId": "sha256:…"
+    "authorityId": "sha256:…",
+    "grant": {
+      "schemaVersion": 1,
+      "semantics": "tenet:admission-grant:v1",
+      "proposal": "sha256:…",
+      "authority": "sha256:…",
+      "mac": "<64 lowercase hex>"
+    }
   }
 }
 ```
@@ -123,28 +150,34 @@ Objects and blobs are addressed by SHA-256 content identity. Refs are mutable na
 
 `CompletionPolicyV1` requires the exact verifier set for the Evaluation scope. Every run binds the exact Admission, Authority, Candidate, contract digest, completion-policy identity, verifier, and typed oracle identity. The kernel rejects duplicate, missing, extra, cross-Admission, cross-Authority, cross-Candidate, cross-contract, cross-policy, oracle-mismatched, and internally inconsistent provenance. Assurance and evidence-control requirements participate in every Criterion result. Candidate-controlled verification is admissible only when the Authority contract explicitly permits it.
 
-The local runner uses structured argv, typed Candidate/Authority/scratch paths, explicit environment inheritance, timeouts, bounded output, `RunnerSemanticsV1`, and `LOCAL_V1`. It invokes no implicit shell. Its environment identity covers the resolved executable digest, admitted command, effective inherited environment digests, typed oracle identity, Tenet subjects, runner version, OS, and architecture. It terminates the verifier process group before accepting output.
+The local runner uses structured argv, typed Candidate/Authority/scratch/output paths, explicit environment inheritance, timeouts, bounded output, and `RunnerSemanticsV1`. It invokes no implicit shell. Its environment identity covers the resolved executable digest, admitted command, effective inherited environment digests, typed oracle identity, Tenet subjects, runner version, OS, architecture, and protection backend. It terminates the verifier process group before accepting output.
+
+Admitted verifier definitions carry a `protection` level:
+
+- `local` executes without an enforcement boundary and yields `LOCAL_V1` (detection only).
+- `protected` requires the runner to enforce read-only Candidate and Authority views, a separate writable scratch directory, and a controlled output directory — via macOS Seatbelt (`sandbox-exec`) or Linux Bubblewrap (`bwrap`) — and yields `PROTECTED_V1`. When the platform cannot enforce the boundary, the runner returns an explicit infrastructure result and never downgrades to `LOCAL_V1`. `TMPDIR` is redirected into the run's scratch directory for protected runs.
 
 ## Trust boundaries
 
 These distinctions are mandatory:
 
 - **`LOCAL_V1` ≠ same-user tamper resistance.** A same-user process can affect local execution; `LOCAL_V1` makes no stronger claim.
+- **`PROTECTED_V1` ≠ independent authorship.** It enforces the runtime observation boundary for verifier processes; it does not prove who wrote the Candidate.
+- **a valid grant ≠ a human decision.** The admission grant authenticates possession of the trusted secret, not a specific person; the trust anchor is the secret's confidentiality in the operator process.
 - **`AuthorityBound` ≠ independent authorship.** Binding verifier material to Authority identifies content; it does not prove who wrote it.
-- **fresh materialization ≠ sandboxing.** Each verifier gets a pristine view, not an isolation or containment guarantee.
+- **fresh materialization ≠ sandboxing.** Each verifier gets a pristine view; only `protected` adds the OS enforcement boundary.
 - **content addressing ≠ writer authentication.** A digest identifies bytes; it does not authenticate their producer.
 - **MCP user input ≠ cryptographic human identity.** Admission is an explicit workflow boundary, not a signature scheme.
 - **verifier `Pass` ≠ task completion.** Only deterministic kernel evaluation of the full admitted Final Evaluation can yield `DONE`.
 
 ## Residual limitations
 
-- **Admission authorization is not independent.** The current `ADMISSION` operation validates exact Proposal/Reconciliation/Authority bindings, but any process with protocol access can submit a consistent chain. Repository-contained digests authenticate bytes, not writers. A non-cooperative producer therefore can still self-admit or replace the active Authority. Fixing this requires a durable external trust anchor; signatures, HMACs, keychains, and privileged services are intentionally outside the current product boundary.
+- **The admission trust anchor is a shared secret.** `ADMISSION` now requires a grant the producer cannot mint without the trusted admission secret, so protocol-level self-admission is closed. Possession of `TENET_ADMISSION_SECRET` is the only authorization: a process that obtains the secret can mint grants. The secret is a single shared capability with no per-identity revocation; rotation requires re-admission.
+- **Stored-state integrity is not writer-authenticated.** Content addressing authenticates bytes, not writers. A same-user process with direct `.tenet/` write access can hand-craft a persisted chain whose grant mac is structurally well-formed but was never verified (the mac is verified at admission submission; load paths enforce the grant's semantic version and exact proposal/authority binding). Such forged state is outside the same-user local assurance boundary; the protocol surface cannot produce it.
 - **`LOCAL_V1` is detection, not confinement.** Fresh materializations, process-group cleanup, per-view recapture, and final working-tree recapture detect ordinary mutation and prevent sequential contamination. A hostile same-user process can still race or tamper with local files. Such evidence cannot satisfy `Protected` criteria.
-- **The canonical process surface is intentionally limited.** The initial CLI remains `init`, `doctor`, `mcp`, and `version`; completion lifecycle operations are exposed only through the four-operation MCP adapter. Receipt verification is available without MCP through `doctor --receipt`, but a complete non-MCP lifecycle interface is not yet present.
+- **Protected enforcement is platform-dependent.** Where neither Seatbelt nor Bubblewrap exists, protected verification fails closed with an infrastructure result; it never silently degrades. Unprivileged-container Bubblewrap restrictions are the operator's deployment concern.
 
-- **Descendants can escape process-group cleanup.** Tenet places verifiers in a dedicated group and sends `SIGKILL` to that group, but a descendant that starts a new session can retain an inherited output pipe. Output collection now fails closed after a five-second drain deadline; the surviving process itself is outside the same-user local assurance boundary.
-
-Because of the first and second limitations, Tenet does not currently support the stronger claim that admission and authoritative verification are independent of a same-user non-cooperative candidate producer.
+- **Descendants can escape process-group cleanup.** Tenet places verifiers in a dedicated group and sends `SIGKILL` to that group, but a descendant that starts a new session can retain an inherited output pipe. Output collection now fails closed after a five-second drain deadline; the surviving process itself is outside the same-user local assurance boundary. Protected runs additionally confine such descendants by the OS sandbox.
 
 ## Architecture
 

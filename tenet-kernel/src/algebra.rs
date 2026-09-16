@@ -128,12 +128,10 @@ pub fn evidence_result(
   if observation.infrastructure_error.is_some() {
     return EvidenceResult::InfrastructureError;
   }
-  let derived =
-    definition
-      .command
-      .result
-      .interpret(observation.exit_code, observation.timed_out, false);
-  derived
+  definition
+    .command
+    .result
+    .interpret(observation.exit_code, observation.timed_out, false)
 }
 
 pub fn evaluate(
@@ -261,12 +259,15 @@ fn admitted_definition<'a>(
     .verifiers
     .iter()
     .find(|definition| definition.id == verifier.id.0)
-    .ok_or_else(|| AlgebraError::AdmittedVerifierMismatch)?;
-  let matches_material = match (verifier.material, definition.authority) {
+    .ok_or(AlgebraError::AdmittedVerifierMismatch)?;
+  let matches_material = matches!(
+    (verifier.material, definition.authority),
     (VerifierMaterial::Candidate, VerifierAuthority::Project)
-    | (VerifierMaterial::AuthorityBundle, VerifierAuthority::AuthoritySnapshot) => true,
-    _ => false,
-  };
+      | (
+        VerifierMaterial::AuthorityBundle,
+        VerifierAuthority::AuthoritySnapshot
+      )
+  );
   if !matches_material {
     return Err(AlgebraError::AdmittedVerifierMismatch);
   }

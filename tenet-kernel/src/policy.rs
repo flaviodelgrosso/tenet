@@ -235,6 +235,8 @@ fn is_reserved_environment_name(value: &str) -> bool {
       | "TENET_CANDIDATE_ROOT"
       | "TENET_AUTHORITY_ROOT"
       | "TENET_SCRATCH_ROOT"
+      | "TENET_OUTPUT_ROOT"
+      | "TMPDIR"
   )
 }
 
@@ -269,6 +271,7 @@ mod tests {
         max_output_bytes: 1_024,
         authority: VerifierAuthority::Project,
         oracle_path: None,
+        protection: tenet_domain::policy::VerifierProtection::default(),
       }],
     }
   }

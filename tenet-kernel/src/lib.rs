@@ -4,6 +4,7 @@
 pub mod algebra;
 pub mod authority;
 pub mod digest;
+pub mod grant;
 pub mod identity;
 pub mod policy;
 pub mod protocol;

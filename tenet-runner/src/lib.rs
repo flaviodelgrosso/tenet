@@ -21,14 +21,14 @@ use sha2::{Digest, Sha256};
 use tenet_application::ports::{ExecutedVerifier, VerifierRun, VerifierRunner};
 use tenet_domain::{
   algebra::{
-    AssuranceProfileId, EvidenceResult, ExecutionContext, LOCAL_V1, PlatformInformation,
-    RUNNER_SEMANTICS_V1, RunnerSemanticsId,
+    AssuranceProfileId, EvidenceResult, ExecutionContext, LOCAL_V1, PROTECTED_V1,
+    PlatformInformation, RUNNER_SEMANTICS_V1, RunnerSemanticsId,
   },
   evidence::{
     ExecutionEnvironmentIdentity, ExecutionProvenance, OracleIdentity, RunnerIdentity,
     VerifierObservation,
   },
-  policy::{CommandArgument, CommandCwd},
+  policy::{CommandArgument, CommandCwd, VerifierProtection},
 };
 use tenet_kernel::digest::canonical_digest;
 
@@ -63,8 +63,42 @@ impl VerifierRunner for LocalProcessRunner {
     let resolved_program_digest = resolved_program
       .as_deref()
       .and_then(|path| file_digest(path).ok());
-    let context = execution_context(resolved_program.as_deref(), resolved_program_digest);
-    let execution = provenance(request, &context, &environment)?;
+
+    // Protected verification is fail-closed: when the platform cannot
+    // enforce read-only Candidate/Authority views with separate writable
+    // scratch and controlled output, the runner returns an explicit
+    // infrastructure result instead of downgrading to `LOCAL_V1`.
+    let backend = match request.verifier.protection {
+      VerifierProtection::Local => None,
+      VerifierProtection::Protected => match ProtectionBackend::detect() {
+        Some(backend) => Some(backend),
+        None => {
+          let context = execution_context(None, None, LOCAL_V1);
+          let execution = provenance(request, &context, &environment, "local")?;
+          return Ok(infrastructure_result(
+            context,
+            execution,
+            format!(
+              "protected verification is unsupported on this platform ({} {}); Tenet refuses to downgrade assurance",
+              std::env::consts::OS,
+              std::env::consts::ARCH
+            ),
+          ));
+        }
+      },
+    };
+    let protection_identity = backend.map(ProtectionBackend::identity).unwrap_or("local");
+    let assurance = if backend.is_some() {
+      PROTECTED_V1
+    } else {
+      LOCAL_V1
+    };
+    let context = execution_context(
+      resolved_program.as_deref(),
+      resolved_program_digest,
+      assurance,
+    );
+    let execution = provenance(request, &context, &environment, protection_identity)?;
 
     let Some(program) = resolved_program else {
       return Ok(infrastructure_result(
@@ -76,9 +110,26 @@ impl VerifierRunner for LocalProcessRunner {
         ),
       ));
     };
-    let mut command = Command::new(&program);
+    let mut command = match backend {
+      None => {
+        let mut command = Command::new(&program);
+        command.args(&argv[1..]);
+        command
+      }
+      Some(ProtectionBackend::Seatbelt) => {
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command
+          .arg("-p")
+          .arg(seatbelt_profile(request))
+          .arg(&program)
+          .args(&argv[1..]);
+        command
+      }
+      Some(ProtectionBackend::Bubblewrap) => {
+        bubblewrap_command(request, &program, &argv, &working_directory)
+      }
+    };
     command
-      .args(&argv[1..])
       .env_clear()
       .envs(&environment)
       .env("TENET_AUTHORITY_ID", &request.authority_id.0.0)
@@ -86,6 +137,12 @@ impl VerifierRunner for LocalProcessRunner {
       .env("TENET_CANDIDATE_ROOT", request.candidate_root)
       .env("TENET_AUTHORITY_ROOT", request.authority_root)
       .env("TENET_SCRATCH_ROOT", request.scratch_root)
+      .env("TENET_OUTPUT_ROOT", request.output_root);
+    if backend.is_some() {
+      // Runtime temp space must land inside the only writable regions.
+      command.env("TMPDIR", request.scratch_root);
+    }
+    command
       .current_dir(&working_directory)
       .stdin(Stdio::null())
       .stdout(Stdio::piped())
@@ -174,6 +231,112 @@ impl VerifierRunner for LocalProcessRunner {
   }
 }
 
+/// Standard OS enforcement primitives for protected verification. Detection
+/// is runtime and honest: an unavailable backend yields an explicit
+/// infrastructure result, never a silent downgrade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtectionBackend {
+  /// macOS Seatbelt via `/usr/bin/sandbox-exec`.
+  Seatbelt,
+  /// Linux Bubblewrap via `bwrap` on `PATH`.
+  Bubblewrap,
+}
+
+impl ProtectionBackend {
+  fn detect() -> Option<Self> {
+    if cfg!(target_os = "macos") {
+      return Path::new("/usr/bin/sandbox-exec")
+        .is_file()
+        .then_some(Self::Seatbelt);
+    }
+    if cfg!(target_os = "linux") {
+      return path_executable("bwrap").then_some(Self::Bubblewrap);
+    }
+    None
+  }
+
+  fn identity(self) -> &'static str {
+    match self {
+      Self::Seatbelt => "seatbelt",
+      Self::Bubblewrap => "bubblewrap",
+    }
+  }
+}
+
+/// True when this platform can enforce `PROTECTED_V1` verification. Callers
+/// use this to decide whether a protected verifier is runnable; the runner
+/// itself fails closed with an infrastructure result when it is not.
+pub fn protection_backend_available() -> bool {
+  ProtectionBackend::detect().is_some()
+}
+
+fn path_executable(name: &str) -> bool {
+  let Some(path) = std::env::var_os("PATH") else {
+    return false;
+  };
+  std::env::split_paths(&path).any(|directory| directory.join(name).is_file())
+}
+
+fn seatbelt_escape(value: &str) -> String {
+  value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Seatbelt matches resolved filesystem paths, so a writable subpath must be
+/// canonicalized (`/var/folders` lives behind the `/var` symlink on macOS).
+fn seatbelt_writable_path(path: &Path) -> String {
+  let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+  seatbelt_escape(&resolved.to_string_lossy())
+}
+
+/// Seatbelt policy: everything readable and executable, all writes denied
+/// except the run's private scratch and controlled output directories.
+/// Sandboxes are inherited across fork/exec, so background descendants of a
+/// verifier remain confined.
+fn seatbelt_profile(request: &VerifierRun<'_>) -> String {
+  let writable = [request.scratch_root, request.output_root]
+    .iter()
+    .map(|path| format!("(subpath \"{}\")", seatbelt_writable_path(path)))
+    .collect::<Vec<_>>()
+    .join(" ");
+  format!(
+    "(version 1)(allow default)(deny file-write*)(allow file-write* (literal \"/dev/null\") {writable})"
+  )
+}
+
+/// Bubblewrap invocation: the whole filesystem (including `/tmp`) is read-bound,
+/// only the run's scratch and output directories are writable, and the process
+/// runs in fresh namespaces.
+fn bubblewrap_command(
+  request: &VerifierRun<'_>,
+  program: &Path,
+  argv: &[OsString],
+  working_directory: &Path,
+) -> Command {
+  let mut command = Command::new("bwrap");
+  command
+    .arg("--ro-bind")
+    .arg("/")
+    .arg("/")
+    .arg("--dev")
+    .arg("/dev")
+    .arg("--proc")
+    .arg("/proc")
+    .arg("--bind")
+    .arg(request.scratch_root)
+    .arg(request.scratch_root)
+    .arg("--bind")
+    .arg(request.output_root)
+    .arg(request.output_root)
+    .arg("--unshare-all")
+    .arg("--die-with-parent")
+    .arg("--chdir")
+    .arg(working_directory)
+    .arg("--")
+    .arg(program)
+    .args(&argv[1..]);
+  command
+}
+
 const RUNNER_IDENTITY: &str = "tenet.local_process_runner.v1";
 const TENET_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -185,6 +348,7 @@ struct RunnerAttributes<'a> {
   tenet_version: &'a str,
   os: &'a str,
   architecture: &'a str,
+  protection: &'a str,
 }
 
 #[derive(Serialize)]
@@ -313,9 +477,10 @@ fn resolve_program(
 fn execution_context(
   resolved_program: Option<&Path>,
   resolved_program_digest: Option<String>,
+  assurance: &str,
 ) -> ExecutionContext {
   ExecutionContext {
-    assurance: AssuranceProfileId(LOCAL_V1.into()),
+    assurance: AssuranceProfileId(assurance.into()),
     runner_semantics: RunnerSemanticsId(RUNNER_SEMANTICS_V1.into()),
     platform: PlatformInformation {
       os: std::env::consts::OS.into(),
@@ -330,6 +495,7 @@ fn provenance(
   request: &VerifierRun<'_>,
   context: &ExecutionContext,
   environment: &BTreeMap<OsString, OsString>,
+  protection: &str,
 ) -> Result<ExecutionProvenance> {
   let runner = RunnerAttributes {
     identity: RUNNER_IDENTITY,
@@ -337,6 +503,7 @@ fn provenance(
     tenet_version: TENET_VERSION,
     os: &context.platform.os,
     architecture: &context.platform.architecture,
+    protection,
   };
   let inherited_environment_digests =
     inherited_environment_digests(&request.verifier.command.env.inherit, environment);
@@ -510,6 +677,7 @@ mod tests {
     let candidate = tempfile::tempdir().expect("candidate");
     let authority = tempfile::tempdir().expect("authority");
     let scratch = tempfile::tempdir().expect("scratch");
+    let output = tempfile::tempdir().expect("output");
     let program = candidate.path().join("verify.sh");
     if let Some(script) = script {
       fs::write(&program, script).expect("program");
@@ -529,6 +697,7 @@ mod tests {
       max_output_bytes: 1_024,
       authority: VerifierAuthority::Project,
       oracle_path: None,
+      protection: tenet_domain::policy::VerifierProtection::Local,
     };
     let authority_id = AuthorityId(content('a'));
     let candidate_id = CandidateId(content('b'));
@@ -542,6 +711,7 @@ mod tests {
         candidate_root: candidate.path(),
         authority_root: authority.path(),
         scratch_root: scratch.path(),
+        output_root: output.path(),
         verifier: &verifier,
         authority_id: &authority_id,
         candidate_id: &candidate_id,
@@ -667,6 +837,7 @@ mod tests {
     let candidate = tempfile::tempdir().expect("candidate");
     let authority = tempfile::tempdir().expect("authority");
     let scratch = tempfile::tempdir().expect("scratch");
+    let output = tempfile::tempdir().expect("output");
     let program = candidate.path().join("tools/verify");
     fs::create_dir(candidate.path().join("tools")).expect("tools");
     fs::write(
@@ -699,6 +870,7 @@ mod tests {
       max_output_bytes: 1_024,
       authority: VerifierAuthority::Project,
       oracle_path: None,
+      protection: tenet_domain::policy::VerifierProtection::Local,
     };
     let authority_id = AuthorityId(content('a'));
     let candidate_id = CandidateId(content('b'));
@@ -712,6 +884,7 @@ mod tests {
         candidate_root: candidate.path(),
         authority_root: authority.path(),
         scratch_root: scratch.path(),
+        output_root: output.path(),
         verifier: &verifier,
         authority_id: &authority_id,
         candidate_id: &candidate_id,
