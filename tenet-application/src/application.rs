@@ -1748,23 +1748,23 @@ fn doctor_check(name: impl Into<String>, passed: bool, detail: impl Into<String>
 }
 
 fn authoring_readiness(policy: &VerificationPolicy) -> AuthoringReadiness {
-  let candidate_capture_configured = !policy.candidate.include.is_empty();
-  let verifier_ids = policy
+  let candidate_configured = validate_candidate_surface(&policy.candidate).is_ok();
+  let configured_verifier_ids = policy
     .verifiers
     .iter()
     .map(|verifier| verifier.id.clone())
     .collect::<Vec<_>>();
   let mut missing_prerequisites = Vec::new();
-  if !candidate_capture_configured {
-    missing_prerequisites.push("candidate_capture_unconfigured".into());
+  if !candidate_configured {
+    missing_prerequisites.push("candidate_surface_not_configured".into());
   }
-  if verifier_ids.is_empty() {
-    missing_prerequisites.push("verifiers_unconfigured".into());
+  if configured_verifier_ids.is_empty() {
+    missing_prerequisites.push("no_verifiers_configured".into());
   }
   AuthoringReadiness {
     config_path: ".tenet/tenet.toml".into(),
-    candidate_capture_configured,
-    verifier_ids,
+    candidate_configured,
+    configured_verifier_ids,
     missing_prerequisites,
   }
 }

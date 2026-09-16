@@ -120,8 +120,10 @@ pub struct RequirementStatus {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthoringReadiness {
   pub config_path: String,
-  pub candidate_capture_configured: bool,
-  pub verifier_ids: Vec<String>,
+  /// True only when the validated configuration defines a positive Candidate
+  /// capture surface acceptable to Authority submission.
+  pub candidate_configured: bool,
+  pub configured_verifier_ids: Vec<String>,
   pub missing_prerequisites: Vec<String>,
 }
 

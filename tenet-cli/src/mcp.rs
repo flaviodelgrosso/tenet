@@ -28,6 +28,7 @@ const MCP_INSTRUCTIONS: &str = "Tenet exposes exactly four completion operations
 fn authoring_resource() -> Result<String, ErrorData> {
   serde_json::to_string_pretty(&serde_json::json!({
     "schemaVersion": 1,
+    "configurationSemantics": "tenet:authoring-configuration-resource:v1",
     "configPath": ".tenet/tenet.toml",
     "configurationSchema": schema_for!(ProjectConfig),
   }))

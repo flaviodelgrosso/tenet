@@ -5,6 +5,9 @@ use std::{
   process::{Command, Stdio},
 };
 
+use schemars::schema_for;
+use tenet_domain::policy::ProjectConfig;
+
 fn mcp_request(root: &Path, method: &str, params: serde_json::Value) -> serde_json::Value {
   let mut child = Command::new(env!("CARGO_BIN_EXE_tenet"))
     .arg("--cwd")
@@ -208,8 +211,8 @@ fn mcp_authoring_discovery_reaches_admission_without_internal_protocol_knowledge
   assert_eq!(
     initial_context.pointer("/authoring/missingPrerequisites"),
     Some(&serde_json::json!([
-      "candidate_capture_unconfigured",
-      "verifiers_unconfigured"
+      "candidate_surface_not_configured",
+      "no_verifiers_configured"
     ]))
   );
 
@@ -243,25 +246,43 @@ fn mcp_authoring_discovery_reaches_admission_without_internal_protocol_knowledge
           .any(|resource| resource["uri"] == "tenet://authoring/configuration")
       })
   );
+  let config_before_resource_read =
+    fs::read(root.join(".tenet/tenet.toml")).expect("initial configuration");
   let metadata = mcp_request(
     root,
     "resources/read",
     serde_json::json!({ "uri": "tenet://authoring/configuration" }),
   );
-  let configuration_schema: serde_json::Value = serde_json::from_str(
+  let configuration = serde_json::from_str::<serde_json::Value>(
     metadata
       .pointer("/result/contents/0/text")
       .and_then(serde_json::Value::as_str)
       .expect("authoring metadata"),
   )
   .expect("authoring metadata JSON");
-  let configuration_schema = &configuration_schema["configurationSchema"].to_string();
+  assert_eq!(configuration["schemaVersion"], 1);
+  assert_eq!(
+    configuration["configurationSemantics"],
+    "tenet:authoring-configuration-resource:v1"
+  );
+  assert_eq!(configuration["configPath"], ".tenet/tenet.toml");
+  assert_eq!(
+    configuration["configurationSchema"],
+    serde_json::to_value(schema_for!(ProjectConfig)).expect("ProjectConfig schema")
+  );
+  assert_eq!(
+    fs::read(root.join(".tenet/tenet.toml")).expect("configuration after resource read"),
+    config_before_resource_read
+  );
+  let configuration_schema = &configuration["configurationSchema"].to_string();
   for field in [
     "candidate",
     "include",
+    "exclude",
     "argv",
     "cwd",
     "timeoutMs",
+    "max_output_bytes",
     "authority_snapshot",
     "protection",
     "inconclusive",
@@ -271,7 +292,20 @@ fn mcp_authoring_discovery_reaches_admission_without_internal_protocol_knowledge
       "configuration schema must expose {field}"
     );
   }
-
+  let unknown_resource = mcp_request(
+    root,
+    "resources/read",
+    serde_json::json!({ "uri": "tenet://authoring/unknown" }),
+  );
+  assert!(
+    unknown_resource.get("error").is_some(),
+    "unknown resource must fail explicitly: {unknown_resource}"
+  );
+  let malformed_resource = mcp_request(root, "resources/read", serde_json::json!({}));
+  assert!(
+    malformed_resource.get("error").is_some(),
+    "malformed resource request must fail explicitly: {malformed_resource}"
+  );
   fs::write(root.join("candidate.txt"), "candidate\n").expect("candidate");
   fs::write(root.join("verify.sh"), "#!/bin/sh\nexit 0\n").expect("verifier");
   #[cfg(unix)]
@@ -313,11 +347,11 @@ inconclusive = []
   let configured_context = mcp_tool(root, "tenet_context", serde_json::json!({}));
   assert_eq!(configured_context["phase"], "AUTHORITY_REQUIRED");
   assert_eq!(
-    configured_context.pointer("/authoring/candidateCaptureConfigured"),
+    configured_context.pointer("/authoring/candidateConfigured"),
     Some(&serde_json::json!(true))
   );
   assert_eq!(
-    configured_context.pointer("/authoring/verifierIds"),
+    configured_context.pointer("/authoring/configuredVerifierIds"),
     Some(&serde_json::json!(["V1"]))
   );
   assert_eq!(
@@ -371,4 +405,121 @@ inconclusive = []
 
   let admission_context = mcp_tool(root, "tenet_context", serde_json::json!({}));
   assert_eq!(admission_context["phase"], "AUTHORITY_ADMISSION");
+}
+
+#[test]
+fn mcp_context_reports_authoring_facts_only_for_valid_configuration() {
+  let directory = tempfile::tempdir().expect("repository");
+  let root = directory.path();
+  fs::write(root.join("SPEC.md"), "# Specification\n").expect("specification");
+  let init = Command::new(env!("CARGO_BIN_EXE_tenet"))
+    .arg("--cwd")
+    .arg(root)
+    .args(["init", "--json"])
+    .output()
+    .expect("initialize");
+  assert!(
+    init.status.success(),
+    "{}",
+    String::from_utf8_lossy(&init.stderr)
+  );
+
+  let unconfigured = mcp_tool(root, "tenet_context", serde_json::json!({}));
+  assert_eq!(
+    unconfigured.pointer("/authoring/missingPrerequisites"),
+    Some(&serde_json::json!([
+      "candidate_surface_not_configured",
+      "no_verifiers_configured"
+    ]))
+  );
+
+  fs::write(
+    root.join(".tenet/tenet.toml"),
+    "version = 1\nspec_path = \"SPEC.md\"\n\n[candidate]\ninclude = [\"candidate.txt\"]\n",
+  )
+  .expect("candidate-only configuration");
+  let candidate_only = mcp_tool(root, "tenet_context", serde_json::json!({}));
+  assert_eq!(
+    candidate_only.pointer("/authoring/candidateConfigured"),
+    Some(&serde_json::json!(true))
+  );
+  assert_eq!(
+    candidate_only.pointer("/authoring/configuredVerifierIds"),
+    Some(&serde_json::json!([]))
+  );
+  assert_eq!(
+    candidate_only.pointer("/authoring/missingPrerequisites"),
+    Some(&serde_json::json!(["no_verifiers_configured"]))
+  );
+
+  fs::write(
+    root.join(".tenet/tenet.toml"),
+    r#"
+version = 1
+spec_path = "SPEC.md"
+
+[candidate]
+include = ["candidate.txt"]
+
+[[verifiers]]
+id = "V1"
+authority = "project"
+
+[verifiers.command]
+argv = [{ kind = "literal", value = "true" }]
+cwd = { kind = "scratch" }
+"#,
+  )
+  .expect("one-verifier configuration");
+  let one_verifier = mcp_tool(root, "tenet_context", serde_json::json!({}));
+  assert_eq!(
+    one_verifier.pointer("/authoring/configuredVerifierIds"),
+    Some(&serde_json::json!(["V1"]))
+  );
+  assert_eq!(
+    one_verifier.pointer("/authoring/missingPrerequisites"),
+    Some(&serde_json::json!([]))
+  );
+
+  fs::write(
+    root.join(".tenet/tenet.toml"),
+    r#"
+version = 1
+spec_path = "SPEC.md"
+
+[candidate]
+include = ["candidate.txt"]
+
+[[verifiers]]
+id = "V1"
+authority = "project"
+
+[verifiers.command]
+argv = [{ kind = "literal", value = "true" }]
+cwd = { kind = "scratch" }
+
+[[verifiers]]
+id = "V2"
+authority = "project"
+
+[verifiers.command]
+argv = [{ kind = "literal", value = "true" }]
+cwd = { kind = "scratch" }
+"#,
+  )
+  .expect("multiple-verifier configuration");
+  let multiple_verifiers = mcp_tool(root, "tenet_context", serde_json::json!({}));
+  assert_eq!(
+    multiple_verifiers.pointer("/authoring/configuredVerifierIds"),
+    Some(&serde_json::json!(["V1", "V2"]))
+  );
+
+  fs::write(
+    root.join(".tenet/tenet.toml"),
+    "version = 999\nspec_path = \"SPEC.md\"\n",
+  )
+  .expect("unsupported configuration");
+  let incompatible = mcp_tool(root, "tenet_context", serde_json::json!({}));
+  assert_ne!(incompatible["phase"], "AUTHORITY_REQUIRED");
+  assert!(incompatible.get("authoring").is_none());
 }
