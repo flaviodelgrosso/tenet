@@ -1,10 +1,17 @@
 use std::{path::PathBuf, sync::Arc};
 
 use rmcp::{
-  ErrorData, Json, ServerHandler, ServiceExt, handler::server::wrapper::Parameters, tool,
-  tool_handler, tool_router, transport::stdio,
+  ErrorData, Json, RoleServer, ServerHandler, ServiceExt,
+  handler::server::wrapper::Parameters,
+  model::{
+    Implementation, ListResourcesResult, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerConfig,
+  },
+  service::RequestContext,
+  tool, tool_handler, tool_router,
+  transport::stdio,
 };
-use schemars::JsonSchema;
+use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use tenet_application::{
   application::{AuthoritySubmitRequest, RequirementCheckRequest, Tenet},
@@ -12,7 +19,22 @@ use tenet_application::{
     AuthoritySubmissionResult, ContextResult, RequirementCheckResult, TenetError, VerifyResult,
   },
 };
+use tenet_domain::policy::ProjectConfig;
 use tokio::sync::Mutex;
+
+const AUTHORING_RESOURCE_URI: &str = "tenet://authoring/configuration";
+const MCP_INSTRUCTIONS: &str = "Tenet exposes exactly four completion operations: context, staged authority submission, requirement checking, and final verification. Read tenet://authoring/configuration before configuring .tenet/tenet.toml: it exposes the JSON Schema generated from Tenet's authoritative ProjectConfig type. At AUTHORITY_REQUIRED, use tenet_context authoring facts to identify missing Candidate capture or verifier prerequisites, then use the authority-submit tool schema for the contract and staged request shape. ADMISSION requires a trusted admission grant the candidate producer cannot mint; every persisted Admission is cryptographically revalidated on each trusted load and verification requires the trusted admission secret in-process. LOCAL_V1 is not same-user tamper resistance. PROTECTED_V1 verification runs only against an OS-enforced immutable view (macOS read-only volume with unlinked backing store, Linux private namespace copy verified against trusted digests before exec), never against a repository materialization. AuthorityBound is not independent authorship. Fresh materialization is not sandboxing. Content addressing is not writer authentication and MCP input is not cryptographic human identity. verifier Pass is not task completion; only kernel evaluation through tenet_verify can return DONE.";
+
+fn authoring_resource() -> Result<String, ErrorData> {
+  serde_json::to_string_pretty(&serde_json::json!({
+    "schemaVersion": 1,
+    "configPath": ".tenet/tenet.toml",
+    "configurationSchema": schema_for!(ProjectConfig),
+  }))
+  .map_err(|error| {
+    ErrorData::internal_error(format!("serialize authoring metadata: {error}"), None)
+  })
+}
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AuthoritySubmitParameters {
@@ -108,12 +130,46 @@ impl TenetMcp {
   }
 }
 
-#[tool_handler(
-  name = "tenet",
-  version = "0.7.0",
-  instructions = "Tenet exposes exactly four completion operations: context, staged authority submission, requirement checking, and final verification. The complete lifecycle is also available through the tenet CLI with identical kernel semantics; MCP is an optional adapter. ADMISSION requires a trusted admission grant the candidate producer cannot mint; every persisted Admission is cryptographically revalidated on each trusted load and verification requires the trusted admission secret in-process. LOCAL_V1 is not same-user tamper resistance; PROTECTED_V1 verification runs only against an OS-enforced immutable view (macOS read-only volume with unlinked backing store, Linux private namespace copy verified against trusted digests before exec), never against a directory a same-user producer can transiently mutate, and the runner fails closed when the platform cannot enforce it. AuthorityBound is not independent authorship; fresh materialization is not sandboxing; content addressing is not writer authentication; MCP user input is not cryptographic human identity; verifier Pass is not task completion. Only tenet_verify can return DONE after kernel evaluation of the exact active Admission, Authority, Candidate, and Final Evaluation."
-)]
-impl ServerHandler for TenetMcp {}
+#[tool_handler(name = "tenet", version = "0.7.0")]
+impl ServerHandler for TenetMcp {
+  fn get_info(&self) -> ServerConfig {
+    ServerConfig::new(
+      ServerCapabilities::builder()
+        .enable_resources()
+        .enable_tools()
+        .build(),
+    )
+    .with_server_info(Implementation::new("tenet", "0.7.0"))
+    .with_instructions(MCP_INSTRUCTIONS.to_string())
+  }
+
+  async fn list_resources(
+    &self,
+    _: Option<rmcp::model::PaginatedRequestParams>,
+    _: RequestContext<RoleServer>,
+  ) -> Result<ListResourcesResult, ErrorData> {
+    Ok(ListResourcesResult::with_all_items(vec![
+      Resource::new(AUTHORING_RESOURCE_URI, "Tenet authoring configuration")
+        .with_description(
+          "Canonical .tenet/tenet.toml schema generated from Tenet's ProjectConfig Rust type.",
+        )
+        .with_mime_type("application/schema+json"),
+    ]))
+  }
+
+  async fn read_resource(
+    &self,
+    request: ReadResourceRequestParams,
+    _: RequestContext<RoleServer>,
+  ) -> Result<ReadResourceResponse, ErrorData> {
+    if request.uri != AUTHORING_RESOURCE_URI {
+      return Err(ErrorData::resource_not_found("resource not found", None));
+    }
+    let content = ResourceContents::text(authoring_resource()?, AUTHORING_RESOURCE_URI)
+      .with_mime_type("application/schema+json");
+    Ok(ReadResourceResult::new(vec![content]).into())
+  }
+}
 pub fn run(cwd: PathBuf) -> anyhow::Result<()> {
   // A malformed secret degrades to `None` so the server still serves reads;
   // every admission attempt then fails closed with `admission_secret_unavailable`.

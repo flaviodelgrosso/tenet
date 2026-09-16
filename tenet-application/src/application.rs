@@ -47,10 +47,10 @@ use crate::{
     Repository, VerifierRun, VerifierRunner,
   },
   response::{
-    ActiveAdmissionInspection, AuthorityInspectionResult, AuthoritySubmissionResult, Blocker,
-    BlockersResult, ContextResult, DoctorCheck, DoctorResult, EvidenceReport, InitResult,
-    ProposalInspection, ReceiptVerificationResult, ReconciliationInspection,
-    RequirementCheckResult, RequirementStatus, TenetError, VerifyResult,
+    ActiveAdmissionInspection, AuthoringReadiness, AuthorityInspectionResult,
+    AuthoritySubmissionResult, Blocker, BlockersResult, ContextResult, DoctorCheck, DoctorResult,
+    EvidenceReport, InitResult, ProposalInspection, ReceiptVerificationResult,
+    ReconciliationInspection, RequirementCheckResult, RequirementStatus, TenetError, VerifyResult,
   },
 };
 
@@ -500,6 +500,7 @@ impl Tenet {
         None,
         None,
         vec![],
+        None,
       ));
     }
 
@@ -640,6 +641,10 @@ impl Tenet {
       current_matches_final,
     };
     let phase = derive_phase(facts);
+    let authoring = (phase == WorkflowPhase::AuthorityRequired)
+      .then_some(live_policy.as_ref())
+      .flatten()
+      .map(authoring_readiness);
     Ok(context_for_phase(
       phase,
       chain.as_ref().map(|chain| chain.id.clone()),
@@ -651,6 +656,7 @@ impl Tenet {
         .map(|chain| chain.loaded.contract.policy.clone()),
       current_candidate,
       requirement_checks,
+      authoring,
     ))
   }
 
@@ -1741,6 +1747,28 @@ fn doctor_check(name: impl Into<String>, passed: bool, detail: impl Into<String>
   }
 }
 
+fn authoring_readiness(policy: &VerificationPolicy) -> AuthoringReadiness {
+  let candidate_capture_configured = !policy.candidate.include.is_empty();
+  let verifier_ids = policy
+    .verifiers
+    .iter()
+    .map(|verifier| verifier.id.clone())
+    .collect::<Vec<_>>();
+  let mut missing_prerequisites = Vec::new();
+  if !candidate_capture_configured {
+    missing_prerequisites.push("candidate_capture_unconfigured".into());
+  }
+  if verifier_ids.is_empty() {
+    missing_prerequisites.push("verifiers_unconfigured".into());
+  }
+  AuthoringReadiness {
+    config_path: ".tenet/tenet.toml".into(),
+    candidate_capture_configured,
+    verifier_ids,
+    missing_prerequisites,
+  }
+}
+
 fn context_for_phase(
   phase: WorkflowPhase,
   active_admission_id: Option<AdmissionId>,
@@ -1748,10 +1776,13 @@ fn context_for_phase(
   completion_policy_id: Option<tenet_domain::algebra::CompletionPolicyId>,
   current_candidate_id: Option<CandidateId>,
   requirement_checks: Vec<RequirementStatus>,
+  authoring: Option<AuthoringReadiness>,
 ) -> ContextResult {
   let next_action = match phase {
     WorkflowPhase::SpecRequired => "Create SPEC.md, then run tenet init.",
-    WorkflowPhase::AuthorityRequired => "Submit an authority PROPOSAL.",
+    WorkflowPhase::AuthorityRequired => {
+      "Configure the Candidate and verifier prerequisites, then submit an authority PROPOSAL."
+    }
     WorkflowPhase::AuthorityReconciliation => "Submit RECONCILIATION for the exact proposal.",
     WorkflowPhase::AuthorityClarification => "Submit CLARIFICATION or a revised PROPOSAL.",
     WorkflowPhase::AuthorityAdmission => {
@@ -1772,6 +1803,7 @@ fn context_for_phase(
     completion_policy_id,
     current_candidate_id,
     requirement_checks,
+    authoring,
     next_action: next_action.into(),
   }
 }

@@ -45,6 +45,20 @@ PROPOSAL → RECONCILIATION → CLARIFICATION (when needed) → ADMISSION
 
 Each transition binds exact content identities. Existence, a mutable ref, MCP user input, or an agent assertion is not admission. `ADMISSION` additionally requires a trusted admission grant bound to the exact proposal and authority; the producer cannot mint it, and a process without the trusted admission secret cannot admit. Every persisted Admission is cryptographically revalidated under the trusted secret on each load that can influence verification, so a hand-edited or forged Admission in repository state fails closed.
 
+## Authority authoring
+
+At `AUTHORITY_REQUIRED`:
+
+1. Inspect `.tenet/tenet.toml` and `tenet_context`'s `authoring` facts. They identify the config path, configured Candidate capture state, configured verifier IDs, and missing prerequisites.
+2. Inspect the `tenet_authority_submit` MCP tool schema for the complete Contract and stage-specific request fields, finite enums, and serialized names.
+3. Read the `tenet://authoring/configuration` MCP resource. Its `configurationSchema` is generated from Tenet's authoritative configuration type and defines the strict `.tenet/tenet.toml` surface, including typed argv/cwd, `timeoutMs`, verifier authority/protection, and exit-code disposition fields.
+4. Define the positive Candidate surface in `candidate.include`; configure every verifier referenced by the Contract; then use `tenet doctor` to confirm the strict configuration is valid.
+5. Submit `PROPOSAL` only after those prerequisites exist. Independently falsifiable behavioral claims should normally be distinct Criteria/proof obligations. Multiple Criteria may use the same verifier.
+
+Do not use Tenet implementation source or tests as normal protocol discovery.
+
+At `AUTHORITY_ADMISSION`, a candidate producer must not mint an `AdmissionGrant`. If no trusted grant is available, report the exact Proposal ID and Authority ID to the trusted admission side and stop progression. The trusted side alone can mint a grant bound to that exact pair and submit `ADMISSION`.
+
 During implementation, call `tenet_requirement_check` for one requirement. Its Candidate-specific Evaluation is development evidence only and cannot establish terminal completion.
 
 Call `tenet_verify` for final verification. It captures one Candidate, reruns every required verifier with a fresh Candidate materialization per verifier, persists one Final Evaluation, and alone may return `DONE`. If the repository changes after successful verification, the successful Evaluation remains historical for the verified Candidate and the protocol returns `INCONCLUSIVE` with `CANDIDATE_CHANGED_DURING_VERIFICATION`.

@@ -114,6 +114,17 @@ pub struct RequirementStatus {
   pub state: CompletionState,
 }
 
+/// Read-only project facts needed before an Authority Proposal can bind the
+/// configured Candidate and verifier surfaces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthoringReadiness {
+  pub config_path: String,
+  pub candidate_capture_configured: bool,
+  pub verifier_ids: Vec<String>,
+  pub missing_prerequisites: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContextResult {
@@ -128,6 +139,8 @@ pub struct ContextResult {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub current_candidate_id: Option<CandidateId>,
   pub requirement_checks: Vec<RequirementStatus>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub authoring: Option<AuthoringReadiness>,
   pub next_action: String,
 }
 
