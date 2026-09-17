@@ -9,10 +9,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tenet_domain::{
   algebra::{
-    AssuranceProfileId, CompletionContractV1, CompletionState, Evaluation, EvaluationId,
-    EvaluationScope, EvidenceResult, ExecutionContext, ExecutionObservation, LOCAL_V1,
-    PROTECTED_V1, PlatformInformation, RUNNER_SEMANTICS_V1, RunnerSemanticsId, VerifierId,
-    VerifierMaterial,
+    AssuranceProfileId, AssuranceRequirementV1, CompletionContractV1, CompletionState, Evaluation,
+    EvaluationId, EvaluationScope, EvidenceResult, ExecutionContext, ExecutionObservation,
+    LOCAL_V1, PROTECTED_V1, PlatformInformation, RUNNER_SEMANTICS_V1, RunnerSemanticsId,
+    VerifierId, VerifierMaterial,
   },
   authority::{
     Admission, AdmissionError, AdmissionGrant, AdmissionId, Authority, AuthorityProposal,
@@ -47,10 +47,12 @@ use crate::{
     Repository, VerifierRun, VerifierRunner,
   },
   response::{
-    ActiveAdmissionInspection, AuthoringReadiness, AuthorityInspectionResult,
-    AuthoritySubmissionResult, Blocker, BlockersResult, ContextResult, DoctorCheck, DoctorResult,
-    EvidenceReport, InitResult, ProposalInspection, ReceiptVerificationResult,
-    ReconciliationInspection, RequirementCheckResult, RequirementStatus, TenetError, VerifyResult,
+    ActiveAdmissionInspection, AdmissionContentIds, AdmissionDetail, AdmissionHandoff,
+    AdmissionPreview, AdmissionSummary, AuthoringReadiness, AuthorityInspectionResult,
+    AuthoritySubmissionResult, Blocker, BlockersResult, ContextResult, CriterionPreview,
+    DoctorCheck, DoctorResult, EvidenceReport, InitResult, ProposalInspection,
+    ReceiptVerificationResult, ReconciliationInspection, RequirementCheckResult,
+    RequirementPreview, RequirementStatus, TenetError, VerifierPreview, VerifyResult,
   },
 };
 
@@ -265,6 +267,22 @@ impl Tenet {
       let root = self.initialized_root()?;
       let _lock = self.repository.acquire_lock(&root)?;
       self.authority_submit_inner(request)
+    })())
+  }
+
+  /// Trusted handoff: admit the exact prepared chain derived from the
+  /// proposal and reconciliation refs without manual identity re-entry. The
+  /// grant is minted under the trusted admission secret held by this process;
+  /// a candidate producer without the secret fails closed with
+  /// `admission_secret_unavailable`. The submission runs through the same
+  /// kernel path as a manual `ADMISSION`, so every exact identity binding and
+  /// completion admission rule is re-validated; nothing here bypasses the
+  /// grant verification that a user approval value can never replace.
+  pub fn authority_admit_prepared(&self) -> AppResult<AuthoritySubmissionResult> {
+    app_result((|| {
+      let root = self.initialized_root()?;
+      let _lock = self.repository.acquire_lock(&root)?;
+      self.admit_prepared_inner(&root)
     })())
   }
 
@@ -493,29 +511,28 @@ impl Tenet {
         .is_ok()
     });
     if !spec_exists && compatible {
-      return Ok(context_for_phase(
-        WorkflowPhase::SpecRequired,
-        None,
-        None,
-        None,
-        None,
-        vec![],
-        None,
-      ));
+      return Ok(ContextResult {
+        schema_version: 1,
+        phase: WorkflowPhase::SpecRequired,
+        active_admission_id: None,
+        authority_id: None,
+        completion_policy_id: None,
+        current_candidate_id: None,
+        requirement_checks: vec![],
+        authoring: None,
+        admission: None,
+        next_action: next_action_for(WorkflowPhase::SpecRequired).into(),
+      });
     }
 
     let proposal_id = self.repository.read_ref(&root, PROPOSAL_REF)?;
     let reconciliation_id = self.repository.read_ref(&root, RECONCILIATION_REF)?;
-    let proposal = if let Some(chain) = &chain {
-      Some(chain.proposal.clone())
+    let loaded_proposal = if chain.is_some() {
+      None
     } else {
       match proposal_id
         .as_ref()
-        .map(|id| {
-          self
-            .load_proposed(&root, &ProposalId(id.clone()))
-            .map(|(proposal, _)| proposal)
-        })
+        .map(|id| self.load_proposed(&root, &ProposalId(id.clone())))
         .transpose()
       {
         Ok(value) => value,
@@ -524,6 +541,13 @@ impl Tenet {
           None
         }
       }
+    };
+    let proposal = if let Some(chain) = &chain {
+      Some(chain.proposal.clone())
+    } else {
+      loaded_proposal
+        .as_ref()
+        .map(|(proposal, _)| proposal.clone())
     };
     let report = if let Some(chain) = &chain {
       Some(chain.report.clone())
@@ -645,19 +669,43 @@ impl Tenet {
       .then_some(live_policy.as_ref())
       .flatten()
       .map(authoring_readiness);
-    Ok(context_for_phase(
+    // The admission preview is informational guidance for the exact prepared
+    // chain: it grants nothing, and only a kernel-verified grant admits.
+    let admission = match (
+      &phase,
+      loaded_proposal.as_ref(),
+      proposal_id.as_ref(),
+      reconciliation_id.as_ref(),
+    ) {
+      (
+        WorkflowPhase::AuthorityAdmission,
+        Some((proposal, loaded)),
+        Some(proposal_id),
+        Some(reconciliation),
+      ) => Some(admission_preview(
+        &ProposalId(proposal_id.clone()),
+        &ReconciliationReportId(reconciliation.clone()),
+        proposal,
+        loaded,
+      )),
+      _ => None,
+    };
+    Ok(ContextResult {
+      schema_version: 1,
       phase,
-      chain.as_ref().map(|chain| chain.id.clone()),
-      chain
+      active_admission_id: chain.as_ref().map(|chain| chain.id.clone()),
+      authority_id: chain
         .as_ref()
         .map(|chain| chain.admission.authority.clone()),
-      chain
+      completion_policy_id: chain
         .as_ref()
         .map(|chain| chain.loaded.contract.policy.clone()),
-      current_candidate,
+      current_candidate_id: current_candidate,
       requirement_checks,
       authoring,
-    ))
+      admission,
+      next_action: next_action_for(phase).into(),
+    })
   }
 
   fn authority_submit_inner(
@@ -816,6 +864,47 @@ impl Tenet {
         })
       }
     }
+  }
+  fn admit_prepared_inner(&self, root: &Path) -> Result<AuthoritySubmissionResult> {
+    let secret = self.trusted_admission_secret()?;
+    let proposal_id = ProposalId(self.repository.read_ref(root, PROPOSAL_REF)?.ok_or_else(
+      || {
+        TenetError::new(
+          "admission_precondition_missing",
+          "no proposal exists to admit; submit PROPOSAL and RECONCILIATION first",
+        )
+      },
+    )?);
+    let (proposal, _loaded) = self.load_proposed(root, &proposal_id)?;
+    let reconciliation_id = ReconciliationReportId(
+      self
+        .repository
+        .read_ref(root, RECONCILIATION_REF)?
+        .ok_or_else(|| {
+          TenetError::new(
+            "admission_precondition_missing",
+            "no reconciliation exists for the active proposal; submit RECONCILIATION first",
+          )
+        })?,
+    );
+    let report: ReconciliationReport = self.load_object(root, &reconciliation_id.0)?;
+    if report.proposal != proposal_id {
+      return Err(
+        TenetError::new(
+          "admission_identity_mismatch",
+          "the reconciliation ref targets a report for another proposal",
+        )
+        .into(),
+      );
+    }
+    let grant = grant::mint_grant(secret, &proposal_id, &proposal.authority)
+      .map_err(|error| TenetError::new("admission_grant_invalid", error.to_string()))?;
+    self.authority_submit_inner(AuthoritySubmitRequest::Admission {
+      proposal_id,
+      reconciliation_id,
+      authority_id: proposal.authority,
+      grant,
+    })
   }
 
   fn requirement_check_inner(
@@ -1769,16 +1858,100 @@ fn authoring_readiness(policy: &VerificationPolicy) -> AuthoringReadiness {
   }
 }
 
-fn context_for_phase(
-  phase: WorkflowPhase,
-  active_admission_id: Option<AdmissionId>,
-  authority_id: Option<AuthorityId>,
-  completion_policy_id: Option<tenet_domain::algebra::CompletionPolicyId>,
-  current_candidate_id: Option<CandidateId>,
-  requirement_checks: Vec<RequirementStatus>,
-  authoring: Option<AuthoringReadiness>,
-) -> ContextResult {
-  let next_action = match phase {
+/// Derive the approval-UX preview for the exact prepared chain from the
+/// already-validated immutable objects. Purely informational: counts, the
+/// admitted Candidate surface, evidence policy, and content identities. It
+/// grants nothing; only a kernel-verified grant bound to these exact
+/// identities admits.
+fn admission_preview(
+  proposal_id: &ProposalId,
+  reconciliation_id: &ReconciliationReportId,
+  proposal: &AuthorityProposal,
+  loaded: &LoadedAuthority,
+) -> AdmissionPreview {
+  let criteria = loaded
+    .contract
+    .requirements
+    .iter()
+    .flat_map(|requirement| &requirement.criteria)
+    .collect::<Vec<_>>();
+  let verifier_ids = criteria
+    .iter()
+    .flat_map(|criterion| &criterion.verifiers)
+    .map(|verifier| verifier.id.0.as_str())
+    .collect::<BTreeSet<_>>();
+  let assurance = if criteria
+    .iter()
+    .any(|criterion| criterion.evidence.assurance == AssuranceRequirementV1::Protected)
+  {
+    PROTECTED_V1
+  } else {
+    LOCAL_V1
+  };
+  AdmissionPreview {
+    proposal_id: proposal_id.clone(),
+    reconciliation_id: reconciliation_id.clone(),
+    authority_id: proposal.authority.clone(),
+    summary: AdmissionSummary {
+      requirements: loaded.contract.requirements.len(),
+      criteria: criteria.len(),
+      verifiers: verifier_ids.len(),
+      assurance: assurance.to_owned(),
+      candidate_surface: loaded.policy.candidate.include.clone(),
+      spec_path: loaded.spec.path.clone(),
+    },
+    detail: AdmissionDetail {
+      requirements: loaded
+        .contract
+        .requirements
+        .iter()
+        .map(|requirement| RequirementPreview {
+          id: requirement.id.clone(),
+          statement: requirement.statement.clone(),
+          criteria: requirement
+            .criteria
+            .iter()
+            .map(|criterion| CriterionPreview {
+              id: criterion.id.clone(),
+              proposition: criterion.proposition.clone(),
+              verifier_ids: criterion
+                .verifiers
+                .iter()
+                .map(|verifier| verifier.id.0.clone())
+                .collect(),
+              evidence: criterion.evidence,
+            })
+            .collect(),
+        })
+        .collect(),
+      verifiers: loaded
+        .policy
+        .verifiers
+        .iter()
+        .map(|verifier| VerifierPreview {
+          id: verifier.id.clone(),
+          authority: verifier.authority,
+          protection: verifier.protection,
+        })
+        .collect(),
+      content_ids: AdmissionContentIds {
+        spec_id: loaded.authority.spec.clone(),
+        contract_id: loaded.authority.contract.clone(),
+        surface_id: loaded.authority.surface.clone(),
+      },
+    },
+    handoff: AdmissionHandoff {
+      command: ["tenet", "authority", "admit-prepared", "--json"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+      requires_trusted_secret: true,
+    },
+  }
+}
+
+fn next_action_for(phase: WorkflowPhase) -> &'static str {
+  match phase {
     WorkflowPhase::SpecRequired => "Create SPEC.md, then run tenet init.",
     WorkflowPhase::AuthorityRequired => {
       "Configure the Candidate and verifier prerequisites, then submit an authority PROPOSAL."
@@ -1786,7 +1959,7 @@ fn context_for_phase(
     WorkflowPhase::AuthorityReconciliation => "Submit RECONCILIATION for the exact proposal.",
     WorkflowPhase::AuthorityClarification => "Submit CLARIFICATION or a revised PROPOSAL.",
     WorkflowPhase::AuthorityAdmission => {
-      "Ask the trusted operator to mint a grant and submit ADMISSION for the exact proposal, reconciliation, and authority; never run tenet authority grant yourself."
+      "Present the admission preview to the user through the host agent's native confirmation mechanism; on approval, run the trusted admission handoff `tenet authority admit-prepared` from a trusted context, then re-derive the phase with tenet_context. Never run tenet authority grant yourself, and never treat user approval as an AdmissionGrant."
     }
     WorkflowPhase::AuthorityStale => {
       "Submit and admit a new authority for the current specification."
@@ -1794,17 +1967,6 @@ fn context_for_phase(
     WorkflowPhase::Incompatible => "Run tenet doctor and replace unsupported or corrupt state.",
     WorkflowPhase::Implementation => "Implement requirements, check them, then call tenet_verify.",
     WorkflowPhase::Completed => "No action; current Candidate is verified.",
-  };
-  ContextResult {
-    schema_version: 1,
-    phase,
-    active_admission_id,
-    authority_id,
-    completion_policy_id,
-    current_candidate_id,
-    requirement_checks,
-    authoring,
-    next_action: next_action.into(),
   }
 }
 
@@ -1840,7 +2002,7 @@ fn blockers_from_context(context: &ContextResult) -> BlockersResult {
     )),
     WorkflowPhase::AuthorityAdmission => blockers.push(blocker(
       "admission_missing",
-      "Admission requires a trusted grant bound to the exact proposal and authority; ask the trusted operator to mint a grant and admit.",
+      "Admission requires a trusted grant bound to the exact prepared proposal and authority; present the admission preview for native user approval, then run the trusted handoff `tenet authority admit-prepared` in a context holding the trusted admission secret.",
     )),
     WorkflowPhase::AuthorityStale => blockers.push(blocker(
       "authority_stale",

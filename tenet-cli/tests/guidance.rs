@@ -2,10 +2,10 @@
 //!
 //! A fresh coding agent follows the generated Skill, the derived context
 //! guidance, and the MCP instructions — not the implementation. These tests
-//! pin the three clarifications that failed in a real session so they cannot
-//! silently regress: verifier definitions vs Contract references, the
-//! Admission-vs-implementation ordering, and the producer-side
-//! `tenet authority grant` ban at `AUTHORITY_ADMISSION`.
+//! pin the clarifications that failed in real sessions: verifier definitions
+//! vs Contract references, the Admission-vs-implementation ordering, the
+//! producer-side `tenet authority grant` ban, and the native approval UX at
+//! `AUTHORITY_ADMISSION` that must not require copying content IDs.
 
 use std::{fs, path::Path, process::Command};
 
@@ -101,7 +101,7 @@ fn generated_skill_bans_producer_side_grant_probing() {
 }
 
 #[test]
-fn context_next_action_at_admission_defers_to_the_trusted_operator() {
+fn context_next_action_at_admission_routes_to_the_trusted_handoff() {
   let directory = tempfile::tempdir().expect("repository");
   let root = directory.path();
   init_repo(root);
@@ -202,11 +202,39 @@ fn context_next_action_at_admission_defers_to_the_trusted_operator() {
   assert_eq!(status["phase"], "AUTHORITY_ADMISSION");
   let next_action = status["nextAction"].as_str().expect("next action");
   assert!(
-    next_action.contains("trusted operator"),
-    "next action does not defer to the trusted operator: {next_action}"
+    next_action.contains("native confirmation mechanism"),
+    "next action does not route through native user approval: {next_action}"
   );
   assert!(
-    next_action.contains("never run tenet authority grant"),
+    next_action.contains("admit-prepared"),
+    "next action does not name the trusted admission handoff: {next_action}"
+  );
+  assert!(
+    next_action.contains("Never run tenet authority grant"),
     "next action does not ban producer-side grant minting: {next_action}"
   );
+  assert!(
+    next_action.contains("AdmissionGrant"),
+    "next action does not state that approval is not a grant: {next_action}"
+  );
+}
+
+#[test]
+fn generated_skill_prescribes_the_native_approval_ux() {
+  let directory = tempfile::tempdir().expect("repository");
+  init_repo(directory.path());
+  let skill = generated_skill(directory.path());
+  for claim in [
+    "native user-interaction or confirmation mechanism",
+    "**Review authority**",
+    "**Admit and continue**",
+    "**Stop / reject**",
+    "never make the user copy content IDs",
+    "`tenet authority admit-prepared --json`",
+    "User approval through an agent prompt is not an `AdmissionGrant`",
+    "call `tenet_context` again",
+    "never add `TENET_ADMISSION_SECRET` to your own environment",
+  ] {
+    assert!(skill.contains(claim), "skill omits {claim:?}");
+  }
 }

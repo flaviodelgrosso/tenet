@@ -409,6 +409,17 @@ inconclusive = []
 
   let admission_context = mcp_tool(root, "tenet_context", serde_json::json!({}));
   assert_eq!(admission_context["phase"], "AUTHORITY_ADMISSION");
+  // The MCP adapter derives the same structured approval-UX preview as the
+  // CLI: a host agent needs no content-ID copying on either surface.
+  let preview = &admission_context["admission"];
+  assert_eq!(preview["proposalId"], proposal_id);
+  assert_eq!(preview["summary"]["requirements"], 1);
+  assert_eq!(preview["summary"]["criteria"], 1);
+  assert_eq!(preview["summary"]["verifiers"], 1);
+  assert_eq!(preview["summary"]["assurance"], "LOCAL_V1");
+  assert_eq!(preview["summary"]["candidateSurface"][0], "candidate.txt");
+  assert_eq!(preview["handoff"]["command"][2], "admit-prepared");
+  assert_eq!(preview["handoff"]["requiresTrustedSecret"], true);
 }
 
 #[test]

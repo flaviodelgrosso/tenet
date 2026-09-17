@@ -4,18 +4,105 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tenet_domain::{
   algebra::{
-    CompletionContractV1, CompletionEvaluation, CompletionPolicyId, CompletionState, Evaluation,
-    EvaluationId,
+    CompletionContractV1, CompletionEvaluation, CompletionPolicyId, CompletionState, CriterionId,
+    Evaluation, EvaluationId, EvidenceRequirementV1,
   },
   authority::{
     Admission, AdmissionId, AuthorityProposal, Clarification, ClarificationId, Finding, Issue,
-    ProposalId, ReconciliationReport, ReconciliationReportId,
+    ProposalId, ReconciliationReport, ReconciliationReportId, SpecSnapshotId,
   },
   completion::Verdict,
   contract::RequirementId,
   evidence::{AuthorityId, CandidateId, ContentObjectId, ExecutionEnvironmentIdentity},
+  policy::{VerifierAuthority, VerifierProtection},
   protocol::WorkflowPhase,
 };
+
+/// Structured facts that let a host coding agent render a native approval UX
+/// for the exact prepared Authority at `AUTHORITY_ADMISSION` without making
+/// the user copy content identities or invoke Tenet CLI commands. This is
+/// informational: it admits nothing. Only a kernel-verified `AdmissionGrant`
+/// bound to these exact identities admits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmissionPreview {
+  pub proposal_id: ProposalId,
+  pub reconciliation_id: ReconciliationReportId,
+  pub authority_id: AuthorityId,
+  pub summary: AdmissionSummary,
+  pub detail: AdmissionDetail,
+  pub handoff: AdmissionHandoff,
+}
+
+/// Concise human-readable review surface for the admission approval prompt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmissionSummary {
+  pub requirements: usize,
+  pub criteria: usize,
+  pub verifiers: usize,
+  /// Strongest assurance the Contract's evidence requirements demand.
+  pub assurance: String,
+  /// Admitted Candidate capture surface (include patterns).
+  pub candidate_surface: Vec<String>,
+  pub spec_path: String,
+}
+
+/// Optional detailed review view: statements, propositions, verifier
+/// evidence policy, and the remaining exact content identities.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmissionDetail {
+  pub requirements: Vec<RequirementPreview>,
+  pub verifiers: Vec<VerifierPreview>,
+  pub content_ids: AdmissionContentIds,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequirementPreview {
+  pub id: RequirementId,
+  pub statement: String,
+  pub criteria: Vec<CriterionPreview>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CriterionPreview {
+  pub id: CriterionId,
+  pub proposition: String,
+  pub verifier_ids: Vec<String>,
+  pub evidence: EvidenceRequirementV1,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VerifierPreview {
+  pub id: String,
+  pub authority: VerifierAuthority,
+  pub protection: VerifierProtection,
+}
+
+/// The exact content identities behind the preview beyond the lifecycle IDs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmissionContentIds {
+  pub spec_id: SpecSnapshotId,
+  pub contract_id: ContentObjectId,
+  pub surface_id: ContentObjectId,
+}
+
+/// The trusted handoff: one argv that a trusted context (holding the
+/// admission secret, outside the candidate producer's control) executes to
+/// mint the grant and submit `ADMISSION` for exactly these identities. The
+/// producer must never mint a grant itself; running this command without the
+/// trusted secret fails closed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmissionHandoff {
+  pub command: Vec<String>,
+  pub requires_trusted_secret: bool,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -143,6 +230,10 @@ pub struct ContextResult {
   pub requirement_checks: Vec<RequirementStatus>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub authoring: Option<AuthoringReadiness>,
+  /// Structured approval-UX facts for the exact prepared Authority; present
+  /// only while the derived phase is `AUTHORITY_ADMISSION`.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub admission: Option<AdmissionPreview>,
   pub next_action: String,
 }
 

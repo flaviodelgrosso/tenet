@@ -19,11 +19,13 @@ tenet_requirement_check
 tenet_verify
 ```
 
-The CLI is the canonical process surface and drives the complete lifecycle with identical application and kernel semantics: `init`, `status`, `authority prepare|reconcile|clarify|grant|admit|inspect`, `requirement check`, `verify`, `blockers`, `evidence`, `receipt verify`, `doctor`, `mcp`, `version`. Exit codes distinguish success/`DONE` (0), invalid input (1), `NOT_DONE` (2), `INCONCLUSIVE` (3), and infrastructure failure (4). Do not reintroduce public propose/approve/seal/select/capture/gate workflows, and do not add completion semantics to the CLI beyond the shared application use cases.
+The CLI is the canonical process surface and drives the complete lifecycle with identical application and kernel semantics: `init`, `status`, `authority prepare|reconcile|clarify|grant|admit-prepared|admit|inspect`, `requirement check`, `verify`, `blockers`, `evidence`, `receipt verify`, `doctor`, `mcp`, `version`. Exit codes distinguish success/`DONE` (0), invalid input (1), `NOT_DONE` (2), `INCONCLUSIVE` (3), and infrastructure failure (4). Do not reintroduce public propose/approve/seal/select/capture/gate workflows, and do not add completion semantics to the CLI beyond the shared application use cases.
 
 `tenet_context` derives phase from persisted facts. Never persist workflow phase. `COMPLETED` requires a successful Final Evaluation for the active Admission and Authority whose Candidate equals a fresh current capture.
 
 `tenet_authority_submit` implements `PROPOSAL`, `RECONCILIATION`, `CLARIFICATION`, and `ADMISSION`. Every transition binds exact identities. Clarification never admits. Admission validates the complete exact chain and requires an `AdmissionGrant` bound to the exact proposal and authority. The grant mac is verified by the kernel under the trusted admission secret (`TENET_ADMISSION_SECRET`, hex, at least 32 bytes) held only by the trusted operator process; grant minting is CLI-only and never exposed through MCP. A process without the secret fails closed with `admission_secret_unavailable`. Every load path that can influence verification or completion revalidates the persisted grant mac under the trusted secret, so a hand-edited or forged Admission in repository state fails closed with `admission_grant_invalid`; informational loads (context, inspect, doctor, evidence) enforce the grant's structural binding (semantics version and exact proposal/authority identity) and surface an invalid chain as incompatibility rather than admission.
+
+At `AUTHORITY_ADMISSION`, `tenet_context` derives a structured admission preview: the exact Proposal, Reconciliation, and Authority identities, a human-readable summary (requirement/Criterion/verifier counts, assurance, Candidate surface), a detail view (statements, propositions, verifier evidence policy, remaining content identities), and the trusted handoff argv. The CLI-only trusted handoff `authority admit-prepared` derives those exact identities from refs, verifies their binding, mints the grant under the trusted secret, and submits `ADMISSION` through the same kernel path; it fails closed on missing preconditions, ref mismatches, and absent credentials. User approval through an agent prompt is not an `AdmissionGrant`, no adapter may turn an approval value into Admission, and the candidate producer must never possess the secret or mint a grant.
 
 `tenet_requirement_check` captures one Candidate, reruns all verifiers for one Requirement using a fresh Candidate view per verifier, persists a Requirement-scoped Evaluation, and updates its ref. It cannot establish terminal completion.
 
@@ -120,6 +122,7 @@ Architectural changes require deterministic offline adversarial tests. Preserve 
 - producer assertions cannot create `DONE`;
 - a producer without the trusted admission secret cannot mint a grant or admit;
 - a grant cannot admit across proposal or authority identities, a tampered mac cannot admit, and unknown grant semantics fail closed on load;
+- user approval alone cannot admit: a producer without the trusted secret cannot drive the trusted handoff, a fabricated grant fails closed even in a trusted process, and the handoff admits the exact prepared chain without manual identity re-entry while ref mismatches and missing preconditions fail closed;
 - candidate-controlled verifier trust requires explicit Authority policy;
 - evidence cannot transfer across Candidate or Authority identities;
 - reconciliation and admission cannot transfer across identities;

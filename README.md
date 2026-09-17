@@ -109,11 +109,16 @@ tenet status                                            # derived phase + next a
 tenet authority prepare   --contract contract.json      # PROPOSAL: pin the exact Authority
 tenet authority reconcile --proposal <PROPOSAL_ID>      # RECONCILIATION
 
-# The admission trust boundary. The trusted operator — not the agent —
-# holds TENET_ADMISSION_SECRET and mints a grant bound to the exact
-# proposal and authority. The agent never runs `tenet authority grant`,
-# not even as a probe: at admission it reports the exact Proposal,
-# Reconciliation, and Authority IDs and waits for the trusted grant.
+# The admission trust boundary. User approval is not an AdmissionGrant:
+# the agent presents the `tenet status` admission preview through the host
+# agent's native approval UX, then this trusted handoff runs in a context the
+# candidate producer does not control. It derives the exact Proposal,
+# Reconciliation, and Authority identities from repository state, mints the
+# grant under TENET_ADMISSION_SECRET, and admits through the same kernel path.
+# The agent never runs `tenet authority grant`, not even as a probe.
+TENET_ADMISSION_SECRET=<hex> tenet authority admit-prepared
+
+# Manual equivalent, when the operator drives each step explicitly:
 TENET_ADMISSION_SECRET=<hex> tenet authority grant \
   --proposal <PROPOSAL_ID> --authority <AUTHORITY_ID> --json > grant.json
 
@@ -182,7 +187,7 @@ Once admitted, the Authority is immutable and content-addressed. Mutable refs ar
 | `tenet_requirement_check` | Rerun one requirement's verifiers against the current Candidate |
 | `tenet_verify` | Final evaluation — the only operation that can return `DONE` |
 
-The generated Skill and the derived `tenet_context` next action spell out the rules agents most often miss: Criteria only reference configured verifier IDs (unique across the Contract — never invent near-duplicate definitions), implementation may precede Admission while requirement checks and final verification stay authoritative only under an admitted Authority, and at `AUTHORITY_ADMISSION` the producer reports the exact Proposal/Reconciliation/Authority IDs and waits for a trusted grant instead of running `tenet authority grant`.
+The generated Skill and the derived `tenet_context` next action spell out the rules agents most often miss: Criteria only reference configured verifier IDs (unique across the Contract — never invent near-duplicate definitions), implementation may precede Admission while requirement checks and final verification stay authoritative only under an admitted Authority, and at `AUTHORITY_ADMISSION` the producer presents the context's structured admission preview through the host agent's native approval UX and then runs the trusted handoff `tenet authority admit-prepared` — user approval is not an `AdmissionGrant`, the producer never runs `tenet authority grant`, and after the handoff the agent resumes from the phase Tenet re-derives.
 
 **MCP is optional.** The CLI is the canonical process surface and drives the entire lifecycle with identical application and kernel semantics. Completion never depends on a particular agent or adapter:
 

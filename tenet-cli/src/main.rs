@@ -258,6 +258,15 @@ fn run_authority(tenet: &Tenet, command: AuthorityCommand) -> Result<u8> {
       }
       Ok(EXIT_OK)
     }
+    AuthorityCommand::AdmitPrepared { json } => {
+      let result = tenet.authority_admit_prepared()?;
+      if json {
+        print_json(&result)?;
+      } else {
+        println!("authority admitted");
+      }
+      Ok(EXIT_OK)
+    }
     AuthorityCommand::Admit {
       proposal,
       reconciliation,

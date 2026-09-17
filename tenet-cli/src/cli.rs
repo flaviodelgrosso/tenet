@@ -118,6 +118,16 @@ pub enum AuthorityCommand {
     #[arg(long)]
     json: bool,
   },
+  /// Trusted handoff: derive the exact prepared proposal, reconciliation, and
+  /// authority from repository state, mint the admission grant under the trusted
+  /// admission secret, and submit ADMISSION in one step. Requires the trusted
+  /// admission secret in this process; the candidate producer must run it only
+  /// through a trusted context (the harness approval path or the operator's own
+  /// shell), never with the secret in its own environment.
+  AdmitPrepared {
+    #[arg(long)]
+    json: bool,
+  },
   /// Admit the exact proposal, reconciliation, and authority under a trusted grant.
   Admit {
     #[arg(long, value_name = "PROPOSAL_ID")]
@@ -177,6 +187,7 @@ impl Command {
         | AuthorityCommand::Reconcile { json, .. }
         | AuthorityCommand::Clarify { json, .. }
         | AuthorityCommand::Grant { json, .. }
+        | AuthorityCommand::AdmitPrepared { json }
         | AuthorityCommand::Admit { json, .. }
         | AuthorityCommand::Inspect { json } => *json,
       },

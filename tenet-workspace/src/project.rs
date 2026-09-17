@@ -77,7 +77,19 @@ Candidate implementation may occur before Admission: nothing in the protocol gat
 
 ## At AUTHORITY_ADMISSION
 
-A candidate producer must not mint an `AdmissionGrant` and must never run `tenet authority grant` itself — not even as a fail-closed probe. The kernel already fails closed without the trusted secret, so a probe proves nothing new and only adds noise. Report the exact Proposal ID, Reconciliation ID, and Authority ID to the trusted admission side and stop all authority progression until a trusted grant bound to those exact identities is provided. The trusted side alone mints the grant and submits `ADMISSION`.
+`tenet_context` returns an `admission` preview for the exact prepared chain: the Proposal, Reconciliation, and Authority content identities, a human-readable `summary` (requirement, Criterion, and verifier counts, assurance, Candidate surface, specification path), a `detail` view (requirement statements, Criterion propositions, verifier IDs with evidence policy, and the exact Proposal ID, Reconciliation ID, and Authority ID), and a `handoff` field with the trusted admission command. Render the approval UX from this preview; never make the user copy content IDs or type Tenet CLI commands.
+
+Use the host coding agent's native user-interaction or confirmation mechanism when available (an ask/choice tool). Otherwise present the same summary and choices as a plain question. Ask one question with the concise summary and these choices:
+
+- **Review authority** — show the `detail` view (requirements, propositions, verifiers, evidence policy, exact content IDs), then offer the same choices again.
+- **Admit and continue** — perform the trusted handoff.
+- **Stop / reject** — stop all authority progression and report that the workflow waits for a later admission decision.
+
+On approval, perform the trusted handoff: run the `handoff.command` argv exactly as given (`tenet authority admit-prepared --json`). It derives the exact Proposal, Reconciliation, and Authority identities from the immutable chain, mints the admission grant under the trusted admission secret, and submits `ADMISSION` through the same kernel path as the manual CLI flow. It must run only where the trusted admission secret is present — a context the candidate producer does not control, such as the harness's approval execution path or the operator's own shell. If your environment lacks the secret, ask the user or host harness to run that one command; never add `TENET_ADMISSION_SECRET` to your own environment.
+
+User approval through an agent prompt is not an `AdmissionGrant`: you must never run `tenet authority grant` yourself — not even as a fail-closed probe — never mint, forge, or request a grant from your own process, and never treat an `approved=true` style answer as admission. Only kernel verification of a grant minted under the trusted secret admits.
+
+After the handoff returns, call `tenet_context` again and continue from the phase it derives. Never infer that Admission succeeded because the user approved; the re-derived phase is the only evidence.
 
 ## Checking and verifying
 
