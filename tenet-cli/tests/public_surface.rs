@@ -166,6 +166,10 @@ fn mcp_exposes_exactly_four_completion_operations() {
     "writer authentication",
     "cryptographic human identity",
     "verifier Pass is not task completion",
+    "unique across the Contract",
+    "authoritative only under an admitted Authority",
+    "never run tenet authority grant",
+    "not even as a fail-closed probe",
   ] {
     assert!(initialize.contains(boundary), "missing boundary {boundary}");
   }

@@ -1786,7 +1786,7 @@ fn context_for_phase(
     WorkflowPhase::AuthorityReconciliation => "Submit RECONCILIATION for the exact proposal.",
     WorkflowPhase::AuthorityClarification => "Submit CLARIFICATION or a revised PROPOSAL.",
     WorkflowPhase::AuthorityAdmission => {
-      "Submit ADMISSION for the exact proposal and reconciliation."
+      "Ask the trusted operator to mint a grant and submit ADMISSION for the exact proposal, reconciliation, and authority; never run tenet authority grant yourself."
     }
     WorkflowPhase::AuthorityStale => {
       "Submit and admit a new authority for the current specification."

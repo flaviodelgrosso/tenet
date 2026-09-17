@@ -52,12 +52,34 @@ At `AUTHORITY_REQUIRED`:
 1. Inspect `.tenet/tenet.toml` and `tenet_context`'s `authoring` facts. They identify the config path, configured Candidate capture state, configured verifier IDs, and missing prerequisites.
 2. Inspect the `tenet_authority_submit` MCP tool schema for the complete Contract and stage-specific request fields, finite enums, and serialized names.
 3. Read the `tenet://authoring/configuration` MCP resource. Its `configurationSchema` is generated from Tenet's authoritative configuration type and defines the strict `.tenet/tenet.toml` surface, including typed argv/cwd, `timeoutMs`, verifier authority/protection, and exit-code disposition fields.
-4. Define the positive Candidate surface in `candidate.include`; configure every verifier referenced by the Contract; then use `tenet doctor` to confirm the strict configuration is valid.
-5. Submit `PROPOSAL` only after those prerequisites exist. Independently falsifiable behavioral claims should normally be distinct Criteria/proof obligations. Multiple Criteria may use the same verifier.
+4. Define the positive Candidate surface in `candidate.include`; define every verifier the Contract will reference; then use `tenet doctor` to confirm the strict configuration is valid.
+5. Submit `PROPOSAL` only after those prerequisites exist, authoring the Contract under the reference rules below.
+
+## Verifier definitions vs Contract references
+
+"Verifier" names two distinct things at two distinct layers:
+
+- A verifier definition is one `[[verifiers]]` entry in `.tenet/tenet.toml`: a unique `id` plus the structured command (argv, cwd, timeout, exit-code dispositions, authority, protection). Definitions exist only in the config; the Contract never defines a command.
+- A Criterion's `verifiers` array in the Contract holds references: `{ "id", "material" }` objects whose `id` must exactly match an already-configured definition and whose `material` must match that definition's authority (`candidate` for a project verifier, `authority_bundle` for an authority-snapshot verifier).
+
+An unconfigured reference ID is rejected with `verifier_not_configured`, and a `material` that contradicts the configured authority with `verifier_material_mismatch`. Reference IDs are unique across the whole Contract: the kernel rejects a Contract that references the same verifier ID from two different Criteria with `duplicate verifier identifier`. Therefore:
+
+- One Criterion may reference several distinct configured verifiers.
+- Two Criteria may not share one verifier. If the same observation is meant to prove both claims, they are not independently falsifiable: merge them into one Criterion with one proposition. If the claims are genuinely independent, each Criterion gets its own distinct verifier observation.
+- Never invent a new near-duplicate verifier ID in `.tenet/tenet.toml` — the same command under a renamed ID — to satisfy uniqueness. That duplicates evidence, not observation.
+- Independently falsifiable behavioral claims should normally be distinct Criteria, each backed by its own distinct observation.
 
 Do not use Tenet implementation source or tests as normal protocol discovery.
 
-At `AUTHORITY_ADMISSION`, a candidate producer must not mint an `AdmissionGrant`. If no trusted grant is available, report the exact Proposal ID and Authority ID to the trusted admission side and stop progression. The trusted side alone can mint a grant bound to that exact pair and submit `ADMISSION`.
+## Implementing before or after Admission
+
+Candidate implementation may occur before Admission: nothing in the protocol gates writing code, and authoring the Authority against unfinished work is normal. What Admission gates is authoritative evaluation. `tenet_requirement_check` and `tenet_verify` bind every run to the active admitted Authority: without an Admission they fail closed with `admission_missing`, and a Tenet process without the trusted admission secret fails closed with `admission_secret_unavailable`. Prefer admitting the Authority before implementing when practical, so every requirement check is authoritative from the start. If you implement first, treat pre-admission local test runs as ordinary development feedback and call the protocol operations only after `ADMISSION` succeeds.
+
+## At AUTHORITY_ADMISSION
+
+A candidate producer must not mint an `AdmissionGrant` and must never run `tenet authority grant` itself — not even as a fail-closed probe. The kernel already fails closed without the trusted secret, so a probe proves nothing new and only adds noise. Report the exact Proposal ID, Reconciliation ID, and Authority ID to the trusted admission side and stop all authority progression until a trusted grant bound to those exact identities is provided. The trusted side alone mints the grant and submits `ADMISSION`.
+
+## Checking and verifying
 
 During implementation, call `tenet_requirement_check` for one requirement. Its Candidate-specific Evaluation is development evidence only and cannot establish terminal completion.
 

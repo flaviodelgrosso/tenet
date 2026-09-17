@@ -111,7 +111,9 @@ tenet authority reconcile --proposal <PROPOSAL_ID>      # RECONCILIATION
 
 # The admission trust boundary. The trusted operator — not the agent —
 # holds TENET_ADMISSION_SECRET and mints a grant bound to the exact
-# proposal and authority:
+# proposal and authority. The agent never runs `tenet authority grant`,
+# not even as a probe: at admission it reports the exact Proposal,
+# Reconciliation, and Authority IDs and waits for the trusted grant.
 TENET_ADMISSION_SECRET=<hex> tenet authority grant \
   --proposal <PROPOSAL_ID> --authority <AUTHORITY_ID> --json > grant.json
 
@@ -119,7 +121,8 @@ tenet authority admit --proposal <PROPOSAL_ID> \
   --reconciliation <RECONCILIATION_ID> --authority <AUTHORITY_ID> \
   --grant grant.json                                    # ADMISSION
 
-# implement, then:
+# Implement before or after Admission — requirement checks and final
+# verification are authoritative only under an admitted Authority:
 tenet requirement check --id <REQUIREMENT_ID>           # one requirement's verifiers
 tenet verify                                            # final verdict; exit code = verdict
 ```
@@ -152,7 +155,7 @@ A contract is a JSON document mapping requirements to criteria, and criteria to 
 }
 ```
 
-Verifiers themselves — structured commands with explicit argv, environment, timeout, and exit-code dispositions — are configured in `.tenet/tenet.toml`. No implicit shell; every run is bounded and recorded.
+Each `criteria[].verifiers[]` entry is a *reference*, not a definition: its `id` must exactly match a verifier *defined* in `.tenet/tenet.toml` — the structured command with explicit argv, environment, timeout, and exit-code dispositions — and its `material` must match that definition's authority (`candidate` or `authority_bundle`). Reference IDs are unique across the whole Contract: two Criteria cannot share one verifier, so if one observation proves both claims they are a single Criterion, and genuinely independent Criteria each get their own distinct verifier. Never rename the same command into a second config entry just to satisfy uniqueness. No implicit shell; every run is bounded and recorded.
 
 </details>
 
@@ -178,6 +181,8 @@ Once admitted, the Authority is immutable and content-addressed. Mutable refs ar
 | `tenet_authority_submit` | Submit one lifecycle stage: `PROPOSAL`, `RECONCILIATION`, `CLARIFICATION`, `ADMISSION` |
 | `tenet_requirement_check` | Rerun one requirement's verifiers against the current Candidate |
 | `tenet_verify` | Final evaluation — the only operation that can return `DONE` |
+
+The generated Skill and the derived `tenet_context` next action spell out the rules agents most often miss: Criteria only reference configured verifier IDs (unique across the Contract — never invent near-duplicate definitions), implementation may precede Admission while requirement checks and final verification stay authoritative only under an admitted Authority, and at `AUTHORITY_ADMISSION` the producer reports the exact Proposal/Reconciliation/Authority IDs and waits for a trusted grant instead of running `tenet authority grant`.
 
 **MCP is optional.** The CLI is the canonical process surface and drives the entire lifecycle with identical application and kernel semantics. Completion never depends on a particular agent or adapter:
 
